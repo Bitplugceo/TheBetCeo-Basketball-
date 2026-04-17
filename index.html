@@ -12062,23 +12062,44 @@ function getMassacreNormalRandom() {
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
-function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
+// Fix 7: Off-thread Monte Carlo Bridge
+async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
   if (!isFinite(mean) || !isFinite(stdDev) || !isFinite(line) || stdDev <= 0) {
     return { overPct: 50, underPct: 50 };
   }
 
-  let overHits = 0;
-  for (let i = 0; i < runs; i++) {
-    const sample = mean + getMassacreNormalRandom() * stdDev;
-    if (sample > line) overHits++;
-  }
+  // Define the background logic as a string
+  const workerCode = `
+    function getNormalRandom() {
+      let u = 0, v = 0;
+      while (u === 0) u = Math.random();
+      while (v === 0) v = Math.random();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+    onmessage = function(e) {
+      const { mean, stdDev, line, runs } = e.data;
+      let overHits = 0;
+      for (let i = 0; i < runs; i++) {
+        const sample = mean + getNormalRandom() * stdDev;
+        if (sample > line) overHits++;
+      }
+      const overPct = (overHits / runs) * 100;
+      postMessage({ overPct, underPct: 100 - overPct });
+    };
+  `;
 
-  const overPct = (overHits / runs) * 100;
-  return {
-    overPct,
-    underPct: 100 - overPct
-  };
+  const blob = new Blob([workerCode], { type: "application/javascript" });
+  const worker = new Worker(URL.createObjectURL(blob));
+
+  return new Promise((resolve) => {
+    worker.onmessage = (e) => {
+      worker.terminate(); // Clean up memory immediately
+      resolve(e.data);
+    };
+    worker.postMessage({ mean, stdDev, line, runs });
+  });
 }
+
 
 function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
   const marketKey = getMarketKeyFromName(pickRow?.name);
@@ -12228,12 +12249,13 @@ function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
     return base + rangeAdj + instabilityAdj;
   })();
 
-  const sim = runMassacreMonteCarlo(
+  const sim = await runMassacreMonteCarlo(
     isFinite(ensembleMean) ? ensembleMean : Number(pickRow?.proj),
     marketStdDev,
     Number(pickRow?.line),
     getMassacreRuns(league)
   );
+
 
   const simPct = side === "over" ? sim.overPct : sim.underPct;
 
@@ -12423,17 +12445,18 @@ function rescueBestMassacreLean(picks) {
   candidate.massacreDecision = "lean_rescue";
 }
 
-function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta) {
+async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta) {
   if (!Array.isArray(picks)) return;
 
-  picks.forEach(p => {
+  // Run all simulations in parallel across background threads
+  const promises = picks.map(async (p) => {
     if (!p || p.note || p.pick === "NO PLAY") return;
 
     const side = getPickSideFromText(p.pick);
     if (!side) return;
 
     const originalPick = p.pick;
-    const diag = evaluateMassacreForPick(p, league, parsed, fixtureMeta);
+    const diag = await evaluateMassacreForPick(p, league, parsed, fixtureMeta);
     const profile = getMassacreProfile(diag, p, league);
 
     p.massacre = diag;
@@ -12470,8 +12493,11 @@ function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta) {
     }
   });
 
+  await Promise.all(promises);
   rescueBestMassacreLean(picks);
 }
+
+
 
 
 function applyLeagueTrustToPicks(picks, league) {
