@@ -6574,15 +6574,26 @@ function isTrackerStateMeaningfullyEmpty(state) {
   return active === 0 && archived === 0 && total === 0 && settled === 0;
 }
 
-async function pushTrackerStateToServer(stateSnapshot) {
+async function pushTrackerStateToServer(stateSnapshot, isEmergency = false) {
   syncLineMemoryIntoTrackerState();
 
   if (isTrackerStateMeaningfullyEmpty(stateSnapshot)) {
-    engineDebug("tracker push skipped for empty state", { snapshot: getTrackerStateDebugScore(g_trackerState) });
     return { ok: true, state: g_trackerState };
   }
 
-  let payloadState = JSON.parse(JSON.stringify(stateSnapshot || {}));
+  const payload = JSON.stringify(stateSnapshot);
+
+  // Fix 8: If we are closing the tab, use Beacon for guaranteed delivery
+  if (isEmergency && navigator.sendBeacon) {
+    const blob = new Blob([payload], { type: 'application/json' });
+    const success = navigator.sendBeacon(TRACKER_API_URL, blob);
+    if (success) {
+      engineDebug("Emergency beacon queued successfully");
+      return { ok: true };
+    }
+  }
+
+  let payloadState = JSON.parse(payload);
   engineDebug("tracker push start", { payload: getTrackerStateDebugScore(payloadState) });
 
   try {
@@ -6596,12 +6607,7 @@ async function pushTrackerStateToServer(stateSnapshot) {
     );
 
     if (preRes.ok && preData?.ok && preData?.state) {
-      engineDebug("tracker push premerge state", {
-        payload: getTrackerStateDebugScore(payloadState),
-        server: getTrackerStateDebugScore(preData.state)
-      });
       payloadState = mergeTrackerStates(payloadState, preData.state);
-      engineDebug("tracker push premerge merged", { merged: getTrackerStateDebugScore(payloadState) });
     }
   } catch (err) {
     console.error("[BB Engine] tracker pre-merge GET failed", err);
@@ -6609,41 +6615,31 @@ async function pushTrackerStateToServer(stateSnapshot) {
 
   payloadState.updatedAt = new Date().toISOString();
 
-  const { res, data } = await fetchTrackerJson(
-    TRACKER_API_URL,
-    {
-      method: "POST",
-      headers: getTrackerHeaders(true),
-      body: JSON.stringify(payloadState)
-    }
-  );
+  try {
+    const { res, data } = await fetchTrackerJson(
+      TRACKER_API_URL,
+      {
+        method: "POST",
+        headers: getTrackerHeaders(true),
+        body: JSON.stringify(payloadState)
+      }
+    );
 
-  if (!res.ok) {
-    throw new Error("Tracker POST failed (" + res.status + ")");
+    if (!res.ok) throw new Error("Tracker POST failed (" + res.status + ")");
+
+    if (data?.ok && data?.state) {
+      if (isTrackerStateWorseThan(data.state, payloadState)) {
+        return { ok: true, state: payloadState };
+      }
+      return data;
+    }
+  } catch (err) {
+    engineDebug("Standard push failed, fallback to local", err);
   }
 
-  if (data?.ok && data?.state) {
-    engineDebug("tracker push response", {
-      payload: getTrackerStateDebugScore(payloadState),
-      response: getTrackerStateDebugScore(data.state)
-    });
-    if (isTrackerStateWorseThan(data.state, payloadState)) {
-      trackerDebug("tracker push ignored worse server response", {
-        payload: getTrackerStateDebugScore(payloadState),
-        response: getTrackerStateDebugScore(data.state)
-      });
-      engineDebug("tracker push kept local payload over worse server response", {
-        payload: getTrackerStateDebugScore(payloadState),
-        response: getTrackerStateDebugScore(data.state)
-      });
-      return { ok: true, state: payloadState };
-    }
-    return data;
-  }
-
-  engineDebug("tracker push fell back to payload state", { payload: getTrackerStateDebugScore(payloadState) });
   return { ok: true, state: payloadState };
 }
+
 
 function scheduleTrackerSave() {
   syncLineMemoryIntoTrackerState();
@@ -13808,19 +13804,26 @@ function setEngineMode() {
       openSection("leagueSection");
       refreshTrackerInBackground(false);
 
-      window.addEventListener("focus", () => refreshTrackerInBackground(true));
+            window.addEventListener("focus", () => refreshTrackerInBackground(true));
       window.addEventListener("pageshow", () => refreshTrackerInBackground(true));
       window.addEventListener("online", () => refreshTrackerInBackground(true));
-      window.addEventListener("pagehide", () => queueTrackerKeepaliveSave());
-      window.addEventListener("beforeunload", () => queueTrackerKeepaliveSave());
+      
+      // Fix 8: Use emergency beacon on tab close/hide for guaranteed sync
+      const handleExit = () => {
+        syncLineMemoryIntoTrackerState();
+        pushTrackerStateToServer(g_trackerState, true);
+      };
+
+      window.addEventListener("pagehide", handleExit);
+      window.addEventListener("beforeunload", handleExit);
       document.addEventListener("visibilitychange", () => {
         if (document.hidden) {
-          queueTrackerKeepaliveSave();
-          return;
+          handleExit();
+        } else {
+          refreshTrackerInBackground(true);
         }
-
-        refreshTrackerInBackground(true);
       });
+
 
            [["useFTH2H","ft"], ["use1HH2H","h1"], ["use2HH2H","h2"]].forEach(([id, kind]) => {
         const el = document.getElementById(id);
