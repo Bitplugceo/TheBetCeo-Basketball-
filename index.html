@@ -3945,15 +3945,23 @@ function saveTrackerStateToLocal() {
       }
     }
 
-    const payload = JSON.stringify(g_trackerState);
+        const payload = JSON.stringify(g_trackerState);
 
-    getTrackerLocalStateCandidateKeys().forEach(key => {
+    // Only save to the active keys to prevent localStorage quota bombing.
+    // Legacy keys are for reading/hydration only.
+    const activeKeys = [
+      getTrackerLocalStateStableKey(),
+      getTrackerLocalStateBuildKey(APP_BUILD_VERSION)
+    ].filter(Boolean);
+
+    [...new Set(activeKeys)].forEach(key => {
       try {
         localStorage.setItem(key, payload);
       } catch (err) {
-        console.error("[BB Engine] saveTrackerStateToLocal failed for key", key, err);
+        console.error("[BB Engine] saveTrackerStateToLocal failed for active key", key, err);
       }
     });
+
   } catch (err) {
     console.error("[BB Engine] saveTrackerStateToLocal failed", err);
   }
@@ -6518,15 +6526,16 @@ function mergeTrackerStates(localState, serverState) {
   const mergedArchived = mergeTrackerArchivedPicks(local.archivedPicks, server.archivedPicks);
   const reconciled = reconcileTrackerBucketConflicts(mergedActive, mergedArchived);
 
+    // Safely find the newest actual modification time, without forcing Date.now()
+  const localTime = getTrackerStateUpdatedAtMs(local);
+  const serverTime = getTrackerStateUpdatedAtMs(server);
+  const maxTime = Math.max(localTime, serverTime);
+
   return {
     activePicks: reconciled.activePicks,
     archivedPicks: reconciled.archivedPicks,
     stats: { total: 0, settled: 0, wins: 0, losses: 0, pushes: 0 },
-    updatedAt: new Date(Math.max(
-      getTrackerStateUpdatedAtMs(local),
-      getTrackerStateUpdatedAtMs(server),
-      Date.now()
-    )).toISOString(),
+    updatedAt: maxTime > 0 ? new Date(maxTime).toISOString() : new Date().toISOString(),
     lineMemory: {
       ...(server.lineMemory && typeof server.lineMemory === "object" ? server.lineMemory : {}),
       ...(local.lineMemory && typeof local.lineMemory === "object" ? local.lineMemory : {})
@@ -9012,18 +9021,29 @@ function readLooseSeries(id) {
   const raw = el?.value?.trim() || "";
   if (!raw) return [];
 
+  // Split, trim, and remove completely empty strings
   const parts = raw.split(",").map(x => x.trim()).filter(Boolean);
-  if (!parts.length || parts.length > 5) return [];
+  if (!parts.length) return [];
 
   const out = [];
   for (const part of parts) {
     const value = Number(part);
-    if (!isFinite(value) || value <= 0 || value > 300) return [];
+    
+    // Instead of nuking the whole array, just skip the corrupted entry
+    if (!isFinite(value) || value <= 0 || value > 300) {
+      engineDebug(`readLooseSeries skipped invalid input in #${id}:`, part);
+      continue; 
+    }
+    
     out.push(value);
+    
+    // Enforce the 5-game maximum limit safely
+    if (out.length === 5) break;
   }
 
   return out;
 }
+
 
 function normalizeIntelSeries(arr) {
   return (Array.isArray(arr) ? arr : []).map(Number).filter(v => isFinite(v));
@@ -11155,12 +11175,6 @@ function getH2HSeries(side, marketKey, parsed) {
   return [];
 }
 
-function maybeReadH2HEnabled(marketKey) {
-  if (marketKey === "ft") return !!document.getElementById("useFTH2H")?.checked;
-  if (marketKey === "h1") return !!document.getElementById("use1HH2H")?.checked;
-  if (marketKey === "h2") return !!document.getElementById("use2HH2H")?.checked;
-  return false;
-}
 
 function buildTeamMarketProjection({
   league,
@@ -11426,8 +11440,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const aVenueAllowed = getAllowedSeries("A", "venue", "ft", parsed);
   const bVenueAllowed = getAllowedSeries("B", "venue", "ft", parsed);
 
-  const ftHasH2H =
-    maybeReadH2HEnabled("ft") &&
+    const ftHasH2H =
     getH2HSeries("A", "ft", parsed).length >= 2 &&
     getH2HSeries("B", "ft", parsed).length >= 2;
 
@@ -11678,16 +11691,13 @@ function getExactFetchedSecondHalfH2HSeries(side, parsed) {
     if (out.length) return out;
   }
 
-  const ft = side === "A"
-    ? (safeArr(document.getElementById("useFTH2H")?.checked ? parseGames("aFTH2H") : null) || [])
-    : (safeArr(document.getElementById("useFTH2H")?.checked ? parseGames("bFTH2H") : null) || []);
-
-  const h1 = side === "A"
-    ? (safeArr(document.getElementById("use1HH2H")?.checked ? parseGames("a1HH2H") : null) || [])
-    : (safeArr(document.getElementById("use1HH2H")?.checked ? parseGames("b1HH2H") : null) || []);
+  // DOM calls removed. Using the parsed data directly.
+  const ft = side === "A" ? (safeArr(parsed?.aFTH2H) || []) : (safeArr(parsed?.bFTH2H) || []);
+  const h1 = side === "A" ? (safeArr(parsed?.a1HH2H) || []) : (safeArr(parsed?.b1HH2H) || []);
 
   return deriveSecondHalfSeries(ft, h1);
 }
+
 
 function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
   const supported = league === "nba" || league === "ncaa";
@@ -11888,25 +11898,19 @@ function getMassacreTeamContext(side, parsed) {
   };
 }
 
-function getMassacreH2HSeries(marketKey, fixtureMeta) {
+function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
   const games = Array.isArray(g_massacreFetchContext?.h2hGames) ? g_massacreFetchContext.h2hGames : [];
   if (!games.length) {
     if (marketKey === "ft") {
-      return {
-        A: safeArr(document.getElementById("useFTH2H")?.checked ? parseGames("aFTH2H") : null) || [],
-        B: safeArr(document.getElementById("useFTH2H")?.checked ? parseGames("bFTH2H") : null) || []
-      };
+      return { A: safeArr(parsed?.aFTH2H) || [], B: safeArr(parsed?.bFTH2H) || [] };
     }
     if (marketKey === "h1") {
-      return {
-        A: safeArr(document.getElementById("use1HH2H")?.checked ? parseGames("a1HH2H") : null) || [],
-        B: safeArr(document.getElementById("use1HH2H")?.checked ? parseGames("b1HH2H") : null) || []
-      };
+      return { A: safeArr(parsed?.a1HH2H) || [], B: safeArr(parsed?.b1HH2H) || [] };
     }
     if (marketKey === "h2") {
       return {
-        A: getExactFetchedSecondHalfH2HSeries("A", {}),
-        B: getExactFetchedSecondHalfH2HSeries("B", {})
+        A: getExactFetchedSecondHalfH2HSeries("A", parsed),
+        B: getExactFetchedSecondHalfH2HSeries("B", parsed)
       };
     }
     return { A: [], B: [] };
@@ -11934,6 +11938,7 @@ function getMassacreH2HSeries(marketKey, fixtureMeta) {
 
   return { A, B };
 }
+
 
 function getMassacreMarketWindowSet(marketKey, parsed, fixtureMeta) {
   const A = getMassacreTeamContext("A", parsed);
@@ -11991,8 +11996,10 @@ function getMassacreMarketWindowSet(marketKey, parsed, fixtureMeta) {
   const windows = map[marketKey] || map.ft;
   windows.h2h = getMassacreH2HSeries(
     marketKey === "team_a" || marketKey === "team_b" ? "ft" : marketKey,
-    fixtureMeta
+    fixtureMeta,
+    parsed
   );
+
   windows.restA = A.restDays;
   windows.restB = B.restDays;
   return windows;
