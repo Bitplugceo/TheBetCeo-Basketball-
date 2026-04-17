@@ -2949,18 +2949,35 @@ const WORKER_BASE_URL = String(WORKER_URL || "").replace(/\/+$/, "");
 const DEBUG = false;
 const CACHE_MAX = 120;
 
-    const MODEL = {
-      TEAM_WEIGHT: 0.60,
-      OPP_WEIGHT: 0.40,
-      REGRESSION_WEIGHT: 0.85,
-      BASELINE_WEIGHT: 0.15,
-      PACE_BLEND: 0.50,
+        // Fix 11: Dynamic Calibration System (Replaces Magic Numbers)
+    function getDynamicWeights(sampleTier, volatility, league) {
+      const isFull = sampleTier === "full";
+      const isHighVol = volatility > (LEAGUE_VOL_LIMITS[league] || 12);
+      
+      // Base confidence starts at 0.60 for full samples, drops for thin/volatile
+      let teamWeight = isFull ? 0.65 : 0.50;
+      if (isHighVol) teamWeight -= 0.10;
+
+      // Ensure weights always sum to 1.0
+      teamWeight = clampNumber(teamWeight, 0.40, 0.75);
+      const oppWeight = 1.0 - teamWeight;
+
+      // Regression to mean: High volatility forces a move toward the baseline
+      const baselineWeight = isHighVol ? 0.25 : 0.10;
+      const regressionWeight = 1.0 - baselineWeight;
+
+      return { teamWeight, oppWeight, regressionWeight, baselineWeight };
+    }
+
+    // Keep non-math constants here
+    const MODEL_CONFIG = {
       H2H_DIVERGE_THRESHOLD: 0.20,
       LINE_ANCHOR_NBA: 0.65,
       LINE_ANCHOR_OTHER: 0.50,
       MULTI_GOAL_SUPPRESS: 0.98,
       PACE_SUPPRESS: 0.97
     };
+
 const MODEL_TUNING = {
   anchorEnabled: { ft: true, h1: true, h2: true, team: true },
   anchorScale: { ft: 0.75, h1: 0.75, h2: 0.75, team: 0.85 },
@@ -11196,17 +11213,9 @@ function getH2HSeries(side, marketKey, parsed) {
 
 
 function buildTeamMarketProjection({
-  league,
-  marketKey,
-  side,
-  ownRecentSeries,
-  oppAllowedSeries,
-  ownVenueSeries,
-  oppVenueAllowedSeries,
-  h2hSeries,
-  line = NaN,
-  injMult = 1,
-  sampleTier = "thin"
+  league, marketKey, side, ownRecentSeries, oppAllowedSeries,
+  ownVenueSeries, oppVenueAllowedSeries, h2hSeries, line = NaN,
+  injMult = 1, sampleTier = "thin"
 }) {
   const ownRecent = avgOrNaN(ownRecentSeries);
   const oppAllowed = avgOrNaN(oppAllowedSeries);
@@ -11215,76 +11224,49 @@ function buildTeamMarketProjection({
   const venueBlend = avgFinite([ownVenue, oppVenueAllowed]);
   const h2h = avgOrNaN(h2hSeries);
 
-  const divergence = isFinite(h2h) && isFinite(avgFinite([ownRecent, oppAllowed]))
-    ? Math.abs(h2h - avgFinite([ownRecent, oppAllowed]))
-    : 0;
+  const seriesForVol = [...(ownRecentSeries||[]), ...(oppAllowedSeries||[])].map(Number).filter(v=>isFinite(v));
+  const vol = seriesForVol.length >= 2 ? stdDev(seriesForVol) : 0;
+  
+  // 1. Get Dynamically Calibrated Weights
+  const weights = getDynamicWeights(sampleTier, vol, league);
 
-  const h2hWeight = getH2HWeight(
-    Array.isArray(h2hSeries) ? h2hSeries.length : 0,
-    Array.isArray(h2hSeries) ? h2hSeries.length : 0,
-    marketKey,
-    sampleTier,
-    divergence
-  );
-
-  const marketWeights =
-    marketKey === "h2"
-      ? { own: 0.34, opp: 0.30, venue: 0.18 }
-      : marketKey === "h1"
-        ? { own: 0.36, opp: 0.28, venue: 0.18 }
-        : { own: 0.38, opp: 0.28, venue: 0.18 };
-
+  // 2. Build the Projection Pipeline
   const parts = [];
-  if (isFinite(ownRecent)) parts.push({ value: ownRecent, weight: marketWeights.own });
-  if (isFinite(oppAllowed)) parts.push({ value: oppAllowed, weight: marketWeights.opp });
-  if (isFinite(venueBlend)) parts.push({ value: venueBlend, weight: marketWeights.venue });
-  if (isFinite(h2h) && h2hWeight > 0) parts.push({ value: h2h, weight: h2hWeight });
-
-  const weightSum = parts.reduce((sum, p) => sum + p.weight, 0);
-  let proj = weightSum > 0
-    ? parts.reduce((sum, p) => sum + (p.value * p.weight), 0) / weightSum
-    : NaN;
-
-  const role = getFixtureSideRole(side);
-  const homeEdge = Number(LEAGUE_HOME_EDGE[league] || LEAGUE_HOME_EDGE.unknown || 0);
-  if (isFinite(proj) && marketKey === "ft") {
-    if (role === "home") proj += homeEdge * 0.5;
-    else if (role === "away") proj -= homeEdge * 0.5;
-  } else if (isFinite(proj) && (marketKey === "h1" || marketKey === "h2")) {
-    if (role === "home") proj += homeEdge * 0.28;
-    else if (role === "away") proj -= homeEdge * 0.28;
+  if (isFinite(ownRecent)) parts.push({ value: ownRecent, weight: weights.teamWeight });
+  if (isFinite(oppAllowed)) parts.push({ value: oppAllowed, weight: weights.oppWeight });
+  
+  if (isFinite(venueBlend)) {
+    // Venue data is weighted higher in NCAA where home court is massive
+    const vWeight = league === "ncaa" ? 0.25 : 0.15;
+    parts.push({ value: venueBlend, weight: vWeight });
   }
 
-  const injuryFactor = clampNumber(Number(injMult) || 1, 0.70, 1.03);
-  if (isFinite(proj)) proj *= injuryFactor;
+  if (isFinite(h2h) && h2hSeries.length >= 2) {
+    const hw = getH2HWeight(h2hSeries.length, h2hSeries.length, marketKey, sampleTier);
+    parts.push({ value: h2h, weight: hw });
+  }
 
-  const seriesForVol = [
-    ...(Array.isArray(ownRecentSeries) ? ownRecentSeries : []),
-    ...(Array.isArray(oppAllowedSeries) ? oppAllowedSeries : []),
-    ...(Array.isArray(h2hSeries) ? h2hSeries : [])
-  ].map(Number).filter(v => isFinite(v));
-  const vol = seriesForVol.length >= 2 ? stdDev(seriesForVol) : NaN;
-  const volLimit = getMarketVolLimit(league, marketKey);
+  const weightSum = parts.reduce((sum, p) => sum + p.weight, 0);
+  let proj = weightSum > 0 ? parts.reduce((sum, p) => sum + (p.value * p.weight), 0) / weightSum : NaN;
 
-  if (isFinite(proj)) proj = applyVolatility(proj, vol, volLimit);
-  if (isFinite(proj)) proj = anchorProjection(proj, line, league, marketKey === "ft" ? "team" : marketKey);
+  // 3. Regression to League Baseline (Dynamic)
+  const baseline = (LEAGUE_BASES[league] || 160) / (marketKey === "ft" ? 2 : 4);
+  if (isFinite(proj)) {
+    proj = (proj * weights.regressionWeight) + (baseline * weights.baselineWeight);
+  }
 
-  const featureCount = [ownRecent, oppAllowed, venueBlend, h2h].filter(v => isFinite(v)).length;
+  // 4. Final Adjustments
+  const role = getFixtureSideRole(side);
+  const homeEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5) / (marketKey === "ft" ? 2 : 4);
+  if (isFinite(proj) && role === "home") proj += homeEdge;
+  if (isFinite(proj) && role === "away") proj -= homeEdge;
 
-  return {
-    proj,
-    ownRecent,
-    oppAllowed,
-    ownVenue,
-    oppVenueAllowed,
-    venueBlend,
-    h2h,
-    h2hWeight,
-    vol,
-    featureCount,
-    role
-  };
+  if (isFinite(proj)) proj *= clampNumber(injMult, 0.75, 1.0);
+  if (isFinite(proj)) proj = anchorProjection(proj, line, league, "team");
+
+  return { proj, vol, featureCount: parts.length, role };
 }
+
 
 function computePaceSignal(league, teamAProj, teamBProj, marketKey = "ft") {
   const base = Number(LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160);
@@ -11421,141 +11403,59 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const aFTS = getManualSeries("A", "ft", parsed);
   const bFTS = getManualSeries("B", "ft", parsed);
-  const ftSampleTier = getSampleTier(aFTS, bFTS);
-
-  const ftProjectionOnly = false;
-  const ftProjectionNote = null;
-  const ftNote =
-    ftSampleTier === "insufficient" ? "Insufficient FT sample — need 2+ games" :
-    ftSampleTier === "thin" ? "Thin FT sample — projection downgraded" :
-    null;
-
-  if (ftSampleTier === "insufficient") {
-    return {
-      eb, cl, vl,
-      aS: NaN, aA: NaN, bS: NaN, bA: NaN,
-      projAFT: NaN, projBFT: NaN, ftProj: NaN,
-      ftEdge: NaN, aEdge: NaN, bEdge: NaN,
-      aVol: NaN, bVol: NaN,
-      pace: NaN,
-      paceGapRisk: false,
-      defensiveFloorFlag: false,
-      blowoutGap: NaN,
-      volatilityBlock: false,
-      ftSampleTier,
-      ftHasH2H: false,
-      ftNote,
-      ftProjectionOnly,
-      ftProjectionNote,
-      ftFullModel: false,
-      teamFullModel: false
-    };
-  }
-
   const aAllowed = getAllowedSeries("A", "overall", "ft", parsed);
   const bAllowed = getAllowedSeries("B", "overall", "ft", parsed);
-  const aVenueScored = getFetchedSeries("A", "venue", "ft", "scored");
-  const bVenueScored = getFetchedSeries("B", "venue", "ft", "scored");
-  const aVenueAllowed = getAllowedSeries("A", "venue", "ft", parsed);
-  const bVenueAllowed = getAllowedSeries("B", "venue", "ft", parsed);
-
-    const ftHasH2H =
-    getH2HSeries("A", "ft", parsed).length >= 2 &&
-    getH2HSeries("B", "ft", parsed).length >= 2;
-
-  const aTeam = buildTeamMarketProjection({
-    league,
-    marketKey: "ft",
-    side: "A",
-    ownRecentSeries: aFTS,
-    oppAllowedSeries: bAllowed,
-    ownVenueSeries: aVenueScored,
-    oppVenueAllowedSeries: bVenueAllowed,
-    h2hSeries: ftHasH2H ? getH2HSeries("A", "ft", parsed) : [],
-    line: lines.aLine,
-    injMult: injMultA,
-    sampleTier: ftSampleTier
-  });
-
-  const bTeam = buildTeamMarketProjection({
-    league,
-    marketKey: "ft",
-    side: "B",
-    ownRecentSeries: bFTS,
-    oppAllowedSeries: aAllowed,
-    ownVenueSeries: bVenueScored,
-    oppVenueAllowedSeries: aVenueAllowed,
-    h2hSeries: ftHasH2H ? getH2HSeries("B", "ft", parsed) : [],
-    line: lines.bLine,
-    injMult: injMultB,
-    sampleTier: ftSampleTier
-  });
-
-  let projAFT = aTeam.proj;
-  let projBFT = bTeam.proj;
-  const pace = computePaceSignal(league, projAFT, projBFT, "ft");
-  if (isFinite(pace)) {
-    const paceAdj = 1 + ((pace - 1) * 0.18);
-    if (isFinite(projAFT)) projAFT *= paceAdj;
-    if (isFinite(projBFT)) projBFT *= paceAdj;
+  
+  const ftSampleTier = getSampleTier(aFTS, bFTS);
+  if (ftSampleTier === "insufficient") {
+    return { ftProj: NaN, ftEdge: NaN, ftNote: "Insufficient sample" };
   }
 
-  let ftProj = isFinite(projAFT) && isFinite(projBFT) ? projAFT + projBFT : NaN;
-  if (isFinite(ftProj)) ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
+  // 1. Calculate Individual Efficiency (Points Per Game Relative to League Base)
+  const aOffEff = avgOrNaN(aFTS) / (eb / 2);
+  const bOffEff = avgOrNaN(bFTS) / (eb / 2);
+  const aDefEff = avgOrNaN(aAllowed) / (eb / 2);
+  const bDefEff = avgOrNaN(bAllowed) / (eb / 2);
 
-  if (isFinite(ftProj) && isFinite(projAFT) && isFinite(projBFT)) {
-    const scale = ftProj / Math.max(1, (projAFT + projBFT));
-    projAFT *= scale;
-    projBFT *= scale;
-  }
+  // 2. Derive Estimated Match Pace
+  // We look at how many points both teams' games usually produce to find the 'speed'
+  const aGamePace = (avgOrNaN(aFTS) + avgOrNaN(aAllowed)) / eb;
+  const bGamePace = (avgOrNaN(bFTS) + avgOrNaN(bAllowed)) / eb;
+  const estMatchPace = clampNumber((aGamePace + bGamePace) / 2, cl.min, cl.max);
 
-  const ftEdge = lines.ftLine !== null && isFinite(ftProj) ? ftProj - lines.ftLine : NaN;
-  const aEdge = lines.aLine !== null && isFinite(projAFT) ? projAFT - lines.aLine : NaN;
-  const bEdge = lines.bLine !== null && isFinite(projBFT) ? projBFT - lines.bLine : NaN;
+  // 3. Project Scores using Pace x Efficiency
+  // Team A Score = Match Pace * Team A Offense vs Team B Defense
+  let projAFT = (eb / 2) * estMatchPace * ((aOffEff + bDefEff) / 2) * injMultA;
+  let projBFT = (eb / 2) * estMatchPace * ((bOffEff + aDefEff) / 2) * injMultB;
 
-  const totalOppAllowed = avgFinite([aTeam.oppAllowed, bTeam.oppAllowed]) * 2;
-  const defensiveFloorFlag = isFinite(totalOppAllowed) && totalOppAllowed < (eb * 0.94);
-  const blowoutGap = isFinite(projAFT) && isFinite(projBFT) ? Math.abs(projAFT - projBFT) : NaN;
-  const paceGapRisk = isFinite(pace) && (pace <= cl.min + 0.01 || pace >= cl.max - 0.01);
-  const volatilityBlock = [aTeam.vol, bTeam.vol].some(v => isFinite(v) && v > (vl * 1.35));
+  // 4. Apply League Home Edge to the separated components
+  const roleA = getFixtureSideRole("A");
+  const homeEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5);
+  if (roleA === "home") { projAFT += (homeEdge / 2); projBFT -= (homeEdge / 2); }
+  else { projAFT -= (homeEdge / 2); projBFT += (homeEdge / 2); }
 
-  const ftFullModel =
-    ftSampleTier === "full" &&
-    isFinite(ftProj) &&
-    aTeam.featureCount >= 3 &&
-    bTeam.featureCount >= 3;
-
-  const teamFullModel =
-    ftSampleTier === "full" &&
-    isFinite(projAFT) &&
-    isFinite(projBFT) &&
-    aTeam.featureCount >= 3 &&
-    bTeam.featureCount >= 3;
+  let ftProj = projAFT + projBFT;
+  
+  // 5. Final Calibration & Anchor
+  ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
+  const ftEdge = lines.ftLine ? ftProj - lines.ftLine : NaN;
+  const aEdge = lines.aLine ? projAFT - lines.aLine : NaN;
+  const bEdge = lines.bLine ? projBFT - lines.bLine : NaN;
 
   return {
     eb, cl, vl,
-    aS: aTeam.ownRecent,
-    aA: aTeam.oppAllowed,
-    bS: bTeam.ownRecent,
-    bA: bTeam.oppAllowed,
+    aS: avgOrNaN(aFTS), bS: avgOrNaN(bFTS),
     projAFT, projBFT, ftProj,
     ftEdge, aEdge, bEdge,
-    aVol: aTeam.vol,
-    bVol: bTeam.vol,
-    pace,
-    paceGapRisk,
-    defensiveFloorFlag,
-    blowoutGap,
-    volatilityBlock,
+    pace: estMatchPace,
     ftSampleTier,
-    ftHasH2H,
-    ftNote,
-    ftProjectionOnly,
-    ftProjectionNote,
-    ftFullModel,
-    teamFullModel
+    ftFullModel: ftSampleTier === "full",
+    teamFullModel: ftSampleTier === "full",
+    blowoutGap: Math.abs(projAFT - projBFT),
+    paceGapRisk: estMatchPace > 1.08 || estMatchPace < 0.92
   };
 }
+
 
 function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
   const supported = league === "nba" || league === "ncaa";
@@ -12058,27 +11958,35 @@ function getMassacreNormalRandom() {
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
-// Fix 7: Off-thread Monte Carlo Bridge
+// Fix 7 + 9: Async Poisson-Based Monte Carlo
 async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
   if (!isFinite(mean) || !isFinite(stdDev) || !isFinite(line) || stdDev <= 0) {
     return { overPct: 50, underPct: 50 };
   }
 
-  // Define the background logic as a string
   const workerCode = `
-    function getNormalRandom() {
-      let u = 0, v = 0;
-      while (u === 0) u = Math.random();
-      while (v === 0) v = Math.random();
-      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    // Knuth's algorithm for Poisson samples
+    function getPoisson(lambda) {
+      const L = Math.exp(-lambda);
+      let k = 0;
+      let p = 1;
+      do {
+        k++;
+        p *= Math.random();
+      } while (p > L);
+      return k - 1;
     }
+
     onmessage = function(e) {
-      const { mean, stdDev, line, runs } = e.data;
+      const { mean, line, runs } = e.data;
       let overHits = 0;
+      
       for (let i = 0; i < runs; i++) {
-        const sample = mean + getNormalRandom() * stdDev;
+        // Poisson better reflects discrete basketball scoring events
+        const sample = getPoisson(mean);
         if (sample > line) overHits++;
       }
+      
       const overPct = (overHits / runs) * 100;
       postMessage({ overPct, underPct: 100 - overPct });
     };
@@ -12089,12 +11997,14 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
 
   return new Promise((resolve) => {
     worker.onmessage = (e) => {
-      worker.terminate(); // Clean up memory immediately
+      worker.terminate();
       resolve(e.data);
     };
-    worker.postMessage({ mean, stdDev, line, runs });
+    // Poisson uses 'mean' (lambda) as its primary driver
+    worker.postMessage({ mean, line, runs });
   });
 }
+
 
 
 function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
