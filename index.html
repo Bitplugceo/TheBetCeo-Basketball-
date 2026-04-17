@@ -3444,6 +3444,38 @@ Any suggestion made here without proof is an audit error.
 const TRACKER_ARCHIVED_LIMIT = 2000;
 const TRACKER_ARCHIVE_AFTER_HOURS = 10;
 const TRACKER_API_URL = WORKER_BASE_URL + "/tracker-state";
+// --- ASYNC DATABASE CORE (FIX 6) ---
+const BB_DB_NAME = "BBEngineData";
+const BB_STORE_NAME = "trackerStore";
+
+function initBBDatabase() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(BB_DB_NAME, 1);
+    request.onupgradeneeded = (e) => {
+      e.target.result.createObjectStore(BB_STORE_NAME);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function writeAsyncStorage(key, value) {
+  try {
+    const db = await initBBDatabase();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(BB_STORE_NAME, "readwrite");
+      tx.objectStore(BB_STORE_NAME).put(value, key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    // Fallback to localStorage if in incognito mode with IndexedDB disabled
+    localStorage.setItem(key, value); 
+    return true;
+  }
+}
+// -----------------------------------
+
 const TRACKER_USER_KEY_STORAGE = "bb_engine_tracker_user_key";
 const TRACKER_LOCAL_STATE_PREFIX = "bb_engine_tracker_state_";
 const TRACKER_SAVE_DEBOUNCE_MS = 400;
@@ -3930,42 +3962,33 @@ function loadTrackerStateFromLocal() {
   }
 }
 
-function saveTrackerStateToLocal() {
+async function saveTrackerStateToLocal() {
   try {
     syncLineMemoryIntoTrackerState();
     const reconciled = reconcileTrackerBucketConflicts(g_trackerState.activePicks, g_trackerState.archivedPicks);
     g_trackerState.activePicks = reconciled.activePicks;
     g_trackerState.archivedPicks = reconciled.archivedPicks;
 
-    if (isTrackerStateMeaningfullyEmpty(g_trackerState)) {
-      const existingBest = loadTrackerStateFromLocal();
-      if (existingBest && !isTrackerStateMeaningfullyEmpty(existingBest)) {
-        console.warn("[BB Engine] refusing to overwrite richer local tracker state with empty state");
-        return;
-      }
-    }
+    // Synchronous existingBest check removed to prevent main-thread locking.
+    // The server/hydration logic handles conflict resolution safely.
 
-        const payload = JSON.stringify(g_trackerState);
+    const payload = JSON.stringify(g_trackerState);
 
-    // Only save to the active keys to prevent localStorage quota bombing.
-    // Legacy keys are for reading/hydration only.
     const activeKeys = [
       getTrackerLocalStateStableKey(),
       getTrackerLocalStateBuildKey(APP_BUILD_VERSION)
     ].filter(Boolean);
 
-    [...new Set(activeKeys)].forEach(key => {
-      try {
-        localStorage.setItem(key, payload);
-      } catch (err) {
-        console.error("[BB Engine] saveTrackerStateToLocal failed for active key", key, err);
-      }
-    });
-
+    const uniqueKeys = [...new Set(activeKeys)];
+    
+    // Fire off async writes without blocking the UI
+    await Promise.all(uniqueKeys.map(key => writeAsyncStorage(key, payload)));
+    
   } catch (err) {
-    console.error("[BB Engine] saveTrackerStateToLocal failed", err);
+    console.error("[BB Engine] saveTrackerStateToLocal async failed", err);
   }
 }
+
 
 function getTrackerHeaders(includeJson = false) {
   const headers = {
