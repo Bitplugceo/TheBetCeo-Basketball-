@@ -6171,16 +6171,29 @@ function queueTrackerFollowupRefresh(delayMs = 1200) {
 }
 
 async function refreshTrackerInBackground(forceHydrate = false) {
-  if (g_refreshTrackedPicksInFlight) return;
+  // If a refresh is already happening, don't just skip—wait a second then try one more time
+  if (g_refreshTrackedPicksInFlight) {
+    if (forceHydrate) queueTrackerFollowupRefresh(2000);
+    return;
+  }
+  
+  g_refreshTrackedPicksInFlight = true;
+  
   try {
     await hydrateTrackedPicks(forceHydrate);
     await refreshTrackedPickResults();
     await forceTrackerSaveNow();
     engineDebug("Watchdog: Settle/Sync cycle complete.", "engine");
   } catch (err) {
-    engineDebug("WATCHDOG ERROR: Refresh loop stalled: " + err.message, "engine");
+    engineDebug("WATCHDOG ERROR: Sync cycle interrupted: " + err.message);
+  } finally {
+    // Release the lock after a tiny delay to let the network breathe
+    setTimeout(() => {
+      g_refreshTrackedPicksInFlight = false;
+    }, 500);
   }
 }
+
 
 async function hydrateTrackedPicks(force = false) {
   if (g_trackerHydratePromise && !force) return g_trackerHydratePromise;
@@ -6683,24 +6696,27 @@ async function pushTrackerStateToServer(stateSnapshot, isEmergency = false) {
     console.error("[BB Engine] pre-sync version check failed", err);
   }
 
-  try {
+   try {
     // 3. Push the resolved payload
+    // We wrapped the session ID in the payload instead of a header to avoid CORS "Preflight" blocks
+    payloadState.sessionId = window.__BETCEO_SESSION_ID;
+
     const { res, data } = await fetchTrackerJson(TRACKER_API_URL, {
       method: "POST",
-      headers: {
-        ...getTrackerHeaders(true),
-        "X-Session-ID": window.__BETCEO_SESSION_ID
-      },
+      headers: getTrackerHeaders(true),
       body: JSON.stringify(payloadState)
     });
 
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
     if (data?.ok && data?.state) {
-      // Always accept server state if it's returning the result of our successful push
       return data;
     }
   } catch (err) {
-    engineDebug("Sync Shield: Push failed, relying on local high-water mark.", err);
+    // Now we log the specific error message (e.g., "HTTP 500" or "Failed to fetch")
+    engineDebug(`Sync Shield: Push failed (${err.message}). Local fallback active.`);
   }
+
 
   return { ok: true, state: payloadState };
 }
