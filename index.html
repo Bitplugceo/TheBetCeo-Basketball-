@@ -6875,21 +6875,15 @@ function makeTrackedSignature(pick) {
 
 function getTrackedPickTimeMs(pick) {
   if (!pick) return 0;
-
-  const candidates = [
-    pick.settledAt,
-    pick.createdAt,
-    pick.eventDate
-  ];
-
-  for (const raw of candidates) {
-    if (!raw) continue;
-    const ms = Date.parse(String(raw));
-    if (Number.isFinite(ms) && ms > 0) return ms;
-  }
-
-  return 0;
+  // Prioritize the time it was settled for the 10-hour countdown
+  const status = String(pick.resultStatus || "pending").toLowerCase();
+  const timeStr = (status !== "pending" && pick.settledAt) ? pick.settledAt : (pick.createdAt || pick.eventDate);
+  
+  if (!timeStr) return 0;
+  const ms = Date.parse(timeStr);
+  return isFinite(ms) ? ms : 0;
 }
+
 
 function isTrackedPickVisibleOnPage(pick) {
   if (!pick) return false;
@@ -7006,63 +7000,33 @@ function renderTrackedPicks() {
 
   if (!summaryEl || !marketSummaryEl || !emptyEl || !wrapEl || !bodyEl) return;
 
-  const archivedChanged = archiveExpiredTrackedPicks();
-  if (archivedChanged) {
-    scheduleTrackerSave();
-  }
+  // 1. FORCE ARCHIVE SWEEP (Moves picks > 10hrs to archivedPicks)
+  archiveExpiredTrackedPicks();
 
   const supportedTrackerMarkets = ["ft", "h1", "h2", "team_a", "team_b"];
+  
+  // 2. ONLY PULL FROM ACTIVE PICKS (Archived picks are now hidden from this list)
   const activePicks = (Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [])
-    .filter(p => supportedTrackerMarkets.includes(String(p?.marketKey || "")));
-  const archivedPicks = (Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [])
-    .filter(p => supportedTrackerMarkets.includes(String(p?.marketKey || "")));
-  const allPicks = [...activePicks, ...archivedPicks];
-    const visiblePicks = activePicks.filter(isTrackedPickVisibleOnPage);
-  const displayPicks = visiblePicks
+    .filter(p => supportedTrackerMarkets.includes(String(p?.marketKey || "")))
+    .filter(isTrackedPickVisibleOnPage); // Double-check visibility logic
+
+  const displayPicks = activePicks
     .slice()
-    .sort((a, b) => {
-      // Force "Recent" to prioritize the moment the pick was created
-      const timeA = Date.parse(a.createdAt) || getTrackedPickTimeMs(a);
-      const timeB = Date.parse(b.createdAt) || getTrackedPickTimeMs(b);
-      return timeB - timeA; 
-    });
+    .sort((a, b) => getTrackedPickTimeMs(b) - getTrackedPickTimeMs(a));
 
   rebuildTrackerStats();
   renderTrackerAnalytics();
   renderTrackerDebugPanel();
 
-  const stats = g_trackerState.stats || {
-    total: 0,
-    settled: 0,
-    wins: 0,
-    losses: 0,
-    pushes: 0
-  };
-
+  const stats = g_trackerState.stats || { total: 0, settled: 0, wins: 0, losses: 0, pushes: 0 };
   const pendingCount = activePicks.filter(p => String(p?.resultStatus || "pending").toLowerCase() === "pending").length;
-  const visibleLabel = visiblePicks.length ? `${visiblePicks.length} live/recent` : "0 live/recent";
+  
+  summaryEl.textContent = `${activePicks.length} live/recent • ${pendingCount} pending • ${stats.wins} wins • ${stats.losses} losses`;
 
-  summaryEl.textContent =
-    `${visibleLabel} • ${pendingCount} pending • ${stats.wins} wins • ${stats.losses} losses • ${stats.pushes} pushes`;
-
-  const marketLabels = {
-    ft: "FT",
-    h1: "1H",
-    h2: "2H",
-    team_a: "Team A",
-    team_b: "Team B"
-  };
-
-  const marketKeys = ["ft", "h1", "h2", "team_a", "team_b"];
-
-  const chips = marketKeys.map(key => {
-    const group = activePicks.filter(p => p.marketKey === key);
-    if (!group.length) return "";
-
-    const pending = group.filter(p => String(p.resultStatus || "pending").toLowerCase() === "pending").length;
-    if (!pending) return "";
-
-    return `<div class="tracker-market-chip">${marketLabels[key]} ${pending}</div>`;
+  const marketLabels = { ft: "FT", h1: "1H", h2: "2H", team_a: "Team A", team_b: "Team B" };
+  const chips = ["ft", "h1", "h2", "team_a", "team_b"].map(key => {
+    const pending = activePicks.filter(p => p.marketKey === key && String(p.resultStatus || "pending").toLowerCase() === "pending").length;
+    return pending ? `<div class="tracker-market-chip">${marketLabels[key]} ${pending}</div>` : "";
   }).filter(Boolean);
 
   marketSummaryEl.innerHTML = chips.join("");
@@ -7070,10 +7034,7 @@ function renderTrackedPicks() {
 
   if (!displayPicks.length) {
     emptyEl.style.display = isTrackerPicksView() ? "block" : "none";
-    emptyEl.textContent = "No live/recent tracked picks right now.";
-
-    marketSummaryEl.style.display = "none";
-    marketSummaryEl.innerHTML = "";
+    emptyEl.textContent = "No live/recent picks. Older picks moved to record.";
     wrapEl.style.display = isTrackerPicksView() ? "none" : "block";
     bodyEl.innerHTML = "";
     return;
@@ -7082,23 +7043,10 @@ function renderTrackedPicks() {
   emptyEl.style.display = "none";
   wrapEl.style.display = "block";
 
-  const rows = displayPicks;
-
-  bodyEl.innerHTML = rows.map(p => {
+  bodyEl.innerHTML = displayPicks.map(p => {
     const status = String(p.resultStatus || "pending").toLowerCase();
-    const statusClass =
-      status === "win" ? "track-win" :
-      status === "loss" ? "track-loss" :
-      status === "push" ? "track-push" :
-      "track-pending";
-
-    const edgeText =
-      p.edgePct === null || p.edgePct === undefined || isNaN(p.edgePct)
-        ? "—"
-        : (p.edgePct > 0 ? "+" : "") + Number(p.edgePct).toFixed(2) + "%";
-
-    const statusLabel = status.toUpperCase();
-    const manualSettleMarkup = getManualSettlementControlsMarkup(p);
+    const statusClass = status === "win" ? "track-win" : status === "loss" ? "track-loss" : status === "push" ? "track-push" : "track-pending";
+    const edgeText = (p.edgePct == null || isNaN(p.edgePct)) ? "—" : (p.edgePct > 0 ? "+" : "") + Number(p.edgePct).toFixed(2) + "%";
 
     return `
       <tr>
@@ -7108,11 +7056,12 @@ function renderTrackedPicks() {
         <td>${safeText(displayLine(p.line))}</td>
         <td>${safeText(p.predictionText || "—")}${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
         <td>${safeText(edgeText)}</td>
-        <td class="${statusClass}"><div class="tracker-status-stack"><div>${safeText(statusLabel)}</div>${manualSettleMarkup}</div></td>
+        <td class="${statusClass}"><div class="tracker-status-stack"><div>${status.toUpperCase()}</div>${getManualSettlementControlsMarkup(p)}</div></td>
       </tr>
     `;
   }).join("");
 }
+
 
 
 
