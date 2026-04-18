@@ -3225,12 +3225,13 @@ function getPhase2ActivationState() {
       }
     };
 
-        const ANCHOR_RULES = {
+            const ANCHOR_RULES = {
       ft:   { nbaDiff: 18, otherDiff: 25, nbaWeight: MODEL_CONFIG.LINE_ANCHOR_NBA, otherWeight: MODEL_CONFIG.LINE_ANCHOR_OTHER },
       h1:   { nbaDiff: 9,  otherDiff: 12, nbaWeight: MODEL_CONFIG.LINE_ANCHOR_NBA, otherWeight: MODEL_CONFIG.LINE_ANCHOR_OTHER },
       h2:   { nbaDiff: 9,  otherDiff: 12, nbaWeight: MODEL_CONFIG.LINE_ANCHOR_NBA, otherWeight: MODEL_CONFIG.LINE_ANCHOR_OTHER },
       team: { nbaDiff: 10, otherDiff: 12, nbaWeight: 0.55, otherWeight: 0.50 }
     };
+
 
 
 const LEAGUE_BASES = {
@@ -3515,7 +3516,7 @@ Any suggestion made here without proof is an audit error.
 const TRACKER_ARCHIVED_LIMIT = 2000;
 const TRACKER_ARCHIVE_AFTER_HOURS = 10;
 const TRACKER_API_URL = WORKER_BASE_URL + "/tracker-state";
-// --- ASYNC DATABASE CORE (FIX 6) ---
+// --- FIXED ASYNC DATABASE CORE (FIX 6) ---
 const BB_DB_NAME = "BBEngineData";
 const BB_STORE_NAME = "trackerStore";
 
@@ -3523,11 +3524,27 @@ function initBBDatabase() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(BB_DB_NAME, 1);
     request.onupgradeneeded = (e) => {
-      e.target.result.createObjectStore(BB_STORE_NAME);
+      if (!e.target.result.objectStoreNames.contains(BB_STORE_NAME)) {
+        e.target.result.createObjectStore(BB_STORE_NAME);
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
+}
+
+async function readAsyncStorage(key) {
+  try {
+    const db = await initBBDatabase();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(BB_STORE_NAME, "readonly");
+      const request = tx.objectStore(BB_STORE_NAME).get(key);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    return localStorage.getItem(key);
+  }
 }
 
 async function writeAsyncStorage(key, value) {
@@ -3540,12 +3557,10 @@ async function writeAsyncStorage(key, value) {
       tx.onerror = () => reject(tx.error);
     });
   } catch (err) {
-    // Fallback to localStorage if in incognito mode with IndexedDB disabled
-    localStorage.setItem(key, value); 
+    localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value));
     return true;
   }
 }
-// -----------------------------------
 
 const TRACKER_USER_KEY_STORAGE = "bb_engine_tracker_user_key";
 const TRACKER_LOCAL_STATE_PREFIX = "bb_engine_tracker_state_";
@@ -4004,34 +4019,29 @@ function isBetterTrackerStateCandidate(nextState, bestState) {
   return false;
 }
 
-function loadTrackerStateFromLocal() {
+async function loadTrackerStateFromLocal() {
   try {
     let bestState = null;
+    const keys = getTrackerLocalStateCandidateKeys();
 
-    for (const key of getTrackerLocalStateCandidateKeys()) {
-      const raw = localStorage.getItem(key);
+    for (const key of keys) {
+      const raw = await readAsyncStorage(key);
       if (!raw) continue;
 
-      let parsed;
-      try {
-        parsed = JSON.parse(raw);
-      } catch (err) {
-        console.error("[BB Engine] loadTrackerStateFromLocal parse failed for key", key, err);
-        continue;
-      }
-
+      let parsed = (typeof raw === 'string') ? JSON.parse(raw) : raw;
       if (!parsed || typeof parsed !== "object") continue;
-      if (!isBetterTrackerStateCandidate(parsed, bestState)) continue;
-
-      bestState = parsed;
+      
+      if (!bestState || isBetterTrackerStateCandidate(parsed, bestState)) {
+        bestState = parsed;
+      }
     }
-
     return bestState;
   } catch (err) {
-    console.error("[BB Engine] loadTrackerStateFromLocal failed", err);
+    engineDebug("WATCHDOG: Local load failed, using empty state", err);
     return null;
   }
 }
+
 
 async function saveTrackerStateToLocal() {
   try {
@@ -4669,59 +4679,30 @@ function isIgnoredEngineWatchLine(line = "") {
 }
 
 function shouldTriggerEngineAlert(line) {
-  return isImportantDebugLine(line, "engine");
+  const text = String(line || "").toLowerCase();
+  if (text.includes("watchdog")) return true;
+  return isImportantDebugLine(line, "engine") && g_engineAlertNeedsReview;
 }
 
 function isImportantDebugLine(line = "", scope = "engine") {
   const text = String(line || "").toLowerCase().trim();
   if (!text) return false;
 
-  // GOD-MODE VIP BYPASS: Ensure Watchdog and Integrity messages always show
-  if (text.includes("watchdog") || text.includes("system integrity")) {
+  if (text.includes("watchdog") || text.includes("system integrity") || text.includes("verified")) {
     return true;
   }
 
   if (scope === "engine" && isIgnoredEngineWatchLine(text)) return false;
 
-  const fatalSignals = [
-    "runtime error", "unhandled rejection", "syntaxerror", 
-    "referenceerror", "typeerror", "boot failed"
-  ];
-
-  const actionableSignals = [
-    "run failed", "fetch worker failed", "fetch direct failed",
-    "summary worker fetch failed", "summary direct fetch failed",
-    "flush save failed", "hydrate failed", "tracker push failed",
-    "missing competition data", "refresh final game still returned pending",
-    "nan", "mismatch", "rejected"
-  ];
+  const fatalSignals = ["runtime error", "unhandled rejection", "syntaxerror", "referenceerror", "typeerror", "boot failed"];
+  const actionableSignals = ["run failed", "fetch worker failed", "nan", "mismatch", "rejected", "tracker push failed"];
 
   if (fatalSignals.some(s => text.includes(s))) return true;
   if (actionableSignals.some(s => text.includes(s))) return true;
 
-  const severity = getDebugSeverity(text);
-  if (severity === "error" && scope !== "engine") return true;
-
-  if (scope === "tracker") {
-    return text.includes("refresh missing competition data") ||
-      text.includes("refresh final game still returned pending") ||
-      text.includes("flush save failed") ||
-      text.includes("hydrate failed") ||
-      text.includes("tracker push failed");
-  }
-
-  if (scope === "engine") {
-    return text.includes("run failed") ||
-      text.includes("fetch worker failed") ||
-      text.includes("fetch direct failed") ||
-      text.includes("summary worker fetch failed") ||
-      text.includes("summary direct fetch failed") ||
-      text.includes("nan") ||
-      text.includes("mismatch");
-  }
-
   return false;
 }
+
 
 
 
@@ -4750,41 +4731,31 @@ function getImportantDebugFingerprint(line = "") {
   return String(line || "").trim();
 }
 
-function getVisibleDebugLines(scope) {
-  const all = scope === "engine" ? g_engineDebugLog : g_trackerDebugLog;
-  const filtered = (all || []).filter(line => isImportantDebugLine(line, scope));
-  
-  // GOD-MODE: If the list is empty, but we have a Watchdog success, FORCE it in.
-  if (scope === "engine" && filtered.length === 0) {
-    const watchdogLine = (all || []).find(l => String(l).includes("WATCHDOG SUCCESS"));
-    if (watchdogLine) return [watchdogLine];
+function getVisibleDebugLines(scope, limit = 5) {
+  try {
+    const all = scope === "engine" ? (window.g_engineDebugLog || []) : (window.g_trackerDebugLog || []);
+    const filtered = all.filter(line => isImportantDebugLine(line, scope));
+
+    if (scope === "engine" && filtered.length === 0) {
+      const watchdogLine = all.find(l => String(l).includes("WATCHDOG SUCCESS"));
+      if (watchdogLine) return [watchdogLine];
+    }
+
+    const seen = new Set();
+    const deduped = [];
+    filtered.forEach(line => {
+      const key = String(line).split(":")[0]; 
+      if (seen.has(key)) return;
+      seen.add(key);
+      deduped.push(line);
+    });
+
+    return prioritizeDebugLines(deduped, limit);
+  } catch (e) {
+    return ["DEBUG ERROR: UI Retrieval Failed"];
   }
-  
-  return filtered;
 }
 
-  function getVisibleDebugLines(scope, limit = 5) {
-  const all = scope === "engine" ? (window.g_engineDebugLog || []) : (window.g_trackerDebugLog || []);
-  const filtered = all.filter(line => isImportantDebugLine(line, scope));
-
-  // GOD-MODE FORCE: If no errors exist, but the Watchdog verified the system, show it.
-  if (scope === "engine" && filtered.length === 0) {
-    const watchdogLine = all.find(l => String(l).includes("WATCHDOG SUCCESS"));
-    if (watchdogLine) return [watchdogLine];
-  }
-
-  const seen = new Set();
-  const deduped = [];
-
-  filtered.forEach(line => {
-    const key = getImportantDebugFingerprint(line);
-    if (seen.has(key)) return;
-    seen.add(key);
-    deduped.push(line);
-  });
-
-  return prioritizeDebugLines(deduped, limit);
-}
 
 
 function getDebugButtonState() {
@@ -6167,8 +6138,8 @@ async function fetchTrackerJson(url, options = {}, timeoutMs = TRACKER_NETWORK_T
   }
 }
 
-function primeTrackerStateForRun() {
-  const localState = loadTrackerStateFromLocal();
+async function primeTrackerStateForRun() {
+  const localState = await loadTrackerStateFromLocal();
 
   if (localState) {
     normalizeTrackerState(localState);
@@ -6179,6 +6150,7 @@ function primeTrackerStateForRun() {
 
   renderTrackedPicks();
 }
+
 
 function clearTrackerFollowupRefresh() {
   if (g_trackerFollowupTimer) {
@@ -6195,11 +6167,16 @@ function queueTrackerFollowupRefresh(delayMs = 1200) {
   }, delayMs);
 }
 
-function refreshTrackerInBackground(forceHydrate = false) {
-  Promise.resolve()
-    .then(() => hydrateTrackedPicks(forceHydrate))
-    .then(() => refreshTrackedPickResults())
-    .catch(err => console.error("[BB Engine] background tracker refresh failed", err));
+async function refreshTrackerInBackground(forceHydrate = false) {
+  if (g_refreshTrackedPicksInFlight) return;
+  try {
+    await hydrateTrackedPicks(forceHydrate);
+    await refreshTrackedPickResults();
+    await forceTrackerSaveNow();
+    engineDebug("Watchdog: Settle/Sync cycle complete.", "engine");
+  } catch (err) {
+    engineDebug("WATCHDOG ERROR: Refresh loop stalled: " + err.message, "engine");
+  }
 }
 
 async function hydrateTrackedPicks(force = false) {
@@ -6207,13 +6184,14 @@ async function hydrateTrackedPicks(force = false) {
 
   g_trackerHydratePromise = (async () => {
     trackerDebug("hydrate start", { force, key: getTrackerUserKey() });
-    const localState = loadTrackerStateFromLocal();
+       const localState = await loadTrackerStateFromLocal();
     const hadLocalState =
       !!localState &&
       (
         (Array.isArray(localState.activePicks) && localState.activePicks.length > 0) ||
         (Array.isArray(localState.archivedPicks) && localState.archivedPicks.length > 0)
       );
+
 
     if (localState) {
       normalizeTrackerState(localState);
@@ -12079,6 +12057,8 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
 
 
 async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
+
+
   const marketKey = getMarketKeyFromName(pickRow?.name);
   const side = getPickSideFromText(pickRow?.pick);
   const thresholds = getMassacreThresholdBucket(league, marketKey);
@@ -12883,8 +12863,9 @@ async function runEngine() {
   });
 
   try {
-    primeTrackerStateForRun();
+    await primeTrackerStateForRun();
     engineDebug("tracker primed for run", { trackerState: getTrackerStateDebugScore(g_trackerState) });
+
     refreshTrackerInBackground(false);
     if (!table) return;
 
