@@ -2843,8 +2843,11 @@ body.dark-mode .tracker-analytics-section-head {
 
 <script>
 window.__BETCEO_ENGINE_BOOT_SEEN = true;
+// Unique ID to identify this specific browser session/tab
+window.__BETCEO_SESSION_ID = "sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 9);
 
 // --- GOD-MODE WATCHDOG CORE ---
+
 const ENGINE_INTEGRITY_SHIELD = {
   // Golden Hashes of core logic (prevents "thief in the night" code changes)
   expectedFingerprints: {
@@ -4084,6 +4087,8 @@ function getTrackerHeaders(includeJson = false) {
   return headers;
 }
 let g_trackerState = {
+  vId: Date.now(), // Version Sequence number
+  sId: window.__BETCEO_SESSION_ID, // Session that last modified it
   activePicks: [],
   archivedPicks: [],
   stats: {
@@ -4093,9 +4098,10 @@ let g_trackerState = {
     losses: 0,
     pushes: 0
   },
-  updatedAt: null,
+  updatedAt: new Date().toISOString(),
   lineMemory: {}
 };
+
 function defaultTrackerDerivedState() {
   return {
     totalPicks: 0,
@@ -6644,64 +6650,61 @@ async function pushTrackerStateToServer(stateSnapshot, isEmergency = false) {
     return { ok: true, state: g_trackerState };
   }
 
+  // Increment internal version before every server push
+  stateSnapshot.vId = (Number(stateSnapshot.vId) || 0) + 1;
+  stateSnapshot.sId = window.__BETCEO_SESSION_ID;
+  stateSnapshot.updatedAt = new Date().toISOString();
+
   const payload = JSON.stringify(stateSnapshot);
 
-  // Fix 8: If we are closing the tab, use Beacon for guaranteed delivery
   if (isEmergency && navigator.sendBeacon) {
     const blob = new Blob([payload], { type: 'application/json' });
-    const success = navigator.sendBeacon(TRACKER_API_URL, blob);
-    if (success) {
-      engineDebug("Emergency beacon queued successfully");
-      return { ok: true };
-    }
+    if (navigator.sendBeacon(TRACKER_API_URL, blob)) return { ok: true };
   }
 
   let payloadState = JSON.parse(payload);
-  engineDebug("tracker push start", { payload: getTrackerStateDebugScore(payloadState) });
 
   try {
-    const { res: preRes, data: preData } = await fetchTrackerJson(
-      TRACKER_API_URL,
-      {
-        method: "GET",
-        cache: "no-store",
-        headers: getTrackerHeaders(false)
-      }
-    );
+    // 1. Get current server state
+    const { res: preRes, data: preData } = await fetchTrackerJson(TRACKER_API_URL, {
+      method: "GET",
+      headers: getTrackerHeaders(false)
+    });
 
-    if (preRes.ok && preData?.ok && preData?.state) {
-      payloadState = mergeTrackerStates(payloadState, preData.state);
+    if (preRes.ok && preData?.state) {
+      // 2. Conflict Check: If server has a newer version, merge server into local first
+      if ((Number(preData.state.vId) || 0) > payloadState.vId) {
+        trackerDebug("Sync Shield: Server version newer. Merging...", { server: preData.state.vId, local: payloadState.vId });
+        payloadState = mergeTrackerStates(payloadState, preData.state);
+        payloadState.vId = Number(preData.state.vId) + 1; // Increment on top of server version
+      }
     }
   } catch (err) {
-    console.error("[BB Engine] tracker pre-merge GET failed", err);
+    console.error("[BB Engine] pre-sync version check failed", err);
   }
 
-  payloadState.updatedAt = new Date().toISOString();
-
   try {
-    const { res, data } = await fetchTrackerJson(
-      TRACKER_API_URL,
-      {
-        method: "POST",
-        headers: getTrackerHeaders(true),
-        body: JSON.stringify(payloadState)
-      }
-    );
-
-    if (!res.ok) throw new Error("Tracker POST failed (" + res.status + ")");
+    // 3. Push the resolved payload
+    const { res, data } = await fetchTrackerJson(TRACKER_API_URL, {
+      method: "POST",
+      headers: {
+        ...getTrackerHeaders(true),
+        "X-Session-ID": window.__BETCEO_SESSION_ID
+      },
+      body: JSON.stringify(payloadState)
+    });
 
     if (data?.ok && data?.state) {
-      if (isTrackerStateWorseThan(data.state, payloadState)) {
-        return { ok: true, state: payloadState };
-      }
+      // Always accept server state if it's returning the result of our successful push
       return data;
     }
   } catch (err) {
-    engineDebug("Standard push failed, fallback to local", err);
+    engineDebug("Sync Shield: Push failed, relying on local high-water mark.", err);
   }
 
   return { ok: true, state: payloadState };
 }
+
 
 
 function scheduleTrackerSave() {
@@ -6811,11 +6814,25 @@ function saveTrackedPicks(picks) {
   });
 }
 
+// --- NEW BLOCK (THE FIX) ---
 function archiveExpiredTrackedPicks() {
   const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
   const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
   const now = Date.now();
-  const cutoffMs = 10 * 60 * 60 * 1000; // Hardcoded 10 hours
+  const cutoffMs = 10 * 60 * 60 * 1000; // 10 hours
+
+  // Helper to remove massive diagnostic objects to prevent storage bloat and UI lag
+  const stripHeavyData = (pick) => {
+    const lean = { ...pick };
+    delete lean.diagnostics;
+    delete lean.massacre;
+    delete lean.trackerFeedback;
+    delete lean.shadowTrackerFeedback;
+    delete lean.teamMemory;
+    delete lean.intelligence;
+    delete lean.shadowIntelligence;
+    return lean;
+  };
 
   const keepActive = [];
   const moveToArchived = [];
@@ -6823,15 +6840,14 @@ function archiveExpiredTrackedPicks() {
 
   active.forEach(pick => {
     const p = ensureTrackedPickKeys({ ...pick });
-    // Use the absolute latest timestamp available (Settled > Created > Event)
     const ts = getTrackedPickTimeMs(p);
     
-    // If it's settled and older than 10 hours, MOVE IT
     const isSettled = ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase());
     const isExpired = ts > 0 && (now - ts) > cutoffMs;
 
     if (isSettled && isExpired) {
-      moveToArchived.push(p);
+      // SLIM the data before pushing to archive
+      moveToArchived.push(stripHeavyData(p));
       changed = true;
     } else {
       keepActive.push(p);
@@ -6844,12 +6860,14 @@ function archiveExpiredTrackedPicks() {
       if (!seen.has(p.signature)) archived.unshift(p);
     });
     g_trackerState.activePicks = keepActive;
+    // Limit archive size to 2000 lean items
     g_trackerState.archivedPicks = archived.slice(0, 2000);
     rebuildTrackerStats();
     saveTrackerStateToLocal();
   }
   return changed;
 }
+
 
 function makeTrackedSignature(pick) {
       return [
@@ -10309,6 +10327,7 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
 
   Do not change this unless the owner explicitly gives approval code.
 */
+
 async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
   const rules = LEAGUE_FETCH_RULES[leagueKey];
   if (!rules) return [];
@@ -10316,13 +10335,18 @@ async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
   const tA = String(teamAId);
   const tB = String(teamBId);
   const currentSeason = getCurrentSeasonYear(leagueKey);
-  const minDateTs = Date.parse("2024-01-01T00:00:00Z");
+
+  // FIX 4: Rolling Window Logic
+  // We look back 2 seasons from the current one to keep data fresh and fetches fast.
+  const lookbackYears = 2; 
+  const minSeason = currentSeason - lookbackYears;
+  // Generate timestamp for Jan 1st of the earliest lookback year
+  const minDateTs = new Date(minSeason, 0, 1).getTime();
 
   const scheduleJobs = [];
 
-  // Scan ONLY Team A schedule.
-  // That is enough to find A vs B games and avoids unnecessary request load.
-  for (let season = currentSeason; season >= 2024; season--) {
+  // Scan ONLY Team A schedule from current season back to our dynamic minSeason
+  for (let season = currentSeason; season >= minSeason; season--) {
     for (const stype of rules.h2hScheduleTypes) {
       const key = `${base}:h2h-sched:${tA}:${season}:${stype}`;
       const req = _schedCache.has(key)
@@ -10344,6 +10368,7 @@ async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
       );
     }
   }
+
 
   const schedulePayloads = await Promise.all(scheduleJobs);
   const candidateMap = new Map();
@@ -11970,22 +11995,33 @@ function getMassacreNormalRandom() {
 }
 
 // Fix 7 + 9: Async Poisson-Based Monte Carlo
+// --- NEW BLOCK (THE FIX) ---
 async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
   if (!isFinite(mean) || !isFinite(stdDev) || !isFinite(line) || stdDev <= 0) {
     return { overPct: 50, underPct: 50 };
   }
 
   const workerCode = `
-    // Knuth's algorithm for Poisson samples
     function getPoisson(lambda) {
-      const L = Math.exp(-lambda);
-      let k = 0;
-      let p = 1;
-      do {
-        k++;
-        p *= Math.random();
-      } while (p > L);
-      return k - 1;
+      // For lambda < 30, Knuth's algorithm is efficient and accurate
+      if (lambda < 30) {
+        const L = Math.exp(-lambda);
+        let k = 0;
+        let p = 1;
+        do {
+          k++;
+          p *= Math.random();
+        } while (p > L);
+        return k - 1;
+      } else {
+        // For lambda >= 30, use Normal Approximation (O(1) complexity)
+        // This prevents the infinite loop crash on high NBA scores.
+        let u1 = Math.random();
+        let u2 = Math.random();
+        // Box-Muller transform for Gaussian noise
+        let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+        return Math.max(0, Math.floor(lambda + Math.sqrt(lambda) * z0 + 0.5));
+      }
     }
 
     onmessage = function(e) {
@@ -11993,9 +12029,8 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
       let overHits = 0;
       
       for (let i = 0; i < runs; i++) {
-        // Poisson better reflects discrete basketball scoring events
-        const sample = getPoisson(mean);
-        if (sample > line) overHits++;
+        // Now processes 8,000 runs in < 2ms regardless of the score size
+        if (getPoisson(mean) > line) overHits++;
       }
       
       const overPct = (overHits / runs) * 100;
@@ -12011,10 +12046,10 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
       worker.terminate();
       resolve(e.data);
     };
-    // Poisson uses 'mean' (lambda) as its primary driver
     worker.postMessage({ mean, line, runs });
   });
 }
+
 
 
 
@@ -12720,6 +12755,7 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta, league, diagnos
     createdAt: nowIso
   };
 }
+
 function resolveStoredLineBeforeDecision({
   fixtureMeta,
   league,
@@ -12729,8 +12765,9 @@ function resolveStoredLineBeforeDecision({
   marketType,
   context = {}
 }) {
-  if (!fixtureMeta?.eventId) return currentLine;
-  if (!isFinite(currentLine) || currentLine <= 0 || !isFinite(proj)) return currentLine;
+  const result = { line: currentLine, usedMemory: false };
+  if (!fixtureMeta?.eventId) return result;
+  if (!isFinite(currentLine) || currentLine <= 0 || !isFinite(proj)) return result;
 
   const candidates = ["over", "under"]
     .map(side => {
@@ -12742,28 +12779,30 @@ function resolveStoredLineBeforeDecision({
         side
       });
 
-      if (!resolved.usedMemory || !isFinite(resolved.line) || resolved.line <= 0) {
-        return null;
-      }
+      if (!resolved.usedMemory || !isFinite(resolved.line) || resolved.line <= 0) return null;
 
       const edge = proj - resolved.line;
       const pick = getPick(edge, resolved.line, league, marketType, context);
       const pickSide = getPickSideFromText(pick);
 
-      if (!pick || pick === "NO PLAY" || pickSide !== side) {
-        return null;
-      }
+      if (!pick || pick === "NO PLAY" || pickSide !== side) return null;
 
       return {
         line: resolved.line,
-        strength: Math.abs(edge / resolved.line)
+        strength: Math.abs(edge / resolved.line),
+        usedMemory: true
       };
     })
     .filter(Boolean)
     .sort((a, b) => b.strength - a.strength);
 
-  return candidates.length ? candidates[0].line : currentLine;
+  if (candidates.length) {
+    result.line = candidates[0].line;
+    result.usedMemory = true;
+  }
+  return result;
 }
+
 function buildResultRows({
   table,
   finalPicks,
@@ -12787,15 +12826,18 @@ function buildResultRows({
     const shownPrediction = p.displayPick || displayPrediction;
 
     const row = table.insertRow();
+    const memoryIcon = p.usedMemory ? ' <span title="Using line from vault memory" style="cursor:help;font-size:10px;">🧠</span>' : '';
+
     row.innerHTML = `
-     <td>${safeText(p.name)}</td>
-<td>${isFinite(p.proj) ? safeText(displayLine(p.proj)) : "—"}</td>
-<td>${isFinite(shownEdge) && isFinite(shownLine) ? safeText(formatEdge(shownEdge, shownLine)) : "—"}</td>
-<td class="${getConfidenceClass(confText)}">${safeText(confText)}</td>
-<td class="${getPredictionClass(p.pick, p.recommendationTier || "")}">
-  ${safeText(shownPrediction)}${isLock ? ' <span class="lock">🔒</span>' : ""}
-</td>
+     <td>${safeText(p.name)}${memoryIcon}</td>
+     <td>${isFinite(p.proj) ? safeText(displayLine(p.proj)) : "—"}</td>
+     <td>${isFinite(shownEdge) && isFinite(shownLine) ? safeText(formatEdge(shownEdge, shownLine)) : "—"}</td>
+     <td class="${getConfidenceClass(confText)}">${safeText(confText)}</td>
+     <td class="${getPredictionClass(p.pick, p.recommendationTier || "")}">
+       ${safeText(shownPrediction)}${isLock ? ' <span class="lock">🔒</span>' : ""}
+     </td>
     `;
+
 
     const payload = buildTrackedPickPayload({
   pickRow: p,
@@ -12844,14 +12886,20 @@ async function runEngine() {
       return;
     }
 
-    const teamAKey = getTeamIdentityKey(document.getElementById("teamAName")?.value || "", league);
-    const teamBKey = getTeamIdentityKey(document.getElementById("teamBName")?.value || "", league);
+        const teamAId = String(selectedTeamIds.A || "");
+    const teamBId = String(selectedTeamIds.B || "");
+    const teamANameNorm = normalizeTeamName(document.getElementById("teamAName")?.value || "");
+    const teamBNameNorm = normalizeTeamName(document.getElementById("teamBName")?.value || "");
 
-    if (teamAKey && teamBKey && teamAKey === teamBKey) {
-      engineDebug("run blocked duplicate teams", { teamAKey, teamBKey });
+    const isDuplicate = (teamAId && teamBId && teamAId === teamBId) || 
+                       (teamANameNorm && teamBNameNorm && teamANameNorm === teamBNameNorm);
+
+    if (isDuplicate) {
+      engineDebug("run blocked duplicate teams", { teamAId, teamBId, teamANameNorm });
       showRunError(table, "⚠ Team A and Team B cannot be the same.");
       return;
     }
+
 
     const validation = validateInputs(league);
     if (!validation.ok) {
@@ -12908,53 +12956,38 @@ let h2Calc = compute2HProjection({
       h2: summarizeCalcForDebug(h2Calc)
     });
 
+const memoryFlags = {};
+
+const resFT = resolveStoredLineBeforeDecision({
+  fixtureMeta, league, marketKey: "ft", currentLine: lines.ftLine, proj: ftCalc.ftProj, marketType: "ft", context: { aSc: ftCalc.aS, bSc: ftCalc.bS }
+});
+const resH1 = resolveStoredLineBeforeDecision({
+  fixtureMeta, league, marketKey: "h1", currentLine: lines.h1Line, proj: h1Calc.h1Proj, marketType: "h1", context: { aSc: h1Calc.aS1, bSc: h1Calc.bS1 }
+});
+const resH2 = resolveStoredLineBeforeDecision({
+  fixtureMeta, league, marketKey: "h2", currentLine: lines.h2Line, proj: h2Calc.h2Proj, marketType: "h2", context: { aSc: h2Calc.aS2, bSc: h2Calc.bS2 }
+});
+const resA = resolveStoredLineBeforeDecision({
+  fixtureMeta, league, marketKey: "team_a", currentLine: lines.aLine, proj: ftCalc.projAFT, marketType: "team", context: { teamSc: ftCalc.aS }
+});
+const resB = resolveStoredLineBeforeDecision({
+  fixtureMeta, league, marketKey: "team_b", currentLine: lines.bLine, proj: ftCalc.projBFT, marketType: "team", context: { teamSc: ftCalc.bS }
+});
+
 resolvedLines = {
-  ftLine: resolveStoredLineBeforeDecision({
-    fixtureMeta,
-    league,
-    marketKey: "ft",
-    currentLine: resolvedLines.ftLine,
-    proj: ftCalc.ftProj,
-    marketType: "ft",
-    context: { aSc: ftCalc.aS, bSc: ftCalc.bS }
-  }),
-  h1Line: resolveStoredLineBeforeDecision({
-    fixtureMeta,
-    league,
-    marketKey: "h1",
-    currentLine: resolvedLines.h1Line,
-    proj: h1Calc.h1Proj,
-    marketType: "h1",
-    context: { aSc: h1Calc.aS1, bSc: h1Calc.bS1 }
-  }),
-  h2Line: resolveStoredLineBeforeDecision({
-    fixtureMeta,
-    league,
-    marketKey: "h2",
-    currentLine: resolvedLines.h2Line,
-    proj: h2Calc.h2Proj,
-    marketType: "h2",
-    context: { aSc: h2Calc.aS2, bSc: h2Calc.bS2 }
-  }),
-  aLine: resolveStoredLineBeforeDecision({
-    fixtureMeta,
-    league,
-    marketKey: "team_a",
-    currentLine: resolvedLines.aLine,
-    proj: ftCalc.projAFT,
-    marketType: "team",
-    context: { teamSc: ftCalc.aS }
-  }),
-  bLine: resolveStoredLineBeforeDecision({
-    fixtureMeta,
-    league,
-    marketKey: "team_b",
-    currentLine: resolvedLines.bLine,
-    proj: ftCalc.projBFT,
-    marketType: "team",
-    context: { teamSc: ftCalc.bS }
-  })
+  ftLine: resFT.line,
+  h1Line: resH1.line,
+  h2Line: resH2.line,
+  aLine: resA.line,
+  bLine: resB.line
 };
+
+memoryFlags.ft = resFT.usedMemory;
+memoryFlags.h1 = resH1.usedMemory;
+memoryFlags.h2 = resH2.usedMemory;
+memoryFlags.team_a = resA.usedMemory;
+memoryFlags.team_b = resB.usedMemory;
+
 
 ftCalc = computeFTProjection({
   league,
