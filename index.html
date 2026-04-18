@@ -6877,18 +6877,19 @@ function getTrackedPickTimeMs(pick) {
 
 function isTrackedPickVisibleOnPage(pick) {
   if (!pick) return false;
-  const status = String(pick.resultStatus || "pending").toLowerCase();
-  
-  // Always show pending games regardless of age
-  if (status === "pending") return true;
-
-  // For settled games, strictly enforce the 10-hour limit
   const ts = getTrackedPickTimeMs(pick);
-  if (!ts) return false; 
+  if (!ts) return false;
 
-  const isWithin10Hours = (Date.now() - ts) < (10 * 60 * 60 * 1000);
-  return isWithin10Hours;
+  const hoursOld = (Date.now() - ts) / (1000 * 60 * 60);
+  const status = String(pick.resultStatus || "pending").toLowerCase();
+
+  // If a game is stuck in PENDING for more than 24 hours, hide it (API failed/Game cancelled)
+  if (status === "pending") return hoursOld < 24;
+
+  // Hide settled picks older than 10 hours
+  return hoursOld < 10;
 }
+
 
 
         function getCurrentFixtureMeta() {
@@ -6988,43 +6989,72 @@ function closeTrackerModal() {
 function renderTrackedPicks() {
   const summaryEl = document.getElementById("trackerSummary");
   const marketSummaryEl = document.getElementById("trackerMarketSummary");
+  const emptyEl = document.getElementById("trackerEmpty");
+  const wrapEl = document.getElementById("trackedPicksWrap");
   const bodyEl = document.getElementById("trackedPicksBody");
 
-  if (!summaryEl || !bodyEl) return;
+  if (!summaryEl || !marketSummaryEl || !emptyEl || !wrapEl || !bodyEl) return;
 
-  // Run the hard sweep before drawing anything
   archiveExpiredTrackedPicks();
 
+  const supportedTrackerMarkets = ["ft", "h1", "h2", "team_a", "team_b"];
   const activePicks = (Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [])
-    .filter(isTrackedPickVisibleOnPage);
+    .filter(p => supportedTrackerMarkets.includes(String(p?.marketKey || "")));
+    
+  const visiblePicks = activePicks.filter(isTrackedPickVisibleOnPage);
 
-  const displayPicks = activePicks.sort((a, b) => getTrackedPickTimeMs(b) - getTrackedPickTimeMs(a));
+  const displayPicks = visiblePicks
+    .slice()
+    .sort((a, b) => getTrackedPickTimeMs(b) - getTrackedPickTimeMs(a));
 
   rebuildTrackerStats();
   renderTrackerAnalytics();
-  
-  const stats = g_trackerState.stats || { total: 0, settled: 0, wins: 0, losses: 0 };
-  const pendingCount = activePicks.filter(p => String(p.resultStatus || "pending").toLowerCase() === "pending").length;
-  
-  summaryEl.textContent = `${activePicks.length} live/recent • ${pendingCount} pending • ${stats.wins} wins • ${stats.losses} losses`;
+  renderTrackerDebugPanel();
 
-  // Draw the table
+  const stats = g_trackerState.stats || { total: 0, settled: 0, wins: 0, losses: 0, pushes: 0 };
+  const pendingCount = activePicks.filter(p => String(p?.resultStatus || "pending").toLowerCase() === "pending").length;
+
+  summaryEl.textContent = `${displayPicks.length} live/recent • ${pendingCount} pending • ${stats.wins} wins • ${stats.losses} losses`;
+
+  const marketLabels = { ft: "FT", h1: "1H", h2: "2H", team_a: "Team A", team_b: "Team B" };
+  const chips = ["ft", "h1", "h2", "team_a", "team_b"].map(key => {
+    const pending = activePicks.filter(p => p.marketKey === key && String(p.resultStatus || "pending").toLowerCase() === "pending").length;
+    return pending ? `<div class="tracker-market-chip">${marketLabels[key]} ${pending}</div>` : "";
+  }).filter(Boolean);
+
+  marketSummaryEl.innerHTML = chips.join("");
+  marketSummaryEl.style.display = chips.length ? "flex" : "none";
+
+  if (!displayPicks.length) {
+    emptyEl.style.display = isTrackerPicksView() ? "block" : "none";
+    emptyEl.textContent = "No live/recent picks. Older picks moved to record.";
+    wrapEl.style.display = isTrackerPicksView() ? "none" : "block";
+    bodyEl.innerHTML = "";
+    return;
+  }
+
+  emptyEl.style.display = "none";
+  wrapEl.style.display = "block";
+
   bodyEl.innerHTML = displayPicks.map(p => {
     const status = String(p.resultStatus || "pending").toLowerCase();
     const statusClass = status === "win" ? "track-win" : status === "loss" ? "track-loss" : status === "push" ? "track-push" : "track-pending";
+    const edgeText = (p.edgePct == null || isNaN(p.edgePct)) ? "—" : (p.edgePct > 0 ? "+" : "") + Number(p.edgePct).toFixed(2) + "%";
+
     return `
       <tr>
         <td>${safeText(formatTrackedDate(p.createdAt || p.eventDate))}</td>
-        <td>${safeText(p.homeTeam + " vs " + p.awayTeam)}</td>
-        <td>${safeText(p.marketName)}</td>
+        <td>${safeText((p.homeTeam || "—") + " vs " + (p.awayTeam || "—"))}</td>
+        <td>${safeText(p.marketName || "—")}</td>
         <td>${safeText(displayLine(p.line))}</td>
-        <td>${safeText(p.predictionText)}${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
-        <td>${safeText((p.edgePct > 0 ? "+" : "") + Number(p.edgePct).toFixed(2) + "%")}</td>
-        <td class="${statusClass}">${status.toUpperCase()}</td>
+        <td>${safeText(p.predictionText || "—")}${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
+        <td>${safeText(edgeText)}</td>
+        <td class="${statusClass}"><div class="tracker-status-stack"><div>${status.toUpperCase()}</div>${getManualSettlementControlsMarkup(p)}</div></td>
       </tr>
     `;
   }).join("");
 }
+
 
 function renderTrackerAnalytics() {
   const panel = document.getElementById("trackerAnalyticsPanel");
@@ -8373,9 +8403,10 @@ function isManualSettlementLeague(league) {
 function canManuallySettleTrackedPick(pick) {
   if (!pick) return false;
   const status = String(pick?.resultStatus || "pending").toLowerCase();
-  if (status !== "pending") return false;
-  return isManualSettlementLeague(pick?.league);
+  // Allow manual override for ANY pending pick, regardless of league
+  return status === "pending";
 }
+
 
 function getManualSettlementControlsMarkup(pick) {
   if (!canManuallySettleTrackedPick(pick)) return "";
