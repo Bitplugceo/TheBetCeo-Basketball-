@@ -11619,100 +11619,64 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
 function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
   const supported = league === "nba" || league === "ncaa";
+  const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
+  
   const a1HS = getManualSeries("A", "h1", parsed);
   const b1HS = getManualSeries("B", "h1", parsed);
   const sampleTier = getSampleTier(a1HS, b1HS);
 
-  const projectionOnly = false;
-  const projectionNote = null;
-  const note =
-    !supported ? "1H market not available for this league" :
-    sampleTier === "insufficient" ? "Insufficient 1H sample — need 2+ games" :
-    sampleTier === "thin" ? "Thin 1H sample — projection downgraded" :
-    null;
+  // Level 2 Memory Access
+  const aORTG = g_massacreFetchContext.A.ortg10 || [];
+  const aDRTG = g_massacreFetchContext.A.drtg10 || [];
+  const bORTG = g_massacreFetchContext.B.ortg10 || [];
+  const bDRTG = g_massacreFetchContext.B.drtg10 || [];
+  const aPace = g_massacreFetchContext.A.pace10 || [];
+  const bPace = g_massacreFetchContext.B.pace10 || [];
 
   if (!supported || sampleTier === "insufficient") {
-    return {
-      h1Proj: NaN,
-      h1Edge: NaN,
-      aS1: NaN, aA1: NaN, bS1: NaN, bA1: NaN,
-      aVol1: NaN, bVol1: NaN,
-      h1SampleTier: sampleTier,
-      h1HasH2H: false,
-      h1Note: note,
-      h1ProjectionOnly: projectionOnly,
-      h1ProjectionNote: projectionNote,
-      h1FullModel: false,
-      paceGapRisk: false,
-      defensiveFloorFlag: false
-    };
+    return { h1Proj: NaN, h1Edge: NaN, h1SampleTier: sampleTier, h1Note: "Insufficient 1H sample" };
   }
 
-  const aAllowed1 = getAllowedSeries("A", "overall", "h1", parsed);
-  const bAllowed1 = getAllowedSeries("B", "overall", "h1", parsed);
-  const aVenueScored1 = getFetchedSeries("A", "venue", "h1", "scored");
-  const bVenueScored1 = getFetchedSeries("B", "venue", "h1", "scored");
-  const aVenueAllowed1 = getAllowedSeries("A", "venue", "h1", parsed);
-  const bVenueAllowed1 = getAllowedSeries("B", "venue", "h1", parsed);
+  let projA1H, projB1H, estHalfPace;
 
-  const h1HasH2H =
-    maybeReadH2HEnabled("h1") &&
-    getH2HSeries("A", "h1", parsed).length >= 2 &&
-    getH2HSeries("B", "h1", parsed).length >= 2;
+  // Level 2 Matchup-Specific Calculation
+  if (aORTG.length >= 2 && bORTG.length >= 2) {
+    const expEffA = (avgOrNaN(aORTG) + avgOrNaN(bDRTG)) / 2;
+    const expEffB = (avgOrNaN(bORTG) + avgOrNaN(aDRTG)) / 2;
+    const rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
+    
+    // Half-time pace is derived from game pace (standard 50%)
+    estHalfPace = (rawPace / 2); 
 
-  const aTeam = buildTeamMarketProjection({
-    league,
-    marketKey: "h1",
-    side: "A",
-    ownRecentSeries: a1HS,
-    oppAllowedSeries: bAllowed1,
-    ownVenueSeries: aVenueScored1,
-    oppVenueAllowedSeries: bVenueAllowed1,
-    h2hSeries: h1HasH2H ? getH2HSeries("A", "h1", parsed) : [],
-    line: lines.h1Line ? lines.h1Line / 2 : NaN,
-    injMult: injMultA,
-    sampleTier
-  });
+    projA1H = (expEffA / 100) * estHalfPace * injMultA;
+    projB1H = (expEffB / 100) * estHalfPace * injMultB;
+    
+    trackerDebug("Level 2 1H Projection Active", { pace: estHalfPace.toFixed(2), effA: expEffA.toFixed(2) });
+  } else {
+    // Level 1 Fallback
+    const aOffEff = avgOrNaN(a1HS) / (eb / 4);
+    const bOffEff = avgOrNaN(b1HS) / (eb / 4);
+    projA1H = (eb / 4) * aOffEff * injMultA;
+    projB1H = (eb / 4) * bOffEff * injMultB;
+  }
 
-  const bTeam = buildTeamMarketProjection({
-    league,
-    marketKey: "h1",
-    side: "B",
-    ownRecentSeries: b1HS,
-    oppAllowedSeries: aAllowed1,
-    ownVenueSeries: bVenueScored1,
-    oppVenueAllowedSeries: aVenueAllowed1,
-    h2hSeries: h1HasH2H ? getH2HSeries("B", "h1", parsed) : [],
-    line: lines.h1Line ? lines.h1Line / 2 : NaN,
-    injMult: injMultB,
-    sampleTier
-  });
+  const roleA = getFixtureSideRole("A");
+  const homeEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5) / 2;
+  if (roleA === "home") { projA1H += (homeEdge / 2); projB1H -= (homeEdge / 2); }
+  else if (roleA === "away") { projA1H -= (homeEdge / 2); projB1H += (homeEdge / 2); }
 
-  let h1Proj = isFinite(aTeam.proj) && isFinite(bTeam.proj) ? aTeam.proj + bTeam.proj : NaN;
-  const pace = computePaceSignal(league, aTeam.proj, bTeam.proj, "h1");
-  if (isFinite(pace)) h1Proj *= (1 + ((pace - 1) * 0.16));
+  let h1Proj = projA1H + projB1H;
   if (isFinite(h1Proj)) h1Proj = anchorProjection(h1Proj, lines.h1Line, league, "h1");
-
-  const h1Edge = lines.h1Line !== null && isFinite(h1Proj) ? h1Proj - lines.h1Line : NaN;
-  const paceGapRisk = isFinite(pace) && Math.abs(pace - 1) >= 0.10;
-  const defensiveFloorFlag = isFinite(avgFinite([aTeam.oppAllowed, bTeam.oppAllowed])) && avgFinite([aTeam.oppAllowed, bTeam.oppAllowed]) < ((LEAGUE_BASES[league] || LEAGUE_BASES.unknown) / 2) * 0.94;
-  const h1FullModel = sampleTier === "full" && isFinite(h1Proj) && aTeam.featureCount >= 3 && bTeam.featureCount >= 3;
 
   return {
     h1Proj,
-    h1Edge,
-    aS1: aTeam.ownRecent, aA1: aTeam.oppAllowed, bS1: bTeam.ownRecent, bA1: bTeam.oppAllowed,
-    aVol1: aTeam.vol, bVol1: bTeam.vol,
+    h1Edge: lines.h1Line ? h1Proj - lines.h1Line : NaN,
     h1SampleTier: sampleTier,
-    h1HasH2H,
-    h1Note: note,
-    h1ProjectionOnly: projectionOnly,
-    h1ProjectionNote: projectionNote,
-    h1FullModel,
-    paceGapRisk,
-    defensiveFloorFlag
+    h1FullModel: sampleTier === "full" && aORTG.length >= 5,
+    paceGapRisk: false
   };
 }
+
 
 function deriveSecondHalfSeries(ftSeries, firstHalfSeries) {
   const ft = Array.isArray(ftSeries) ? ftSeries : [];
