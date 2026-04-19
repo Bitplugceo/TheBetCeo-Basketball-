@@ -5251,11 +5251,17 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
   const fta = parseFloat(stats.freeThrowsAttempted || stats["freeThrowsAttempted"] || 0);
   const orb = parseFloat(stats.offensiveRebounds || stats["offensiveRebounds"] || 0);
   const tov = parseFloat(stats.turnovers || stats["turnovers"] || 0);
+
+  // Robust Possession Formula
   let possessions = 0.96 * (fga + (0.44 * fta) - orb + tov);
+  
+  // If stats are missing, estimate possessions based on league baseline
   if (possessions < 60) possessions = (minutes === 48 ? 100 : 70);
+
   const ortg = (pointsScored / possessions) * 100;
   const drtg = (pointsAllowed / possessions) * 100;
   const pace = possessions * (48 / minutes); 
+
   return {
     possessions: parseFloat(possessions.toFixed(2)),
     ortg: parseFloat(ortg.toFixed(2)),
@@ -5263,6 +5269,7 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
     pace: parseFloat(pace.toFixed(2))
   };
 }
+
 
 
     function logDebug(...args) {
@@ -5415,51 +5422,42 @@ proven in this exact build.
 If proof is absent, this section must be skipped completely.
 Any suggestion made here without proof is an audit error.
 */
-    async function proxyFetch(url, timeoutMs = 12000) {
+        async function proxyFetch(url, timeoutMs = 12000) {
       const fetchLabel = getEngineFetchLabel(url);
       engineDebug("fetch start", { request: fetchLabel, timeoutMs });
       async function fetchJson(requestUrl, label) {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-
         try {
-          const res = await fetch(requestUrl, {
-            signal: ctrl.signal,
-            headers: {},
-            cache: "no-store"
-          });
-
+          const res = await fetch(requestUrl, { signal: ctrl.signal, headers: {}, cache: "no-store" });
           if (!res.ok) throw new Error(label + " HTTP " + res.status);
-
           const text = await res.text();
-
-          try {
-            return JSON.parse(text);
-          } catch (e) {
-            throw new Error(label + " bad JSON: " + text.slice(0, 120));
-          }
-        } finally {
-          clearTimeout(timer);
-        }
+          try { return JSON.parse(text); } catch (e) { throw new Error(label + " bad JSON: " + text.slice(0, 120)); }
+        } finally { clearTimeout(timer); }
       }
 
       try {
         const workerData = await fetchJson(WORKER_URL + "?url=" + encodeURIComponent(url), "Worker");
-        engineDebug("fetch ok via worker", { request: fetchLabel });
         if (String(url).includes("/summary?event=")) {
           trackerDebug("summary fetch ok via worker", { event: String(url).split("event=")[1]?.split("&")[0] || "", source: "worker" });
         }
         return workerData;
       } catch (workerErr) {
-        console.error("[BB Engine] worker proxy failed, trying direct fetch", workerErr, url);
-        // We log silently here so the "Watch Dog" doesn't show a red error 
-        // as long as the direct fetch (the fallback) still works.
-        logDebug("Worker blocked, trying direct connection..."); 
-        throw workerErr;
-      }
+        // Silent logging - no more red boxes if fallback works!
+        logDebug("Worker blocked, trying direct connection...");
+        try {
+          const directData = await fetchJson(url, "Direct fetch");
+          if (String(url).includes("/summary?event=")) {
+            trackerDebug("summary fetch ok via direct", { event: String(url).split("event=")[1]?.split("&")[0] || "", source: "direct" });
+          }
+          return directData;
+        } catch (directErr) {
+          engineDebug("fetch failed completely", { request: fetchLabel, error: String(directErr?.message || directErr) });
+          throw workerErr;
         }
       }
     }
+
 
     function openSection(id) {
       const el = document.getElementById(id);
@@ -11109,6 +11107,7 @@ function validateInputs(league) {
     }
   };
 }
+
 
 
 function avgOrNaN(arr) {
