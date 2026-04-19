@@ -5247,20 +5247,25 @@ function validateFetchSection() {
 }
     // --- LEVEL 2 MATH MODULE ---
 function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 48) {
-  const fga = parseFloat(stats.fieldGoalsAttempted || 0);
-  const fta = parseFloat(stats.freeThrowsAttempted || 0);
-  const orb = parseFloat(stats.offensiveRebounds || 0);
-  const tov = parseFloat(stats.turnovers || 0);
+  const getStat = (key) => {
+    const val = stats[key] || "0/0";
+    if (typeof val === "string" && val.includes("/")) return parseFloat(val.split("/")[1]) || 0;
+    return parseFloat(val) || 0;
+  };
 
-  // Hollinger Possession Formula
-  const possessions = 0.96 * (fga + (0.44 * fta) - orb + tov);
+  const fga = getStat("fieldGoalsMadeAttempted");
+  const fta = getStat("freeThrowsMadeAttempted");
+  const orb = getStat("offensiveRebounds");
+  const tov = getStat("turnovers");
+
+  // Hollinger Possession Formula: 0.96 * (FGA + (0.44 * FTA) - ORB + TOV)
+  let possessions = 0.96 * (fga + (0.44 * fta) - orb + tov);
   
-  if (possessions <= 0) return null;
+  // Safety: If stats are missing, use league average (approx 100 for NBA)
+  if (possessions < 50) possessions = (minutes >= 40 ? 100 : 50);
 
   const ortg = (pointsScored / possessions) * 100;
   const drtg = (pointsAllowed / possessions) * 100;
-  
-  // FIX: Ensure pace represents a FULL game (e.g., ~100 possessions)
   const pace = (possessions / minutes) * 48; 
 
   return {
@@ -5270,6 +5275,7 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
     pace: parseFloat(pace.toFixed(2))
   };
 }
+
 
 
 
@@ -11369,7 +11375,6 @@ function getMarketKeyFromName(name) {
 function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const cl = getEffectivePaceClamp(league);
-  const vl = LEAGUE_VOL_LIMITS[league] || LEAGUE_VOL_LIMITS.unknown;
 
   const aORTG = g_massacreFetchContext.A.ortg10 || [];
   const aDRTG = g_massacreFetchContext.A.drtg10 || [];
@@ -11382,9 +11387,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const bFTS = getManualSeries("B", "ft", parsed);
   const ftSampleTier = getSampleTier(aFTS, bFTS);
 
-  if (ftSampleTier === "insufficient") {
-    return { ftProj: NaN, ftEdge: NaN, ftNote: "Insufficient sample" };
-  }
+  if (ftSampleTier === "insufficient") return { ftProj: NaN, ftEdge: NaN, ftNote: "Insufficient sample" };
 
   let projAFT, projBFT, estMatchPace;
 
@@ -11393,15 +11396,16 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const expEffB = (avgOrNaN(bORTG) + avgOrNaN(aDRTG)) / 2;
     const rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
     
-    // FIX: Clamp match pace based on the league base (e.g., 230 for NBA)
-    estMatchPace = clampNumber(rawPace, cl.min * (eb/2.3), cl.max * (eb/2.3));
+    // Normalize pace to the league base (usually ~100 possessions)
+    estMatchPace = clampNumber(rawPace, cl.min * 100, cl.max * 100);
 
     projAFT = (expEffA / 100) * estMatchPace * injMultA;
     projBFT = (expEffB / 100) * estMatchPace * injMultB;
   } else {
+    // Fallback to Level 1
     const aOffEff = avgOrNaN(aFTS) / (eb / 2);
     const bOffEff = avgOrNaN(bFTS) / (eb / 2);
-    estMatchPace = eb / 2; 
+    estMatchPace = 100; 
     projAFT = (eb / 2) * aOffEff * injMultA;
     projBFT = (eb / 2) * bOffEff * injMultB;
   }
@@ -11415,21 +11419,17 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   if (isFinite(ftProj)) ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
 
   return {
-    eb, cl, vl,
-    aS: avgOrNaN(aFTS), bS: avgOrNaN(bFTS),
-    aVol: stdDev(aFTS), bVol: stdDev(bFTS),
-    projAFT, projBFT, ftProj,
+    eb, projAFT, projBFT, ftProj, pace: estMatchPace, ftSampleTier,
     ftEdge: lines.ftLine ? ftProj - lines.ftLine : NaN,
     aEdge: lines.aLine ? projAFT - lines.aLine : NaN,
     bEdge: lines.bLine ? projBFT - lines.bLine : NaN,
-    pace: estMatchPace,
-    ftSampleTier,
     ftFullModel: ftSampleTier === "full" && aORTG.length >= 5,
     teamFullModel: ftSampleTier === "full" && aORTG.length >= 5,
     blowoutGap: Math.abs(projAFT - projBFT),
-    paceGapRisk: estMatchPace > (eb * 0.48) || estMatchPace < (eb * 0.40)
+    paceGapRisk: estMatchPace > 108 || estMatchPace < 92
   };
 }
+
 
 
 
@@ -13179,14 +13179,13 @@ const markets = finalPicksForDisplay.map(p => ({
     if (existingDash) existingDash.remove();
 
     const paceIcon = (ftCalc.pace > 100) ? "🔥" : "🧊";
-        const oA = avgOrNaN(g_massacreFetchContext.A.ortg10);
+            const oA = avgOrNaN(g_massacreFetchContext.A.ortg10);
     const dA = avgOrNaN(g_massacreFetchContext.A.drtg10);
-    const netA = (isFinite(oA) && isFinite(dA)) ? (oA - dA).toFixed(1) : "—";
+    let netA = (isFinite(oA) && isFinite(dA)) ? (oA - dA) : 0;
 
     const oB = avgOrNaN(g_massacreFetchContext.B.ortg10);
     const dB = avgOrNaN(g_massacreFetchContext.B.drtg10);
-    const netB = (isFinite(oB) && isFinite(dB)) ? (oB - dB).toFixed(1) : "—";
-
+    let netB = (isFinite(oB) && isFinite(dB)) ? (oB - dB) : 0;
 
     const dashHtml = `
       <div id="syndicateDashboard" style="background: var(--panel); border: 1px solid var(--panel-border); margin: 10px 0; padding: 0; box-shadow: var(--shadow); font-family: sans-serif;">
@@ -13195,22 +13194,13 @@ const markets = finalPicksForDisplay.map(p => ({
           <span style="color: ${ftCalc.ftFullModel ? '#4CAF50' : '#ffa500'}">${ftCalc.ftFullModel ? '🟢 FULL MODEL' : '🟡 LIMITED DATA'}</span>
         </div>
         <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; padding: 12px; text-align: center; gap: 5px;">
-          <div>
-            <div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team A Net</div>
-            <div style="font-size: 18px; font-weight: 900; color: ${netA >= 0 ? '#3a9c35' : '#c91920'}">${isNaN(netA) ? '—' : netA}</div>
-          </div>
-          <div>
-            <div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Exp. Pace</div>
-            <div style="font-size: 18px; font-weight: 900; color: var(--text);">${isFinite(ftCalc.pace) ? ftCalc.pace.toFixed(1) + ' ' + paceIcon : '—'}</div>
-          </div>
-          <div>
-            <div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team B Net</div>
-            <div style="font-size: 18px; font-weight: 900; color: ${netB >= 0 ? '#3a9c35' : '#c91920'}">${isNaN(netB) ? '—' : netB}</div>
-          </div>
+          <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team A Net</div><div style="font-size: 18px; font-weight: 900; color: ${netA >= 0 ? '#3a9c35' : '#c91920'}">${netA.toFixed(1)}</div></div>
+          <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Exp. Pace</div><div style="font-size: 18px; font-weight: 900; color: var(--text);">${isFinite(ftCalc.pace) ? ftCalc.pace.toFixed(1) + ' ' + paceIcon : '—'}</div></div>
+          <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team B Net</div><div style="font-size: 18px; font-weight: 900; color: ${netB >= 0 ? '#3a9c35' : '#c91920'}">${netB.toFixed(1)}</div></div>
         </div>
-      </div>
-    `;
+      </div>`;
     table.insertAdjacentHTML('beforebegin', dashHtml);
+
     // --- END SYNDICATE DASHBOARD INJECTION ---
 
     const lockIdx = selectLock(markets);
