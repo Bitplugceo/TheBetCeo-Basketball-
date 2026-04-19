@@ -5247,20 +5247,21 @@ function validateFetchSection() {
 }
     // --- LEVEL 2 MATH MODULE ---
 function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 48) {
-  const fga = parseFloat(stats.fieldGoalsAttempted || stats["fieldGoalsAttempted"] || 0);
-  const fta = parseFloat(stats.freeThrowsAttempted || stats["freeThrowsAttempted"] || 0);
-  const orb = parseFloat(stats.offensiveRebounds || stats["offensiveRebounds"] || 0);
-  const tov = parseFloat(stats.turnovers || stats["turnovers"] || 0);
+  const fga = parseFloat(stats.fieldGoalsAttempted || 0);
+  const fta = parseFloat(stats.freeThrowsAttempted || 0);
+  const orb = parseFloat(stats.offensiveRebounds || 0);
+  const tov = parseFloat(stats.turnovers || 0);
 
-  // Robust Possession Formula
-  let possessions = 0.96 * (fga + (0.44 * fta) - orb + tov);
+  // Hollinger Possession Formula
+  const possessions = 0.96 * (fga + (0.44 * fta) - orb + tov);
   
-  // If stats are missing, estimate possessions based on league baseline
-  if (possessions < 60) possessions = (minutes === 48 ? 100 : 70);
+  if (possessions <= 0) return null;
 
   const ortg = (pointsScored / possessions) * 100;
   const drtg = (pointsAllowed / possessions) * 100;
-  const pace = possessions * (48 / minutes); 
+  
+  // FIX: Ensure pace represents a FULL game (e.g., ~100 possessions)
+  const pace = (possessions / minutes) * 48; 
 
   return {
     possessions: parseFloat(possessions.toFixed(2)),
@@ -5269,6 +5270,7 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
     pace: parseFloat(pace.toFixed(2))
   };
 }
+
 
 
 
@@ -5442,17 +5444,14 @@ Any suggestion made here without proof is an audit error.
           trackerDebug("summary fetch ok via worker", { event: String(url).split("event=")[1]?.split("&")[0] || "", source: "worker" });
         }
         return workerData;
-      } catch (workerErr) {
-        // Silent logging - no more red boxes if fallback works!
-        logDebug("Worker blocked, trying direct connection...");
+           } catch (workerErr) {
+        // We log to standard console, but NOT trackerDebug to avoid red boxes
+        console.warn("[BB Engine] Worker failed, attempting direct connection...");
         try {
           const directData = await fetchJson(url, "Direct fetch");
-          if (String(url).includes("/summary?event=")) {
-            trackerDebug("summary fetch ok via direct", { event: String(url).split("event=")[1]?.split("&")[0] || "", source: "direct" });
-          }
           return directData;
         } catch (directErr) {
-          engineDebug("fetch failed completely", { request: fetchLabel, error: String(directErr?.message || directErr) });
+          engineDebug("fetch failed completely", { request: fetchLabel, error: directErr.message });
           throw workerErr;
         }
       }
@@ -11372,13 +11371,6 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const cl = getEffectivePaceClamp(league);
   const vl = LEAGUE_VOL_LIMITS[league] || LEAGUE_VOL_LIMITS.unknown;
 
-  // Level 1 Data (Fallback)
-  const aFTS = getManualSeries("A", "ft", parsed);
-  const bFTS = getManualSeries("B", "ft", parsed);
-  const aAllowed = getAllowedSeries("A", "overall", "ft", parsed);
-  const bAllowed = getAllowedSeries("B", "overall", "ft", parsed);
-  
-  // Level 2 Data (Advanced Metrics harvested from memory)
   const aORTG = g_massacreFetchContext.A.ortg10 || [];
   const aDRTG = g_massacreFetchContext.A.drtg10 || [];
   const bORTG = g_massacreFetchContext.B.ortg10 || [];
@@ -11386,79 +11378,59 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const aPace = g_massacreFetchContext.A.pace10 || [];
   const bPace = g_massacreFetchContext.B.pace10 || [];
 
+  const aFTS = getManualSeries("A", "ft", parsed);
+  const bFTS = getManualSeries("B", "ft", parsed);
   const ftSampleTier = getSampleTier(aFTS, bFTS);
+
   if (ftSampleTier === "insufficient") {
     return { ftProj: NaN, ftEdge: NaN, ftNote: "Insufficient sample" };
   }
 
-  // --- START LEVEL 2 CALCULATION ENGINE ---
-  
   let projAFT, projBFT, estMatchPace;
 
-  // Use Level 2 Efficiency Math if advanced stats exist
   if (aORTG.length >= 2 && bORTG.length >= 2) {
-    // 1. Calculate Matchup-Specific Efficiency
-    // Team A Offense vs Team B Defense
     const expEffA = (avgOrNaN(aORTG) + avgOrNaN(bDRTG)) / 2;
-    // Team B Offense vs Team A Defense
     const expEffB = (avgOrNaN(bORTG) + avgOrNaN(aDRTG)) / 2;
-
-    // 2. Calculate Expected Match Pace
     const rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
-    // Scale pace clamp to league baseline
-    estMatchPace = clampNumber(rawPace, cl.min * (eb/100), cl.max * (eb/100));
+    
+    // FIX: Clamp match pace based on the league base (e.g., 230 for NBA)
+    estMatchPace = clampNumber(rawPace, cl.min * (eb/2.3), cl.max * (eb/2.3));
 
-    // 3. Generate Score Projections (Points = Efficiency/100 * Possessions)
     projAFT = (expEffA / 100) * estMatchPace * injMultA;
     projBFT = (expEffB / 100) * estMatchPace * injMultB;
-    
-    trackerDebug("Level 2 Projection Active", { pace: estMatchPace.toFixed(2), effA: expEffA.toFixed(2), effB: expEffB.toFixed(2) });
   } else {
-    // LEVEL 1 FALLBACK: Standard PPG and Pace Estimation
     const aOffEff = avgOrNaN(aFTS) / (eb / 2);
     const bOffEff = avgOrNaN(bFTS) / (eb / 2);
-    const aDefEff = avgOrNaN(aAllowed) / (eb / 2);
-    const bDefEff = avgOrNaN(bAllowed) / (eb / 2);
-    const aGamePace = (avgOrNaN(aFTS) + avgOrNaN(aAllowed)) / eb;
-    const bGamePace = (avgOrNaN(bFTS) + avgOrNaN(bAllowed)) / eb;
-    estMatchPace = clampNumber((aGamePace + bGamePace) / 2, cl.min, cl.max);
-
-    projAFT = (eb / 2) * estMatchPace * ((aOffEff + bDefEff) / 2) * injMultA;
-    projBFT = (eb / 2) * estMatchPace * ((bOffEff + aDefEff) / 2) * injMultB;
+    estMatchPace = eb / 2; 
+    projAFT = (eb / 2) * aOffEff * injMultA;
+    projBFT = (eb / 2) * bOffEff * injMultB;
   }
 
-  // 4. Apply League Home Edge components
   const roleA = getFixtureSideRole("A");
   const homeEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5);
   if (roleA === "home") { projAFT += (homeEdge / 2); projBFT -= (homeEdge / 2); }
   else if (roleA === "away") { projAFT -= (homeEdge / 2); projBFT += (homeEdge / 2); }
 
   let ftProj = projAFT + projBFT;
-  
-  // 5. Final Calibration & Line Anchor
-  ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
-  const ftEdge = lines.ftLine ? ftProj - lines.ftLine : NaN;
-  const aEdge = lines.aLine ? projAFT - lines.aLine : NaN;
-  const bEdge = lines.bLine ? projBFT - lines.bLine : NaN;
-
-  const aVol = stdDev(aFTS);
-  const bVol = stdDev(bFTS);
+  if (isFinite(ftProj)) ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
 
   return {
     eb, cl, vl,
     aS: avgOrNaN(aFTS), bS: avgOrNaN(bFTS),
-    aVol, bVol,
+    aVol: stdDev(aFTS), bVol: stdDev(bFTS),
     projAFT, projBFT, ftProj,
-    ftEdge, aEdge, bEdge,
+    ftEdge: lines.ftLine ? ftProj - lines.ftLine : NaN,
+    aEdge: lines.aLine ? projAFT - lines.aLine : NaN,
+    bEdge: lines.bLine ? projBFT - lines.bLine : NaN,
     pace: estMatchPace,
     ftSampleTier,
-    // Model is full ONLY if advanced stats have sufficient depth
     ftFullModel: ftSampleTier === "full" && aORTG.length >= 5,
     teamFullModel: ftSampleTier === "full" && aORTG.length >= 5,
     blowoutGap: Math.abs(projAFT - projBFT),
-    paceGapRisk: estMatchPace > (eb * 1.08) || estMatchPace < (eb * 0.92)
+    paceGapRisk: estMatchPace > (eb * 0.48) || estMatchPace < (eb * 0.40)
   };
 }
+
 
 
 
