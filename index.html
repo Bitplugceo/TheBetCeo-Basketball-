@@ -11385,7 +11385,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   if (ftSampleTier === "insufficient") return { ftProj: NaN, ftEdge: NaN, ftNote: "Insufficient sample" };
 
-    let projAFT, projBFT, estMatchPace, synNetA = null, synNetB = null;
+  let projAFT, projBFT, estMatchPace, synNetA = null, synNetB = null;
 
   if (aORTG.length >= 2 && bORTG.length >= 2) {
     const expEffA = (avgOrNaN(aORTG) + avgOrNaN(bDRTG)) / 2;
@@ -11400,26 +11400,29 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const bS = avgOrNaN(bFTS);
     const aA = avgOrNaN(parsed.aFTAllowed) || (eb / 2); 
     const bA = avgOrNaN(parsed.bFTAllowed) || (eb / 2);
-
     const basePace = eb / 2.3; 
     const paceFactorA = (aS + aA) / eb;
     const paceFactorB = (bS + bA) / eb;
-    
-estMatchPace = clampNumber(basePace * ((paceFactorA + paceFactorB) / 2), basePace * cl.min, basePace * cl.max);
-
-
-
-
+    estMatchPace = clampNumber(basePace * ((paceFactorA + paceFactorB) / 2), basePace * cl.min, basePace * cl.max);
     const synOrtgA = (aS / (basePace * paceFactorA)) * 100;
     const synDrtgA = (aA / (basePace * paceFactorA)) * 100;
     const synOrtgB = (bS / (basePace * paceFactorB)) * 100;
     const synDrtgB = (bA / (basePace * paceFactorB)) * 100;
-
     synNetA = synOrtgA - synDrtgA;
     synNetB = synOrtgB - synDrtgB;
-
     projAFT = ((synOrtgA + synDrtgB) / 2 / 100) * estMatchPace * injMultA;
     projBFT = ((synOrtgB + synDrtgA) / 2 / 100) * estMatchPace * injMultB;
+  }
+
+  // --- H2H INJECTION FOR FT, TEAM A, AND TEAM B ---
+  const aH2H = getH2HSeries("A", "ft", parsed);
+  const bH2H = getH2HSeries("B", "ft", parsed);
+  const ftHasH2H = maybeReadH2HEnabled("ft") && aH2H.length >= 2 && bH2H.length >= 2;
+
+  if (ftHasH2H) {
+    const hw = getH2HWeight(aH2H.length, bH2H.length, "ft", ftSampleTier);
+    projAFT = (projAFT * (1 - hw)) + (avgOrNaN(aH2H) * hw);
+    projBFT = (projBFT * (1 - hw)) + (avgOrNaN(bH2H) * hw);
   }
 
   const roleA = getFixtureSideRole("A");
@@ -11427,12 +11430,16 @@ estMatchPace = clampNumber(basePace * ((paceFactorA + paceFactorB) / 2), basePac
   if (roleA === "home") { projAFT += (homeEdge / 2); projBFT -= (homeEdge / 2); }
   else if (roleA === "away") { projAFT -= (homeEdge / 2); projBFT += (homeEdge / 2); }
 
+  // Anchor individual team projections
+  if (isFinite(projAFT)) projAFT = anchorProjection(projAFT, lines.aLine, league, "team");
+  if (isFinite(projBFT)) projBFT = anchorProjection(projBFT, lines.bLine, league, "team");
+
   let ftProj = projAFT + projBFT;
   if (isFinite(ftProj)) ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
 
   return {
     eb, projAFT, projBFT, ftProj, pace: estMatchPace, ftSampleTier,
-    synNetA, synNetB, 
+    synNetA, synNetB, ftHasH2H,
     ftEdge: lines.ftLine ? ftProj - lines.ftLine : NaN,
     aEdge: lines.aLine ? projAFT - lines.aLine : NaN,
     bEdge: lines.bLine ? projBFT - lines.bLine : NaN,
@@ -11456,7 +11463,6 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const b1HS = getManualSeries("B", "h1", parsed);
   const sampleTier = getSampleTier(a1HS, b1HS);
 
-  // Level 2 Memory Access
   const aORTG = g_massacreFetchContext.A.ortg10 || [];
   const aDRTG = g_massacreFetchContext.A.drtg10 || [];
   const bORTG = g_massacreFetchContext.B.ortg10 || [];
@@ -11464,31 +11470,35 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const aPace = g_massacreFetchContext.A.pace10 || [];
   const bPace = g_massacreFetchContext.B.pace10 || [];
 
-  if (!supported || sampleTier === "insufficient") {
+  if (!supported && sampleTier === "insufficient") {
     return { h1Proj: NaN, h1Edge: NaN, h1SampleTier: sampleTier, h1Note: "Insufficient 1H sample" };
   }
 
   let projA1H, projB1H, estHalfPace;
 
-  // Level 2 Matchup-Specific Calculation
   if (aORTG.length >= 2 && bORTG.length >= 2) {
     const expEffA = (avgOrNaN(aORTG) + avgOrNaN(bDRTG)) / 2;
     const expEffB = (avgOrNaN(bORTG) + avgOrNaN(aDRTG)) / 2;
     const rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
-    
-    // Half-time pace is derived from game pace (standard 50%)
     estHalfPace = (rawPace / 2); 
-
     projA1H = (expEffA / 100) * estHalfPace * injMultA;
     projB1H = (expEffB / 100) * estHalfPace * injMultB;
-    
-    trackerDebug("Level 2 1H Projection Active", { pace: estHalfPace.toFixed(2), effA: expEffA.toFixed(2) });
   } else {
-    // Level 1 Fallback
     const aOffEff = avgOrNaN(a1HS) / (eb / 4);
     const bOffEff = avgOrNaN(b1HS) / (eb / 4);
     projA1H = (eb / 4) * aOffEff * injMultA;
     projB1H = (eb / 4) * bOffEff * injMultB;
+  }
+
+  // --- H2H INJECTION FOR 1H ---
+  const aH2H1 = getH2HSeries("A", "h1", parsed);
+  const bH2H1 = getH2HSeries("B", "h1", parsed);
+  const h1HasH2H = maybeReadH2HEnabled("h1") && aH2H1.length >= 2 && bH2H1.length >= 2;
+
+  if (h1HasH2H) {
+    const hw1 = getH2HWeight(aH2H1.length, bH2H1.length, "h1", sampleTier);
+    projA1H = (projA1H * (1 - hw1)) + (avgOrNaN(aH2H1) * hw1);
+    projB1H = (projB1H * (1 - hw1)) + (avgOrNaN(bH2H1) * hw1);
   }
 
   const roleA = getFixtureSideRole("A");
@@ -11503,10 +11513,12 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     h1Proj,
     h1Edge: lines.h1Line ? h1Proj - lines.h1Line : NaN,
     h1SampleTier: sampleTier,
+    h1HasH2H,
     h1FullModel: sampleTier === "full" && aORTG.length >= 5,
     paceGapRisk: false
   };
 }
+
 
 
 function deriveSecondHalfSeries(ftSeries, firstHalfSeries) {
