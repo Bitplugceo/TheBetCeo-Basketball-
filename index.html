@@ -8718,128 +8718,73 @@ function handleTrackedPicksActionClick(event) {
       return "pending";
     }
 
-    async function refreshTrackedPickResults() {
-  // Lock check removed because refreshTrackerInBackground() already handles it!
+async function refreshTrackedPickResults() {
   try {
     const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
-
     const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
     const allBuckets = [...active, ...archived];
 
     if (!allBuckets.length) {
-      trackerDebug("refresh found no tracked picks", { key: getTrackerUserKey() });
       renderTrackedPicks();
       return;
     }
 
     let changed = false;
     const pendingPicks = allBuckets.filter(p => (
-      p &&
-      p.eventId &&
-      (!p.resultStatus || p.resultStatus === "pending") &&
-      isTrackerSupportedLeague(p.league)
+      p && p.eventId && (!p.resultStatus || p.resultStatus === "pending") && isTrackerSupportedLeague(p.league)
     ));
-    trackerDebug("refresh started", {
-      totalBuckets: allBuckets.length,
-      pendingPicks: pendingPicks.length,
-      skippedUnsupported: allBuckets.filter(p => p && p.eventId && !isTrackerSupportedLeague(p.league)).length,
-      key: getTrackerUserKey()
-    });
 
     if (pendingPicks.length) {
-      const eventEntries = [...new Map(
-        pendingPicks
-          .map(p => {
-            const base = getTrackedLeagueBase(p.league);
-            if (!base) return null;
-            const cacheKey = `${p.league}:${p.eventId}`;
-            return [cacheKey, { cacheKey, base, eventId: p.eventId }];
-          })
-          .filter(Boolean)
-      ).values()];
+      const eventEntries = [...new Map(pendingPicks.map(p => {
+        const base = getTrackedLeagueBase(p.league);
+        if (!base) return null;
+        return [`${p.league}:${p.eventId}`, { base, eventId: p.eventId }];
+      }).filter(Boolean)).values()];
 
-      trackerDebug("refresh fetching event summaries", { uniqueEvents: eventEntries.length });
-      const eventResults = await Promise.all(
-        eventEntries.map(async entry => {
-          const summaryUrl = `${entry.base}/summary?event=${entry.eventId}&_=${Date.now()}&cb=${Math.random().toString(36).slice(2)}`;
-          const data = await proxyFetch(summaryUrl, 15000).catch(() => null);
-          return [entry.cacheKey, data];
-        })
-      );
+      const eventResults = await Promise.all(eventEntries.map(async entry => {
+        const url = `${entry.base}/summary?event=${entry.eventId}&_=${Date.now()}`;
+        const data = await proxyFetch(url, 15000).catch(() => null);
+        return [`${entry.eventId}`, data];
+      }));
 
       const eventMap = new Map(eventResults);
 
       pendingPicks.forEach(pick => {
-        const data = eventMap.get(`${pick.league}:${pick.eventId}`);
+        const data = eventMap.get(pick.eventId);
         const competition = data?.header?.competitions?.[0];
-        if (!competition) {
-          trackerDebug("refresh missing competition data", { eventId: pick.eventId, market: pick.marketKey, league: pick.league });
-          return;
-        }
+        if (!competition) return;
 
-        const apiFinal = competition?.status?.type?.completed || 
-                         competition?.status?.type?.state === "post" || 
-                         competition?.status?.type?.name === "STATUS_FINAL";
-
+        const apiFinal = competition?.status?.type?.completed || competition?.status?.type?.state === "post";
         const clock = competition?.status?.displayClock;
         const period = competition?.status?.period;
-        
-        // Fix: Force settle if API says final OR clock is 0:00 in 4th Qtr (NBA) or 2nd Half (NCAA)
-        const forceSettle = (clock === "0.0" || clock === "0:00" || clock === "0") && period >= (pick.league === "nba" ? 4 : 2);
+        const forceSettle = (clock === "0.0" || clock === "0:00") && period >= (pick.league === "nba" ? 4 : 2);
 
-        if (!apiFinal && !forceSettle) {
-          trackerDebug("refresh game still active", { eventId: pick.eventId, clock, period });
-          return;
-        }
-
-
-                        const settled = settleTrackedPickFromCompetition(pick, competition);
-        if (settled !== "pending" && pick.resultStatus !== settled) {
-          pick.resultStatus = settled;
-          pick.settledAt = new Date().toISOString();
-          changed = true;
-          trackerDebug("refresh settled pick", { eventId: pick.eventId, market: pick.marketKey, result: settled, line: pick.line, side: pick.side });
-        } else if (settled === "pending") {
-          trackerDebug("refresh final game still returned pending", { eventId: pick.eventId, market: pick.marketKey, line: pick.line, side: pick.side });
+        if (apiFinal || forceSettle) {
+          const settled = settleTrackedPickFromCompetition(pick, competition);
+          if (settled !== "pending" && pick.resultStatus !== settled) {
+            pick.resultStatus = settled;
+            pick.settledAt = new Date().toISOString();
+            changed = true;
+          }
         }
       });
     }
 
     if (changed) {
-      if (typeof g_trackerState !== "undefined" && g_trackerState) {
-        g_trackerState.updatedAt = new Date().toISOString();
-      }
+      g_trackerState.updatedAt = new Date().toISOString();
       saveTrackerStateToLocal();
     }
 
-    const activeSignaturesBeforeReconcile = JSON.stringify((g_trackerState.activePicks || []).map(makeTrackedSignature));
-    const archivedSignaturesBeforeReconcile = JSON.stringify((g_trackerState.archivedPicks || []).map(makeTrackedSignature));
-    const reconciled = reconcileTrackerBucketConflicts(g_trackerState.activePicks, g_trackerState.archivedPicks);
-    g_trackerState.activePicks = reconciled.activePicks;
-    g_trackerState.archivedPicks = reconciled.archivedPicks;
-    
     const archivedChanged = archiveExpiredTrackedPicks();
     if (changed || archivedChanged) {
       rebuildTrackerStats();
       saveTrackerStateToLocal();
     }
     renderTrackedPicks();
-      saveTrackerStateToLocal();
-      scheduleTrackerSave();
-      Promise.resolve().then(() => forceTrackerSaveNow());
-        } else {
-      trackerDebug("refresh finished with no tracker changes", {
-        pendingAfter: getPendingActivePickCount(g_trackerState),
-        settled: Number(g_trackerState?.stats?.settled || 0)
-      });
-    }
-
-    renderTrackedPicks();
   } catch (err) {
-    trackerDebug("refresh threw an error", { error: String(err?.message || err) });
+    console.error("[BB Engine] refresh failed", err);
   }
 }
-
 
     function addTrackedPicks(newPicks) {
   if (!Array.isArray(newPicks) || !newPicks.length) {
@@ -11461,7 +11406,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const paceFactorA = (aS + aA) / eb;
     const paceFactorB = (bS + bA) / eb;
     
-    estMatchPace = clampNumber(basePace * ((paceFactorA + paceFactorB) / 2), basePace * cl.min, basePace * cl.max);
+estMatchPace = clampNumber(basePace * ((paceFactorA + paceFactorB) / 2), basePace * cl.min, basePace * cl.max);
+
 
 
     const synOrtgA = (aS / (basePace * paceFactorA)) * 100;
@@ -12445,7 +12391,6 @@ function applyLeagueTrustToPicks(picks, league) {
     if (trust.mode === "block") {
       if (p.pick && p.pick !== "NO PLAY") {
         p.pick = "NO PLAY";
-        p.confidence = "—";
         p.note = trust.guidance;
         p.lockRestricted = true;
         p.trustAction = "blocked";
@@ -12455,7 +12400,6 @@ function applyLeagueTrustToPicks(picks, league) {
 
     if (trust.mode === "advisory" && p.pick && p.pick !== "NO PLAY") {
       p.recommendationTier = "lean";
-      p.confidence = "—";
       p.note = p.note ? `${p.note} • ${trust.guidance}` : trust.guidance;
       p.lockRestricted = true;
       p.trustAction = "advisory";
@@ -12797,8 +12741,8 @@ function buildResultRows({
   table.innerHTML = "<tr><th>Pick</th><th>Projection</th><th>Edge</th><th>Model Grade</th><th>Prediction</th></tr>";
 
   finalPicks.forEach(p => {
-        const isLock = p._idx === lockIdx && p.pick !== "NO PLAY";
-const confText = p.pick === "NO PLAY" ? "—" : (p.confidence || "D");
+            const isLock = p._idx === lockIdx && p.pick !== "NO PLAY";
+    const confText = p.pick === "NO PLAY" ? "—" : (p.confidence || "D");
 
     const displayPrediction = getDisplayedPredictionText(p.pick, p.recommendationTier || "");
 
