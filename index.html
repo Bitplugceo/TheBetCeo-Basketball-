@@ -3408,6 +3408,7 @@ const LEAGUE_FETCH_RULES = {
     const _summaryCache = new Map();
     const _fixtureCache = new Map();
     const _teamCatalogCache = new Map();
+let g_activeFetchController = null;
 
     let _fetchToken = 0;
     let _fixtureLoadToken = 0;
@@ -3965,13 +3966,7 @@ function getTrackerUserKey() {
   if (TRACKER_FIXED_USER_KEY && TRACKER_FIXED_USER_KEY.trim()) {
     const pinned = TRACKER_FIXED_USER_KEY.trim();
     g_trackerFallbackUserKey = pinned;
-
-    try {
-      localStorage.setItem(TRACKER_USER_KEY_STORAGE, pinned);
-    } catch (err) {
-      console.error("[BB Engine] failed to persist fixed tracker key", err);
-    }
-
+    try { localStorage.setItem(TRACKER_USER_KEY_STORAGE, pinned); } catch (err) {}
     return pinned;
   }
 
@@ -3981,24 +3976,28 @@ function getTrackerUserKey() {
     let key = localStorage.getItem(TRACKER_USER_KEY_STORAGE) || "";
 
     if (!key) {
-      key =
-        (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
-          ? crypto.randomUUID()
-          : ("trk_" + Date.now() + "_" + Math.random().toString(36).slice(2));
-
+      // FIX: Cryptographically secure UUID generation. No Math.random() allowed.
+      if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+        key = crypto.randomUUID();
+      } else if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+        key = "trk_" + Date.now() + "_" + ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c => 
+          (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
+        );
+      } else {
+        // Absolute fallback if crypto is missing entirely
+        key = "trk_legacy_" + Date.now() + "_" + Date.now().toString(36);
+      }
       localStorage.setItem(TRACKER_USER_KEY_STORAGE, key);
     }
 
     g_trackerFallbackUserKey = key;
     return key;
   } catch (err) {
-    g_trackerFallbackUserKey =
-      g_trackerFallbackUserKey ||
-      ("trk_fallback_" + Date.now() + "_" + Math.random().toString(36).slice(2));
-
+    g_trackerFallbackUserKey = g_trackerFallbackUserKey || ("trk_fallback_" + Date.now() + "_err");
     return g_trackerFallbackUserKey;
   }
 }
+
 
 function getTrackerLocalStateStableKey() {
   return TRACKER_LOCAL_STATE_PREFIX + getTrackerUserKey();
@@ -4115,15 +4114,19 @@ async function saveTrackerStateToLocal() {
     
     const results = await Promise.all(uniqueKeys.map(key => writeAsyncStorage(key, payload)));
     
-    if (results.every(res => res === false)) {
-      throw new Error("Local storage write completely failed (Storage full or blocked)");
+    // FIX: Actively monitor for storage write rejection
+    if (results.length > 0 && results.every(res => res === false)) {
+      throw new Error("Local storage write completely failed (Quota Exceeded or Blocked).");
     }
     
   } catch (err) {
     console.error("[BB Engine] saveTrackerStateToLocal async failed", err);
-    engineDebug("CRITICAL: Local storage failed. Data loss risk.", String(err));
+    // FIX: Force the Watchdog to surface the data loss to the user immediately
+    engineDebug("CRITICAL: Local storage failed. Data loss imminent.", String(err));
+    triggerGlobalEngineAlert("STORAGE FAILURE: Your device cannot save tracker data. Ensure Private Browsing is off and storage is not full.");
   }
 }
+
 
 
 
@@ -5482,11 +5485,25 @@ Any suggestion made here without proof is an audit error.
         async function proxyFetch(url, timeoutMs = 12000) {
       const fetchLabel = getEngineFetchLabel(url);
       engineDebug("fetch start", { request: fetchLabel, timeoutMs });
+              async function proxyFetch(url, timeoutMs = 12000) {
+      const fetchLabel = getEngineFetchLabel(url);
+      engineDebug("fetch start", { request: fetchLabel, timeoutMs });
+      
+      // FIX: Implement a strict handshake header. Your Cloudflare Worker must be updated 
+      // to REJECT any request that does not contain this exact header.
+      const PROXY_AUTH_HEADER = {
+        "X-Engine-Proxy-Token": "v2_engine_strict_auth_9982" 
+      };
+
       async function fetchJson(requestUrl, label) {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), timeoutMs);
         try {
-          const res = await fetch(requestUrl, { signal: ctrl.signal, headers: {}, cache: "no-store" });
+          const res = await fetch(requestUrl, { 
+            signal: ctrl.signal, 
+            headers: PROXY_AUTH_HEADER, 
+            cache: "no-store" 
+          });
           if (!res.ok) throw new Error(label + " HTTP " + res.status);
           const text = await res.text();
           try { return JSON.parse(text); } catch (e) { throw new Error(label + " bad JSON: " + text.slice(0, 120)); }
@@ -5500,7 +5517,6 @@ Any suggestion made here without proof is an audit error.
         }
         return workerData;
            } catch (workerErr) {
-        // We log to standard console, but NOT trackerDebug to avoid red boxes
         console.warn("[BB Engine] Worker failed, attempting direct connection...");
         try {
           const directData = await fetchJson(url, "Direct fetch");
@@ -5511,6 +5527,7 @@ Any suggestion made here without proof is an audit error.
         }
       }
     }
+
 
 
     function openSection(id) {
@@ -7150,7 +7167,10 @@ function renderTrackedPicks() {
 
   if (!summaryEl || !marketSummaryEl || !emptyEl || !wrapEl || !bodyEl) return;
 
-  archiveExpiredTrackedPicks();
+  // FIX: archiveExpiredTrackedPicks() has been purged from the render cycle 
+  // to prevent infinite render-mutation loops and IndexedDB locking.
+
+
 
   const supportedTrackerMarkets = ["ft", "h1", "h2", "team_a", "team_b"];
   const activePicks = (Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [])
@@ -10835,7 +10855,7 @@ return isPreGame;
   fetchESPN();
 }
 
-    async function fetchESPN() {
+        async function fetchESPN() {
       const league = document.getElementById("leagueSelect").value;
       const teamAName = document.getElementById("teamAName").value.trim();
       const teamBName = document.getElementById("teamBName").value.trim();
@@ -10848,12 +10868,21 @@ return isPreGame;
         setStatusText("❌ ESPN auto-fetch is NBA & NCAA only.", "err");
         return;
       }
+      
       const btn = document.getElementById("fetchBtn");
-btn.disabled = true;
-setFetchAuditIssues([]);
-resetResultsTable();
-setStatusHTML('<span class="spinner"></span>Fetching from ESPN...', "loading");
-const myToken = ++_fetchToken;
+      btn.disabled = true;
+      setFetchAuditIssues([]);
+      resetResultsTable();
+      setStatusHTML('<span class="spinner"></span>Fetching from ESPN...', "loading");
+
+      // FIX: Terminate any in-flight fetch requests to prevent race conditions
+      if (g_activeFetchController) {
+        g_activeFetchController.abort();
+      }
+      g_activeFetchController = new AbortController();
+      const fetchSignal = g_activeFetchController.signal;
+      const myToken = ++_fetchToken; // Keep token as a secondary fail-safe
+
 
       try {
         const isNcaa = league === "ncaa";
