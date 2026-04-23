@@ -5524,22 +5524,23 @@ Any suggestion made here without proof is an audit error.
     "X-Engine-Proxy-Token": "v2_engine_strict_auth_9982" 
   };
 
-  async function fetchJson(requestUrl, label) {
+  async function fetchJson(requestUrl, label, useProxyHeaders) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     
-    // FIX: Wire the global fetch controller to abort in-flight requests and prevent race conditions
     const onGlobalAbort = () => ctrl.abort();
     if (typeof g_activeFetchController !== 'undefined' && g_activeFetchController?.signal) {
       g_activeFetchController.signal.addEventListener("abort", onGlobalAbort, { once: true });
     }
 
     try {
-      const res = await fetch(requestUrl, { 
-        signal: ctrl.signal, 
-        headers: PROXY_AUTH_HEADER, 
-        cache: "no-store" 
-      });
+      const reqOpts = { signal: ctrl.signal, cache: "no-store" };
+      // FIX: Only attach the custom security token if we are hitting the Worker
+      if (useProxyHeaders) {
+        reqOpts.headers = PROXY_AUTH_HEADER;
+      }
+
+      const res = await fetch(requestUrl, reqOpts);
       if (!res.ok) throw new Error(label + " HTTP " + res.status);
       const text = await res.text();
       try { return JSON.parse(text); } catch (e) { throw new Error(label + " bad JSON: " + text.slice(0, 120)); }
@@ -5550,6 +5551,27 @@ Any suggestion made here without proof is an audit error.
       }
     }
   }
+
+  try {
+    // 1. Try the Cloudflare Worker with the security token attached
+    const workerData = await fetchJson(WORKER_URL + "?url=" + encodeURIComponent(url), "Worker", true);
+    if (String(url).includes("/summary?event=")) {
+      trackerDebug("summary fetch ok via worker", { event: String(url).split("event=")[1]?.split("&")[0] || "", source: "worker" });
+    }
+    return workerData;
+  } catch (workerErr) {
+    console.warn("[BB Engine] Worker failed, attempting direct connection...");
+    try {
+      // 2. Try ESPN directly, but strip the security token so ESPN doesn't block it
+      const directData = await fetchJson(url, "Direct fetch", false);
+      return directData;
+    } catch (directErr) {
+      engineDebug("fetch failed completely", { request: fetchLabel, error: directErr.message });
+      throw workerErr;
+    }
+  }
+}
+
 
   try {
     const workerData = await fetchJson(WORKER_URL + "?url=" + encodeURIComponent(url), "Worker");
