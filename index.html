@@ -4738,17 +4738,12 @@ function prioritizeDebugLines(lines = [], limit = 10) {
   return (Array.isArray(lines) ? lines : [])
     .filter(line => {
         const text = line.toLowerCase();
-        // Whitelist "Level 2" so it bypasses the junk filter
-        const isJunk = (text.includes('{"') && !text.includes("level 2")) || text.includes("push start") || text.includes("hydrate") || text.includes("flush save") || text.includes("apply response");
-        return !isJunk || text.includes("error") || text.includes("complete") || text.includes("failed");
-    })
-    .map(line => {
-        if (line.includes(" | {")) return line.split(" | {")[0];
-        return line;
+        // ADVERSARIAL OVERRIDE: Destroyed the JSON censor. Show the raw code.
+        const isSpam = text.includes("push start") || text.includes("flush save") || text.includes("apply response");
+        return !isSpam || text.includes("error") || text.includes("failed");
     })
     .map((line, index) => ({ line, index, severity: getDebugSeverity(line) }))
     .sort((a, b) => {
-      // Force Level 2 logs to the absolute top
       if (a.line.toLowerCase().includes("level 2") && !b.line.toLowerCase().includes("level 2")) return -1;
       if (!a.line.toLowerCase().includes("level 2") && b.line.toLowerCase().includes("level 2")) return 1;
 
@@ -4756,8 +4751,22 @@ function prioritizeDebugLines(lines = [], limit = 10) {
       return diff !== 0 ? diff : a.index - b.index;
     })
     .slice(0, limit)
-    .map(row => row.line);
+    .map(row => {
+        // Automatically prettify JSON payloads into readable code blocks
+        if (row.line.includes(" | {")) {
+            try {
+                const parts = row.line.split(" | ");
+                const jsonStr = parts.slice(1).join(" | ");
+                const parsed = JSON.parse(jsonStr);
+                return parts[0] + "\n" + JSON.stringify(parsed, null, 2);
+            } catch(e) {
+                return row.line;
+            }
+        }
+        return row.line;
+    });
 }
+
 
 
 
@@ -12107,27 +12116,32 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
     return { overPct: 50, underPct: 50 };
   }
 
-  // FIX: Swap Gaussian distribution for a true Poisson generator for discrete scores
+  // Box-Muller transform injected to prevent infinite loops on high NBA scores
   const workerCode = `
     function getPoisson(lambda) {
-      let L = Math.exp(-lambda);
-      let p = 1.0;
-      let k = 0;
-      do {
-        k++;
-        p *= Math.random();
-      } while (p > L);
-      return k - 1;
+      if (lambda < 30) {
+        const L = Math.exp(-lambda);
+        let k = 0;
+        let p = 1;
+        do {
+          k++;
+          p *= Math.random();
+        } while (p > L);
+        return k - 1;
+      } else {
+        let u1 = Math.random();
+        let u2 = Math.random();
+        let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+        return Math.max(0, Math.floor(lambda + Math.sqrt(lambda) * z0 + 0.5));
+      }
     }
 
     onmessage = function(e) {
       const { mean, line, runs } = e.data;
       let overHits = 0;
-      
       for (let i = 0; i < runs; i++) {
         if (getPoisson(mean) > line) overHits++;
       }
-      
       const overPct = (overHits / runs) * 100;
       postMessage({ overPct, underPct: 100 - overPct });
     };
@@ -12155,13 +12169,14 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
     setTimeout(() => {
       worker.terminate();
       URL.revokeObjectURL(workerUrl);
-      console.warn("[BB Engine] Poisson Worker timed out. Using fallback.");
+      console.warn("[BB Engine] Worker timed out. Reverting to median.");
       resolve({ overPct: 50, underPct: 50 });
-    }, 3000);
+    }, 3000); // Failsafe timeout to prevent permanent lockup
   });
 
   return Promise.race([workerPromise, timeoutPromise]);
 }
+
 
 
 
