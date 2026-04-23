@@ -3650,16 +3650,28 @@ function syncLineMemoryIntoTrackerState() {
 
 function saveEngineLineMemory() {
   try {
-    // FIX: Prune memory to prevent LocalStorage Quota Exceeded crashes
-    const keys = Object.keys(g_engineLineMemory);
-    if (keys.length > 500) {
+    // FIX: Strict memory pruning to prevent QuotaExceeded errors
+    const MAX_ENTRIES = 200;
+    const MAX_AGE_MS = 48 * 60 * 60 * 1000; // 48 hours
+    const now = Date.now();
+    let keys = Object.keys(g_engineLineMemory);
+    
+    keys.forEach(k => {
+      const entryTime = Date.parse(g_engineLineMemory[k].lastSeenAt || "") || 0;
+      if (now - entryTime > MAX_AGE_MS) {
+        delete g_engineLineMemory[k];
+      }
+    });
+
+    keys = Object.keys(g_engineLineMemory);
+    if (keys.length > MAX_ENTRIES) {
       const sorted = keys.sort((a, b) => {
         const timeA = Date.parse(g_engineLineMemory[a].lastSeenAt || "") || 0;
         const timeB = Date.parse(g_engineLineMemory[b].lastSeenAt || "") || 0;
         return timeA - timeB; 
       });
-      // Delete the oldest 100 entries
-      sorted.slice(0, 100).forEach(k => delete g_engineLineMemory[k]);
+      // Delete down to the cap
+      sorted.slice(0, keys.length - MAX_ENTRIES).forEach(k => delete g_engineLineMemory[k]);
     }
     localStorage.setItem(ENGINE_LINE_MEMORY_STORAGE, JSON.stringify(g_engineLineMemory));
   } catch (err) {
@@ -3668,6 +3680,7 @@ function saveEngineLineMemory() {
 
   syncLineMemoryIntoTrackerState();
 }
+
 
 
 function makeEngineLineMemoryKey(eventId, league, marketKey, side = "") {
@@ -7269,9 +7282,23 @@ function renderTrackedPicks() {
 }
 
 
+let g_lastRenderedTrackerVersion = null;
+
 function renderTrackerAnalytics() {
   const panel = document.getElementById("trackerAnalyticsPanel");
   if (!panel) return;
+
+  // FIX: Memoize deep analytics array calculations to prevent CPU thrashing
+  if (g_lastRenderedTrackerVersion === g_trackerState.vId) {
+     syncTrackerModalView();
+     const currentView = g_trackerModalView;
+     panel.classList.toggle("tracker-hidden", currentView === "picks");
+     panel.style.display = currentView === "picks" ? "none" : "block";
+     return;
+  }
+  g_lastRenderedTrackerVersion = g_trackerState.vId;
+
+
 
   const allReportPicks = getAllTrackedPicksForReport().map(p => ensureTrackedPickKeys(p));
   const currentVersionSettledPicks = getLearningTrackedPicks()
@@ -10210,8 +10237,6 @@ validateFetchSection();
     const items = data?.injuries || data?.items || [];
     if (!items.length) return result;
 
-    // teamAvgScored is the caller-supplied per-team scoring average.
-    // It is already league-aware at the call site. No hardcoded fallback needed here.
     const avgPPG = (isFinite(teamAvgScored) && teamAvgScored > 0) ? teamAvgScored : 80;
     let totalReduction = 0;
 
@@ -10240,9 +10265,12 @@ validateFetchSection();
 
       if (ppg <= 0) {
         result.unknownImpactCount++;
+        // FIX: Apply a flat, conservative 2% offense penalty for unknown injuries
+        const unknownPenalty = isOut ? 0.02 : 0.01; 
+        totalReduction += unknownPenalty;
         result.notes.push({
           type: isOut ? "out" : "dtd",
-          text: `${playerName} — ${tag} (impact unknown)`
+          text: `${playerName} — ${tag} (impact unknown) → -${(unknownPenalty * 100).toFixed(1)}%`
         });
         continue;
       }
@@ -10280,6 +10308,7 @@ validateFetchSection();
 
   return result;
 }
+
 
     function stripOTFromScores(scoreA, scoreB, linesA, linesB, regulationPeriods) {
       let sA = scoreA, sB = scoreB;
@@ -10887,344 +10916,251 @@ return isPreGame;
   fetchESPN();
 }
 
-        async function fetchESPN() {
-      const league = document.getElementById("leagueSelect").value;
-      const teamAName = document.getElementById("teamAName").value.trim();
-      const teamBName = document.getElementById("teamBName").value.trim();
+async function fetchESPN() {
+  const league = document.getElementById("leagueSelect").value;
+  const teamAName = document.getElementById("teamAName").value.trim();
+  const teamBName = document.getElementById("teamBName").value.trim();
 
-      if (!teamAName || !teamBName) {
-        setStatusText("❌ Enter both team names first.", "err");
-        return;
-      }
-      if (league !== "nba" && league !== "ncaa") {
-        setStatusText("❌ ESPN auto-fetch is NBA & NCAA only.", "err");
-        return;
-      }
-      
-      const btn = document.getElementById("fetchBtn");
-      btn.disabled = true;
-      setFetchAuditIssues([]);
-      resetResultsTable();
-      setStatusHTML('<span class="spinner"></span>Fetching from ESPN...', "loading");
-
-      // FIX: Terminate any in-flight fetch requests to prevent race conditions
-      if (g_activeFetchController) {
-        g_activeFetchController.abort();
-      }
-      g_activeFetchController = new AbortController();
-      const fetchSignal = g_activeFetchController.signal;
-      const myToken = ++_fetchToken; // Keep token as a secondary fail-safe
-
-
-      try {
-        const isNcaa = league === "ncaa";
-        const isNba = league === "nba";
-        const leagueSlug = isNcaa ? "mens-college-basketball" : "nba";
-        const espnBase = `https://site.api.espn.com/apis/site/v2/sports/basketball/${leagueSlug}`;
-
-        let teamAId = selectedTeamIds.A || lookupTeamId(teamAName, league);
-        if (!validateTeamId(teamAId, league)) teamAId = await searchTeamFromAPI(espnBase, teamAName, league);
-        if (!validateTeamId(teamAId, league)) teamAId = null;
-
-        let teamBId = selectedTeamIds.B || lookupTeamId(teamBName, league);
-        if (!validateTeamId(teamBId, league)) teamBId = await searchTeamFromAPI(espnBase, teamBName, league);
-        if (!validateTeamId(teamBId, league)) teamBId = null;
-
-        if (!teamAId) throw new Error(`Can't find "${teamAName}". Try a fuller team name.`);
-if (!teamBId) throw new Error(`Can't find "${teamBName}". Try a fuller team name.`);
-if (String(teamAId) === String(teamBId)) throw new Error("Team A and Team B cannot be the same team.");
-
-selectedTeamIds.A = String(teamAId);
-selectedTeamIds.B = String(teamBId);
-        setStatusHTML('<span class="spinner"></span>Loading game stats...', "loading");
-
-const selectedFixture = getSelectedFixtureOption();
-const teamAVenue =
-  selectedFixture && String(selectedFixture.dataset.homeId || "") === String(teamAId) ? "home" :
-  selectedFixture && String(selectedFixture.dataset.awayId || "") === String(teamAId) ? "away" :
-  null;
-
-const teamBVenue =
-  selectedFixture && String(selectedFixture.dataset.homeId || "") === String(teamBId) ? "home" :
-  selectedFixture && String(selectedFixture.dataset.awayId || "") === String(teamBId) ? "away" :
-  null;
-
-const [aStats, bStats, aVenueStats, bVenueStats] = await Promise.all([
-  isNcaa ? fetchNcaaSchedule(espnBase, teamAId, null) : fetchNbaSchedule(espnBase, teamAId, null),
-  isNcaa ? fetchNcaaSchedule(espnBase, teamBId, null) : fetchNbaSchedule(espnBase, teamBId, null),
-  teamAVenue ? (isNcaa ? fetchNcaaSchedule(espnBase, teamAId, teamAVenue, true) : fetchNbaSchedule(espnBase, teamAId, teamAVenue, true)) : Promise.resolve(null),
-  teamBVenue ? (isNcaa ? fetchNcaaSchedule(espnBase, teamBId, teamBVenue, true) : fetchNbaSchedule(espnBase, teamBId, teamBVenue, true)) : Promise.resolve(null)
-]);
-
-        if (myToken !== _fetchToken) return;
-        if (!aStats && !bStats) throw new Error("No recent schedule data found from ESPN.");
-g_injA = defaultInjuryMeta();
-g_injB = defaultInjuryMeta();
-g_fetchMeta = defaultFetchMeta();
-hideInjuryBox("A");
-hideInjuryBox("B");
-clearSideFields("A");
-clearSideFields("B");
-clearH2HFields();
-        const messages = [];
-
-        if (aStats?.scored?.length > 0) {
-          document.getElementById("aFTScored").value = aStats.scored.join(",");
-          if (aStats.allowed?.length > 0) {
-            document.getElementById("aFTAllowed").value = aStats.allowed.join(",");
-          }
-          if (aStats.h1Scored?.length > 0) {
-            document.getElementById("a1HScored").value = aStats.h1Scored.join(",");
-          }
-          if (aStats.h1Allowed?.length > 0) {
-            document.getElementById("a1HAllowed").value = aStats.h1Allowed.join(",");
-          }
-          if (aStats.h2Scored?.length > 0) {
-            document.getElementById("a2HScored").value = aStats.h2Scored.join(",");
-            messages.push(`${safeText(teamAName)} 2H: ${aStats.h2Scored.length} games ✅`);
-          }
-          if (aStats.h2Allowed?.length > 0) {
-            document.getElementById("a2HAllowed").value = aStats.h2Allowed.join(",");
-          }
-          document.getElementById("aAutoTag").style.display = "inline";
-          messages.push(`${safeText(teamAName)}: ${aStats.scored.length} games ✅`);
-          if (aStats.allowed?.length > 0) {
-            messages.push(`${safeText(teamAName)} allowed: ${aStats.allowed.length} games ✅`);
-          }
-        } else {
-          messages.push(`${safeText(teamAName)}: no data ❌`);
-        }
-        if (bStats?.scored?.length > 0) {
-          document.getElementById("bFTScored").value = bStats.scored.join(",");
-          if (bStats.allowed?.length > 0) {
-            document.getElementById("bFTAllowed").value = bStats.allowed.join(",");
-          }
-          if (bStats.h1Scored?.length > 0) {
-            document.getElementById("b1HScored").value = bStats.h1Scored.join(",");
-          }
-          if (bStats.h1Allowed?.length > 0) {
-            document.getElementById("b1HAllowed").value = bStats.h1Allowed.join(",");
-          }
-          if (bStats.h2Scored?.length > 0) {
-            document.getElementById("b2HScored").value = bStats.h2Scored.join(",");
-            messages.push(`${safeText(teamBName)} 2H: ${bStats.h2Scored.length} games ✅`);
-          }
-          if (bStats.h2Allowed?.length > 0) {
-            document.getElementById("b2HAllowed").value = bStats.h2Allowed.join(",");
-          }
-          document.getElementById("bAutoTag").style.display = "inline";
-          messages.push(`${safeText(teamBName)}: ${bStats.scored.length} games ✅`);
-          if (bStats.allowed?.length > 0) {
-            messages.push(`${safeText(teamBName)} allowed: ${bStats.allowed.length} games ✅`);
-          }
-        } else {
-          messages.push(`${safeText(teamBName)}: no data ❌`);
-        }
-g_fetchMeta.A = {
-  ft: { source: "espn", venueReliable: !!(aVenueStats?.venueReliable || aVenueStats?.usedVenueFallback === false) },
-  h1: { source: "espn", venueReliable: !!(aVenueStats?.venueReliable || aVenueStats?.usedVenueFallback === false) },
-  h2: { source: "espn", venueReliable: !!(aVenueStats?.h2VenueReliable || aVenueStats?.venueReliable || aVenueStats?.usedVenueFallback === false) }
-};
-
-g_fetchMeta.B = {
-  ft: { source: "espn", venueReliable: !!(bVenueStats?.venueReliable || bVenueStats?.usedVenueFallback === false) },
-  h1: { source: "espn", venueReliable: !!(bVenueStats?.venueReliable || bVenueStats?.usedVenueFallback === false) },
-  h2: { source: "espn", venueReliable: !!(bVenueStats?.h2VenueReliable || bVenueStats?.venueReliable || bVenueStats?.usedVenueFallback === false) }
-};
-        setStatusHTML('<span class="spinner"></span>Scanning H2H since 2024...', "loading");
-
-        let h2hGames = [];
-        try {
-          h2hGames = isNcaa
-            ? await fetchNcaaH2H(espnBase, teamAId, teamBId)
-            : await fetchNbaH2H(espnBase, teamAId, teamBId);
-        } catch (e) {
-          logDebug("H2H fetch failed", e);
-          h2hGames = [];
-        }
-
-        if (myToken !== _fetchToken) return;
-
-        if (h2hGames.length >= 2) {
-          clearH2HFields();
-          const tA = String(teamAId);
-          const h2hA = [], h2hB = [];
-          for (const g of h2hGames.slice(0, 5)) {
-            if (normalizeId(g.teamAId) === tA) { h2hA.push(g.scoreA); h2hB.push(g.scoreB); }
-            else { h2hA.push(g.scoreB); h2hB.push(g.scoreA); }
-          }
-          document.getElementById("aFTH2H").value = h2hA.join(",");
-          document.getElementById("bFTH2H").value = h2hB.join(",");
-          syncH2HCheckbox("ft", false);
-          queueH2HCheckboxSync(false);
-          document.getElementById("h2hAutoTag").style.display = "inline";
-
-          const h2hA1H = h2hGames.slice(0, 5).map(g => normalizeId(g.teamAId) === tA ? g.h1A : g.h1B).filter(v => v > 0);
-          const h2hB1H = h2hGames.slice(0, 5).map(g => normalizeId(g.teamAId) === tA ? g.h1B : g.h1A).filter(v => v > 0);
-          if (h2hA1H.length >= 2 && h2hB1H.length >= 2) {
-            document.getElementById("a1HH2H").value = h2hA1H.join(",");
-            document.getElementById("b1HH2H").value = h2hB1H.join(",");
-            syncH2HCheckbox("h1", false);
-            queueH2HCheckboxSync(false);
-          }
-
-          const h2hA2H = h2hGames.slice(0, 5).map(g => normalizeId(g.teamAId) === tA ? g.h2A : g.h2B).filter(v => v > 0);
-          const h2hB2H = h2hGames.slice(0, 5).map(g => normalizeId(g.teamAId) === tA ? g.h2B : g.h2A).filter(v => v > 0);
-          if (h2hA2H.length >= 2 && h2hB2H.length >= 2) {
-            document.getElementById("a2HH2H").value = h2hA2H.join(",");
-            document.getElementById("b2HH2H").value = h2hB2H.join(",");
-            syncH2HCheckbox("h2", false);
-            queueH2HCheckboxSync(false);
-            messages.push(`2H H2H: ${Math.min(h2hA2H.length, h2hB2H.length)} games ✅`);
-          }
-
-messages.push(`H2H: ${Math.min(h2hGames.length, 5)} 2024+ games ✅`);
-        } else if (h2hGames.length === 1) {
-          clearH2HFields();
-          const tA = String(teamAId);
-          const g = h2hGames[0];
-          document.getElementById("aFTH2H").value = normalizeId(g.teamAId) === tA ? g.scoreA : g.scoreB;
-          document.getElementById("bFTH2H").value = normalizeId(g.teamAId) === tA ? g.scoreB : g.scoreA;
-          syncAllH2HCheckboxes(false);
-          queueH2HCheckboxSync(false);
-messages.push("H2H: 1 game found from 2024+ (min 2 to auto-enable)");
-        } else {
-messages.push("H2H: no 2024+ games found");
-        }
-
-        setStatusHTML('<span class="spinner"></span>Checking injuries...', "loading");
-
-        // Use the league baseline as fallback (÷2 because LEAGUE_BASES is full-game total for both teams)
-        // This gives a realistic per-team scoring estimate, e.g. NBA ≈ 115, Euroleague ≈ 80
-        const leagueAvgFallback = Math.round((LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160) / 2);
-        const aAvg = aStats?.scored?.length ? avg(aStats.scored) : leagueAvgFallback;
-        const bAvg = bStats?.scored?.length ? avg(bStats.scored) : leagueAvgFallback;
-        [g_injA, g_injB] = await Promise.all([
-          fetchInjuryMeta(espnBase, teamAId, aAvg, league),
-          fetchInjuryMeta(espnBase, teamBId, bAvg, league)
-        ]);
-
-        if (myToken !== _fetchToken) return;
-
-g_massacreFetchContext = {
-  league,
-  eventDate: String(selectedFixture?.dataset?.eventDate || ""),
-  A: {
-    overall: aStats ? {
-      ftScored10: aStats.scored10 || aStats.scored || [],
-      ftAllowed10: aStats.allowed10 || aStats.allowed || [],
-      h1Scored10: aStats.h1Scored10 || aStats.h1Scored || [],
-      h1Allowed10: aStats.h1Allowed10 || aStats.h1Allowed || [],
-      h2Scored10: aStats.h2Scored10 || aStats.h2Scored || [],
-      h2Allowed10: aStats.h2Allowed10 || aStats.h2Allowed || []
-    } : null,
-    venue: aVenueStats ? {
-      ftScored10: aVenueStats.scored10 || aVenueStats.scored || [],
-      ftAllowed10: aVenueStats.allowed10 || aVenueStats.allowed || [],
-      h1Scored10: aVenueStats.h1Scored10 || aVenueStats.h1Scored || [],
-      h1Allowed10: aVenueStats.h1Allowed10 || aVenueStats.h1Allowed || [],
-      h2Scored10: aVenueStats.h2Scored10 || aVenueStats.h2Scored || [],
-      h2Allowed10: aVenueStats.h2Allowed10 || aVenueStats.h2Allowed || []
-    } : null,
-    // LEVEL 2 MAPPING Team A
-    ortg10: aStats?.ortg10 || [],
-    drtg10: aStats?.drtg10 || [],
-    pace10: aStats?.pace10 || [],
-    lastGameDate: aStats?.lastGameDate || "",
-    restDays: (() => {
-      const lastMs = Date.parse(aStats?.lastGameDate || "");
-      const eventMs = Date.parse(String(selectedFixture?.dataset?.eventDate || ""));
-      return isFinite(lastMs) && isFinite(eventMs)
-        ? Math.max(0, Math.round((eventMs - lastMs) / 86400000) - 1)
-        : null;
-    })()
-  },
-  B: {
-    overall: bStats ? {
-      ftScored10: bStats.scored10 || bStats.scored || [],
-      ftAllowed10: bStats.allowed10 || bStats.allowed || [],
-      h1Scored10: bStats.h1Scored10 || bStats.h1Scored || [],
-      h1Allowed10: bStats.h1Allowed10 || bStats.h1Allowed || [],
-      h2Scored10: bStats.h2Scored10 || bStats.h2Scored || [],
-      h2Allowed10: bStats.h2Allowed10 || bStats.h2Allowed || []
-    } : null,
-    venue: bVenueStats ? {
-      ftScored10: bVenueStats.scored10 || bVenueStats.scored || [],
-      ftAllowed10: bVenueStats.allowed10 || bVenueStats.allowed || [],
-      h1Scored10: bVenueStats.h1Scored10 || bVenueStats.h1Scored || [],
-      h1Allowed10: bVenueStats.h1Allowed10 || bVenueStats.h1Allowed || [],
-      h2Scored10: bVenueStats.h2Scored10 || bVenueStats.h2Scored || [],
-      h2Allowed10: bVenueStats.h2Allowed10 || bVenueStats.h2Allowed || []
-    } : null,
-    // LEVEL 2 MAPPING Team B
-    ortg10: bStats?.ortg10 || [],
-    drtg10: bStats?.drtg10 || [],
-    pace10: bStats?.pace10 || [],
-    lastGameDate: bStats?.lastGameDate || "",
-    restDays: (() => {
-      const lastMs = Date.parse(bStats?.lastGameDate || "");
-      const eventMs = Date.parse(String(selectedFixture?.dataset?.eventDate || ""));
-      return isFinite(lastMs) && isFinite(eventMs)
-        ? Math.max(0, Math.round((eventMs - lastMs) / 86400000) - 1)
-        : null;
-    })()
-  },
-  h2hGames: Array.isArray(h2hGames) ? h2hGames.slice(0, 10) : []
-};
-
-
-        renderInjuryBox("injuryBoxA", "injuryContentA", g_injA);
-renderInjuryBox("injuryBoxB", "injuryContentB", g_injB);
-
-updateIntelligencePack(league, {
-  ftLine: parseMarketLine(document.getElementById("ftMarket")?.value || ""),
-  h1Line: parseMarketLine(document.getElementById("h1Market")?.value || ""),
-  h2Line: parseMarketLine(document.getElementById("h2Market")?.value || ""),
-  aLine: parseMarketLine(document.getElementById("teamAMarket")?.value || ""),
-  bLine: parseMarketLine(document.getElementById("teamBMarket")?.value || "")
-});
-
-const fetchAuditIssues = buildFetchAuditIssues({
-  league,
-  teamAName,
-  teamBName,
-  aStats,
-  bStats,
-  h2hGames
-});
-
-setFetchAuditIssues(fetchAuditIssues);
-
-const allGood =
-  Math.min(aStats?.scored?.length || 0, aStats?.allowed?.length || 0) >= 5 &&
-  Math.min(bStats?.scored?.length || 0, bStats?.allowed?.length || 0) >= 5 &&
-  (
-    league !== "nba" && league !== "ncaa" ||
-    (
-      Math.min(aStats?.h1Scored?.length || 0, aStats?.h1Allowed?.length || 0) >= 5 &&
-      Math.min(bStats?.h1Scored?.length || 0, bStats?.h1Allowed?.length || 0) >= 5
-    )
-  );
-        if (allGood) {
-          g_lastFetchedTeams.A = normalizeTeamName(teamAName);
-          g_lastFetchedTeams.B = normalizeTeamName(teamBName);
-          updateSectionLocks();
-        }
-
-const compactFetchStatus = buildCompactFetchStatus(messages, fetchAuditIssues);
-setStatusHTML(
-  compactFetchStatus ? `<div>${compactFetchStatus}</div>` : "",
-  allGood && !fetchAuditIssues.length ? "ok" : "err"
-);
-     } catch (e) {
-  if (myToken === _fetchToken) {
-    setFetchAuditIssues([e.message]);
-    setStatusText("❌ " + e.message, "err");
+  if (!teamAName || !teamBName) {
+    setStatusText("❌ Enter both team names first.", "err");
+    return;
   }
-} finally {
-        if (myToken === _fetchToken) unlockFetchBtn();
+  if (league !== "nba" && league !== "ncaa") {
+    setStatusText("❌ ESPN auto-fetch is NBA & NCAA only.", "err");
+    return;
+  }
+  
+  const btn = document.getElementById("fetchBtn");
+  btn.disabled = true;
+  setFetchAuditIssues([]);
+  resetResultsTable();
+  setStatusHTML('<span class="spinner"></span>Fetching from ESPN...', "loading");
+
+  if (g_activeFetchController) {
+    g_activeFetchController.abort();
+  }
+  g_activeFetchController = new AbortController();
+
+  try {
+    const isNcaa = league === "ncaa";
+    const isNba = league === "nba";
+    const leagueSlug = isNcaa ? "mens-college-basketball" : "nba";
+    const espnBase = `https://site.api.espn.com/apis/site/v2/sports/basketball/${leagueSlug}`;
+
+    let teamAId = selectedTeamIds.A || lookupTeamId(teamAName, league);
+    if (!validateTeamId(teamAId, league)) teamAId = await searchTeamFromAPI(espnBase, teamAName, league);
+    if (!validateTeamId(teamAId, league)) teamAId = null;
+
+    let teamBId = selectedTeamIds.B || lookupTeamId(teamBName, league);
+    if (!validateTeamId(teamBId, league)) teamBId = await searchTeamFromAPI(espnBase, teamBName, league);
+    if (!validateTeamId(teamBId, league)) teamBId = null;
+
+    if (!teamAId) throw new Error(`Can't find "${teamAName}". Try a fuller team name.`);
+    if (!teamBId) throw new Error(`Can't find "${teamBName}". Try a fuller team name.`);
+    if (String(teamAId) === String(teamBId)) throw new Error("Team A and Team B cannot be the same team.");
+
+    selectedTeamIds.A = String(teamAId);
+    selectedTeamIds.B = String(teamBId);
+    setStatusHTML('<span class="spinner"></span>Loading game stats...', "loading");
+
+    const selectedFixture = getSelectedFixtureOption();
+    const teamAVenue =
+      selectedFixture && String(selectedFixture.dataset.homeId || "") === String(teamAId) ? "home" :
+      selectedFixture && String(selectedFixture.dataset.awayId || "") === String(teamAId) ? "away" :
+      null;
+
+    const teamBVenue =
+      selectedFixture && String(selectedFixture.dataset.homeId || "") === String(teamBId) ? "home" :
+      selectedFixture && String(selectedFixture.dataset.awayId || "") === String(teamBId) ? "away" :
+      null;
+
+    const [aStats, bStats, aVenueStats, bVenueStats] = await Promise.all([
+      isNcaa ? fetchNcaaSchedule(espnBase, teamAId, null) : fetchNbaSchedule(espnBase, teamAId, null),
+      isNcaa ? fetchNcaaSchedule(espnBase, teamBId, null) : fetchNbaSchedule(espnBase, teamBId, null),
+      teamAVenue ? (isNcaa ? fetchNcaaSchedule(espnBase, teamAId, teamAVenue, true) : fetchNbaSchedule(espnBase, teamAId, teamAVenue, true)) : Promise.resolve(null),
+      teamBVenue ? (isNcaa ? fetchNcaaSchedule(espnBase, teamBId, teamBVenue, true) : fetchNbaSchedule(espnBase, teamBId, teamBVenue, true)) : Promise.resolve(null)
+    ]);
+
+    if (!aStats && !bStats) throw new Error("No recent schedule data found from ESPN.");
+    g_injA = defaultInjuryMeta();
+    g_injB = defaultInjuryMeta();
+    g_fetchMeta = defaultFetchMeta();
+    hideInjuryBox("A");
+    hideInjuryBox("B");
+    clearSideFields("A");
+    clearSideFields("B");
+    clearH2HFields();
+    
+    const messages = [];
+
+    if (aStats?.scored?.length > 0) {
+      document.getElementById("aFTScored").value = aStats.scored.join(",");
+      if (aStats.allowed?.length > 0) document.getElementById("aFTAllowed").value = aStats.allowed.join(",");
+      if (aStats.h1Scored?.length > 0) document.getElementById("a1HScored").value = aStats.h1Scored.join(",");
+      if (aStats.h1Allowed?.length > 0) document.getElementById("a1HAllowed").value = aStats.h1Allowed.join(",");
+      if (aStats.h2Scored?.length > 0) {
+        document.getElementById("a2HScored").value = aStats.h2Scored.join(",");
+        messages.push(`${safeText(teamAName)} 2H: ${aStats.h2Scored.length} games ✅`);
       }
+      if (aStats.h2Allowed?.length > 0) document.getElementById("a2HAllowed").value = aStats.h2Allowed.join(",");
+      document.getElementById("aAutoTag").style.display = "inline";
+      messages.push(`${safeText(teamAName)}: ${aStats.scored.length} games ✅`);
+    } else {
+      messages.push(`${safeText(teamAName)}: no data ❌`);
     }
+
+    if (bStats?.scored?.length > 0) {
+      document.getElementById("bFTScored").value = bStats.scored.join(",");
+      if (bStats.allowed?.length > 0) document.getElementById("bFTAllowed").value = bStats.allowed.join(",");
+      if (bStats.h1Scored?.length > 0) document.getElementById("b1HScored").value = bStats.h1Scored.join(",");
+      if (bStats.h1Allowed?.length > 0) document.getElementById("b1HAllowed").value = bStats.h1Allowed.join(",");
+      if (bStats.h2Scored?.length > 0) {
+        document.getElementById("b2HScored").value = bStats.h2Scored.join(",");
+        messages.push(`${safeText(teamBName)} 2H: ${bStats.h2Scored.length} games ✅`);
+      }
+      if (bStats.h2Allowed?.length > 0) document.getElementById("b2HAllowed").value = bStats.h2Allowed.join(",");
+      document.getElementById("bAutoTag").style.display = "inline";
+      messages.push(`${safeText(teamBName)}: ${bStats.scored.length} games ✅`);
+    } else {
+      messages.push(`${safeText(teamBName)}: no data ❌`);
+    }
+
+    g_fetchMeta.A = {
+      ft: { source: "espn", venueReliable: !!(aVenueStats?.venueReliable || aVenueStats?.usedVenueFallback === false) },
+      h1: { source: "espn", venueReliable: !!(aVenueStats?.venueReliable || aVenueStats?.usedVenueFallback === false) },
+      h2: { source: "espn", venueReliable: !!(aVenueStats?.h2VenueReliable || aVenueStats?.venueReliable || aVenueStats?.usedVenueFallback === false) }
+    };
+    g_fetchMeta.B = {
+      ft: { source: "espn", venueReliable: !!(bVenueStats?.venueReliable || bVenueStats?.usedVenueFallback === false) },
+      h1: { source: "espn", venueReliable: !!(bVenueStats?.venueReliable || bVenueStats?.usedVenueFallback === false) },
+      h2: { source: "espn", venueReliable: !!(bVenueStats?.h2VenueReliable || bVenueStats?.venueReliable || bVenueStats?.usedVenueFallback === false) }
+    };
+
+    setStatusHTML('<span class="spinner"></span>Scanning H2H since 2024...', "loading");
+
+    let h2hGames = [];
+    try {
+      h2hGames = isNcaa ? await fetchNcaaH2H(espnBase, teamAId, teamBId) : await fetchNbaH2H(espnBase, teamAId, teamBId);
+    } catch (e) {
+      logDebug("H2H fetch failed", e);
+    }
+
+    if (h2hGames.length >= 2) {
+      clearH2HFields();
+      const tA = String(teamAId);
+      const h2hA = [], h2hB = [];
+      for (const g of h2hGames.slice(0, 5)) {
+        if (normalizeId(g.teamAId) === tA) { h2hA.push(g.scoreA); h2hB.push(g.scoreB); }
+        else { h2hA.push(g.scoreB); h2hB.push(g.scoreA); }
+      }
+      document.getElementById("aFTH2H").value = h2hA.join(",");
+      document.getElementById("bFTH2H").value = h2hB.join(",");
+      syncH2HCheckbox("ft", false); queueH2HCheckboxSync(false);
+      document.getElementById("h2hAutoTag").style.display = "inline";
+
+      const h2hA1H = h2hGames.slice(0, 5).map(g => normalizeId(g.teamAId) === tA ? g.h1A : g.h1B).filter(v => v > 0);
+      const h2hB1H = h2hGames.slice(0, 5).map(g => normalizeId(g.teamAId) === tA ? g.h1B : g.h1A).filter(v => v > 0);
+      if (h2hA1H.length >= 2 && h2hB1H.length >= 2) {
+        document.getElementById("a1HH2H").value = h2hA1H.join(",");
+        document.getElementById("b1HH2H").value = h2hB1H.join(",");
+        syncH2HCheckbox("h1", false); queueH2HCheckboxSync(false);
+      }
+
+      const h2hA2H = h2hGames.slice(0, 5).map(g => normalizeId(g.teamAId) === tA ? g.h2A : g.h2B).filter(v => v > 0);
+      const h2hB2H = h2hGames.slice(0, 5).map(g => normalizeId(g.teamAId) === tA ? g.h2B : g.h2A).filter(v => v > 0);
+      if (h2hA2H.length >= 2 && h2hB2H.length >= 2) {
+        document.getElementById("a2HH2H").value = h2hA2H.join(",");
+        document.getElementById("b2HH2H").value = h2hB2H.join(",");
+        syncH2HCheckbox("h2", false); queueH2HCheckboxSync(false);
+      }
+      messages.push(`H2H: ${Math.min(h2hGames.length, 5)} 2024+ games ✅`);
+    } else if (h2hGames.length === 1) {
+      clearH2HFields();
+      const tA = String(teamAId);
+      const g = h2hGames[0];
+      document.getElementById("aFTH2H").value = normalizeId(g.teamAId) === tA ? g.scoreA : g.scoreB;
+      document.getElementById("bFTH2H").value = normalizeId(g.teamAId) === tA ? g.scoreB : g.scoreA;
+      syncAllH2HCheckboxes(false); queueH2HCheckboxSync(false);
+      messages.push("H2H: 1 game found from 2024+ (min 2 to auto-enable)");
+    } else {
+      messages.push("H2H: no 2024+ games found");
+    }
+
+    setStatusHTML('<span class="spinner"></span>Checking injuries...', "loading");
+
+    const leagueAvgFallback = Math.round((LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160) / 2);
+    const aAvg = aStats?.scored?.length ? avg(aStats.scored) : leagueAvgFallback;
+    const bAvg = bStats?.scored?.length ? avg(bStats.scored) : leagueAvgFallback;
+    [g_injA, g_injB] = await Promise.all([
+      fetchInjuryMeta(espnBase, teamAId, aAvg, league),
+      fetchInjuryMeta(espnBase, teamBId, bAvg, league)
+    ]);
+
+    g_massacreFetchContext = {
+      league,
+      eventDate: String(selectedFixture?.dataset?.eventDate || ""),
+      A: {
+        overall: aStats ? { ...aStats, ftScored10: aStats.scored10 || [], ftAllowed10: aStats.allowed10 || [] } : null,
+        venue: aVenueStats ? { ...aVenueStats, ftScored10: aVenueStats.scored10 || [], ftAllowed10: aVenueStats.allowed10 || [] } : null,
+        ortg10: aStats?.ortg10 || [], drtg10: aStats?.drtg10 || [], pace10: aStats?.pace10 || [],
+        lastGameDate: aStats?.lastGameDate || "",
+        restDays: (() => {
+          const lastMs = Date.parse(aStats?.lastGameDate || "");
+          const eventMs = Date.parse(String(selectedFixture?.dataset?.eventDate || ""));
+          return isFinite(lastMs) && isFinite(eventMs) ? Math.max(0, Math.round((eventMs - lastMs) / 86400000) - 1) : null;
+        })()
+      },
+      B: {
+        overall: bStats ? { ...bStats, ftScored10: bStats.scored10 || [], ftAllowed10: bStats.allowed10 || [] } : null,
+        venue: bVenueStats ? { ...bVenueStats, ftScored10: bVenueStats.scored10 || [], ftAllowed10: bVenueStats.allowed10 || [] } : null,
+        ortg10: bStats?.ortg10 || [], drtg10: bStats?.drtg10 || [], pace10: bStats?.pace10 || [],
+        lastGameDate: bStats?.lastGameDate || "",
+        restDays: (() => {
+          const lastMs = Date.parse(bStats?.lastGameDate || "");
+          const eventMs = Date.parse(String(selectedFixture?.dataset?.eventDate || ""));
+          return isFinite(lastMs) && isFinite(eventMs) ? Math.max(0, Math.round((eventMs - lastMs) / 86400000) - 1) : null;
+        })()
+      },
+      h2hGames: Array.isArray(h2hGames) ? h2hGames.slice(0, 10) : []
+    };
+
+    renderInjuryBox("injuryBoxA", "injuryContentA", g_injA);
+    renderInjuryBox("injuryBoxB", "injuryContentB", g_injB);
+
+    updateIntelligencePack(league, {
+      ftLine: parseMarketLine(document.getElementById("ftMarket")?.value || ""),
+      h1Line: parseMarketLine(document.getElementById("h1Market")?.value || ""),
+      h2Line: parseMarketLine(document.getElementById("h2Market")?.value || ""),
+      aLine: parseMarketLine(document.getElementById("teamAMarket")?.value || ""),
+      bLine: parseMarketLine(document.getElementById("teamBMarket")?.value || "")
+    });
+
+    const fetchAuditIssues = buildFetchAuditIssues({ league, teamAName, teamBName, aStats, bStats, h2hGames });
+    setFetchAuditIssues(fetchAuditIssues);
+
+    const allGood =
+      Math.min(aStats?.scored?.length || 0, aStats?.allowed?.length || 0) >= 5 &&
+      Math.min(bStats?.scored?.length || 0, bStats?.allowed?.length || 0) >= 5;
+
+    if (allGood) {
+      g_lastFetchedTeams.A = normalizeTeamName(teamAName);
+      g_lastFetchedTeams.B = normalizeTeamName(teamBName);
+      updateSectionLocks();
+    }
+
+    const compactFetchStatus = buildCompactFetchStatus(messages, fetchAuditIssues);
+    setStatusHTML(compactFetchStatus ? `<div>${compactFetchStatus}</div>` : "", allGood && !fetchAuditIssues.length ? "ok" : "err");
+
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      setFetchAuditIssues([e.message]);
+      setStatusText("❌ " + e.message, "err");
+    }
+  } finally {
+    unlockFetchBtn();
+  }
+}
+
 
     function showRunError(table, html) {
       const row = table.insertRow();
@@ -12143,20 +12079,25 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
     return { overPct: 50, underPct: 50 };
   }
 
+  // FIX: Swap Gaussian distribution for a true Poisson generator for discrete scores
   const workerCode = `
-    function getGaussian(mean, stdDev) {
-      let u1 = Math.random();
-      let u2 = Math.random();
-      let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-      return mean + z0 * stdDev;
+    function getPoisson(lambda) {
+      let L = Math.exp(-lambda);
+      let p = 1.0;
+      let k = 0;
+      do {
+        k++;
+        p *= Math.random();
+      } while (p > L);
+      return k - 1;
     }
 
     onmessage = function(e) {
-      const { mean, stdDev, line, runs } = e.data;
+      const { mean, line, runs } = e.data;
       let overHits = 0;
       
       for (let i = 0; i < runs; i++) {
-        if (getGaussian(mean, stdDev) > line) overHits++;
+        if (getPoisson(mean) > line) overHits++;
       }
       
       const overPct = (overHits / runs) * 100;
@@ -12179,21 +12120,21 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
       URL.revokeObjectURL(workerUrl);
       reject(err);
     };
-    worker.postMessage({ mean, stdDev, line, runs }); 
+    worker.postMessage({ mean, line, runs }); 
   });
 
-  // FIX: Provide a strict timeout so a hanging thread doesn't freeze the runEngine loop
   const timeoutPromise = new Promise((resolve) => {
     setTimeout(() => {
       worker.terminate();
       URL.revokeObjectURL(workerUrl);
-      console.warn("[BB Engine] Monte Carlo Worker timed out. Using fallback.");
+      console.warn("[BB Engine] Poisson Worker timed out. Using fallback.");
       resolve({ overPct: 50, underPct: 50 });
     }, 3000);
   });
 
   return Promise.race([workerPromise, timeoutPromise]);
 }
+
 
 
 
@@ -12950,24 +12891,51 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
   const tracked = [];
   table.style.display = "table";
   table.innerHTML = "<tr><th>Pick</th><th>Projection</th><th>Edge</th><th>Model Grade</th><th>Prediction</th></tr>";
+  
   finalPicks.forEach(p => {
     const isLock = p._idx === lockIdx && p.pick !== "NO PLAY";
     const confText = p.pick === "NO PLAY" ? "—" : (p.confidence || "D");
     const shownLine = isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line;
     const shownEdge = isFinite(p.displayEdge) ? p.displayEdge : p.edge;
+    
+    // FIX: Eliminate innerHTML for data injection to block XSS
     const row = table.insertRow();
-    row.innerHTML = `
-     <td>${safeText(p.name)}${p.usedMemory ? ' 🧠' : ''}</td>
-     <td>${isFinite(p.proj) ? safeText(displayLine(p.proj)) : "—"}</td>
-     <td>${isFinite(shownEdge) && isFinite(shownLine) ? safeText(formatEdge(shownEdge, shownLine)) : "—"}</td>
-     <td class="${getConfidenceClass(confText)}">${safeText(confText)}</td>
-     <td class="${getPredictionClass(p.pick)}">${safeText(p.displayPick || p.pick)}${isLock ? ' <span class="lock">🔒</span>' : ""}</td>
-    `;
+    
+    const tdPick = document.createElement("td");
+    tdPick.textContent = p.name + (p.usedMemory ? ' 🧠' : '');
+    row.appendChild(tdPick);
+
+    const tdProj = document.createElement("td");
+    tdProj.textContent = isFinite(p.proj) ? displayLine(p.proj) : "—";
+    row.appendChild(tdProj);
+
+    const tdEdge = document.createElement("td");
+    tdEdge.textContent = isFinite(shownEdge) && isFinite(shownLine) ? formatEdge(shownEdge, shownLine) : "—";
+    row.appendChild(tdEdge);
+
+    const tdConf = document.createElement("td");
+    tdConf.className = getConfidenceClass(confText);
+    tdConf.textContent = confText;
+    row.appendChild(tdConf);
+
+    const tdPred = document.createElement("td");
+    tdPred.className = getPredictionClass(p.pick);
+    tdPred.textContent = p.displayPick || p.pick;
+    if (isLock) {
+      const lockSpan = document.createElement("span");
+      lockSpan.className = "lock";
+      lockSpan.textContent = "🔒";
+      tdPred.appendChild(document.createTextNode(" "));
+      tdPred.appendChild(lockSpan);
+    }
+    row.appendChild(tdPred);
+
     const payload = buildTrackedPickPayload({ pickRow: p, isLock, fixtureMeta, league, diagnostics });
     if (payload) tracked.push(payload);
   });
   return tracked;
 }
+
 
 
 async function runEngine() {
