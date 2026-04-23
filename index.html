@@ -4105,25 +4105,26 @@ async function saveTrackerStateToLocal() {
     g_trackerState.activePicks = reconciled.activePicks;
     g_trackerState.archivedPicks = reconciled.archivedPicks;
 
-    // Synchronous existingBest check removed to prevent main-thread locking.
-    // The server/hydration logic handles conflict resolution safely.
-
     const payload = JSON.stringify(g_trackerState);
-
     const activeKeys = [
       getTrackerLocalStateStableKey(),
       getTrackerLocalStateBuildKey(APP_BUILD_VERSION)
     ].filter(Boolean);
-
+    
     const uniqueKeys = [...new Set(activeKeys)];
     
-    // Fire off async writes without blocking the UI
-    await Promise.all(uniqueKeys.map(key => writeAsyncStorage(key, payload)));
+    const results = await Promise.all(uniqueKeys.map(key => writeAsyncStorage(key, payload)));
+    
+    if (results.every(res => res === false)) {
+      throw new Error("Local storage write completely failed (Storage full or blocked)");
+    }
     
   } catch (err) {
     console.error("[BB Engine] saveTrackerStateToLocal async failed", err);
+    engineDebug("CRITICAL: Local storage failed. Data loss risk.", String(err));
   }
 }
+
 
 
 function getTrackerHeaders(includeJson = false) {
@@ -8723,6 +8724,11 @@ function handleTrackedPicksActionClick(event) {
   const btn = event?.target?.closest?.("[data-manual-settle]");
   if (!btn) return;
 
+  if (g_trackerSaveInFlight) {
+      engineDebug("Manual settle blocked: Tracker save currently in flight.");
+      return;
+  }
+
   const resultStatus = String(btn.getAttribute("data-manual-settle") || "").toLowerCase();
   const encodedSignature = String(btn.getAttribute("data-signature") || "");
   const signature = encodedSignature ? decodeURIComponent(encodedSignature) : "";
@@ -8739,6 +8745,7 @@ function handleTrackedPicksActionClick(event) {
       btn.disabled = false;
     });
 }
+
 
     function sumLineScores(lines, count) {
       if (!Array.isArray(lines) || !lines.length) return 0;
@@ -11166,31 +11173,58 @@ setStatusHTML(
   // V11: Run button disabled during execution via try/finally
 
 function validateInputs(league) {
+  const errors = []; 
+
   function parseSoftLine(id) {
     const raw = document.getElementById(id)?.value?.trim() || "";
     if (!raw) return null;
     const val = parseMarketLine(raw);
     return isFinite(val) ? val : null;
   }
-  function parseArrayField(id) {
+  
+  function parseArrayField(id, label) {
     const raw = document.getElementById(id)?.value?.trim() || "";
     if (!raw) return [];
     const p = parseGames(id);
-    return (p && !p.err) ? p : [];
+    
+    if (p && p.err) {
+      errors.push(`<b>${label}:</b> ${p.err}`);
+      return [];
+    }
+    return p || [];
   }
+  
   const parsed = {
-    aFTScored: parseArrayField("aFTScored"), bFTScored: parseArrayField("bFTScored"),
-    aFTAllowed: parseArrayField("aFTAllowed"), bFTAllowed: parseArrayField("bFTAllowed"),
-    a1HScored: parseArrayField("a1HScored"), b1HScored: parseArrayField("b1HScored"),
-    a1HAllowed: parseArrayField("a1HAllowed"), b1HAllowed: parseArrayField("b1HAllowed"),
-    a2HScored: parseArrayField("a2HScored"), b2HScored: parseArrayField("b2HScored"),
-    a2HAllowed: parseArrayField("a2HAllowed"), b2HAllowed: parseArrayField("b2HAllowed"),
-    aFTH2H: parseArrayField("aFTH2H"), bFTH2H: parseArrayField("bFTH2H"),
-    a1HH2H: parseArrayField("a1HH2H"), b1HH2H: parseArrayField("b1HH2H"),
-    a2HH2H: parseArrayField("a2HH2H"), b2HH2H: parseArrayField("b2HH2H")
+    aFTScored: parseArrayField("aFTScored", "Team A FT Scored"), 
+    bFTScored: parseArrayField("bFTScored", "Team B FT Scored"),
+    aFTAllowed: parseArrayField("aFTAllowed", "Team A FT Allowed"), 
+    bFTAllowed: parseArrayField("bFTAllowed", "Team B FT Allowed"),
+    a1HScored: parseArrayField("a1HScored", "Team A 1H Scored"), 
+    b1HScored: parseArrayField("b1HScored", "Team B 1H Scored"),
+    a1HAllowed: parseArrayField("a1HAllowed", "Team A 1H Allowed"), 
+    b1HAllowed: parseArrayField("b1HAllowed", "Team B 1H Allowed"),
+    a2HScored: parseArrayField("a2HScored", "Team A 2H Scored"), 
+    b2HScored: parseArrayField("b2HScored", "Team B 2H Scored"),
+    a2HAllowed: parseArrayField("a2HAllowed", "Team A 2H Allowed"), 
+    b2HAllowed: parseArrayField("b2HAllowed", "Team B 2H Allowed"),
+    aFTH2H: parseArrayField("aFTH2H", "FT H2H (Team A)"), 
+    bFTH2H: parseArrayField("bFTH2H", "FT H2H (Team B)"),
+    a1HH2H: parseArrayField("a1HH2H", "1H H2H (Team A)"), 
+    b1HH2H: parseArrayField("b1HH2H", "1H H2H (Team B)"),
+    a2HH2H: parseArrayField("a2HH2H", "2H H2H (Team A)"), 
+    b2HH2H: parseArrayField("b2HH2H", "2H H2H (Team B)")
   };
+
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      errorHtml: "⚠ <b>Input Errors Detected:</b><br>" + errors.join("<br>")
+    };
+  }
+
   return {
-    ok: true, parsed,
+    ok: true, 
+    parsed,
     lines: {
       ftLine: parseSoftLine("ftMarket"), h1Line: parseSoftLine("h1Market"),
       h2Line: parseSoftLine("h2Market"), aLine: parseSoftLine("teamAMarket"),
@@ -11198,6 +11232,7 @@ function validateInputs(league) {
     }
   };
 }
+
 
 
 
@@ -12069,16 +12104,24 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
   `;
 
   const blob = new Blob([workerCode], { type: "application/javascript" });
-  const worker = new Worker(URL.createObjectURL(blob));
+  const workerUrl = URL.createObjectURL(blob); 
+  const worker = new Worker(workerUrl);
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     worker.onmessage = (e) => {
       worker.terminate();
+      URL.revokeObjectURL(workerUrl); 
       resolve(e.data);
+    };
+    worker.onerror = (err) => {
+      worker.terminate();
+      URL.revokeObjectURL(workerUrl);
+      reject(err);
     };
     worker.postMessage({ mean, stdDev, line, runs }); 
   });
 }
+
 
 async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
 
