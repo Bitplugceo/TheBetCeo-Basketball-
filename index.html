@@ -2813,12 +2813,14 @@ body.dark-mode .tracker-analytics-section-head {
 
   window.__BETCEO_WATCHDOG_PANIC = panic;
 
-  window.addEventListener("error", function (event) {
+    window.addEventListener("error", function (event) {
     var msg = event && event.message ? event.message : "";
     var filename = event && event.filename ? event.filename.split("/").pop() : "";
     var line = event && event.lineno ? " line " + event.lineno : "";
+    var stack = event && event.error && event.error.stack ? "<br><br>Stack Trace:<br>" + event.error.stack : "";
     var detail = msg || "Unknown script error";
     if (filename) detail += " @ " + filename + line;
+    detail += stack;
     panic(detail);
   });
 
@@ -4573,23 +4575,19 @@ function trackerDebug(message, extra = null) {
     const stamp = new Date().toLocaleTimeString([], { hour12: false });
     let detail = "";
     if (extra !== null && extra !== undefined) {
-      if (typeof extra === "string") {
-        detail = extra;
-      } else {
-        try {
-          detail = JSON.stringify(extra);
-        } catch (err) {
-          detail = String(extra);
-        }
+      if (typeof extra === "string") { detail = extra; }
+      else if (extra instanceof Error) { detail = `${extra.message} | Stack: ${extra.stack}`; }
+      else {
+        const copy = Array.isArray(extra) ? [...extra] : { ...extra };
+        for (const k in copy) { if (copy[k] instanceof Error) copy[k] = `${copy[k].message} | Stack: ${copy[k].stack}`; }
+        try { detail = JSON.stringify(copy); } catch (err) { detail = String(extra); }
       }
     }
     const line = detail ? `[${stamp}] ${message} | ${detail}` : `[${stamp}] ${message}`;
     g_trackerDebugLog.unshift(line);
-    if (g_trackerDebugLog.length > TRACKER_DEBUG_LIMIT) {
-      g_trackerDebugLog = g_trackerDebugLog.slice(0, TRACKER_DEBUG_LIMIT);
-    }
-    console.log("[BB Tracker Debug]", message, extra ?? "");
-    if (shouldTriggerEngineAlert(line)) {
+    if (g_trackerDebugLog.length > TRACKER_DEBUG_LIMIT) g_trackerDebugLog = g_trackerDebugLog.slice(0, TRACKER_DEBUG_LIMIT);
+    
+    if (getDebugSeverity(line) === "error") {
       triggerGlobalEngineAlert(line);
     }
     renderTrackerDebugPanel();
@@ -4598,7 +4596,6 @@ function trackerDebug(message, extra = null) {
     console.error("[BB Engine] trackerDebug failed", err);
   }
 }
-
 
 function renderTrackerDebugPanel() {
   if (!isTrackerPicksView()) {
@@ -4614,22 +4611,18 @@ function engineDebug(message, extra = null) {
     const stamp = new Date().toLocaleTimeString([], { hour12: false });
     let detail = "";
     if (extra !== null && extra !== undefined) {
-      if (typeof extra === "string") {
-        detail = extra;
-      } else {
-        try {
-          detail = JSON.stringify(extra);
-        } catch (err) {
-          detail = String(extra);
-        }
+      if (typeof extra === "string") { detail = extra; }
+      else if (extra instanceof Error) { detail = `${extra.message} | Stack: ${extra.stack}`; }
+      else {
+        const copy = Array.isArray(extra) ? [...extra] : { ...extra };
+        for (const k in copy) { if (copy[k] instanceof Error) copy[k] = `${copy[k].message} | Stack: ${copy[k].stack}`; }
+        try { detail = JSON.stringify(copy); } catch (err) { detail = String(extra); }
       }
     }
     const line = detail ? `[${stamp}] ${message} | ${detail}` : `[${stamp}] ${message}`;
     g_engineDebugLog.unshift(line);
-    if (g_engineDebugLog.length > ENGINE_DEBUG_LIMIT) {
-      g_engineDebugLog = g_engineDebugLog.slice(0, ENGINE_DEBUG_LIMIT);
-    }
-    console.log("[BB Engine Debug]", message, extra ?? "");
+    if (g_engineDebugLog.length > ENGINE_DEBUG_LIMIT) g_engineDebugLog = g_engineDebugLog.slice(0, ENGINE_DEBUG_LIMIT);
+    
     if (getDebugSeverity(line) === "error") {
       triggerGlobalEngineAlert(line);
     }
@@ -4639,6 +4632,7 @@ function engineDebug(message, extra = null) {
     console.error("[BB Engine] engineDebug failed", err);
   }
 }
+
 
 function renderEngineDebugPanel() {
   if (!isTrackerPicksView()) {
@@ -14040,24 +14034,46 @@ syncAllH2HCheckboxes(false);
 queueH2HCheckboxSync(false);
 updateIntelligencePack();
 
-// Runtime error logging only — watchdog block (above) handles alerts and integrity checks.
-// Duplicate handlers removed: previously both fired on every error causing double alerts.
+// Runtime error logging only
 window.addEventListener("error", event => {
-  engineDebug("runtime error", {
+  const detail = {
     message: event?.message || "Unknown runtime error",
     file: event?.filename || "inline",
     line: event?.lineno || 0,
-    column: event?.colno || 0
-  });
+    column: event?.colno || 0,
+    stack: event?.error?.stack || "No stack trace attached"
+  };
+  engineDebug("FATAL RUNTIME ERROR", detail);
 });
 
 window.addEventListener("unhandledrejection", event => {
-  let reason = event?.reason;
-  if (reason && typeof reason === "object") {
-    try { reason = JSON.stringify(reason); } catch (err) { reason = String(reason); }
+  const err = event?.reason;
+  const detail = {
+    message: err?.message || String(err),
+    stack: err?.stack || "No stack trace available"
+  };
+  engineDebug("UNHANDLED PROMISE REJECTION", detail);
+
+  // GOD-MODE WATCHDOG: FINAL SCAN (Safeguarded)
+  try {
+    if (typeof ENGINE_INTEGRITY_SHIELD !== "undefined") {
+      const integrityReport = ENGINE_INTEGRITY_SHIELD.audit();
+      if (integrityReport.length > 0) {
+        integrityReport.forEach(e => {
+          engineDebug("WATCHDOG CRITICAL ERROR: " + e, "engine");
+          if (typeof triggerGlobalEngineAlert === "function") triggerGlobalEngineAlert("WATCHDOG: " + e);
+        });
+      } else {
+        engineDebug("WATCHDOG SUCCESS: System integrity 100% verified. 🥶⚡️", "engine");
+      }
+    } else {
+      engineDebug("WATCHDOG BYPASS: Integrity Shield undefined due to earlier syntax crash.");
+    }
+  } catch(e) {
+    engineDebug("WATCHDOG CRITICAL: Audit engine crashed.", { error: e.message, stack: e.stack });
   }
-  engineDebug("unhandled rejection", reason || "Unknown promise rejection");
 });
+
     });
   </script>
 
