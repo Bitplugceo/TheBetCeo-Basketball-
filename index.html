@@ -3410,12 +3410,14 @@ const LEAGUE_FETCH_RULES = {
     const _teamCatalogCache = new Map();
 let g_activeFetchController = null;
 
-// FIX: _fetchToken eradicated. _fixtureLoadToken retained for UI dropdowns.
+// FIX: Cleaned up duplicate declarations and initialized AbortControllers for UI search
 let _fixtureLoadToken = 0;
 let activeDropTeam = null;
 let selectedTeamIds = { A: null, B: null };
-const _teamSearchToken = { A: 0, B: 0 };
+let g_teamSearchControllers = { A: null, B: null };
 let g_lastFetchedTeams = { A: "", B: "" };
+
+
 
 
     const defaultFetchMeta = () => ({
@@ -10043,49 +10045,62 @@ updateIntelligencePack();
       const league = document.getElementById("leagueSelect").value;
       const normVal = normalizeTeamName(val);
 
-if (normVal !== g_lastFetchedTeams[side]) {
-  _fetchToken++;
+      if (normVal !== g_lastFetchedTeams[side]) {
+        if (g_lastFetchedTeams[side]) {
+          clearAutoFill(side);
+        } else {
+          setStatusText("", "");
+          setFetchAuditIssues([]);
+          resetResultsTable();
+        }
+      }
+      selectedTeamIds[side] = null;
+      validateFetchSection();
 
-  if (g_lastFetchedTeams[side]) {
-    clearAutoFill(side);
-  } else {
-    setStatusText("", "");
-    setFetchAuditIssues([]);
-    resetResultsTable();
-  }
-}
-selectedTeamIds[side] = null;
-validateFetchSection();
+      if (!val) { closeDrop(dropId); return; }
+      if (league !== "nba" && league !== "ncaa") { closeDrop(dropId); return; }
 
-if (!val) { closeDrop(dropId); return; }
-if (league !== "nba" && league !== "ncaa") { closeDrop(dropId); return; }
+      // FIX: Use AbortController instead of legacy integer tokens
+      if (g_teamSearchControllers[side]) {
+        g_teamSearchControllers[side].abort();
+      }
+      g_teamSearchControllers[side] = new AbortController();
+      const currentSignal = g_teamSearchControllers[side].signal;
 
-      const myToken = ++_teamSearchToken[side];
-      const teams = await fetchLeagueTeamCatalog(league);
-      if (myToken !== _teamSearchToken[side]) return;
+      try {
+        const teams = await fetchLeagueTeamCatalog(league);
+        
+        // Bail out if a newer keystroke has aborted this specific cycle
+        if (currentSignal.aborted) return;
 
-      const matches = teams.filter(t => normalizeTeamName(t.name).includes(normVal)).slice(0, 20);
-      if (!matches.length) { closeDrop(dropId); return; }
+        const matches = teams.filter(t => normalizeTeamName(t.name).includes(normVal)).slice(0, 20);
+        if (!matches.length) { closeDrop(dropId); return; }
 
-      drop.innerHTML = "";
-      const group = document.createElement("div");
-      group.className = "group-label";
-      group.textContent = league === "nba" ? "NBA" : "NCAA";
-      drop.appendChild(group);
+        drop.innerHTML = "";
+        const group = document.createElement("div");
+        group.className = "group-label";
+        group.textContent = league === "nba" ? "NBA" : "NCAA";
+        drop.appendChild(group);
 
-      matches.forEach(team => {
-        const div = document.createElement("div");
-        div.dataset.id = team.id;
-        div.dataset.name = team.name;
-        div.innerHTML = highlight(team.name, val);
-        div.addEventListener("mousedown", () => selectTeam(side, team.name, team.id));
-        drop.appendChild(div);
-      });
+        matches.forEach(team => {
+          const div = document.createElement("div");
+          div.dataset.id = team.id;
+          div.dataset.name = team.name;
+          div.innerHTML = highlight(team.name, val);
+          div.addEventListener("mousedown", () => selectTeam(side, team.name, team.id));
+          drop.appendChild(div);
+        });
 
-      drop.style.display = "block";
-activeDropTeam = side;
-validateFetchSection();
+        drop.style.display = "block";
+        activeDropTeam = side;
+        validateFetchSection();
+      } catch (err) {
+        if (!currentSignal.aborted) {
+          console.error("[BB Engine] Autocomplete fetch failed", err);
+        }
+      }
     }
+
 
     document.addEventListener("click", e => {
       if (!e.target.closest(".autocomplete-wrap")) {
