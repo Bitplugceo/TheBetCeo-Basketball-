@@ -5853,14 +5853,34 @@ function trimmedAvg(arr) {
   if (!work.length) return NaN;
   if (work.length <= 2) return avg(work);
 
-  const sorted = [...work].sort((a, b) => a - b);
+  if (work.length >= 5) {
+    // FIX 2: Find extremes without sorting the array to preserve chronological order
+    const maxVal = Math.max(...work);
+    const minVal = Math.min(...work);
+    
+    let removedMax = false;
+    let removedMin = false;
+    
+    const chronologicalMiddle = work.filter(v => {
+      // Remove exactly one instance of the highest score
+      if (!removedMax && v === maxVal) {
+        removedMax = true;
+        return false;
+      }
+      // Remove exactly one instance of the lowest score
+      if (!removedMin && v === minVal) {
+        removedMin = true;
+        return false;
+      }
+      return true;
+    });
 
-  if (sorted.length >= 5) {
-    const middle = sorted.slice(1, -1);
-    return weightedRecentAverage(middle);
+    // The array is now trimmed BUT still in perfectly accurate chronological order
+    return weightedRecentAverage(chronologicalMiddle);
   }
 
   return weightedRecentAverage(work);
+
 }
 
     function stdDev(arr) {
@@ -11734,13 +11754,28 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     estHalfPace = (rawPace / 2); 
     projA1H = (expEffA / 100) * estHalfPace * injMultA;
     projB1H = (expEffB / 100) * estHalfPace * injMultB;
-   } else {
-    const halfBase = eb / 2; 
-    const aOffEff = avgOrNaN(a1HS) / (halfBase / 2);
-    const bOffEff = avgOrNaN(b1HS) / (halfBase / 2);
-    projA1H = (halfBase / 2) * aOffEff * injMultA;
-    projB1H = (halfBase / 2) * bOffEff * injMultB;
+     } else {
+    // FIX 3: 1H Fallback now blends Team's Offense (55%) with Opponent's Defense (45%)
+    const avgA1HScored = avgOrNaN(a1HS);
+    const avgB1HScored = avgOrNaN(b1HS);
+    
+    // a1HA and b1HA are already fetched securely above for the volatility check
+    const avgA1HAllowed = avgOrNaN(a1HA); 
+    const avgB1HAllowed = avgOrNaN(b1HA);
+
+    const baseTeam1H = eb / 4; 
+
+    // Safe fallback if data is missing: use league baseline
+    const aOff = isFinite(avgA1HScored) ? avgA1HScored : baseTeam1H;
+    const bDef = isFinite(avgB1HAllowed) ? avgB1HAllowed : baseTeam1H;
+    const bOff = isFinite(avgB1HScored) ? avgB1HScored : baseTeam1H;
+    const aDef = isFinite(avgA1HAllowed) ? avgA1HAllowed : baseTeam1H;
+
+    // Apply the 55/45 Offense/Defense blend and the injury multiplier
+    projA1H = ((aOff * 0.55) + (bDef * 0.45)) * injMultA;
+    projB1H = ((bOff * 0.55) + (aDef * 0.45)) * injMultB;
   }
+
 
 
   // --- H2H INJECTION FOR 1H ---
@@ -12200,31 +12235,21 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
     return { overPct: 50, underPct: 50 };
   }
 
-  // Box-Muller transform injected to prevent infinite loops on high NBA scores
+  // FIX 1: Box-Muller transform using actual stdDev (Normal Distribution)
   const workerCode = `
-    function getPoisson(lambda) {
-      if (lambda < 30) {
-        const L = Math.exp(-lambda);
-        let k = 0;
-        let p = 1;
-        do {
-          k++;
-          p *= Math.random();
-        } while (p > L);
-        return k - 1;
-      } else {
-        let u1 = Math.random();
-        let u2 = Math.random();
-        let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-        return Math.max(0, Math.floor(lambda + Math.sqrt(lambda) * z0 + 0.5));
-      }
-    }
-
     onmessage = function(e) {
-      const { mean, line, runs } = e.data;
+      const { mean, stdDev, line, runs } = e.data;
       let overHits = 0;
       for (let i = 0; i < runs; i++) {
-        if (getPoisson(mean) > line) overHits++;
+        let u1 = Math.random();
+        let u2 = Math.random();
+        // Protect against Math.random() returning exactly 0
+        while (u1 === 0) u1 = Math.random();
+        
+        let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+        let simulatedScore = mean + (stdDev * z0);
+        
+        if (simulatedScore > line) overHits++;
       }
       const overPct = (overHits / runs) * 100;
       postMessage({ overPct, underPct: 100 - overPct });
@@ -12235,34 +12260,38 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
   const workerUrl = URL.createObjectURL(blob); 
   const worker = new Worker(workerUrl);
 
+  // FIX 12: Assign the timeout to a variable so we can kill it
+  let failsafeTimer;
+
   const workerPromise = new Promise((resolve, reject) => {
     worker.onmessage = (e) => {
+      clearTimeout(failsafeTimer); // Kill the ghost timer!
       worker.terminate();
       URL.revokeObjectURL(workerUrl); 
       resolve(e.data);
     };
     worker.onerror = (err) => {
+      clearTimeout(failsafeTimer); // Kill the ghost timer!
       worker.terminate();
       URL.revokeObjectURL(workerUrl);
       reject(err);
     };
-    worker.postMessage({ mean, line, runs }); 
+    
+    // FIX 1: Actually pass stdDev into the worker payload
+    worker.postMessage({ mean, stdDev, line, runs }); 
   });
 
   const timeoutPromise = new Promise((resolve) => {
-    setTimeout(() => {
+    failsafeTimer = setTimeout(() => {
       worker.terminate();
       URL.revokeObjectURL(workerUrl);
       console.warn("[BB Engine] Worker timed out. Reverting to median.");
       resolve({ overPct: 50, underPct: 50 });
-    }, 3000); // Failsafe timeout to prevent permanent lockup
+    }, 3000); 
   });
 
   return Promise.race([workerPromise, timeoutPromise]);
 }
-
-
-
 
 
 async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
