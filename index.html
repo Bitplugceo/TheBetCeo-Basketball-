@@ -2392,11 +2392,8 @@ body.dark-mode .tracker-analytics-section-head {
   </span>
 </header>
 
-
   <div class="wrapper">
-      <div class="wrapper">
-</body>
-</html>
+
 
     <div class="section" id="leagueSection">
       <h3>League Tier</h3>
@@ -3587,19 +3584,36 @@ async function writeAsyncStorage(key, value) {
     });
   } catch (err) {
     // IndexedDB unavailable — fall back to localStorage.
-    // Always serialize to string so readAsyncStorage fallback can parse it back.
     try {
       const serialized = typeof value === "string" ? value : JSON.stringify(value);
       localStorage.setItem(key, serialized);
       return true;
     } catch (lsErr) {
-      // QuotaExceededError or SecurityError — surface to caller instead of silent loss
+      // FIX 13: Storage Quota Timebomb Rescue
+      // If we hit the 5MB wall, intercept the crash and slice the archive to survive
+      if (lsErr.name === 'QuotaExceededError' && typeof value === 'string' && value.includes('"archivedPicks"')) {
+        try {
+          let parsed = JSON.parse(value);
+          if (parsed.archivedPicks && parsed.archivedPicks.length > 150) {
+            console.warn("[BB Engine] Quota exceeded. Slicing archive down to 150 to survive 5MB limit.");
+            engineDebug("Quota Rescue", "Sliced archive to 150 picks to survive localStorage 5MB limit.");
+            
+            parsed.archivedPicks = parsed.archivedPicks.slice(0, 150);
+            localStorage.setItem(key, JSON.stringify(parsed));
+            return true;
+          }
+        } catch (rescueErr) {
+          // If rescue parsing fails, drop down to the standard error log
+        }
+      }
+
       console.error("[BB Engine] writeAsyncStorage localStorage fallback failed — data NOT saved:", lsErr?.name, lsErr?.message);
       engineDebug("storage write failed", { key, error: lsErr?.name || String(lsErr) });
       return false;
     }
   }
 }
+
 
 const TRACKER_USER_KEY_STORAGE = "bb_engine_tracker_user_key";
 const TRACKER_LOCAL_STATE_PREFIX = "bb_engine_tracker_state_";
@@ -4858,9 +4872,13 @@ function getVisibleDebugLines(logs, scope, limit) {
   return prioritizeDebugLines(logs, limit);
 }
 
-function getVisibleDebugLines(logs, scope, limit) {
-  return prioritizeDebugLines(logs, limit);
+function maybeReadH2HEnabled(kind) {
+  const id = (kind === "ft") ? "useFTH2H" : (kind === "h1") ? "use1HH2H" : (kind === "h2") ? "use2HH2H" : null;
+  if (!id) return false;
+  const el = document.getElementById(id);
+  return !!(el && el.checked);
 }
+
 
 function maybeReadH2HEnabled(kind) {
   const id = (kind === "ft") ? "useFTH2H" : (kind === "h1") ? "use1HH2H" : (kind === "h2") ? "use2HH2H" : null;
@@ -6563,7 +6581,7 @@ if (!serverHasState && !hadLocalState) {
 }
 
 return g_trackerState;
-}  // ← THIS IS WHAT YOU WERE MISSING
+} 
 
 catch (err) {
   console.error("[BB Engine] hydrateTrackedPicks failed", err);
@@ -6580,13 +6598,15 @@ catch (err) {
   trackerDebug("Falling back to empty tracker state");
 
   return createEmptyTrackerState();
+} finally {
+  // FIX 10: Moved dead code into a finally block so the UI actually updates
+  renderTrackedPicks();
+  g_trackerHydratePromise = null;
 }
-            renderTrackedPicks();
-g_trackerHydratePromise = null;
 })();
 
 return g_trackerHydratePromise;
-} // <--- THIS MISSING BRACKET NUKED THE ENTIRE FILE
+}
 
 // You also MUST add this missing function, or the engine will throw a ReferenceError and crash:
 function createEmptyTrackerState() {
@@ -6824,7 +6844,7 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
     keepActiveBySlot.set(slotKey, pick);
   });
 
-  const keepArchived = archived.filter(pick => {
+    const keepArchived = archived.filter(pick => {
     const slotKey = makeTrackerActiveMergeKey(pick);
     if (!slotKey) return true;
 
@@ -6838,7 +6858,8 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
     if (!archivedSettled && activeSettled) return false;
 
     const preferred = choosePreferredBucketPick(activePick, pick);
-    return preferred === pick;
+    // FIX 9: Compare unique string signatures instead of object memory references
+    return makeTrackedSignature(preferred) === makeTrackedSignature(pick);
   });
 
   const dedupedArchived = mergeTrackerArchivedPicks([], keepArchived);
@@ -9024,16 +9045,18 @@ async function refreshTrackedPickResults() {
 
     const archivedChanged = archiveExpiredTrackedPicks();
     
-    // THIS IS THE FIX: IT NOW FORCES THE SERVER TO ACCEPT THE WIN/LOSS
+        // FIX 11: Stop Render Thrashing. Only re-render the DOM if the state actually changed.
     if (changed || archivedChanged) {
       g_trackerState.updatedAt = new Date().toISOString();
       rebuildTrackerStats();
       saveTrackerStateToLocal();
       scheduleTrackerSave();
       Promise.resolve().then(() => forceTrackerSaveNow());
+      
+      // Moved inside the condition! No more wiping the table for no reason.
+      renderTrackedPicks(); 
     }
-    
-    renderTrackedPicks();
+
   } catch (err) {
     console.error("[BB Engine] refresh failed", err);
   }
@@ -13188,8 +13211,10 @@ async function runEngine() {
     const teamANameNorm = normalizeTeamName(document.getElementById("teamAName")?.value || "");
     const teamBNameNorm = normalizeTeamName(document.getElementById("teamBName")?.value || "");
 
-    const isDuplicate = (teamAId && teamBId && teamAId === teamBId) || 
-                       (teamANameNorm && teamBNameNorm && teamANameNorm === teamBNameNorm);
+        // FIX 15: Simplified duplicate team check for raw execution speed
+    const isDuplicate = (teamAId && teamAId === teamBId) || 
+                       (teamANameNorm && teamANameNorm === teamBNameNorm);
+
 
     if (isDuplicate) {
       engineDebug("run blocked duplicate teams", { teamAId, teamBId, teamANameNorm });
