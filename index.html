@@ -11468,16 +11468,21 @@ function buildTeamMarketProjection({
     proj = (proj * weights.regressionWeight) + (baseline * weights.baselineWeight);
   }
 
-    // 4. Final Adjustments
+      // 4. Final Adjustments
   const role = getFixtureSideRole(side);
-  const homeEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5) / (marketKey === "ft" ? 2 : 4);
-  
   const hasVenueData = ownVenueSeries?.length >= 5;
   
-  if (!hasVenueData) {
-    if (isFinite(proj) && role === "home") proj += homeEdge;
-    if (isFinite(proj) && role === "away") proj -= homeEdge;
+  if (!hasVenueData && isFinite(proj)) {
+    // FIX 4: Explicitly scale the home edge for the period to prevent spread double-counting.
+    // The total game edge is split between the two teams (+ for home, - for away).
+    // For a half (like 2H), the edge itself must be halved first, then split.
+    const fullGameEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5);
+    const periodEdge = marketKey === "ft" ? fullGameEdge : (fullGameEdge / 2);
+    
+    if (role === "home") proj += (periodEdge / 2);
+    if (role === "away") proj -= (periodEdge / 2);
   }
+
 
   if (isFinite(proj)) proj *= clampNumber(injMult, 0.75, 1.0);
   if (isFinite(proj)) proj = anchorProjection(proj, line, league, "team");
@@ -11650,19 +11655,30 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projAFT = (expEffA / 100) * estMatchPace * injMultA;
     projBFT = (expEffB / 100) * estMatchPace * injMultB;
   } else {
-    // --- SYNTHETIC LEVEL 2 MATH (For Manual Leagues) ---
+        // --- SYNTHETIC LEVEL 2 MATH (For Manual Leagues) ---
     const aS = avgOrNaN(aFTS);
     const bS = avgOrNaN(bFTS);
     const aA = avgOrNaN(parsed.aFTAllowed) || (eb / 2); 
     const bA = avgOrNaN(parsed.bFTAllowed) || (eb / 2);
-    const basePace = eb / 2.3; 
+
+    // FIX 5: Decouple base pace from the raw Vegas total.
+    // Assign a true possession baseline based on league norms.
+    const basePace = league === "nba" ? 99.5 : league === "ncaa" ? 67.5 : 80.0;
+    
     const paceFactorA = (aS + aA) / eb;
     const paceFactorB = (bS + bA) / eb;
-    estMatchPace = clampNumber(basePace * ((paceFactorA + paceFactorB) / 2), basePace * cl.min, basePace * cl.max);
-    const synOrtgA = (aS / (basePace * paceFactorA)) * 100;
-    const synDrtgA = (aA / (basePace * paceFactorA)) * 100;
-    const synOrtgB = (bS / (basePace * paceFactorB)) * 100;
-    const synDrtgB = (bA / (basePace * paceFactorB)) * 100;
+    
+    // Dampen the pace factor so extreme scores translate to efficiency, not just hyper-speed
+    const dampenedPaceA = 1 + ((paceFactorA - 1) * 0.4);
+    const dampenedPaceB = 1 + ((paceFactorB - 1) * 0.4);
+
+    estMatchPace = clampNumber(basePace * ((dampenedPaceA + dampenedPaceB) / 2), basePace * cl.min, basePace * cl.max);
+    
+    const synOrtgA = (aS / (basePace * dampenedPaceA)) * 100;
+    const synDrtgA = (aA / (basePace * dampenedPaceA)) * 100;
+    const synOrtgB = (bS / (basePace * dampenedPaceB)) * 100;
+    const synDrtgB = (bA / (basePace * dampenedPaceB)) * 100;
+    
     synNetA = synOrtgA - synDrtgA;
     synNetB = synOrtgB - synDrtgB;
     projAFT = ((synOrtgA + synDrtgB) / 2 / 100) * estMatchPace * injMultA;
@@ -11690,12 +11706,24 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
 
 
-  // Anchor individual team projections
-  if (isFinite(projAFT)) projAFT = anchorProjection(projAFT, lines.aLine, league, "team");
-  if (isFinite(projBFT)) projBFT = anchorProjection(projBFT, lines.bLine, league, "team");
+    // FIX 6: Apply Volatility Suppression before anchoring
+  const vl = getMarketVolLimit(league, "ft");
+
+  if (isFinite(projAFT)) {
+    projAFT = applyVolatility(projAFT, aVol, vl);
+    projAFT = anchorProjection(projAFT, lines.aLine, league, "team");
+  }
+  if (isFinite(projBFT)) {
+    projBFT = applyVolatility(projBFT, bVol, vl);
+    projBFT = anchorProjection(projBFT, lines.bLine, league, "team");
+  }
 
   let ftProj = projAFT + projBFT;
-  if (isFinite(ftProj)) ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
+  if (isFinite(ftProj)) {
+    ftProj = applyVolatility(ftProj, Math.max(aVol, bVol), vl);
+    ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
+  }
+
 
     return {
     eb, projAFT, projBFT, ftProj, pace: estMatchPace, ftSampleTier,
@@ -11800,8 +11828,18 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
 
+    // FIX 6: Apply Volatility Suppression before anchoring
+  const h1Vl = getMarketVolLimit(league, "h1");
+  
+  if (isFinite(projA1H)) projA1H = applyVolatility(projA1H, aVol1, h1Vl);
+  if (isFinite(projB1H)) projB1H = applyVolatility(projB1H, bVol1, h1Vl);
+
   let h1Proj = projA1H + projB1H;
-  if (isFinite(h1Proj)) h1Proj = anchorProjection(h1Proj, lines.h1Line, league, "h1");
+  if (isFinite(h1Proj)) {
+    h1Proj = applyVolatility(h1Proj, Math.max(aVol1, bVol1), h1Vl);
+    h1Proj = anchorProjection(h1Proj, lines.h1Line, league, "h1");
+  }
+
 
     return {
     h1Proj,
@@ -11954,9 +11992,16 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   });
 
   let h2Proj = isFinite(aTeam.proj) && isFinite(bTeam.proj) ? aTeam.proj + bTeam.proj : NaN;
-  const pace = computePaceSignal(league, aTeam.proj, bTeam.proj, "h2");
+    const pace = computePaceSignal(league, aTeam.proj, bTeam.proj, "h2");
   if (isFinite(pace)) h2Proj *= (1 + ((pace - 1) * 0.10));
-  if (isFinite(h2Proj)) h2Proj = anchorProjection(h2Proj, lines.h2Line, league, "h2");
+  
+  // FIX 6: Apply Volatility Suppression before anchoring
+  const h2Vl = getMarketVolLimit(league, "h2");
+  if (isFinite(h2Proj)) {
+    h2Proj = applyVolatility(h2Proj, Math.max(aTeam.vol, bTeam.vol), h2Vl);
+    h2Proj = anchorProjection(h2Proj, lines.h2Line, league, "h2");
+  }
+
 
   const h2Edge = lines.h2Line !== null && isFinite(h2Proj) ? h2Proj - lines.h2Line : NaN;
   const paceGapRisk = isFinite(pace) && Math.abs(pace - 1) >= 0.08;
