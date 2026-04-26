@@ -9093,7 +9093,6 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
 
 
         async function refreshTrackedPickResults() {
-
   try {
     const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
     const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
@@ -9116,9 +9115,18 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
         return [`${p.league}:${p.eventId}`, { base, eventId: p.eventId }];
       }).filter(Boolean)).values()];
 
+      // FIX: Fetch directly from ESPN first! Bypasses the 15-second proxy delay.
       const eventResults = await Promise.all(eventEntries.map(async entry => {
         const url = `${entry.base}/summary?event=${entry.eventId}&_=${Date.now()}`;
-        const data = await proxyFetch(url, 15000).catch(() => null);
+        let data = null;
+        try {
+          // Direct lightning-fast connection
+          const res = await fetch(url, { cache: "no-store" });
+          if (res.ok) data = await res.json();
+        } catch (err) {
+          // Only use the proxy if direct connection fails
+          data = await proxyFetch(url, 10000).catch(() => null);
+        }
         return [entry.eventId, data];
       }));
 
@@ -9129,14 +9137,12 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
         const competition = data?.header?.competitions?.[0];
         if (!competition) return;
 
-        // FIX: Add STATUS_FINAL to catch ESPN's lazy API updates
         const apiFinal = competition?.status?.type?.completed || competition?.status?.type?.state === "post" || competition?.status?.type?.name === "STATUS_FINAL";
         const clock = competition?.status?.displayClock;
         const period = competition?.status?.period;
         const forceSettle = (clock === "0.0" || clock === "0:00") && period >= (pick.league === "nba" ? 4 : 2);
 
         if (apiFinal || forceSettle) {
-          // FIX: Pass data.boxscore into the function so 1H/2H bets can settle
           const settled = settleTrackedPickFromCompetition(pick, competition, data?.boxscore);
           if (settled !== "pending" && pick.resultStatus !== settled) {
             pick.resultStatus = settled;
@@ -9149,7 +9155,6 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
 
     const archivedChanged = archiveExpiredTrackedPicks();
     
-    // FIX 11: Stop Render Thrashing. Only re-render the DOM if the state actually changed.
     if (changed || archivedChanged) {
       g_trackerState.updatedAt = new Date().toISOString();
       rebuildTrackerStats();
@@ -9157,7 +9162,6 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
       scheduleTrackerSave();
       Promise.resolve().then(() => forceTrackerSaveNow());
       
-      // Moved inside the condition! No more wiping the table for no reason.
       renderTrackedPicks(); 
     }
 
@@ -9166,79 +9170,6 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
   }
 }
 
-
-async function refreshTrackedPickResults() {
-  try {
-    const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
-    const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
-    const allBuckets = [...active, ...archived];
-
-    if (!allBuckets.length) {
-      renderTrackedPicks();
-      return;
-    }
-
-    let changed = false;
-    const pendingPicks = allBuckets.filter(p => (
-      p && p.eventId && (!p.resultStatus || p.resultStatus === "pending") && isTrackerSupportedLeague(p.league)
-    ));
-
-    if (pendingPicks.length) {
-      const eventEntries = [...new Map(pendingPicks.map(p => {
-        const base = getTrackedLeagueBase(p.league);
-        if (!base) return null;
-        return [`${p.league}:${p.eventId}`, { base, eventId: p.eventId }];
-      }).filter(Boolean)).values()];
-
-      const eventResults = await Promise.all(eventEntries.map(async entry => {
-        const url = `${entry.base}/summary?event=${entry.eventId}&_=${Date.now()}`;
-        const data = await proxyFetch(url, 15000).catch(() => null);
-        return [entry.eventId, data];
-      }));
-
-      const eventMap = new Map(eventResults);
-
-            pendingPicks.forEach(pick => {
-        const data = eventMap.get(pick.eventId);
-        const competition = data?.header?.competitions?.[0];
-        if (!competition) return;
-
-        // FIX: Add STATUS_FINAL to catch ESPN's lazy API updates
-        const apiFinal = competition?.status?.type?.completed || competition?.status?.type?.state === "post" || competition?.status?.type?.name === "STATUS_FINAL";
-        const clock = competition?.status?.displayClock;
-        const period = competition?.status?.period;
-        const forceSettle = (clock === "0.0" || clock === "0:00") && period >= (pick.league === "nba" ? 4 : 2);
-
-        if (apiFinal || forceSettle) {
-          // FIX: Pass data.boxscore into the function so 1H/2H bets can settle
-          const settled = settleTrackedPickFromCompetition(pick, competition, data?.boxscore);
-          if (settled !== "pending" && pick.resultStatus !== settled) {
-            pick.resultStatus = settled;
-            pick.settledAt = new Date().toISOString();
-            changed = true;
-          }
-        }
-      });
-    }
-
-    const archivedChanged = archiveExpiredTrackedPicks();
-    
-        // FIX 11: Stop Render Thrashing. Only re-render the DOM if the state actually changed.
-    if (changed || archivedChanged) {
-      g_trackerState.updatedAt = new Date().toISOString();
-      rebuildTrackerStats();
-      saveTrackerStateToLocal();
-      scheduleTrackerSave();
-      Promise.resolve().then(() => forceTrackerSaveNow());
-      
-      // Moved inside the condition! No more wiping the table for no reason.
-      renderTrackedPicks(); 
-    }
-
-  } catch (err) {
-    console.error("[BB Engine] refresh failed", err);
-  }
-}
 
 
 
