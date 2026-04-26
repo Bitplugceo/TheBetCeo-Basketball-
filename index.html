@@ -8989,62 +8989,79 @@ function handleTrackedPicksActionClick(event) {
       return total;
     }
 
-        function settleTrackedPickFromCompetition(pick, competition, boxscore) {
-      if (!pick || !competition) return "pending";
-      const competitors = competition.competitors || [];
-      if (competitors.length < 2) return "pending";
+        async function refreshTrackedPickResults() {
+  try {
+    const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
+    const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
+    const allBuckets = [...active, ...archived];
 
-      const home = competitors.find(c => c.homeAway === "home") || competitors[0];
-      const away = competitors.find(c => c.homeAway === "away") || competitors[1];
-      const finalHomeScore = parseFloat(home?.score);
-      const finalAwayScore = parseFloat(away?.score);
-      
-      // FIX: Pull linescores from boxscore if header is empty
-      const homeBox = boxscore?.teams?.find(t => t.homeAway === "home" || t.team?.id === home?.id) || {};
-      const awayBox = boxscore?.teams?.find(t => t.homeAway === "away" || t.team?.id === away?.id) || {};
-      
-      const homeLines = (home?.linescores?.length ? home.linescores : homeBox?.linescores) || [];
-      const awayLines = (away?.linescores?.length ? away.linescores : awayBox?.linescores) || [];
+    if (!allBuckets.length) {
+      renderTrackedPicks();
+      return;
+    }
 
-      let actual = NaN;
+    let changed = false;
+    const pendingPicks = allBuckets.filter(p => (
+      p && p.eventId && (!p.resultStatus || p.resultStatus === "pending") && isTrackerSupportedLeague(p.league)
+    ));
 
+    if (pendingPicks.length) {
+      const eventEntries = [...new Map(pendingPicks.map(p => {
+        const base = getTrackedLeagueBase(p.league);
+        if (!base) return null;
+        return [`${p.league}:${p.eventId}`, { base, eventId: p.eventId }];
+      }).filter(Boolean)).values()];
 
-      if (pick.marketKey === "ft") {
-        if (!isFinite(finalHomeScore) || !isFinite(finalAwayScore)) return "pending";
-        actual = finalHomeScore + finalAwayScore;
-      } else if (pick.marketKey === "team_a") {
-        actual = isNaN(finalHomeScore) ? NaN : finalHomeScore;
-      } else if (pick.marketKey === "team_b") {
-        actual = isNaN(finalAwayScore) ? NaN : finalAwayScore;
-      } else if (pick.marketKey === "h1") {
-        if (pick.league === "ncaa") {
-          if (!homeLines.length || !awayLines.length) return "pending";
-          const [homeH1, awayH1] = extractFirstHalf(homeLines, awayLines);
-          actual = homeH1 + awayH1;
-        } else {
-          if (homeLines.length < 2 || awayLines.length < 2) return "pending";
-          actual = sumLineScores(homeLines, 2) + sumLineScores(awayLines, 2);
+      const eventResults = await Promise.all(eventEntries.map(async entry => {
+        const url = `${entry.base}/summary?event=${entry.eventId}&_=${Date.now()}`;
+        const data = await proxyFetch(url, 15000).catch(() => null);
+        return [entry.eventId, data];
+      }));
+
+      const eventMap = new Map(eventResults);
+
+      pendingPicks.forEach(pick => {
+        const data = eventMap.get(pick.eventId);
+        const competition = data?.header?.competitions?.[0];
+        if (!competition) return;
+
+        // FIX: Add STATUS_FINAL to catch ESPN's lazy API updates
+        const apiFinal = competition?.status?.type?.completed || competition?.status?.type?.state === "post" || competition?.status?.type?.name === "STATUS_FINAL";
+        const clock = competition?.status?.displayClock;
+        const period = competition?.status?.period;
+        const forceSettle = (clock === "0.0" || clock === "0:00") && period >= (pick.league === "nba" ? 4 : 2);
+
+        if (apiFinal || forceSettle) {
+          // FIX: Pass data.boxscore into the function so 1H/2H bets can settle
+          const settled = settleTrackedPickFromCompetition(pick, competition, data?.boxscore);
+          if (settled !== "pending" && pick.resultStatus !== settled) {
+            pick.resultStatus = settled;
+            pick.settledAt = new Date().toISOString();
+            changed = true;
+          }
         }
-      } else if (pick.marketKey === "h2") {
-        if (pick.league === "ncaa") {
-          if (homeLines.length < 2 || awayLines.length < 2) return "pending";
-          const [homeH2, awayH2] = extractSecondHalf(homeLines, awayLines);
-          actual = homeH2 + awayH2;
-        } else {
-          if (homeLines.length < 4 || awayLines.length < 4) return "pending";
-          actual = sumLineScores(homeLines.slice(2, 4), 2) + sumLineScores(awayLines.slice(2, 4), 2);
-        }
-      }
+      });
+    }
 
-            if (!isFinite(actual)) return "pending";
-      pick.actualScore = actual; // Permanently save the exact score played
-      const line = Number(pick.line);
-      if (!isFinite(line)) return "pending";
-      if (Math.abs(actual - line) < 0.001) return "push";
-      if (pick.side === "over") return actual > line ? "win" : "loss";
-      if (pick.side === "under") return actual < line ? "win" : "loss";
-      return "pending";
-      }
+    const archivedChanged = archiveExpiredTrackedPicks();
+    
+    // FIX 11: Stop Render Thrashing. Only re-render the DOM if the state actually changed.
+    if (changed || archivedChanged) {
+      g_trackerState.updatedAt = new Date().toISOString();
+      rebuildTrackerStats();
+      saveTrackerStateToLocal();
+      scheduleTrackerSave();
+      Promise.resolve().then(() => forceTrackerSaveNow());
+      
+      // Moved inside the condition! No more wiping the table for no reason.
+      renderTrackedPicks(); 
+    }
+
+  } catch (err) {
+    console.error("[BB Engine] refresh failed", err);
+  }
+}
+
 
 async function refreshTrackedPickResults() {
   try {
