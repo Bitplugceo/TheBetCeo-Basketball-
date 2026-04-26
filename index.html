@@ -4211,18 +4211,18 @@ async function saveTrackerStateToLocal() {
 
 
 function getTrackerHeaders(includeJson = false) {
-  const headers = {
-    "X-Engine-User": getTrackerUserKey()
-  };
-
-
+  // FIX: Safari blocks custom headers and application/json with CORS preflight errors.
+  // We pass the user key in the URL instead, and use text/plain to guarantee 
+  // the sync goes through between the PWA and the browser without being blocked.
+  const headers = {};
 
   if (includeJson) {
-    headers["Content-Type"] = "application/json";
+    headers["Content-Type"] = "text/plain";
   }
 
   return headers;
 }
+
 let g_trackerState = {
   vId: Date.now(), // Version Sequence number
   sId: window.__BETCEO_SESSION_ID, // Session that last modified it
@@ -9119,17 +9119,15 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
         return [`${p.league}:${p.eventId}`, { base, eventId: p.eventId }];
       }).filter(Boolean)).values()];
 
-      // FIX: Fetch directly from ESPN first! Bypasses the 15-second proxy delay.
       const eventResults = await Promise.all(eventEntries.map(async entry => {
         const url = `${entry.base}/summary?event=${entry.eventId}&_=${Date.now()}`;
         let data = null;
         try {
-          // Direct lightning-fast connection
-          const res = await fetch(url, { cache: "no-store" });
+          const res = await fetch(url, { cache: "no-store", mode: "cors" });
           if (res.ok) data = await res.json();
+          else throw new Error("Direct fetch failed");
         } catch (err) {
-          // Only use the proxy if direct connection fails
-          data = await proxyFetch(url, 10000).catch(() => null);
+          data = await proxyFetch(url, 4000).catch(() => null);
         }
         return [entry.eventId, data];
       }));
@@ -9162,9 +9160,13 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
     if (changed || archivedChanged) {
       g_trackerState.updatedAt = new Date().toISOString();
       rebuildTrackerStats();
-      saveTrackerStateToLocal();
-      scheduleTrackerSave();
-      Promise.resolve().then(() => forceTrackerSaveNow());
+      
+      // FIX: Await the database save so it safely finishes writing to your phone
+      // BEFORE it attempts to push to the server. This stops the database crash.
+      await saveTrackerStateToLocal();
+      
+      // Fire a clean background push
+      forceTrackerSaveNow();
       
       renderTrackedPicks(); 
     }
@@ -9173,6 +9175,7 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
     console.error("[BB Engine] refresh failed", err);
   }
 }
+
 
 
 
