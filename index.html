@@ -7137,9 +7137,8 @@ function archiveExpiredTrackedPicks() {
   const cutoffMs = 10 * 60 * 60 * 1000; // 10 hours
 
   // Helper to remove massive diagnostic objects to prevent storage bloat and UI lag
-    const stripHeavyData = (pick) => {
+  const stripHeavyData = (pick) => {
     const lean = { ...pick };
-    // Keep the specific stats God's Eye needs before nuking the heavy object
     if (lean.diagnostics) {
       lean.godsEyeMemory = {
         pace: lean.diagnostics.pace,
@@ -7159,20 +7158,19 @@ function archiveExpiredTrackedPicks() {
     return lean;
   };
 
-
   const keepActive = [];
   const moveToArchived = [];
   let changed = false;
 
   active.forEach(pick => {
     const p = ensureTrackedPickKeys({ ...pick });
-    const ts = getTrackedPickTimeMs(p);
-    
     const isSettled = ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase());
-    const isExpired = ts > 0 && (now - ts) > cutoffMs;
+    
+    // FIX: STRICTLY use settledAt. Do not fall back to createdAt.
+    const settleTs = p.settledAt ? Date.parse(p.settledAt) : 0;
+    const isExpired = isSettled && settleTs > 0 && (now - settleTs) > cutoffMs;
 
     if (isSettled && isExpired) {
-      // SLIM the data before pushing to archive
       moveToArchived.push(stripHeavyData(p));
       changed = true;
     } else {
@@ -7190,13 +7188,13 @@ function archiveExpiredTrackedPicks() {
       }
     });
     g_trackerState.activePicks = keepActive;
-    // Limit archive size to 2000 lean items
     g_trackerState.archivedPicks = archived.slice(0, 2000);
     rebuildTrackerStats();
     saveTrackerStateToLocal();
   }
   return changed;
 }
+
 
 
 function makeTrackedSignature(pick) {
@@ -7238,18 +7236,21 @@ function getTrackedPickTimeMs(pick) {
 
 function isTrackedPickVisibleOnPage(pick) {
   if (!pick) return false;
-  const ts = getTrackedPickTimeMs(pick);
-  if (!ts) return false;
-
-  const hoursOld = (Date.now() - ts) / (1000 * 60 * 60);
   const status = String(pick.resultStatus || "pending").toLowerCase();
 
-  // If a game is stuck in PENDING for more than 24 hours, hide it (API failed/Game cancelled)
-  if (status === "pending") return hoursOld < 24;
-
-  // Hide settled picks older than 10 hours
-  return hoursOld < 10;
+  if (status === "pending") {
+    // If a game is stuck in PENDING for more than 24 hours from creation, hide it
+    const ts = pick.createdAt ? Date.parse(pick.createdAt) : (pick.eventDate ? Date.parse(pick.eventDate) : 0);
+    if (!ts) return false;
+    return (Date.now() - ts) / (1000 * 60 * 60) < 24;
+  } else {
+    // FIX: Hide settled picks 10 hours specifically after SETTLEMENT.
+    const settleTs = pick.settledAt ? Date.parse(pick.settledAt) : 0;
+    if (!settleTs) return true; // Keep visible if it somehow settled without a timestamp
+    return (Date.now() - settleTs) / (1000 * 60 * 60) < 10;
+  }
 }
+
 
 
 
@@ -8995,7 +8996,86 @@ function handleTrackedPicksActionClick(event) {
       return total;
     }
 
+function settleTrackedPickFromCompetition(pick, competition, boxscore) {
+  if (!pick || !competition) return "pending";
+
+  const status = competition?.status?.type?.name || "";
+  const state = competition?.status?.type?.state || "";
+  const completed = competition?.status?.type?.completed || false;
+
+  // Ensure the game is actually over
+  if (!completed && state !== "post" && status !== "STATUS_FINAL") return "pending";
+
+  const competitors = competition.competitors || [];
+  const home = competitors.find(c => c.homeAway === "home") || competitors[0];
+  const away = competitors.find(c => c.homeAway === "away") || competitors[1];
+
+  if (!home || !away) return "pending";
+
+  const sHome = parseInt(home.score, 10);
+  const sAway = parseInt(away.score, 10);
+  
+  if (isNaN(sHome) || isNaN(sAway)) return "pending";
+
+  const lsHome = home.linescores || [];
+  const lsAway = away.linescores || [];
+  
+  let h1Home = 0, h1Away = 0, h2Home = 0, h2Away = 0;
+  
+  // Extract period scores based on league format
+  if (lsHome.length >= 2 && lsAway.length >= 2) {
+     if (pick.league === "nba") {
+        h1Home = parseInt(lsHome[0]?.value || 0) + parseInt(lsHome[1]?.value || 0);
+        h1Away = parseInt(lsAway[0]?.value || 0) + parseInt(lsAway[1]?.value || 0);
+        if (lsHome.length >= 4 && lsAway.length >= 4) {
+          h2Home = parseInt(lsHome[2]?.value || 0) + parseInt(lsHome[3]?.value || 0);
+          h2Away = parseInt(lsAway[2]?.value || 0) + parseInt(lsAway[3]?.value || 0);
+        }
+     } else { // NCAA
+        h1Home = parseInt(lsHome[0]?.value || 0);
+        h1Away = parseInt(lsAway[0]?.value || 0);
+        if (lsHome.length >= 2 && lsAway.length >= 2) {
+          h2Home = parseInt(lsHome[1]?.value || 0);
+          h2Away = parseInt(lsAway[1]?.value || 0);
+        }
+     }
+  }
+
+  const market = pick.marketKey;
+  const line = parseFloat(pick.line);
+  if (isNaN(line)) return "pending";
+
+  let actual = 0;
+  const isTeamAHome = String(pick.homeId) === String(home.id) || pick.homeTeam === home.team?.displayName;
+
+  // Grade based on market type
+  if (market === "ft") {
+     actual = sHome + sAway;
+  } else if (market === "h1") {
+     if (!h1Home && !h1Away) return "pending"; 
+     actual = h1Home + h1Away;
+  } else if (market === "h2") {
+     if (!h2Home && !h2Away) return "pending";
+     actual = h2Home + h2Away;
+  } else if (market === "team_a") {
+     actual = isTeamAHome ? sHome : sAway;
+  } else if (market === "team_b") {
+     actual = isTeamAHome ? sAway : sHome;
+  } else {
+     return "pending";
+  }
+
+  // Save the exact score context for your God's Eye post-mortem UI
+  pick.actualScore = actual;
+
+  const pickSide = String(pick.side).toLowerCase();
+  if (actual > line) return pickSide === "over" ? "win" : "loss";
+  if (actual < line) return pickSide === "under" ? "win" : "loss";
+  return "push";
+}
+
         async function refreshTrackedPickResults() {
+
   try {
     const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
     const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
