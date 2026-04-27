@@ -6020,7 +6020,9 @@ function ensureTrackedPickKeys(pick = {}) {
   // and would make the clock start 'now' instead of when the game ended.
   // Use only createdAt or eventDate, which are immutable.
   if (["win", "loss", "push"].includes(next.resultStatus) && !next.settledAt) {
-    next.settledAt = next.createdAt || next.eventDate || null;
+    // Use eventDate first (when the game was played) so the 10h archive clock
+    // starts from game time — not from when the pick was created or the field backfilled.
+    next.settledAt = next.eventDate || next.createdAt || null;
   }
   next.modelVersion = normalizeModelVersion(next.modelVersion);
   next.createdAt = next.createdAt || new Date().toISOString();
@@ -6730,31 +6732,28 @@ function choosePreferredActivePick(existingPick, incomingPick) {
   const currentStatus = String(current.resultStatus || "pending").toLowerCase();
   const incomingStatus = String(incoming.resultStatus || "pending").toLowerCase();
 
-  // FIX: Protect manual settlements from being overwritten by stale background data
-  if (current.settlementSource === "manual" && incoming.settlementSource !== "manual" && incomingStatus === "pending") {
-    return current;
-  }
-  if (incoming.settlementSource === "manual" && current.settlementSource !== "manual" && currentStatus === "pending") {
-    return incoming;
-  }
-
-  if (incomingStatus === "pending" && currentStatus !== "pending") {
-    trackerDebug("merge kept settled pick over pending", {
+  // PERMANENT SETTLEMENT RULE: Once a pick is settled (win/loss/push), it can NEVER
+  // be reverted to pending by any merge — regardless of source (manual or API).
+  // This is the root cause of the flickering: server still has the old pending copy,
+  // hydrate merges it in, and the pending copy was winning the timestamp race.
+  const SETTLED = ["win", "loss", "push"];
+  if (SETTLED.includes(currentStatus) && !SETTLED.includes(incomingStatus)) {
+    trackerDebug("merge: settled pick protected from pending overwrite", {
       eventId: current.eventId || incoming.eventId || "",
       market: current.marketKey || incoming.marketKey || "",
       kept: currentStatus,
       dropped: incomingStatus
     });
-    return current;
+    return current; // settled always beats pending — no exceptions
   }
-  if (currentStatus === "pending" && incomingStatus !== "pending") {
-    trackerDebug("merge replaced pending pick with settled", {
+  if (SETTLED.includes(incomingStatus) && !SETTLED.includes(currentStatus)) {
+    trackerDebug("merge: pending pick replaced by settled", {
       eventId: incoming.eventId || current.eventId || "",
       market: incoming.marketKey || current.marketKey || "",
       kept: incomingStatus,
       dropped: currentStatus
     });
-    return incoming;
+    return incoming; // settled always beats pending — no exceptions
   }
 
   const sameSide = String(current.side || "") === String(incoming.side || "");
@@ -7588,12 +7587,14 @@ function buildArchiveDebugHtml() {
     const stampSource = updatedAtMs ? "updatedAt ⚠️" : settledAtMs ? "settledAt ✅" : "createdAt";
     const label = `${(p.homeTeam||"?").substring(0,12)} vs ${(p.awayTeam||"?").substring(0,12)} · ${p.marketKey||"?"} · ${p.resultStatus}`;
     const risk = updatedAtMs > settledAtMs && settledAtMs > 0 ? badge("#f44336","FLICKER RISK: updatedAt > settledAt") : badge("#4caf50","OK");
+    const srcTag = p.settlementSource ? badge(p.settlementSource==="manual"?"#9c27b0":p.settlementSource==="api"?"#2196f3":"#555", p.settlementSource.toUpperCase()) : badge("#555","NONE ⚠️");
 
     mergeRows += `<tr style="border-bottom:1px solid #1e1e1e">
       <td style="padding:5px 4px;color:#aaa;font-size:11px">${label}</td>
       <td style="padding:5px 4px;color:${stampSource.includes("⚠️")?"#ff9800":"#4caf50"};font-size:10px">${stampSource}</td>
       <td style="padding:5px 4px;color:#555;font-size:10px">${ts(p.updatedAt)}</td>
       <td style="padding:5px 4px;color:#555;font-size:10px">${ts(p.settledAt)}</td>
+      <td style="padding:5px 4px">${srcTag}</td>
       <td style="padding:5px 4px">${risk}</td>
     </tr>`;
   });
@@ -7609,7 +7610,7 @@ function buildArchiveDebugHtml() {
         <thead><tr style="color:#555;border-bottom:1px solid #2a2a2a">
           <th style="padding:4px;text-align:left">Pick</th><th style="padding:4px;text-align:left">Stamp source</th>
           <th style="padding:4px;text-align:left">updatedAt</th><th style="padding:4px;text-align:left">settledAt</th>
-          <th style="padding:4px;text-align:left">Risk</th>
+          <th style="padding:4px;text-align:left">settlementSource</th><th style="padding:4px;text-align:left">Risk</th>
         </tr></thead><tbody>${mergeRows}</tbody></table></div>`
         : `<div style="color:#4caf50;font-size:12px">✅ No settled picks in active bucket to check</div>`}
     </div>`;
@@ -9321,6 +9322,8 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
           if (settled && settled !== "pending" && pick.resultStatus !== settled) {
             pick.resultStatus = settled;
             pick.settledAt = new Date().toISOString();
+            pick.settlementSource = "api"; // marks this as permanently settled — merge will never revert it
+            pick.settledVersion = ENGINE_MODEL_VERSION;
             changed = true;
             trackerDebug("auto-settled pick", { eventId: pick.eventId, market: pick.marketKey, result: settled, actual: pick.actualScore, line: pick.lineAtPick || pick.line });
           }
