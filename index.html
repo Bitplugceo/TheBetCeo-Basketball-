@@ -6014,6 +6014,12 @@ function ensureTrackedPickKeys(pick = {}) {
   next.trackerImpactLabel = next.trackerImpactLabel || next?.diagnostics?.trackerImpactLabel || getTrackerImpactLabel(next.trackerImpactKey);
 
   next.resultStatus = String(next.resultStatus || "pending").toLowerCase();
+  // FIX 2: Backfill settledAt so the 10-hour archive clock has a valid anchor
+  // for picks that were settled before the settledAt field existed or were
+  // settled on another device and synced without it.
+  if (["win", "loss", "push"].includes(next.resultStatus) && !next.settledAt) {
+    next.settledAt = next.updatedAt || next.createdAt || new Date().toISOString();
+  }
   next.modelVersion = normalizeModelVersion(next.modelVersion);
   next.createdAt = next.createdAt || new Date().toISOString();
   next.signature = next.signature || makeTrackedSignature(next);
@@ -6646,6 +6652,9 @@ catch (err) {
   return createEmptyTrackerState();
 } finally {
   // FIX 10: Moved dead code into a finally block so the UI actually updates
+  // FIX 3: Sweep archive immediately after every hydrate/merge so settled picks
+  // that arrive pre-settled from the server don't stay in activePicks forever.
+  archiveExpiredTrackedPicks();
   renderTrackedPicks();
   g_trackerHydratePromise = null;
 }
@@ -6866,6 +6875,11 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
       }
 
       if (archivedSettled && activeSettled) {
+        // FIX 4: If the archived copy has already passed the 10-hour cutoff,
+        // never let the active copy win — it would reset the archive clock.
+        const _archiveTs = Date.parse(archivedPick.settledAt || archivedPick.createdAt || '') || 0;
+        const _cutoffMs  = TRACKER_ARCHIVE_AFTER_HOURS * 60 * 60 * 1000;
+        if (_archiveTs > 0 && (Date.now() - _archiveTs) >= _cutoffMs) return;
         const preferred = choosePreferredBucketPick(pick, archivedPick);
         if (preferred === archivedPick) return;
       }
@@ -7162,7 +7176,9 @@ function archiveExpiredTrackedPicks() {
     
     // FIX: STRICTLY use settledAt. Do not fall back to createdAt.
     // ARCHIVE FIX: fall back to createdAt → eventDate if settledAt is missing
-    const settleTs = Date.parse(p.settledAt || p.updatedAt || p.createdAt || p.eventDate || '') || 0;
+    // FIX 1: Only use settledAt (or createdAt/eventDate as last resort).
+    // updatedAt is touched on every sync and would reset the 10-hour clock.
+    const settleTs = Date.parse(p.settledAt || p.createdAt || p.eventDate || '') || 0;
     const isExpired = settleTs > 0 && (now - settleTs) > cutoffMs;
 
     if (isSettled && isExpired) {
@@ -7239,9 +7255,9 @@ function isTrackedPickVisibleOnPage(pick) {
     if (!ts) return false;
     return (Date.now() - ts) / (1000 * 60 * 60) < 48; 
   } else {
-    // FIX: Hide settled picks exactly 10 hours after they are graded
-    // VISIBILITY FIX: fall back to createdAt → eventDate if settledAt is missing
-    const settleTs = Date.parse(pick.settledAt || pick.updatedAt || pick.createdAt || pick.eventDate || '') || 0;
+    // FIX: Hide settled picks exactly 10 hours after they are graded.
+    // Do NOT fall back to updatedAt — it resets on every sync and breaks the window.
+    const settleTs = Date.parse(pick.settledAt || pick.createdAt || pick.eventDate || '') || 0;
     if (!settleTs) return true;
     return (Date.now() - settleTs) / (1000 * 60 * 60) < 10;
   }
