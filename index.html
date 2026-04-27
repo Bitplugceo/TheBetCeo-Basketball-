@@ -3100,7 +3100,7 @@ const TEAM_MEMORY_RULES = {
 // To enable live tracker influence on picks, set advisoryOnly: false AND set
 // PHASE2_CONTROL.trackerFeedbackLive = true (requires 20+ settled picks first).
 const TRACKER_POLICY = {
-  advisoryOnly: true,
+  advisoryOnly: false, // U6: Self-calibration live at 20+ picks
   dailyWatchlistOnly: false,
   reviewCheckpointSettled: 20,
   policyVersion: "soft_tracker_advisory_v3"
@@ -3119,7 +3119,7 @@ const TRACKER_SOFT_EFFECTS = {
 };
 
 const PHASE2_CONTROL = {
-  mode: "shadow", // phase-2 dashboards stay in shadow; separate soft tracker influence is allowed to alter live picks/locks
+  mode: "auto", // U6: Auto-activates at 20+ settled picksoards stay in shadow; separate soft tracker influence is allowed to alter live picks/locks
   trackerFeedbackLive: false,
   teamMemoryLive: false
 };
@@ -9159,6 +9159,20 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
           if (settled !== "pending" && pick.resultStatus !== settled) {
             pick.resultStatus = settled;
             pick.settledAt = new Date().toISOString();
+            // U4: CLV — capture closing line at settlement
+            if (!pick.closingLine) {
+              const _cl = (isFinite(pick.latestSeenLine) && pick.latestSeenLine > 0)
+                ? pick.latestSeenLine
+                : (isFinite(pick.lineAtPick) ? pick.lineAtPick : pick.line);
+              if (isFinite(_cl) && _cl > 0) {
+                pick.closingLine = _cl;
+                const _lp = isFinite(pick.lineAtPick) ? pick.lineAtPick : (isFinite(pick.line) ? pick.line : null);
+                if (isFinite(_lp)) {
+                  pick.clvDelta = _lp - _cl;
+                  pick.clvBeat = (pick.side === "over" && pick.clvDelta > 0) || (pick.side === "under" && pick.clvDelta < 0);
+                }
+              }
+            }
             changed = true;
           }
         }
@@ -9202,6 +9216,17 @@ function addTrackedPicks(newPicks) {
 
   newPicks.forEach(raw => {
     const p = ensureTrackedPickKeys(raw);
+
+    // U5: Period Correlation Gate — prevent FT+1H+2H all locking same game simultaneously
+    if (p.isLock && p.eventId) {
+      const _allExisting = [...current, ...(Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [])];
+      const _alreadyLocked = _allExisting.some(ex =>
+        ex && ex.eventId === p.eventId && ex.isLock === true &&
+        ex.marketKey !== p.marketKey &&
+        (!ex.resultStatus || ex.resultStatus === "pending")
+      );
+      if (_alreadyLocked) { p.isLock = false; p.correlationGated = true; }
+    }
 
     // --- LEVEL 3 FIX: PRE-EMPTIVE DATA SLIMMING ---
     if (p.diagnostics) {
@@ -11195,6 +11220,14 @@ return isPreGame && !gameHasStarted;
   validateFetchSection();
   accordionOpen("espnSection");
   setStatusHTML('<span class="spinner"></span>Match selected. Fetching stats...', "loading");
+  // U2c: Auto-fetch referees when fixture selected (NBA only)
+  try {
+    const _fOpt = (()=>{ const s=document.getElementById("fixtureSelect"); return s&&s.options[s.selectedIndex]; })();
+    const _lid = document.getElementById("leagueSelect")?.value;
+    if (_fOpt && _fOpt.dataset && _fOpt.dataset.eventId && _lid === "nba") {
+      fetchGameReferees(_fOpt.dataset.eventId, "nba").then(r => { g_gameReferees = r||[]; }).catch(()=>{ g_gameReferees=[]; });
+    } else { g_gameReferees = []; }
+  } catch(e) { g_gameReferees = []; }
   fetchESPN();
 }
 
@@ -11808,6 +11841,63 @@ function getMarketKeyFromName(name) {
   return "other";
 }
 
+
+// ── U1: Pythagorean Strength + Net Rating Power Index ──
+function computePythagoreanPowerIndex(ortgArr, drtgArr) {
+  if (!ortgArr || !drtgArr || ortgArr.length < 2 || drtgArr.length < 2) return null;
+  const ortg = ortgArr.reduce((a, b) => a + Number(b), 0) / ortgArr.length;
+  const drtg = drtgArr.reduce((a, b) => a + Number(b), 0) / drtgArr.length;
+  if (!isFinite(ortg) || !isFinite(drtg) || drtg <= 0) return null;
+  const exp = 14;
+  const oE = Math.pow(ortg, exp), dE = Math.pow(drtg, exp);
+  const pythWin = oE / (oE + dE);
+  const netRtg = ortg - drtg;
+  const powerIndex = (pythWin - 0.5) * 20 + netRtg * 0.5;
+  return { pythWin, netRtg, powerIndex, ortg, drtg };
+}
+
+// ── U2: Referee Tendency System ──
+const NBA_REF_FOUL_PROFILES = {
+  "marc davis":{ foulBias:2.1 }, "scott foster":{ foulBias:1.8 },
+  "tony brothers":{ foulBias:1.6 }, "ken mauer":{ foulBias:1.4 },
+  "bill kennedy":{ foulBias:0.8 }, "ed malloy":{ foulBias:0.5 },
+  "nate green":{ foulBias:0.3 }, "tom washington":{ foulBias:0.2 },
+  "zach zarba":{ foulBias:-0.3 }, "justin van duyne":{ foulBias:-0.4 },
+  "james capers":{ foulBias:-0.6 }, "jason phillips":{ foulBias:-0.9 },
+  "ben taylor":{ foulBias:-1.2 }, "derek richardson":{ foulBias:-1.5 },
+  "john goble":{ foulBias:-1.3 }
+};
+let g_gameReferees = [];
+
+function computeRefTendencyAdjust(refs, league) {
+  if (!Array.isArray(refs) || !refs.length || league !== "nba") return 0;
+  let total = 0, count = 0;
+  refs.forEach(name => {
+    const p = NBA_REF_FOUL_PROFILES[name.toLowerCase().trim()];
+    if (p) { total += p.foulBias; count++; }
+  });
+  return count ? (total / count) * 0.75 : 0;
+}
+
+async function fetchGameReferees(eventId, league) {
+  if (!eventId || league !== "nba") return [];
+  try {
+    const url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=" + eventId;
+    const resp = await fetch(url);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return (data?.officials || []).map(o => (o?.fullName || o?.displayName || "").toLowerCase().trim()).filter(Boolean);
+  } catch(e) { return []; }
+}
+
+// ── U3: SOS Proxy ──
+function computeSosProxy(allowedArr, leagueExpectedHalf) {
+  if (!Array.isArray(allowedArr) || allowedArr.length < 2 || !leagueExpectedHalf) return 1.0;
+  const avg = allowedArr.reduce((a, b) => a + Number(b), 0) / allowedArr.length;
+  if (!isFinite(avg) || avg <= 0) return 1.0;
+  return Math.max(0.80, Math.min(1.20, avg / leagueExpectedHalf));
+}
+
 function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const cl = getEffectivePaceClamp(league);
@@ -11896,6 +11986,36 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
 
+
+
+  // ── U1b: Pythagorean Power Index 30% blend ──
+  const _pythA = computePythagoreanPowerIndex(g_massacreFetchContext.A.ortg10||[], g_massacreFetchContext.A.drtg10||[]);
+  const _pythB = computePythagoreanPowerIndex(g_massacreFetchContext.B.ortg10||[], g_massacreFetchContext.B.drtg10||[]);
+  if (isFinite(projAFT) && _pythA) {
+    const adj = 1 + (_pythA.pythWin / 0.5 - 1) * 0.20;
+    projAFT = projAFT * 0.70 + (projAFT * adj) * 0.30;
+  }
+  if (isFinite(projBFT) && _pythB) {
+    const adj = 1 + (_pythB.pythWin / 0.5 - 1) * 0.20;
+    projBFT = projBFT * 0.70 + (projBFT * adj) * 0.30;
+  }
+
+  // ── U3: SOS correction 40% blend ──
+  {
+    const _leagueHalf = (eb || 200) / 2;
+    const _aAll = getAllowedSeries("A","overall","ft",parsed);
+    const _bAll = getAllowedSeries("B","overall","ft",parsed);
+    const sosA = computeSosProxy(_aAll, _leagueHalf);
+    const sosB = computeSosProxy(_bAll, _leagueHalf);
+    if (isFinite(projAFT) && sosA !== 1.0) projAFT = projAFT * 0.60 + (projAFT * sosA) * 0.40;
+    if (isFinite(projBFT) && sosB !== 1.0) projBFT = projBFT * 0.60 + (projBFT * sosB) * 0.40;
+  }
+
+  // ── U2b: Referee tendency adjust ──
+  {
+    const _refAdj = computeRefTendencyAdjust(g_gameReferees, league);
+    if (isFinite(_refAdj) && _refAdj !== 0) { projAFT += _refAdj * 0.5; projBFT += _refAdj * 0.5; }
+  }
 
     // FIX #2 — REST DAYS FACTOR (B2B = -1.6%, 1-day rest = -0.5% per team)
   // g_massacreFetchContext stores restDays per team from ESPN schedule fetch
@@ -13361,6 +13481,22 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
       lockSpan.textContent = "🔒";
       tdPred.appendChild(document.createTextNode(" "));
       tdPred.appendChild(lockSpan);
+    }
+    // U7: Kelly unit recommendation chip
+    if (p.pick !== "NO PLAY" && isFinite(shownEdge) && isFinite(shownLine) && shownLine > 0) {
+      const _edgePct = Math.abs(shownEdge / shownLine);
+      const _b = 100 / 110; // -110 juice
+      const _p = 0.5 + _edgePct * 0.5;
+      const _q = 1 - _p;
+      const _kellyFrac = (_p * _b - _q) / _b;
+      const _quarterKelly = _kellyFrac / 4;
+      const _units = Math.max(0.5, Math.min(5.0, Math.round(_quarterKelly * 40 * 2) / 2));
+      if (_units >= 0.5) {
+        const kellySpan = document.createElement("span");
+        kellySpan.style.cssText = "display:block;font-size:9px;font-weight:800;opacity:0.82;margin-top:2px;letter-spacing:0.3px;";
+        kellySpan.textContent = _units.toFixed(1) + "u";
+        tdPred.appendChild(kellySpan);
+      }
     }
     row.appendChild(tdPred);
 
