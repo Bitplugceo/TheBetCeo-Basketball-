@@ -7461,6 +7461,116 @@ function renderTrackedPicks() {
 let g_lastRenderedTrackerVersion = null;
 let g_lastRenderedTrackerView = null;
 
+
+// ── ARCHIVE DEBUG PANEL ──────────────────────────────────────────────────────
+// Shows every pick's archive eligibility in real time so you can see exactly
+// why a pick is or isn't being swept out of the active bucket.
+function buildArchiveDebugHtml() {
+  const now = Date.now();
+  const cutoffMs = TRACKER_ARCHIVE_AFTER_HOURS * 60 * 60 * 1000;
+  const active   = Array.isArray(g_trackerState.activePicks)   ? g_trackerState.activePicks   : [];
+  const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
+
+  function safeDate(val) {
+    if (!val) return null;
+    const ms = Date.parse(String(val));
+    return isFinite(ms) ? ms : null;
+  }
+
+  function ageStr(ms) {
+    if (!ms) return "—";
+    const diff = now - ms;
+    const h = Math.floor(diff / 3600000);
+    const m = Math.floor((diff % 3600000) / 60000);
+    return `${h}h ${m}m ago`;
+  }
+
+  function rowHtml(pick, bucket) {
+    const p         = ensureTrackedPickKeys({...pick});
+    const status    = String(p.resultStatus || "pending").toLowerCase();
+    const isSettled = ["win","loss","push"].includes(status);
+    const settledAt = safeDate(p.settledAt);
+    const createdAt = safeDate(p.createdAt);
+    const updatedAt = safeDate(p.updatedAt);
+    const eventDate = safeDate(p.eventDate);
+    const settleTs  = settledAt || createdAt || eventDate || 0;
+    const ageMs     = settleTs ? now - settleTs : null;
+    const isExpired = settleTs > 0 && (now - settleTs) >= cutoffMs;
+
+    const label     = `${p.homeTeam || "?"} vs ${p.awayTeam || "?"} · ${p.marketKey || "?"} · ${p.league || "?"}`;
+    const dateStr   = p.eventDate ? p.eventDate.substring(0,10) : "—";
+
+    // Status colour
+    const statusColor = status === "win" ? "#4caf50" : status === "loss" ? "#f44336" : status === "push" ? "#ff9800" : "#aaa";
+    const bucketColor = bucket === "archived" ? "#888" : "#ccc";
+
+    // Archive eligibility
+    let eligHtml = "";
+    if (!isSettled) {
+      eligHtml = `<span style="color:#aaa">⏳ Pending — not eligible</span>`;
+    } else if (!settleTs) {
+      eligHtml = `<span style="color:#f44336">❌ NO TIMESTAMP — settledAt:${p.settledAt||"null"} createdAt:${p.createdAt||"null"} eventDate:${p.eventDate||"null"}</span>`;
+    } else if (!isExpired) {
+      const hoursLeft = ((cutoffMs - (now - settleTs)) / 3600000).toFixed(1);
+      eligHtml = `<span style="color:#ff9800">⏰ ${hoursLeft}h until archive (clock: settledAt=${p.settledAt ? "✓" : "✗"} createdAt=${p.createdAt ? "✓" : "✗"})</span>`;
+    } else {
+      eligHtml = `<span style="color:#4caf50">✅ SHOULD BE ARCHIVED (${ageStr(settleTs)})</span>`;
+    }
+
+    return `<div style="border-bottom:1px solid #2a2a2a;padding:8px 0;font-size:12px;font-family:monospace">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span style="color:${bucketColor};font-weight:bold;min-width:60px">[${bucket.toUpperCase()}]</span>
+        <span style="color:${statusColor};font-weight:bold;min-width:36px">${status.toUpperCase()}</span>
+        <span style="color:#ddd">${dateStr} · ${label}</span>
+      </div>
+      <div style="margin-top:4px;padding-left:68px">
+        ${eligHtml}
+      </div>
+      <div style="margin-top:2px;padding-left:68px;color:#666;font-size:11px">
+        settledAt: ${p.settledAt || "null"} &nbsp;|&nbsp;
+        createdAt: ${p.createdAt ? p.createdAt.substring(0,19) : "null"} &nbsp;|&nbsp;
+        updatedAt: ${p.updatedAt ? p.updatedAt.substring(0,19) : "null"}
+      </div>
+    </div>`;
+  }
+
+  const settledActive   = active.filter(p => ["win","loss","push"].includes(String(p.resultStatus||"").toLowerCase()));
+  const pendingActive   = active.filter(p => !["win","loss","push"].includes(String(p.resultStatus||"").toLowerCase()));
+  const stuckPicks      = settledActive.filter(p => {
+    const pp = ensureTrackedPickKeys({...p});
+    const settleTs = safeDate(pp.settledAt) || safeDate(pp.createdAt) || safeDate(pp.eventDate) || 0;
+    return settleTs > 0 && (now - settleTs) >= cutoffMs;
+  });
+
+  const headerHtml = `
+    <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px;font-size:13px">
+      <span style="color:#4caf50">✅ Active (settled): <strong>${settledActive.length}</strong></span>
+      <span style="color:#aaa">⏳ Active (pending): <strong>${pendingActive.length}</strong></span>
+      <span style="color:#888">📦 Archived: <strong>${archived.length}</strong></span>
+      <span style="color:${stuckPicks.length > 0 ? "#f44336" : "#4caf50"}">
+        ${stuckPicks.length > 0 ? "🚨" : "✅"} Stuck (should be archived): <strong>${stuckPicks.length}</strong>
+      </span>
+    </div>`;
+
+  const activeRows   = [...settledActive, ...pendingActive].map(p => rowHtml(p, "active")).join("");
+  const archivedRows = archived.slice(0, 20).map(p => rowHtml(p, "archived")).join("");
+
+  return `
+    <div style="background:#111;border:1px solid #333;border-radius:8px;padding:16px;margin-bottom:20px">
+      <div style="font-size:15px;font-weight:bold;color:#fff;margin-bottom:4px">🗂 Archive Diagnostics</div>
+      <div style="font-size:12px;color:#888;margin-bottom:12px">
+        Cutoff: ${TRACKER_ARCHIVE_AFTER_HOURS}h &nbsp;|&nbsp; Now: ${new Date(now).toLocaleTimeString([], {hour12:false})} &nbsp;|&nbsp;
+        Clock source: settledAt → createdAt → eventDate (no updatedAt)
+      </div>
+      ${headerHtml}
+      <div style="max-height:420px;overflow-y:auto;border-top:1px solid #222;padding-top:8px">
+        <div style="color:#aaa;font-size:11px;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Active Picks</div>
+        ${activeRows || '<div style="color:#555;font-size:12px">No active picks</div>'}
+        ${archived.length ? `<div style="color:#555;font-size:11px;margin-top:12px;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Archived (last 20)</div>${archivedRows}` : ""}
+      </div>
+    </div>`;
+}
+
 function renderTrackerAnalytics() {
   const panel = document.getElementById("trackerAnalyticsPanel");
   if (!panel) return;
@@ -8384,6 +8494,7 @@ function renderTrackerAnalytics() {
       </div>
     `;
   } else if (currentView === "debug") {
+    const archiveDebugHtml = buildArchiveDebugHtml();
     panel.innerHTML = `
       <div class="tracker-analytics-shell">
         <div class="tracker-analytics-topbar">
@@ -8393,6 +8504,7 @@ function renderTrackerAnalytics() {
             <div class="tracker-analytics-subtitle">Critical system alerts and completion status.</div>
           </div>
         </div>
+        ${archiveDebugHtml}
         ${debugBodyHtml}
       </div>
     `;
