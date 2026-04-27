@@ -7149,9 +7149,10 @@ function archiveExpiredTrackedPicks() {
   const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
   const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
   const now = Date.now();
-  const cutoffMs = 10 * 60 * 60 * 1000; // 10 hours
+  
+  // Expire 14 hours after game tip-off (approx 3h game + 11h buffer)
+  const cutoffMs = 14 * 60 * 60 * 1000; 
 
-  // Helper to remove massive diagnostic objects to prevent storage bloat and UI lag
   const stripHeavyData = (pick) => {
     const lean = { ...pick };
     if (lean.diagnostics) {
@@ -7181,15 +7182,9 @@ function archiveExpiredTrackedPicks() {
     const p = ensureTrackedPickKeys({ ...pick });
     const isSettled = ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase());
     
-    // FIX: STRICTLY use settledAt. Do not fall back to createdAt.
-    // ARCHIVE FIX: fall back to createdAt → eventDate if settledAt is missing
-    // FIX 1: Only use settledAt (or createdAt/eventDate as last resort).
-    // updatedAt is intentionally excluded — it resets on every sync cycle
-    // and would push the 10-hour clock forward indefinitely.
-    // settledAt is backfilled from createdAt/eventDate in ensureTrackedPickKeys
-    // so by the time we reach here, settledAt should always be populated.
-    const settleTs = Date.parse(p.settledAt || p.createdAt || p.eventDate || '') || 0;
-    const isExpired = settleTs > 0 && (now - settleTs) >= cutoffMs;
+    // Base the archive sweep strictly on the game time, so old games sweep immediately
+    const gameTs = Date.parse(p.eventDate || p.createdAt || '') || 0;
+    const isExpired = gameTs > 0 && (now - gameTs) >= cutoffMs;
 
     if (isSettled && isExpired) {
       moveToArchived.push(stripHeavyData(p));
@@ -7215,6 +7210,7 @@ function archiveExpiredTrackedPicks() {
   }
   return changed;
 }
+
 
 
 
@@ -7258,20 +7254,21 @@ function getTrackedPickTimeMs(pick) {
 function isTrackedPickVisibleOnPage(pick) {
   if (!pick) return false;
   const status = String(pick.resultStatus || "pending").toLowerCase();
+  
+  // Anchor everything to the game tip-off time (eventDate)
+  const gameTs = Date.parse(pick.eventDate || pick.createdAt || '') || 0;
 
   if (status === "pending") {
     // Keep pending games visible for up to 48 hours just in case of API delays
-    const ts = pick.createdAt ? Date.parse(pick.createdAt) : (pick.eventDate ? Date.parse(pick.eventDate) : 0);
-    if (!ts) return false;
-    return (Date.now() - ts) / (1000 * 60 * 60) < 48; 
+    if (!gameTs) return false;
+    return (Date.now() - gameTs) / (1000 * 60 * 60) < 48; 
   } else {
-    // FIX: Hide settled picks exactly 10 hours after they are graded.
-    // Do NOT fall back to updatedAt — it resets on every sync and breaks the window.
-    const settleTs = Date.parse(pick.settledAt || pick.createdAt || pick.eventDate || '') || 0;
-    if (!settleTs) return true;
-    return (Date.now() - settleTs) / (1000 * 60 * 60) < 10;
+    // Hide settled picks exactly 14 hours after game tip-off (3h game + 11h buffer)
+    if (!gameTs) return true;
+    return (Date.now() - gameTs) / (1000 * 60 * 60) < 14;
   }
 }
+
 
 function getCurrentFixtureMeta() {
   const fixtureSelect = document.getElementById("fixtureSelect");
@@ -7471,187 +7468,106 @@ let g_lastRenderedTrackerView = null;
 // ── POWER DEBUG PANEL ────────────────────────────────────────────────────────
 function buildArchiveDebugHtml() {
   const now = Date.now();
-  const cutoffMs = TRACKER_ARCHIVE_AFTER_HOURS * 60 * 60 * 1000;
+  const cutoffMs = 14 * 60 * 60 * 1000; // 14 hours
   const active   = Array.isArray(g_trackerState.activePicks)   ? g_trackerState.activePicks.map(p => ensureTrackedPickKeys({...p}))   : [];
   const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks.map(p => ensureTrackedPickKeys({...p})) : [];
 
   // ── helpers ──
   function safeMs(v) { if (!v) return 0; const ms = Date.parse(String(v)); return isFinite(ms) ? ms : 0; }
-  function ageStr(ms) { if (!ms) return "—"; const d = now - ms; return `${Math.floor(d/3600000)}h ${Math.floor((d%3600000)/60000)}m`; }
-  function ts(v) { return v ? String(v).substring(0,19).replace("T"," ") : `<span style="color:#f44336">null</span>`; }
-  function badge(color, text) { return `<span style="background:${color};color:#000;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:bold">${text}</span>`; }
+  function ageStr(ms) { if (!ms) return "—"; const d = now - ms; return `${Math.floor(d/3600000)}h`; }
+  // FIX: Compact timestamps (04-27 21:07) to save space
+  function ts(v) { return v ? String(v).substring(5,16).replace("T"," ") : `<span style="color:#f44336">-</span>`; }
+  function badge(color, text) { return `<span style="background:${color};color:#000;padding:1px 4px;border-radius:3px;font-size:9px;font-weight:bold">${text}</span>`; }
+
+  const tableStyles = `width:100%; table-layout:fixed; word-wrap:break-word; border-collapse:collapse; font-size:10px; font-family:ui-monospace, monospace;`;
 
   // ── SECTION 1: ARCHIVE STATUS ──
   const stuckPicks = active.filter(p => {
     if (!["win","loss","push"].includes(p.resultStatus)) return false;
-    const st = safeMs(p.settledAt) || safeMs(p.createdAt) || safeMs(p.eventDate);
+    const st = safeMs(p.eventDate) || safeMs(p.createdAt);
     return st > 0 && (now - st) >= cutoffMs;
   });
 
   let archiveRows = "";
   [...active, ...archived].forEach(p => {
-    const bucket = archived.includes(p) ? "ARCHIVED" : "ACTIVE";
+    const bucket = archived.includes(p) ? "ARCH" : "ACTV";
     const settled = ["win","loss","push"].includes(p.resultStatus);
-    const settledAtMs = safeMs(p.settledAt);
-    const createdAtMs = safeMs(p.createdAt);
-    const updatedAtMs = safeMs(p.updatedAt);
-    const settleTs = settledAtMs || createdAtMs || safeMs(p.eventDate);
-    const isExpired = settleTs > 0 && (now - settleTs) >= cutoffMs;
-    const label = `${(p.homeTeam||"?").substring(0,12)} vs ${(p.awayTeam||"?").substring(0,12)} · ${p.marketKey||"?"} · ${(p.eventDate||"").substring(0,10)}`;
+    const gameTs = safeMs(p.eventDate) || safeMs(p.createdAt);
+    const isExpired = gameTs > 0 && (now - gameTs) >= cutoffMs;
+    const label = `${(p.homeTeam||"?").substring(0,10)} vs ${(p.awayTeam||"?").substring(0,10)}`;
 
     let eligBadge = "";
     if (!settled) {
-      eligBadge = badge("#555","PENDING");
-    } else if (!settleTs) {
-      eligBadge = badge("#f44336","NO TIMESTAMP");
+      eligBadge = badge("#555","PEND");
+    } else if (!gameTs) {
+      eligBadge = badge("#f44336","NO TS");
     } else if (isExpired) {
-      eligBadge = badge(bucket==="ACTIVE" ? "#f44336" : "#4caf50", bucket==="ACTIVE" ? "STUCK ❌" : `ARCHIVED ✅ (${ageStr(settleTs)} ago)`);
+      eligBadge = badge(bucket==="ACTV" ? "#f44336" : "#4caf50", bucket==="ACTV" ? "STUCK" : `OK`);
     } else {
-      const hoursLeft = ((cutoffMs - (now - settleTs)) / 3600000).toFixed(1);
-      eligBadge = badge("#ff9800",`${hoursLeft}h left`);
+      eligBadge = badge("#ff9800",`WAIT`);
     }
 
     archiveRows += `<tr style="border-bottom:1px solid #1e1e1e">
-      <td style="padding:5px 4px;color:${bucket==="ARCHIVED"?"#666":"#ccc"}">${bucket}</td>
-      <td style="padding:5px 4px;color:${p.resultStatus==="win"?"#4caf50":p.resultStatus==="loss"?"#f44336":"#aaa"}">${(p.resultStatus||"pending").toUpperCase()}</td>
-      <td style="padding:5px 4px;color:#aaa;font-size:11px">${label}</td>
-      <td style="padding:5px 4px">${eligBadge}</td>
-      <td style="padding:5px 4px;color:#555;font-size:10px">${ts(p.settledAt)}</td>
-      <td style="padding:5px 4px;color:#555;font-size:10px">${ts(p.createdAt)}</td>
-      <td style="padding:5px 4px;color:#444;font-size:10px">${ts(p.updatedAt)}</td>
+      <td style="padding:4px 2px;color:${bucket==="ARCH"?"#666":"#ccc"}">${bucket}</td>
+      <td style="padding:4px 2px;color:${p.resultStatus==="win"?"#4caf50":p.resultStatus==="loss"?"#f44336":"#aaa"}">${(p.resultStatus||"pend").substring(0,4).toUpperCase()}</td>
+      <td style="padding:4px 2px;color:#aaa;font-size:9px">${label}</td>
+      <td style="padding:4px 2px">${eligBadge}</td>
+      <td style="padding:4px 2px;color:#555;font-size:9px">${ts(p.eventDate)}</td>
+      <td style="padding:4px 2px;color:#444;font-size:9px">${ts(p.updatedAt)}</td>
     </tr>`;
   });
 
   const archiveSection = `
-    <div style="background:#111;border:1px solid #333;border-radius:8px;padding:14px;margin-bottom:16px">
-      <div style="font-size:14px;font-weight:bold;color:#fff;margin-bottom:2px">🗂 Archive Status</div>
-      <div style="font-size:11px;color:#666;margin-bottom:10px">Cutoff: ${TRACKER_ARCHIVE_AFTER_HOURS}h | Clock: settledAt → createdAt → eventDate (NO updatedAt)</div>
-      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px;font-size:12px">
-        <span>Active settled: <b style="color:${active.filter(p=>["win","loss","push"].includes(p.resultStatus)).length?"#ff9800":"#4caf50"}">${active.filter(p=>["win","loss","push"].includes(p.resultStatus)).length}</b></span>
-        <span>Active pending: <b style="color:#aaa">${active.filter(p=>!["win","loss","push"].includes(p.resultStatus)).length}</b></span>
-        <span>Archived: <b style="color:#888">${archived.length}</b></span>
-        <span>🚨 Stuck: <b style="color:${stuckPicks.length?"#f44336":"#4caf50"}">${stuckPicks.length}</b></span>
-      </div>
-      <div style="overflow-x:auto">
-        <table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">
-          <thead><tr style="color:#555;border-bottom:1px solid #2a2a2a">
-            <th style="padding:4px;text-align:left">Bucket</th><th style="padding:4px;text-align:left">Status</th>
-            <th style="padding:4px;text-align:left">Pick</th><th style="padding:4px;text-align:left">Archive</th>
-            <th style="padding:4px;text-align:left">settledAt</th><th style="padding:4px;text-align:left">createdAt</th>
-            <th style="padding:4px;text-align:left">updatedAt</th>
-          </tr></thead>
-          <tbody>${archiveRows}</tbody>
-        </table>
-      </div>
-    </div>`;
-
-  // ── SECTION 2: SETTLEMENT (ESPN API) ──
-  let settlementRows = "";
-  active.filter(p => !["win","loss","push"].includes(p.resultStatus)).forEach(p => {
-    const hasEventId = !!(p.eventId && String(p.eventId).trim());
-    const hasLeagueBase = !!getTrackedLeagueBase(String(p.league||""));
-    const ageHrs = safeMs(p.createdAt) ? ((now - safeMs(p.createdAt)) / 3600000).toFixed(1) : "?";
-    const label = `${(p.homeTeam||"?").substring(0,12)} vs ${(p.awayTeam||"?").substring(0,12)} · ${p.marketKey||"?"} · ${(p.eventDate||"").substring(0,10)}`;
-
-    let reasonBadge = "";
-    if (!hasLeagueBase)   reasonBadge = badge("#f44336", `UNSUPPORTED LEAGUE: ${p.league||"null"}`);
-    else if (!hasEventId) reasonBadge = badge("#f44336", "NO EVENT ID ← can never auto-settle");
-    else                  reasonBadge = badge("#2196f3", `ESPN: ${p.league}/${p.eventId}`);
-
-    settlementRows += `<tr style="border-bottom:1px solid #1e1e1e">
-      <td style="padding:5px 4px;color:#aaa;font-size:11px">${label}</td>
-      <td style="padding:5px 4px;color:#888;font-size:10px">${ageHrs}h old</td>
-      <td style="padding:5px 4px">${reasonBadge}</td>
-      <td style="padding:5px 4px;color:#555;font-size:10px">${p.eventId||"—"}</td>
-    </tr>`;
-  });
-
-  const settlementSection = `
-    <div style="background:#111;border:1px solid #333;border-radius:8px;padding:14px;margin-bottom:16px">
-      <div style="font-size:14px;font-weight:bold;color:#fff;margin-bottom:2px">🏀 Auto-Settlement Check</div>
-      <div style="font-size:11px;color:#666;margin-bottom:10px">Why each pending pick is or isn't being auto-settled via ESPN API</div>
-      ${settlementRows ? `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">
+    <div style="background:#111;border:1px solid #333;border-radius:8px;padding:10px;margin-bottom:12px">
+      <div style="font-size:12px;font-weight:bold;color:#fff;margin-bottom:2px">🗂 Archive Status</div>
+      <div style="font-size:10px;color:#666;margin-bottom:6px">Cutoff: 14h after tip-off (eventDate)</div>
+      <table style="${tableStyles}">
         <thead><tr style="color:#555;border-bottom:1px solid #2a2a2a">
-          <th style="padding:4px;text-align:left">Pick</th><th style="padding:4px;text-align:left">Age</th>
-          <th style="padding:4px;text-align:left">Reason</th><th style="padding:4px;text-align:left">Event ID</th>
-        </tr></thead><tbody>${settlementRows}</tbody></table></div>`
-        : `<div style="color:#4caf50;font-size:12px">✅ No pending picks needing settlement</div>`}
+          <th style="padding:4px 2px;text-align:left;width:15%">Box</th>
+          <th style="padding:4px 2px;text-align:left;width:15%">Stat</th>
+          <th style="padding:4px 2px;text-align:left;width:35%">Match</th>
+          <th style="padding:4px 2px;text-align:left;width:15%">Ready</th>
+          <th style="padding:4px 2px;text-align:left;width:10%">event</th>
+          <th style="padding:4px 2px;text-align:left;width:10%">update</th>
+        </tr></thead>
+        <tbody>${archiveRows}</tbody>
+      </table>
     </div>`;
 
-  // ── SECTION 3: MERGE RACE (flickering) ──
-  // getTrackerPickStamp uses updatedAt FIRST — this causes server's stale pending
-  // copy (with fresh updatedAt from last sync) to beat the locally-settled copy.
-  let mergeRows = "";
-  active.filter(p => ["win","loss","push"].includes(p.resultStatus)).forEach(p => {
-    const updatedAtMs = safeMs(p.updatedAt);
-    const settledAtMs = safeMs(p.settledAt);
-    const createdAtMs = safeMs(p.createdAt);
-    const stampUsed = updatedAtMs || settledAtMs || createdAtMs;
-    const stampSource = updatedAtMs ? "updatedAt ⚠️" : settledAtMs ? "settledAt ✅" : "createdAt";
-    const label = `${(p.homeTeam||"?").substring(0,12)} vs ${(p.awayTeam||"?").substring(0,12)} · ${p.marketKey||"?"} · ${p.resultStatus}`;
-    const risk = updatedAtMs > settledAtMs && settledAtMs > 0 ? badge("#f44336","FLICKER RISK: updatedAt > settledAt") : badge("#4caf50","OK");
-    const srcTag = p.settlementSource ? badge(p.settlementSource==="manual"?"#9c27b0":p.settlementSource==="api"?"#2196f3":"#555", p.settlementSource.toUpperCase()) : badge("#555","NONE ⚠️");
-
-    mergeRows += `<tr style="border-bottom:1px solid #1e1e1e">
-      <td style="padding:5px 4px;color:#aaa;font-size:11px">${label}</td>
-      <td style="padding:5px 4px;color:${stampSource.includes("⚠️")?"#ff9800":"#4caf50"};font-size:10px">${stampSource}</td>
-      <td style="padding:5px 4px;color:#555;font-size:10px">${ts(p.updatedAt)}</td>
-      <td style="padding:5px 4px;color:#555;font-size:10px">${ts(p.settledAt)}</td>
-      <td style="padding:5px 4px">${srcTag}</td>
-      <td style="padding:5px 4px">${risk}</td>
-    </tr>`;
-  });
-
-  const mergeSection = `
-    <div style="background:#111;border:1px solid #333;border-radius:8px;padding:14px;margin-bottom:16px">
-      <div style="font-size:14px;font-weight:bold;color:#fff;margin-bottom:2px">🔀 Merge Race / Flicker Check</div>
-      <div style="font-size:11px;color:#666;margin-bottom:10px">
-        <b style="color:#ff9800">Root cause of flickering:</b> getTrackerPickStamp() uses updatedAt first.
-        If server's stale pending copy has a newer updatedAt than local settled copy → server wins → pick reverts to pending.
-      </div>
-      ${mergeRows ? `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">
-        <thead><tr style="color:#555;border-bottom:1px solid #2a2a2a">
-          <th style="padding:4px;text-align:left">Pick</th><th style="padding:4px;text-align:left">Stamp source</th>
-          <th style="padding:4px;text-align:left">updatedAt</th><th style="padding:4px;text-align:left">settledAt</th>
-          <th style="padding:4px;text-align:left">settlementSource</th><th style="padding:4px;text-align:left">Risk</th>
-        </tr></thead><tbody>${mergeRows}</tbody></table></div>`
-        : `<div style="color:#4caf50;font-size:12px">✅ No settled picks in active bucket to check</div>`}
-    </div>`;
-
-    // ── SECTION 4: SETTLEMENT ATTEMPT LOG ──
+  // ── SECTION 2: SETTLEMENT ATTEMPTS ──
   let attemptRows = "";
   g_settlementDebugLog.forEach((entry, key) => {
     const statusColor = entry.status.startsWith("✅") ? "#4caf50" : entry.status.startsWith("⏳") ? "#aaa" : "#f44336";
+    // Clean up the pick name to fit perfectly
+    const cleanPick = entry.pick.replace(" · ", "<br>").substring(0, 35);
+    
     attemptRows += `<tr style="border-bottom:1px solid #1e1e1e">
-      <td style="padding:5px 4px;color:#aaa;font-size:11px">${entry.pick}</td>
-      <td style="padding:5px 4px;color:${statusColor};font-size:11px">${entry.status}</td>
-      <td style="padding:5px 4px;color:#555;font-size:10px">${entry.stateName||"—"} / ${entry.statusName||"—"}</td>
-      <td style="padding:5px 4px;color:#555;font-size:10px">clock:${entry.clock||"—"} p:${entry.period||"—"}</td>
-      <td style="padding:5px 4px;color:#555;font-size:10px">actual:${entry.actual ?? "—"} line:${entry.line ?? "—"}</td>
-      <td style="padding:5px 4px;color:#444;font-size:10px">${entry.ts||"—"}</td>
+      <td style="padding:4px 2px;color:#aaa;font-size:9px">${cleanPick}</td>
+      <td style="padding:4px 2px;color:${statusColor};font-size:9px">${entry.status.replace("SETTLED: ", "")}</td>
+      <td style="padding:4px 2px;color:#555;font-size:9px">${entry.stateName||"—"}</td>
+      <td style="padding:4px 2px;color:#555;font-size:9px">${entry.actual ?? "—"} / ${entry.line ?? "—"}</td>
+      <td style="padding:4px 2px;color:#444;font-size:9px">${entry.ts||"—"}</td>
     </tr>`;
   });
 
-
-
   const attemptSection = `
-    <div style="background:#111;border:1px solid #333;border-radius:8px;padding:14px;margin-bottom:16px">
-      <div style="font-size:14px;font-weight:bold;color:#fff;margin-bottom:2px">📡 ESPN Settlement Attempts</div>
-      <div style="font-size:11px;color:#666;margin-bottom:10px">Live log of every ESPN API response for pending picks. Updates on each refresh cycle.</div>
-      ${attemptRows ? `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">
+    <div style="background:#111;border:1px solid #333;border-radius:8px;padding:10px;margin-bottom:12px">
+      <div style="font-size:12px;font-weight:bold;color:#fff;margin-bottom:2px">📡 ESPN API Responses</div>
+      <div style="font-size:10px;color:#666;margin-bottom:6px">Live log of server pings</div>
+      ${attemptRows ? `<table style="${tableStyles}">
         <thead><tr style="color:#555;border-bottom:1px solid #2a2a2a">
-          <th style="padding:4px;text-align:left">Pick</th>
-          <th style="padding:4px;text-align:left">Result</th>
-          <th style="padding:4px;text-align:left">State/Name</th>
-          <th style="padding:4px;text-align:left">Clock/Period</th>
-          <th style="padding:4px;text-align:left">Scores</th>
-          <th style="padding:4px;text-align:left">Time</th>
-        </tr></thead><tbody>${attemptRows}</tbody></table></div>`
-        : `<div style="color:#aaa;font-size:12px">No settlement attempts yet — waiting for refresh cycle...</div>`}
+          <th style="padding:4px 2px;text-align:left;width:35%">Pick</th>
+          <th style="padding:4px 2px;text-align:left;width:20%">API</th>
+          <th style="padding:4px 2px;text-align:left;width:15%">State</th>
+          <th style="padding:4px 2px;text-align:left;width:15%">Act/Line</th>
+          <th style="padding:4px 2px;text-align:left;width:15%">Time</th>
+        </tr></thead><tbody>${attemptRows}</tbody></table>`
+        : `<div style="color:#aaa;font-size:10px">Waiting for refresh cycle...</div>`}
     </div>`;
 
-  return archiveSection + settlementSection + mergeSection + attemptSection;
+  return archiveSection + attemptSection;
 }
+
 
 function renderTrackerAnalytics() {
   const panel = document.getElementById("trackerAnalyticsPanel");
