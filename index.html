@@ -6620,7 +6620,12 @@ if (!data?.state) {
           g_trackerState.updatedAt = new Date().toISOString();
           const pushed = await pushTrackerStateToServer(JSON.parse(JSON.stringify(g_trackerState)));
           if (pushed?.ok && pushed?.state) {
-            normalizeTrackerState(pushed.state);
+            // FIX C — SETTLEMENT GUARD: safe-merge before normalizing so
+            // settled picks are never overwritten by a stale server echo.
+            // (flushTrackerSave has the same pattern — this brings hydrate in line.)
+            const _hydrateSnap = JSON.parse(JSON.stringify(g_trackerState));
+            const _hydrateMerged = mergeTrackerStates(_hydrateSnap, pushed.state);
+            normalizeTrackerState(_hydrateMerged);
             backfillLineMemoryFromTrackedPicks();
             saveTrackerStateToLocal();
             trackerDebug("hydrate push succeeded", {
@@ -7192,8 +7197,9 @@ function archiveExpiredTrackedPicks() {
     const p = ensureTrackedPickKeys({ ...pick });
     const isSettled = ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase());
     
-    // FIX: STRICTLY use settledAt. Do not fall back to createdAt.
-    const settleTs = p.settledAt ? Date.parse(p.settledAt) : 0;
+    // FIX D: use getTrackedPickTimeMs (settledAt → updatedAt → createdAt fallback)
+    // so picks whose settledAt is null still get archived after 10 hours.
+    const settleTs = getTrackedPickTimeMs(p);
     const isExpired = isSettled && settleTs > 0 && (now - settleTs) > cutoffMs;
 
     if (isSettled && isExpired) {
@@ -7270,9 +7276,10 @@ function isTrackedPickVisibleOnPage(pick) {
     if (!ts) return false;
     return (Date.now() - ts) / (1000 * 60 * 60) < 48; 
   } else {
-    // FIX: Hide settled picks exactly 10 hours after they are graded
-    const settleTs = pick.settledAt ? Date.parse(pick.settledAt) : 0;
-    if (!settleTs) return true; 
+    // FIX E: use getTrackedPickTimeMs fallback (settledAt → updatedAt → createdAt)
+    // so picks without settledAt still disappear from the screen after 10 hours.
+    const settleTs = getTrackedPickTimeMs(pick);
+    if (!settleTs) return true;
     return (Date.now() - settleTs) / (1000 * 60 * 60) < 10;
   }
 }
@@ -13564,7 +13571,7 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     row.appendChild(tdPick);
 
     const tdProj = document.createElement("td");
-    tdProj.textContent = isFinite(p.proj) ? p.proj.toFixed(1) : "—"; // FIX: raw value for edge consistency
+    tdProj.textContent = isFinite(p.proj) ? p.proj.toFixed(1) : "—"; // FIX B: raw value keeps Projection consistent with Edge%
     row.appendChild(tdProj);
 
     const tdEdge = document.createElement("td");
@@ -13800,12 +13807,13 @@ const { ftLine, h1Line, h2Line, aLine, bLine } = resolvedLines;
       h2: summarizeCalcForDebug(h2Calc)
     });
 
-  // ═══ FT=1H+2H RECONCILIATION (moved before pick decisions so ftCalc, picks[], and display are all consistent) ═══
+  // ═══ FT=1H+2H RECONCILIATION ═══
+  // Moved here (before pick decisions, confidence grading, and picks[]) so that
+  // ftCalc.ftProj and ftCalc.ftEdge are reconciled before ANYTHING downstream reads them.
   if (isFinite(ftCalc?.ftProj) && isFinite(h1Calc?.h1Proj) && isFinite(h2Calc?.h2Proj)) {
     const _halfSum = h1Calc.h1Proj + h2Calc.h2Proj;
     const _drift = Math.abs(ftCalc.ftProj - _halfSum);
     if (_drift > 4) {
-      // Blend FT toward the half-sum to enforce mathematical consistency
       const _reconFT = ftCalc.ftProj * 0.55 + _halfSum * 0.45;
       ftCalc = { ...ftCalc, ftProj: _reconFT, ftEdge: isFinite(resolvedLines.ftLine) ? _reconFT - resolvedLines.ftLine : NaN };
     }
@@ -14088,7 +14096,7 @@ const markets = finalPicksForDisplay.map(p => ({
 
     const lockIdx = selectLock(markets);
 
-  // [RECONCILIATION MOVED — see early placement below pass 2 projections]
+  // [RECONCILIATION MOVED — applied early, right after pass 2 projections]
 
 
     const trackedToSave = buildResultRows({
