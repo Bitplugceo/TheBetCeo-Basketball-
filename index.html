@@ -11643,12 +11643,13 @@ function buildTeamMarketProjection({
   ownVenueSeries, oppVenueAllowedSeries, h2hSeries, line = NaN,
   injMult = 1, sampleTier = "thin"
 }) {
-  const ownRecent = avgOrNaN(ownRecentSeries);
-  const oppAllowed = avgOrNaN(oppAllowedSeries);
-  const ownVenue = avgOrNaN(ownVenueSeries);
-  const oppVenueAllowed = avgOrNaN(oppVenueAllowedSeries);
+  // BTP FIX: use recency-weighted averages for all scoring series
+  const ownRecent = weightedRecentAverage(ownRecentSeries, MODEL_TUNING.recencyWeights);
+  const oppAllowed = weightedRecentAverage(oppAllowedSeries, MODEL_TUNING.recencyWeights);
+  const ownVenue = weightedRecentAverage(ownVenueSeries, MODEL_TUNING.recencyWeights);
+  const oppVenueAllowed = weightedRecentAverage(oppVenueAllowedSeries, MODEL_TUNING.recencyWeights);
   const venueBlend = avgFinite([ownVenue, oppVenueAllowed]);
-  const h2h = avgOrNaN(h2hSeries);
+  const h2h = weightedRecentAverage(h2hSeries, MODEL_TUNING.recencyWeights);
 
   const seriesForVol = [...(ownRecentSeries||[]), ...(oppAllowedSeries||[])].map(Number).filter(v=>isFinite(v));
   const vol = seriesForVol.length >= 2 ? stdDev(seriesForVol) : 0;
@@ -11676,7 +11677,8 @@ function buildTeamMarketProjection({
   let proj = weightSum > 0 ? parts.reduce((sum, p) => sum + (p.value * p.weight), 0) / weightSum : NaN;
 
   // 3. Regression to League Baseline (Dynamic)
-  const baseline = (LEAGUE_BASES[league] || 160) / (marketKey === "ft" ? 2 : 4);
+  // Baseline = expected per-team scoring (always /2 for team totals, /2 again for halves)
+  const baseline = (LEAGUE_BASES[league] || 160) / (marketKey === "ft" ? 2 : marketKey === "h1" || marketKey === "h2" ? 4 : 2);
   if (isFinite(proj)) {
     proj = (proj * weights.regressionWeight) + (baseline * weights.baselineWeight);
   }
@@ -11904,10 +11906,13 @@ async function fetchGameReferees(eventId, league) {
 
 // ── U3: SOS Proxy ──
 function computeSosProxy(allowedArr, leagueExpectedHalf) {
+  // Defensive quality signal: teams allowing LESS than avg face tougher opposition (or have better D)
+  // Capped at ±5% to avoid overcorrection — this is a secondary signal only
   if (!Array.isArray(allowedArr) || allowedArr.length < 2 || !leagueExpectedHalf) return 1.0;
-  const avg = allowedArr.reduce((a, b) => a + Number(b), 0) / allowedArr.length;
-  if (!isFinite(avg) || avg <= 0) return 1.0;
-  return Math.max(0.80, Math.min(1.20, avg / leagueExpectedHalf));
+  const av = allowedArr.reduce((a, b) => a + Number(b), 0) / allowedArr.length;
+  if (!isFinite(av) || av <= 0) return 1.0;
+  // Normalize and cap tightly: ±5% max influence
+  return Math.max(0.95, Math.min(1.05, av / leagueExpectedHalf));
 }
 
 // ── FIX-6: Micro-ELO from ESPN win/loss ──
@@ -11932,10 +11937,16 @@ function getPlayoffMultiplier(league){
 // ── FIX-10: Momentum streak ──
 function computeMomentumAdj(series){
   if(!Array.isArray(series)||series.length<3)return 0;
-  const r3=series.slice(0,3).map(Number).filter(v=>isFinite(v));if(r3.length<3)return 0;
   const all=series.map(Number).filter(v=>isFinite(v));
-  const av=all.reduce((a,b)=>a+b,0)/all.length,th=Math.max(3.5,av*0.04);
-  return r3.every(v=>v>av+th)?1.5:r3.every(v=>v<av-th)?-1.5:0;
+  if(all.length<3)return 0;
+  const av=all.reduce((a,b)=>a+b,0)/all.length;
+  const sd=Math.sqrt(all.map(v=>(v-av)**2).reduce((a,b)=>a+b,0)/all.length)||1;
+  const r3=all.slice(0,3);
+  // Z-score: avg z of last 3 games — fires reliably on NBA/NCAA scales
+  const avgZ=r3.map(v=>(v-av)/sd).reduce((a,b)=>a+b,0)/3;
+  if(avgZ>0.75)return Math.min(avgZ*2.0,3.0);   // hot streak: up to +3pts
+  if(avgZ<-0.75)return Math.max(avgZ*2.0,-3.0);  // cold streak: down to -3pts
+  return 0;
 }
 
 // ── FIX-12: Pace-normalize ──
@@ -11978,9 +11989,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   if (aORTG.length >= 2 && bORTG.length >= 2) {
     // FIX-MATH-2: Multiplicative adjusted efficiency (industry standard, not linear blend)
     // Formula: (teamORTG × oppDRTG) / leagueAvgRTG — handles extreme matchups correctly
-    const _leagueAvgRTG = eb / (eb / 100); // normalize: league pts per 100 possessions
-    const expEffA = (avgOrNaN(aORTG) * avgOrNaN(bDRTG)) / (_leagueAvgRTG || 112);
-    const expEffB = (avgOrNaN(bORTG) * avgOrNaN(aDRTG)) / (_leagueAvgRTG || 112);
+    // Real league average offensive efficiency (NBA≈112, NCAA≈104, other≈108)
+    const _leagueAvgRTG = league === "nba" ? 112 : league === "ncaa" ? 104 : 108;
+    const expEffA = (avgOrNaN(aORTG) * avgOrNaN(bDRTG)) / _leagueAvgRTG;
+    const expEffB = (avgOrNaN(bORTG) * avgOrNaN(aDRTG)) / _leagueAvgRTG;
     const rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
     estMatchPace = clampNumber(rawPace, cl.min * 100, cl.max * 100);
     projAFT = (expEffA / 100) * estMatchPace * injMultA;
@@ -12015,6 +12027,11 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     // FIX #20 — 60/40 ORTG-dominant blend: ORTG is more stable/predictive than raw DRTG
     projAFT = ((synOrtgA * 0.60 + synDrtgB * 0.40) / 100) * estMatchPace * injMultA;
     projBFT = ((synOrtgB * 0.60 + synDrtgA * 0.40) / 100) * estMatchPace * injMultB;
+    // Regression to mean: small samples drift toward league mean (25% at 3 games, 8% at 10+)
+    const _regressK = Math.max(0.05, 0.28 - (Math.min(aFTS.length, bFTS.length, 10) / 10) * 0.22);
+    const _leagueMeanHalf = eb / 2;
+    if (isFinite(projAFT)) projAFT = projAFT * (1 - _regressK) + _leagueMeanHalf * _regressK;
+    if (isFinite(projBFT)) projBFT = projBFT * (1 - _regressK) + _leagueMeanHalf * _regressK;
   }
 
   // --- H2H INJECTION FOR FT, TEAM A, AND TEAM B ---
@@ -12039,34 +12056,11 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
 
 
-  // ── U1b: Pythagorean Power Index 30% blend ──
-  const _pythA = computePythagoreanPowerIndex(g_massacreFetchContext.A.ortg10||[], g_massacreFetchContext.A.drtg10||[]);
-  const _pythB = computePythagoreanPowerIndex(g_massacreFetchContext.B.ortg10||[], g_massacreFetchContext.B.drtg10||[]);
-  if (isFinite(projAFT) && _pythA) {
-    const adj = 1 + (_pythA.pythWin / 0.5 - 1) * 0.20;
-    projAFT = projAFT * 0.70 + (projAFT * adj) * 0.30;
-  }
-  if (isFinite(projBFT) && _pythB) {
-    const adj = 1 + (_pythB.pythWin / 0.5 - 1) * 0.20;
-    projBFT = projBFT * 0.70 + (projBFT * adj) * 0.30;
-  }
+  // [U1b removed — Pythagorean handled in consolidated FIX-3 block below]
 
-  // ── U3: SOS correction 40% blend ──
-  {
-    const _leagueHalf = (eb || 200) / 2;
-    const _aAll = getAllowedSeries("A","overall","ft",parsed);
-    const _bAll = getAllowedSeries("B","overall","ft",parsed);
-    const sosA = computeSosProxy(_aAll, _leagueHalf);
-    const sosB = computeSosProxy(_bAll, _leagueHalf);
-    if (isFinite(projAFT) && sosA !== 1.0) projAFT = projAFT * 0.60 + (projAFT * sosA) * 0.40;
-    if (isFinite(projBFT) && sosB !== 1.0) projBFT = projBFT * 0.60 + (projBFT * sosB) * 0.40;
-  }
+  // [U3 removed — SOS handled in consolidated FIX-3 block below]
 
-  // ── U2b: Referee tendency adjust ──
-  {
-    const _refAdj = computeRefTendencyAdjust(g_gameReferees, league);
-    if (isFinite(_refAdj) && _refAdj !== 0) { projAFT += _refAdj * 0.5; projBFT += _refAdj * 0.5; }
-  }
+  // [U2b removed — Referee handled in consolidated FIX-3 block below]
 
 
   // ── FIX-3/6/8/10: Adjustments wired into FT ──
@@ -12105,19 +12099,21 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     // FIX 6: Apply Volatility Suppression before anchoring
   const vl = getMarketVolLimit(league, "ft");
 
-  if (isFinite(projAFT)) {
-    projAFT = applyVolatility(projAFT, aVol, vl);
+  // ANCHOR FIX: apply volatility to each team, anchor individual teams ONLY when team lines exist,
+  // then anchor the FT total once — never double-anchor
+  if (isFinite(projAFT)) projAFT = applyVolatility(projAFT, aVol, vl);
+  if (isFinite(projBFT)) projBFT = applyVolatility(projBFT, bVol, vl);
+  // Team-line anchors only when explicit team totals are set
+  if (isFinite(projAFT) && isFinite(lines.aLine) && lines.aLine > 0)
     projAFT = anchorProjection(projAFT, lines.aLine, league, "team");
-  }
-  if (isFinite(projBFT)) {
-    projBFT = applyVolatility(projBFT, bVol, vl);
+  if (isFinite(projBFT) && isFinite(lines.bLine) && lines.bLine > 0)
     projBFT = anchorProjection(projBFT, lines.bLine, league, "team");
-  }
 
-  let ftProj = projAFT + projBFT;
+  let ftProj = isFinite(projAFT) && isFinite(projBFT) ? projAFT + projBFT : NaN;
   if (isFinite(ftProj)) {
     ftProj = applyVolatility(ftProj, Math.max(aVol, bVol), vl);
-    ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
+    if (isFinite(lines.ftLine) && lines.ftLine > 0)
+      ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
   }
 
 
@@ -12126,6 +12122,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const bS = weightedRecentAverage(bFTS, MODEL_TUNING.recencyWeights);
     const aA = weightedRecentAverage(parsed?.aFTAllowed, MODEL_TUNING.recencyWeights) || (eb / 2);
     const bA = weightedRecentAverage(parsed?.bFTAllowed, MODEL_TUNING.recencyWeights) || (eb / 2);
+
+
+  // ═══ FT RECONCILIATION: store ftProj so reconciler can use it ═══
+  // (actual reconciliation runs in runEngine after all 3 projections computed)
 
     return {
     eb, projAFT, projBFT, ftProj, pace: estMatchPace, ftSampleTier,
@@ -13590,9 +13590,15 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     if (p.pick !== "NO PLAY" && isFinite(shownEdge) && isFinite(shownLine) && shownLine > 0) {
       const _edgePct = Math.abs(shownEdge / shownLine);
       const _rawInp=(typeof rawMarketInputs!=="undefined"&&p.marketKey)?(rawMarketInputs[p.marketKey]||""):"";const _jm=String(_rawInp).match(/[-+](\d{3,4})/);const _jc=_jm?parseInt(_jm[0]):-110;const _aj=Math.abs(_jc);const _b=_jc<0?100/_aj:_aj/100; // FIX-9 actual juice
-      const _p = 0.5 + _edgePct * 0.5;
-      const _q = 1 - _p;
-      const _kellyFrac = (_p * _b - _q) / _b;
+      // Win probability via error function approximation (normal CDF)
+      // sigma ≈ 11.5pts for NBA totals; maps edge to real win probability
+      const _sigma = 11.5;
+      const _z = (shownEdge) / _sigma;
+      const _erfZ = _z / (1 + 0.2316419 * Math.abs(_z)); // fast Horner approx
+      const _p = 0.5 + 0.5 * (_z >= 0 ? 1 : -1) * (1 - Math.pow(1 - 0.3989*Math.exp(-_z*_z/2)*_erfZ*(0.319+_erfZ*(-0.357+_erfZ*(1.781+_erfZ*(-1.822+_erfZ*1.330)))),5));
+      const _pClamped = Math.max(0.51, Math.min(0.80, _p || (0.5 + _edgePct * 0.4)));
+      const _q = 1 - _pClamped;
+      const _kellyFrac = (_pClamped * _b - _q) / _b;
       const _quarterKelly = _kellyFrac / 4;
       const _units = Math.max(0.5, Math.min(5.0, Math.round(_quarterKelly * 40 * 2) / 2));
       if (_units >= 0.5) {
@@ -14070,6 +14076,18 @@ const markets = finalPicksForDisplay.map(p => ({
     // --- END SYNDICATE DASHBOARD INJECTION ---
 
     const lockIdx = selectLock(markets);
+
+  // ═══ FT=1H+2H RECONCILIATION ═══
+  if (isFinite(ftCalc?.ftProj) && isFinite(h1Calc?.h1Proj) && isFinite(h2Calc?.h2Proj)) {
+    const _halfSum = h1Calc.h1Proj + h2Calc.h2Proj;
+    const _drift = Math.abs(ftCalc.ftProj - _halfSum);
+    if (_drift > 4) {
+      // Blend FT toward the half-sum to enforce mathematical consistency
+      const _reconFT = ftCalc.ftProj * 0.55 + _halfSum * 0.45;
+      ftCalc = { ...ftCalc, ftProj: _reconFT, ftEdge: isFinite(resolvedLines.ftLine) ? _reconFT - resolvedLines.ftLine : NaN };
+    }
+  }
+
 
     const trackedToSave = buildResultRows({
   table,
