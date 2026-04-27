@@ -9669,7 +9669,19 @@ function buildTotalMarketIntelSignal(aSc, aAll, bSc, bAll, line, teamBase) {
   let signed = 0;
   const reasons = [];
 
-  if (isFinite(as) && isFinite(bs)) {
+  // FIX #11 — SOS CORRECTION: If both teams scored high AND both opponents leaked,
+  // scoring was inflated by weak opposition — cancel the "offense hot" signal.
+  let _sosCancel = false;
+  if (isFinite(as) && isFinite(bs) && isFinite(aa) && isFinite(ba)) {
+    const avgTeamScored = (as + bs) / 2;
+    const avgOppAllowed = (aa + ba) / 2;
+    if (avgTeamScored >= teamBase * 1.07 && avgOppAllowed >= teamBase * 1.07) {
+      _sosCancel = true;
+      reasons.push("sos-adjusted");
+    }
+  }
+
+  if (!_sosCancel && isFinite(as) && isFinite(bs)) {
     const avgOff = (as + bs) / 2;
     if (avgOff >= teamBase * 1.07) {
       signed += 1;
@@ -11650,6 +11662,25 @@ function buildTeamMarketProjection({
 
 
 function computePaceSignal(league, teamAProj, teamBProj, marketKey = "ft") {
+  // FIX #3 — Use RAW pace10 from ESPN fetch context (not circular projections).
+  // Previous version derived pace from (projA+projB)/baseline where projA/B are
+  // already pace-adjusted — creating a self-reinforcing feedback loop.
+  const aPaceRaw = g_massacreFetchContext?.A?.pace10 || [];
+  const bPaceRaw = g_massacreFetchContext?.B?.pace10 || [];
+  const aPaceAvg = aPaceRaw.length >= 2 ? aPaceRaw.reduce((s,v)=>s+v,0)/aPaceRaw.length : NaN;
+  const bPaceAvg = bPaceRaw.length >= 2 ? bPaceRaw.reduce((s,v)=>s+v,0)/bPaceRaw.length : NaN;
+
+  if (isFinite(aPaceAvg) && isFinite(bPaceAvg) && aPaceAvg > 0 && bPaceAvg > 0) {
+    // Hollinger interaction: two fast teams share possessions, don't simply add
+    const leaguePace = league === "nba" ? 99.5 : league === "ncaa" ? 67.5 : 80.0;
+    const interactedPace = (aPaceAvg * bPaceAvg) / leaguePace;
+    const halfAdj = marketKey !== "ft" ? 0.5 : 1.0;
+    const raw = (interactedPace * halfAdj) / (leaguePace * halfAdj);
+    const clampRange = getEffectivePaceClamp(league);
+    return clampNumber(raw, clampRange.min, clampRange.max);
+  }
+
+  // Fallback: if pace10 not available, use projection-based estimate (original method)
   const base = Number(LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160);
   const baseline = marketKey === "ft" ? base : base / 2;
   if (!isFinite(teamAProj) || !isFinite(teamBProj) || !isFinite(baseline) || baseline <= 0) return NaN;
@@ -11840,8 +11871,9 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     
     synNetA = synOrtgA - synDrtgA;
     synNetB = synOrtgB - synDrtgB;
-    projAFT = ((synOrtgA + synDrtgB) / 2 / 100) * estMatchPace * injMultA;
-    projBFT = ((synOrtgB + synDrtgA) / 2 / 100) * estMatchPace * injMultB;
+    // FIX #20 — 60/40 ORTG-dominant blend: ORTG is more stable/predictive than raw DRTG
+    projAFT = ((synOrtgA * 0.60 + synDrtgB * 0.40) / 100) * estMatchPace * injMultA;
+    projBFT = ((synOrtgB * 0.60 + synDrtgA * 0.40) / 100) * estMatchPace * injMultB;
   }
 
   // --- H2H INJECTION FOR FT, TEAM A, AND TEAM B ---
@@ -11864,6 +11896,19 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
 
+
+    // FIX #2 — REST DAYS FACTOR (B2B = -1.6%, 1-day rest = -0.5% per team)
+  // g_massacreFetchContext stores restDays per team from ESPN schedule fetch
+  const restDaysA = g_massacreFetchContext?.A?.restDays;
+  const restDaysB = g_massacreFetchContext?.B?.restDays;
+  if (isFinite(projAFT)) {
+    if (restDaysA === 0) projAFT *= 0.984;       // B2B: -1.6%
+    else if (restDaysA === 1) projAFT *= 0.995;  // 1-day rest: -0.5%
+  }
+  if (isFinite(projBFT)) {
+    if (restDaysB === 0) projBFT *= 0.984;
+    else if (restDaysB === 1) projBFT *= 0.995;
+  }
 
     // FIX 6: Apply Volatility Suppression before anchoring
   const vl = getMarketVolLimit(league, "ft");
@@ -11991,6 +12036,18 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     else if (roleA === "away") { projA1H -= (homeEdge / 2); projB1H += (homeEdge / 2); }
   }
 
+
+    // FIX #2 — REST DAYS FACTOR for 1H (B2B = -1.6%, 1-day = -0.5%)
+  const restDaysA = g_massacreFetchContext?.A?.restDays;
+  const restDaysB = g_massacreFetchContext?.B?.restDays;
+  if (isFinite(projA1H)) {
+    if (restDaysA === 0) projA1H *= 0.984;
+    else if (restDaysA === 1) projA1H *= 0.995;
+  }
+  if (isFinite(projB1H)) {
+    if (restDaysB === 0) projB1H *= 0.984;
+    else if (restDaysB === 1) projB1H *= 0.995;
+  }
 
     // FIX 6: Apply Volatility Suppression before anchoring
   const h1Vl = getMarketVolLimit(league, "h1");
@@ -12159,6 +12216,13 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   });
 
   let h2Proj = isFinite(aTeam.proj) && isFinite(bTeam.proj) ? aTeam.proj + bTeam.proj : NaN;
+  // FIX #2 — REST DAYS for 2H (cumulative fatigue shows more in 2nd half)
+  const _rA2H = g_massacreFetchContext?.A?.restDays;
+  const _rB2H = g_massacreFetchContext?.B?.restDays;
+  if (isFinite(h2Proj)) {
+    if (_rA2H === 0 || _rB2H === 0) h2Proj *= 0.982;      // B2B: -1.8%
+    else if (_rA2H === 1 || _rB2H === 1) h2Proj *= 0.994; // short rest: -0.6%
+  }
     const pace = computePaceSignal(league, aTeam.proj, bTeam.proj, "h2");
   if (isFinite(pace)) h2Proj *= (1 + ((pace - 1) * 0.10));
   
