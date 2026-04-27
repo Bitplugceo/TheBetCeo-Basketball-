@@ -3424,6 +3424,8 @@ const LEAGUE_FETCH_RULES = {
     const _schedCache = new Map();
     const _summaryCache = new Map();
     const _fixtureCache = new Map();
+    const _fixtureCacheTimes = new Map(); // FIX: tracks cache entry timestamps for TTL
+    const FIXTURE_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes — busts stale pre-game status
     const _teamCatalogCache = new Map();
 let g_activeFetchController = null;
 
@@ -11107,7 +11109,16 @@ validateFetchSection();
 
         const payloadResults = await Promise.allSettled(queryDates.map(dateStr => {
   const cacheKey = "fixtures:" + league + ":" + dateStr;
-  if (_fixtureCache.has(cacheKey)) return _fixtureCache.get(cacheKey);
+  // FIX: Expire fixture cache entries older than 3 minutes
+  if (_fixtureCache.has(cacheKey)) {
+    const cacheAge = Date.now() - (_fixtureCacheTimes.get(cacheKey) || 0);
+    if (cacheAge < FIXTURE_CACHE_TTL_MS) {
+      return _fixtureCache.get(cacheKey); // still fresh — use it
+    } else {
+      _fixtureCache.delete(cacheKey);     // stale — bust it and re-fetch
+      _fixtureCacheTimes.delete(cacheKey);
+    }
+  }
 
   const p = proxyFetch(base + "/scoreboard?dates=" + dateStr + "&limit=200").catch(err => {
     _fixtureCache.delete(cacheKey);
@@ -11115,6 +11126,7 @@ validateFetchSection();
   });
 
   cacheSet(_fixtureCache, cacheKey, p);
+  _fixtureCacheTimes.set(cacheKey, Date.now()); // FIX: record insertion time for TTL
   return p;
 }));
 
@@ -11152,7 +11164,14 @@ const isPreGame =
   statusName === "STATUS_SCHEDULED" ||
   statusName === "STATUS_PRE";
 
-return isPreGame;
+// FIX: Hard time gate — exclude any game whose scheduled start has already passed.
+// 2-minute grace window handles tipoff delays and timezone clock skew.
+// This is the definitive safety net: even a "pre" status from a stale cache
+// cannot sneak a live/started game back onto the list.
+const TIPOFF_GRACE_MS = 2 * 60 * 1000; // 2 minutes
+const gameHasStarted = eventTime.getTime() <= (Date.now() - TIPOFF_GRACE_MS);
+
+return isPreGame && !gameHasStarted;
         }).sort((a, b) => new Date(a.date) - new Date(b.date));
 
         if (myToken !== _fixtureLoadToken) return;
@@ -14002,6 +14021,7 @@ if (trackedToSave.length) {
       _schedCache.clear();
       _summaryCache.clear();
       _fixtureCache.clear();
+      _fixtureCacheTimes.clear(); // FIX: also clear TTL timestamps on full cache reset
 
       setStatusText("", "");
       setFetchAuditIssues([]);
