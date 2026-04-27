@@ -6620,12 +6620,7 @@ if (!data?.state) {
           g_trackerState.updatedAt = new Date().toISOString();
           const pushed = await pushTrackerStateToServer(JSON.parse(JSON.stringify(g_trackerState)));
           if (pushed?.ok && pushed?.state) {
-            // FIX C — SETTLEMENT GUARD: safe-merge before normalizing so
-            // settled picks are never overwritten by a stale server echo.
-            // (flushTrackerSave has the same pattern — this brings hydrate in line.)
-            const _hydrateSnap = JSON.parse(JSON.stringify(g_trackerState));
-            const _hydrateMerged = mergeTrackerStates(_hydrateSnap, pushed.state);
-            normalizeTrackerState(_hydrateMerged);
+            normalizeTrackerState(pushed.state);
             backfillLineMemoryFromTrackedPicks();
             saveTrackerStateToLocal();
             trackerDebug("hydrate push succeeded", {
@@ -7197,9 +7192,8 @@ function archiveExpiredTrackedPicks() {
     const p = ensureTrackedPickKeys({ ...pick });
     const isSettled = ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase());
     
-    // FIX D: use getTrackedPickTimeMs (settledAt → updatedAt → createdAt fallback)
-    // so picks whose settledAt is null still get archived after 10 hours.
-    const settleTs = getTrackedPickTimeMs(p);
+    // FIX: STRICTLY use settledAt. Do not fall back to createdAt.
+    const settleTs = p.settledAt ? Date.parse(p.settledAt) : 0;
     const isExpired = isSettled && settleTs > 0 && (now - settleTs) > cutoffMs;
 
     if (isSettled && isExpired) {
@@ -7276,10 +7270,9 @@ function isTrackedPickVisibleOnPage(pick) {
     if (!ts) return false;
     return (Date.now() - ts) / (1000 * 60 * 60) < 48; 
   } else {
-    // FIX E: use getTrackedPickTimeMs fallback (settledAt → updatedAt → createdAt)
-    // so picks without settledAt still disappear from the screen after 10 hours.
-    const settleTs = getTrackedPickTimeMs(pick);
-    if (!settleTs) return true;
+    // FIX: Hide settled picks exactly 10 hours after they are graded
+    const settleTs = pick.settledAt ? Date.parse(pick.settledAt) : 0;
+    if (!settleTs) return true; 
     return (Date.now() - settleTs) / (1000 * 60 * 60) < 10;
   }
 }
@@ -9353,14 +9346,14 @@ function addTrackedPicks(newPicks) {
 
   return clampNumber(base, 0, maxCap);
 }
-
-    function applyVolatility(proj, std, limit) {
+    function applyVolatility(proj, std, limit, baseline = NaN) {
   if (!isFinite(proj) || !isFinite(std) || !isFinite(limit) || std <= 0 || limit <= 0) return proj;
   if (std <= limit) return proj;
 
-  const excess = clampNumber((std - limit) / Math.max(1, limit), 0, 0.50);
-  const shrink = 1 - Math.min(excess * 0.25 + excess * excess * 0.20, 0.22);
-  return proj * shrink;
+  const anchor = isFinite(baseline) && baseline > 0 ? baseline : proj;
+  const excess = clampNumber((std - limit) / Math.max(1, limit), 0, 0.60);
+  const weight = clampNumber((excess * 0.18) + (excess * excess * 0.10), 0, 0.14);
+  return proj + ((anchor - proj) * weight);
 }
 
     function getSampleTier(...arrays) {
@@ -9589,7 +9582,49 @@ function getConfidenceGrade({
   return (proj * (1 - weight)) + (line * weight);
 }
 
+function getMarketBaseline(league, marketType, explicitLine = NaN) {
+  const base = Number(LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160);
+  if (isFinite(explicitLine) && explicitLine > 0) return explicitLine;
+  if (marketType === "ft") return base;
+  if (marketType === "h1" || marketType === "h2") return base / 2;
+  if (marketType === "team") return base / 2;
+  return base;
+}
+
+function reconcilePeriodPair(h1Proj, h2Proj, ftProj) {
+  if (!isFinite(h1Proj) || !isFinite(h2Proj)) return { h1Proj, h2Proj, ftProj };
+  const halfSum = h1Proj + h2Proj;
+  if (!isFinite(ftProj)) return { h1Proj, h2Proj, ftProj: halfSum };
+  const drift = ftProj - halfSum;
+  if (Math.abs(drift) <= 4) return { h1Proj, h2Proj, ftProj };
+
+  const targetFT = (ftProj * 0.55) + (halfSum * 0.45);
+  const targetHalfSum = (halfSum * 0.60) + (ftProj * 0.40);
+  const scale = halfSum > 0 ? (targetHalfSum / halfSum) : 1;
+
+  return {
+    h1Proj: h1Proj * scale,
+    h2Proj: h2Proj * scale,
+    ftProj: targetFT
+  };
+}
+
+function reconcileTeamTotalsToFT(teamAProj, teamBProj, ftProj) {
+  if (!isFinite(teamAProj) || !isFinite(teamBProj) || !isFinite(ftProj)) {
+    return { teamAProj, teamBProj };
+  }
+  const teamSum = teamAProj + teamBProj;
+  if (teamSum <= 0 || Math.abs(teamSum - ftProj) <= 3) return { teamAProj, teamBProj };
+
+  const scale = ftProj / teamSum;
+  return {
+    teamAProj: teamAProj * scale,
+    teamBProj: teamBProj * scale
+  };
+}
+
 function readLooseSeries(id) {
+
   const el = document.getElementById(id);
   const raw = el?.value?.trim() || "";
   if (!raw) return [];
@@ -11707,7 +11742,10 @@ function buildTeamMarketProjection({
 
 
   if (isFinite(proj)) proj *= clampNumber(injMult, 0.75, 1.0);
-  if (isFinite(proj)) proj = anchorProjection(proj, line, league, "team");
+  const baselineForTeam = getMarketBaseline(league, "team", line);
+  const volLimit = getMarketVolLimit(league, "team");
+  if (isFinite(proj)) proj = applyVolatility(proj, vol, volLimit, baselineForTeam);
+  if (isFinite(proj)) proj = anchorProjection(proj, line, league, "team", { fullModel: sampleTier === "full" });
 
   // FIX 8: Return the context variables so 2H diagnostics aren't undefined
   return { proj, vol, featureCount: parts.length, role, ownRecent, oppAllowed };
@@ -12108,8 +12146,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   // ANCHOR FIX: apply volatility to each team, anchor individual teams ONLY when team lines exist,
   // then anchor the FT total once — never double-anchor
-  if (isFinite(projAFT)) projAFT = applyVolatility(projAFT, aVol, vl);
-  if (isFinite(projBFT)) projBFT = applyVolatility(projBFT, bVol, vl);
+  const teamABaseline = getMarketBaseline(league, "team", lines.aLine);
+  const teamBBaseline = getMarketBaseline(league, "team", lines.bLine);
+  if (isFinite(projAFT)) projAFT = applyVolatility(projAFT, aVol, vl, teamABaseline);
+  if (isFinite(projBFT)) projBFT = applyVolatility(projBFT, bVol, vl, teamBBaseline);
   // Team-line anchors only when explicit team totals are set
   if (isFinite(projAFT) && isFinite(lines.aLine) && lines.aLine > 0)
     projAFT = anchorProjection(projAFT, lines.aLine, league, "team");
@@ -12118,10 +12158,15 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   let ftProj = isFinite(projAFT) && isFinite(projBFT) ? projAFT + projBFT : NaN;
   if (isFinite(ftProj)) {
-    ftProj = applyVolatility(ftProj, Math.max(aVol, bVol), vl);
+    const ftBaseline = getMarketBaseline(league, "ft", lines.ftLine);
+    ftProj = applyVolatility(ftProj, Math.max(aVol, bVol), vl, ftBaseline);
     if (isFinite(lines.ftLine) && lines.ftLine > 0)
       ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
   }
+
+  const reconciledTeams = reconcileTeamTotalsToFT(projAFT, projBFT, ftProj);
+  projAFT = reconciledTeams.teamAProj;
+  projBFT = reconciledTeams.teamBProj;
 
 
     // FIX 7 & 8: Calculate and return missing limits, flags, and scoring context
@@ -13571,7 +13616,7 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     row.appendChild(tdPick);
 
     const tdProj = document.createElement("td");
-    tdProj.textContent = isFinite(p.proj) ? p.proj.toFixed(1) : "—"; // FIX B: raw value keeps Projection consistent with Edge%
+    tdProj.textContent = isFinite(p.proj) ? displayLine(p.proj) : "—";
     row.appendChild(tdProj);
 
     const tdEdge = document.createElement("td");
@@ -13807,18 +13852,6 @@ const { ftLine, h1Line, h2Line, aLine, bLine } = resolvedLines;
       h2: summarizeCalcForDebug(h2Calc)
     });
 
-  // ═══ FT=1H+2H RECONCILIATION ═══
-  // Moved here (before pick decisions, confidence grading, and picks[]) so that
-  // ftCalc.ftProj and ftCalc.ftEdge are reconciled before ANYTHING downstream reads them.
-  if (isFinite(ftCalc?.ftProj) && isFinite(h1Calc?.h1Proj) && isFinite(h2Calc?.h2Proj)) {
-    const _halfSum = h1Calc.h1Proj + h2Calc.h2Proj;
-    const _drift = Math.abs(ftCalc.ftProj - _halfSum);
-    if (_drift > 4) {
-      const _reconFT = ftCalc.ftProj * 0.55 + _halfSum * 0.45;
-      ftCalc = { ...ftCalc, ftProj: _reconFT, ftEdge: isFinite(resolvedLines.ftLine) ? _reconFT - resolvedLines.ftLine : NaN };
-    }
-  }
-
     let ftPick = getPick(ftCalc.ftEdge, ftLine, league, "ft", { aSc: ftCalc.aS, bSc: ftCalc.bS });
     let h1Pick = getPick(h1Calc.h1Edge, h1Line, league, "h1", { aSc: h1Calc.aS1, bSc: h1Calc.bS1 });
     let h2Pick = getPick(h2Calc.h2Edge, h2Line, league, "h2", { aSc: h2Calc.aS2, bSc: h2Calc.bS2 });
@@ -14044,6 +14077,45 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
 
 
 const rawMarketInputs = getRawMarketInputMap();
+if (isFinite(ftCalc?.ftProj) && isFinite(h1Calc?.h1Proj) && isFinite(h2Calc?.h2Proj)) {
+  const reconciledPeriods = reconcilePeriodPair(h1Calc.h1Proj, h2Calc.h2Proj, ftCalc.ftProj);
+  h1Calc = {
+    ...h1Calc,
+    h1Proj: reconciledPeriods.h1Proj,
+    h1Edge: isFinite(resolvedLines.h1Line) ? reconciledPeriods.h1Proj - resolvedLines.h1Line : NaN
+  };
+  h2Calc = {
+    ...h2Calc,
+    h2Proj: reconciledPeriods.h2Proj,
+    h2Edge: isFinite(resolvedLines.h2Line) ? reconciledPeriods.h2Proj - resolvedLines.h2Line : NaN
+  };
+  ftCalc = {
+    ...ftCalc,
+    ftProj: reconciledPeriods.ftProj,
+    ftEdge: isFinite(resolvedLines.ftLine) ? reconciledPeriods.ftProj - resolvedLines.ftLine : NaN
+  };
+
+  const reconciledTeams = reconcileTeamTotalsToFT(ftCalc.projAFT, ftCalc.projBFT, ftCalc.ftProj);
+  ftCalc = {
+    ...ftCalc,
+    projAFT: reconciledTeams.teamAProj,
+    projBFT: reconciledTeams.teamBProj,
+    aEdge: isFinite(resolvedLines.aLine) ? reconciledTeams.teamAProj - resolvedLines.aLine : NaN,
+    bEdge: isFinite(resolvedLines.bLine) ? reconciledTeams.teamBProj - resolvedLines.bLine : NaN,
+    blowoutGap: Math.abs(reconciledTeams.teamAProj - reconciledTeams.teamBProj)
+  };
+
+  finalPicks = finalPicks.map(p => {
+    if (!p || !p.marketKey) return p;
+    if (p.marketKey === "ft") return { ...p, proj: ftCalc.ftProj, edge: ftCalc.ftEdge, displayProjection: ftCalc.ftProj, displayEdge: ftCalc.ftEdge };
+    if (p.marketKey === "h1") return { ...p, proj: h1Calc.h1Proj, edge: h1Calc.h1Edge, displayProjection: h1Calc.h1Proj, displayEdge: h1Calc.h1Edge };
+    if (p.marketKey === "h2") return { ...p, proj: h2Calc.h2Proj, edge: h2Calc.h2Edge, displayProjection: h2Calc.h2Proj, displayEdge: h2Calc.h2Edge };
+    if (p.marketKey === "team_a") return { ...p, proj: ftCalc.projAFT, edge: ftCalc.aEdge, displayProjection: ftCalc.projAFT, displayEdge: ftCalc.aEdge };
+    if (p.marketKey === "team_b") return { ...p, proj: ftCalc.projBFT, edge: ftCalc.bEdge, displayProjection: ftCalc.projBFT, displayEdge: ftCalc.bEdge };
+    return p;
+  });
+}
+
 const finalPicksForDisplay = finalPicks
   .map(p => applySmartLineToPick(p, rawMarketInputs[p.marketKey], league))
   .filter(Boolean);
@@ -14096,7 +14168,16 @@ const markets = finalPicksForDisplay.map(p => ({
 
     const lockIdx = selectLock(markets);
 
-  // [RECONCILIATION MOVED — applied early, right after pass 2 projections]
+  // ═══ FT=1H+2H RECONCILIATION ═══
+  if (isFinite(ftCalc?.ftProj) && isFinite(h1Calc?.h1Proj) && isFinite(h2Calc?.h2Proj)) {
+    const _halfSum = h1Calc.h1Proj + h2Calc.h2Proj;
+    const _drift = Math.abs(ftCalc.ftProj - _halfSum);
+    if (_drift > 4) {
+      // Blend FT toward the half-sum to enforce mathematical consistency
+      const _reconFT = ftCalc.ftProj * 0.55 + _halfSum * 0.45;
+      ftCalc = { ...ftCalc, ftProj: _reconFT, ftEdge: isFinite(resolvedLines.ftLine) ? _reconFT - resolvedLines.ftLine : NaN };
+    }
+  }
 
 
     const trackedToSave = buildResultRows({
