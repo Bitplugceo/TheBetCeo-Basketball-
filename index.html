@@ -7466,76 +7466,110 @@ let g_lastRenderedTrackerView = null;
 
 
 // ── POWER DEBUG PANEL ────────────────────────────────────────────────────────
-function buildArchiveDebugHtml() {
+function buildGodFatherDebugHtml() {
   const now = Date.now();
   const cutoffMs = 14 * 60 * 60 * 1000; // 14 hours
-  const active   = Array.isArray(g_trackerState.activePicks)   ? g_trackerState.activePicks.map(p => ensureTrackedPickKeys({...p}))   : [];
-  const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks.map(p => ensureTrackedPickKeys({...p})) : [];
-
+  const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
+  const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
+  
   // ── helpers ──
   function safeMs(v) { if (!v) return 0; const ms = Date.parse(String(v)); return isFinite(ms) ? ms : 0; }
-  function ageStr(ms) { if (!ms) return "—"; const d = now - ms; return `${Math.floor(d/3600000)}h`; }
-  function ts(v) { return v ? String(v).substring(5,16).replace("T"," ") : `<span style="color:#f44336">-</span>`; }
-  function badge(color, text) { return `<span style="background:${color};color:#000;padding:1px 4px;border-radius:3px;font-size:9px;font-weight:bold">${text}</span>`; }
-
+  function ts(v) { return v ? String(v).substring(5,16).replace("T"," ") : `<span style="color:#555">-</span>`; }
+  function badge(color, text) { return `<span style="background:${color};color:#000;padding:2px 5px;border-radius:3px;font-size:9px;font-weight:900;letter-spacing:0.5px;text-transform:uppercase;">${text}</span>`; }
+  
   const tableStyles = `width:100%; table-layout:fixed; border-collapse:collapse; font-size:10px; font-family:ui-monospace, monospace;`;
 
-  // ── SECTION 1: ARCHIVE STATUS ──
-  const stuckPicks = active.filter(p => {
+  // ==========================================
+  // 1. SYSTEM & MEMORY HEALTH CHECK
+  // ==========================================
+  const lineMemSize = Object.keys(g_engineLineMemory || {}).length;
+  let memStatus = "✅ HEALTHY";
+  let memColor = "#4caf50";
+  if (archived.length >= 1900 || lineMemSize >= 190) {
+    memStatus = "⚠️ NEAR LIMIT";
+    memColor = "#ff9800";
+  }
+
+  const sysHealthHtml = `
+    <div style="background:#111;border:1px solid #333;border-left:4px solid ${memColor};border-radius:4px;padding:10px;margin-bottom:12px">
+      <div style="font-size:12px;font-weight:900;color:#fff;margin-bottom:6px;letter-spacing:0.5px;">🖥️ SYSTEM & MEMORY CORE</div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size:10px; color:#aaa;">
+        <div>Active Picks: <b style="color:#fff">${active.length} / 500</b></div>
+        <div>Archive Size: <b style="color:#fff">${archived.length} / 2000</b></div>
+        <div>Line Memory: <b style="color:#fff">${lineMemSize} / 200</b></div>
+        <div>Engine Status: <b style="color:${memColor}">${memStatus}</b></div>
+      </div>
+    </div>
+  `;
+
+  // ==========================================
+  // 2. SETTLEMENT & ARCHIVE WATCHDOG
+  // ==========================================
+  const pending = active.filter(p => !["win","loss","push"].includes(p.resultStatus));
+  const stuck = active.filter(p => {
     if (!["win","loss","push"].includes(p.resultStatus)) return false;
     const st = safeMs(p.eventDate) || safeMs(p.createdAt);
     return st > 0 && (now - st) >= cutoffMs;
   });
 
   let archiveRows = "";
-  [...active, ...archived].forEach(p => {
-    const bucket = archived.includes(p) ? "ARCH" : "ACTV";
-    const settled = ["win","loss","push"].includes(p.resultStatus);
-    const gameTs = safeMs(p.eventDate) || safeMs(p.createdAt);
-    const isExpired = gameTs > 0 && (now - gameTs) >= cutoffMs;
-    const label = `${(p.homeTeam||"?").substring(0,10)} vs ${(p.awayTeam||"?").substring(0,10)}`;
+  if (stuck.length === 0 && pending.length === 0) {
+    archiveRows = `<tr><td colspan="4" style="padding:6px;color:#4caf50;text-align:center;">✅ All queues clear. No stuck data.</td></tr>`;
+  } else {
+    [...stuck, ...pending].forEach(p => {
+      const isSettled = ["win","loss","push"].includes(p.resultStatus);
+      const gameTs = safeMs(p.eventDate) || safeMs(p.createdAt);
+      const isExpired = gameTs > 0 && (now - gameTs) >= cutoffMs;
+      const label = `${(p.homeTeam||"?").substring(0,12)} vs ${(p.awayTeam||"?").substring(0,12)}`;
 
-    let eligBadge = "";
-    if (!settled) {
-      eligBadge = badge("#555","PEND");
-    } else if (!gameTs) {
-      eligBadge = badge("#f44336","NO TS");
-    } else if (isExpired) {
-      eligBadge = badge(bucket==="ACTV" ? "#f44336" : "#4caf50", bucket==="ACTV" ? "STUCK" : `OK`);
-    } else {
-      eligBadge = badge("#ff9800",`WAIT`);
-    }
+      let alertBadge = "";
+      let rowColor = "#aaa";
+      
+      if (!isSettled && isExpired) {
+        alertBadge = badge("#f44336","API FAILED"); // Game over 14h ago, still pending
+        rowColor = "#f44336";
+      } else if (!isSettled) {
+        alertBadge = badge("#ff9800","WAITING");
+      } else if (isSettled && isExpired) {
+        alertBadge = badge("#f44336","STUCK IN UI"); // Should have archived
+        rowColor = "#f44336";
+      }
 
-    archiveRows += `<tr style="border-bottom:1px solid #1e1e1e">
-      <td style="padding:4px 2px;color:${bucket==="ARCH"?"#666":"#ccc"}">${bucket}</td>
-      <td style="padding:4px 2px;color:${p.resultStatus==="win"?"#4caf50":p.resultStatus==="loss"?"#f44336":"#aaa"}">${(p.resultStatus||"pend").substring(0,4).toUpperCase()}</td>
-      <td style="padding:4px 2px;color:#aaa;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${label}</td>
-      <td style="padding:4px 2px">${eligBadge}</td>
-      <td style="padding:4px 2px;color:#555;font-size:9px;white-space:nowrap;">${ts(p.eventDate)}</td>
-      <td style="padding:4px 2px;color:#444;font-size:9px;white-space:nowrap;">${ts(p.updatedAt)}</td>
-    </tr>`;
-  });
+      archiveRows += `<tr style="border-bottom:1px solid #1e1e1e; color:${rowColor}">
+        <td style="padding:4px 2px;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${label}</td>
+        <td style="padding:4px 2px;font-size:9px">${(p.resultStatus||"pend").toUpperCase()}</td>
+        <td style="padding:4px 2px;font-size:9px">${ts(p.eventDate)}</td>
+        <td style="padding:4px 2px">${alertBadge}</td>
+      </tr>`;
+    });
+  }
+
+  const isArchiveRed = stuck.length > 0 || pending.some(p => (safeMs(p.eventDate) > 0 && (now - safeMs(p.eventDate)) >= cutoffMs));
+  const archiveBorder = isArchiveRed ? "#f44336" : "#4caf50";
 
   const archiveSection = `
-    <div style="background:#111;border:1px solid #333;border-radius:8px;padding:10px;margin-bottom:12px">
-      <div style="font-size:12px;font-weight:bold;color:#fff;margin-bottom:2px">🗂 Archive Status</div>
-      <div style="font-size:10px;color:#666;margin-bottom:6px">Cutoff: 14h after tip-off (eventDate)</div>
+    <div style="background:#111;border:1px solid #333;border-left:4px solid ${archiveBorder};border-radius:4px;padding:10px;margin-bottom:12px">
+      <div style="font-size:12px;font-weight:900;color:#fff;margin-bottom:2px;letter-spacing:0.5px;">🗂️ QUEUE DIAGNOSTICS</div>
+      <div style="font-size:9px;color:#666;margin-bottom:6px">Scans for picks that failed to settle or failed to archive.</div>
       <table style="${tableStyles}">
         <thead><tr style="color:#555;border-bottom:1px solid #2a2a2a">
-          <th style="padding:4px 2px;text-align:left;width:12%">Box</th>
-          <th style="padding:4px 2px;text-align:left;width:14%">Stat</th>
-          <th style="padding:4px 2px;text-align:left;width:34%">Match</th>
-          <th style="padding:4px 2px;text-align:left;width:12%">Ready</th>
-          <th style="padding:4px 2px;text-align:left;width:14%">event</th>
-          <th style="padding:4px 2px;text-align:left;width:14%">update</th>
+          <th style="padding:4px 2px;text-align:left;width:40%">Match</th>
+          <th style="padding:4px 2px;text-align:left;width:20%">Status</th>
+          <th style="padding:4px 2px;text-align:left;width:20%">Tip-Off</th>
+          <th style="padding:4px 2px;text-align:left;width:20%">Alert</th>
         </tr></thead>
         <tbody>${archiveRows}</tbody>
       </table>
     </div>`;
 
-  // ── SECTION 2: SETTLEMENT ATTEMPTS ──
+  // ==========================================
+  // 3. ESPN API RESPONSE LOG (Kept from before)
+  // ==========================================
   let attemptRows = "";
-  g_settlementDebugLog.forEach((entry, key) => {
+  let apiErrors = 0;
+  g_settlementDebugLog.forEach((entry) => {
+    const isErr = entry.status.includes("❌");
+    if (isErr) apiErrors++;
     const statusColor = entry.status.startsWith("✅") ? "#4caf50" : entry.status.startsWith("⏳") ? "#aaa" : "#f44336";
     const cleanPick = entry.pick.replace(" · ", "<br>").substring(0, 35);
     
@@ -7544,29 +7578,27 @@ function buildArchiveDebugHtml() {
       <td style="padding:4px 2px;color:${statusColor};font-size:9px">${entry.status.replace("SETTLED: ", "")}</td>
       <td style="padding:4px 2px;color:#555;font-size:9px">${entry.stateName||"—"}</td>
       <td style="padding:4px 2px;color:#555;font-size:9px">${entry.actual ?? "—"}/${entry.line ?? "—"}</td>
-      <td style="padding:4px 2px;color:#444;font-size:9px;white-space:nowrap;">${entry.ts||"—"}</td>
     </tr>`;
   });
 
+  const apiBorder = apiErrors > 0 ? "#f44336" : "#2196f3";
+
   const attemptSection = `
-    <div style="background:#111;border:1px solid #333;border-radius:8px;padding:10px;margin-bottom:12px">
-      <div style="font-size:12px;font-weight:bold;color:#fff;margin-bottom:2px">📡 ESPN API Responses</div>
-      <div style="font-size:10px;color:#666;margin-bottom:6px">Live log of server pings</div>
+    <div style="background:#111;border:1px solid #333;border-left:4px solid ${apiBorder};border-radius:4px;padding:10px;margin-bottom:12px">
+      <div style="font-size:12px;font-weight:900;color:#fff;margin-bottom:2px;letter-spacing:0.5px;">📡 ESPN NETWORK LOG</div>
+      <div style="font-size:9px;color:#666;margin-bottom:6px">Checks if the server is responding to settlement requests.</div>
       ${attemptRows ? `<table style="${tableStyles}">
         <thead><tr style="color:#555;border-bottom:1px solid #2a2a2a">
-          <th style="padding:4px 2px;text-align:left;width:38%">Pick</th>
-          <th style="padding:4px 2px;text-align:left;width:20%">API</th>
-          <th style="padding:4px 2px;text-align:left;width:14%">State</th>
-          <th style="padding:4px 2px;text-align:left;width:14%">Act/Line</th>
-          <th style="padding:4px 2px;text-align:left;width:14%">Time</th>
+          <th style="padding:4px 2px;text-align:left;width:40%">Pick</th>
+          <th style="padding:4px 2px;text-align:left;width:25%">API</th>
+          <th style="padding:4px 2px;text-align:left;width:15%">State</th>
+          <th style="padding:4px 2px;text-align:left;width:20%">Act/Line</th>
         </tr></thead><tbody>${attemptRows}</tbody></table>`
-        : `<div style="color:#aaa;font-size:10px">Waiting for refresh cycle...</div>`}
+        : `<div style="color:#aaa;font-size:9px;text-align:center;padding:6px;">Waiting for next auto-refresh cycle...</div>`}
     </div>`;
 
-  return archiveSection + attemptSection;
+  return sysHealthHtml + archiveSection + attemptSection;
 }
-
-
 
 function renderTrackerAnalytics() {
   const panel = document.getElementById("trackerAnalyticsPanel");
@@ -7574,7 +7606,6 @@ function renderTrackerAnalytics() {
 
   const currentView = g_trackerModalView;
 
-  // FIX: If we are on the picks view, clear the panel and exit immediately. No heavy math needed.
   if (currentView === "picks") {
     syncTrackerModalView();
     panel.classList.add("tracker-hidden");
@@ -7584,7 +7615,6 @@ function renderTrackerAnalytics() {
     return;
   }
 
-    // FIX: Use 'updatedAt' instead of 'vId' so local settlements instantly break the cache
   if (g_lastRenderedTrackerVersion === g_trackerState.updatedAt && g_lastRenderedTrackerView === currentView) {
      syncTrackerModalView();
      panel.classList.remove("tracker-hidden");
@@ -7594,7 +7624,6 @@ function renderTrackerAnalytics() {
 
   g_lastRenderedTrackerVersion = g_trackerState.updatedAt;
   g_lastRenderedTrackerView = currentView;
-
 
   const allReportPicks = getAllTrackedPicksForReport().map(p => ensureTrackedPickKeys(p));
 
@@ -7635,22 +7664,9 @@ function renderTrackerAnalytics() {
 
   function getLeagueActionMeta(trustMeta) {
     const mode = String(trustMeta?.mode || "advisory").toLowerCase();
-    if (mode === "full") {
-      return {
-        label: "Use",
-        note: "Full plays allowed"
-      };
-    }
-    if (mode === "block") {
-      return {
-        label: "Block",
-        note: "Forced no-play"
-      };
-    }
-    return {
-      label: "Advisory",
-      note: "Lean only"
-    };
+    if (mode === "full") return { label: "Use", note: "Full plays allowed" };
+    if (mode === "block") return { label: "Block", note: "Forced no-play" };
+    return { label: "Advisory", note: "Lean only" };
   }
 
   function buildRecord(items = []) {
@@ -7852,27 +7868,11 @@ function renderTrackerAnalytics() {
 
   if (settled >= trackerMin) {
     if (bestMarket && bestMarket.settled >= 4 && bestMarket.winPct >= 70) {
-      reviewRows.push(
-        makeReviewItem(
-          "Best market",
-          "KEEP",
-          bestMarket.settled >= 6 ? "Confirmed strength" : "Candidate strength",
-          `${bestMarket.label} is leading at ${formatPct(bestMarket.winPct)} with ${bestMarket.wins} wins and ${bestMarket.losses} losses.`,
-          "Keep this market logic as it is. Do not weaken it from one bad day."
-        )
-      );
+      reviewRows.push(makeReviewItem("Best market", "KEEP", bestMarket.settled >= 6 ? "Confirmed strength" : "Candidate strength", `${bestMarket.label} is leading at ${formatPct(bestMarket.winPct)} with ${bestMarket.wins} wins and ${bestMarket.losses} losses.`, "Keep this market logic as it is. Do not weaken it from one bad day."));
     }
 
     if (weakMarket && weakMarket.settled >= 4 && weakMarket.winPct <= 45) {
-      reviewRows.push(
-        makeReviewItem(
-          "Weak market",
-          "REVIEW",
-          weakMarket.settled >= 6 ? "Candidate review" : "Watching",
-          `${weakMarket.label} is the weakest market so far at ${formatPct(weakMarket.winPct)} with ${weakMarket.losses} losses.`,
-          "Do not edit yet from this checkpoint alone. Keep it on review and only change if it repeats."
-        )
-      );
+      reviewRows.push(makeReviewItem("Weak market", "REVIEW", weakMarket.settled >= 6 ? "Candidate review" : "Watching", `${weakMarket.label} is the weakest market so far at ${formatPct(weakMarket.winPct)} with ${weakMarket.losses} losses.`, "Do not edit yet from this checkpoint alone. Keep it on review and only change if it repeats."));
     }
 
     if (lockRecord.settled >= 5) {
@@ -7890,15 +7890,7 @@ function renderTrackerAnalytics() {
         action = "Lock performance is healthy. Keep the current lock behavior unless a later checkpoint says otherwise.";
       }
 
-      reviewRows.push(
-        makeReviewItem(
-          "Lock icon",
-          decision,
-          status,
-          `Locks are ${lockRecord.wins} wins, ${lockRecord.losses} losses, ${lockRecord.pushes} pushes for ${formatPct(lockRecord.winPct)} win rate.`,
-          action
-        )
-      );
+      reviewRows.push(makeReviewItem("Lock icon", decision, status, `Locks are ${lockRecord.wins} wins, ${lockRecord.losses} losses, ${lockRecord.pushes} pushes for ${formatPct(lockRecord.winPct)} win rate.`, action));
     }
 
     const eligibleTeams = [...teamRows].filter(row => Number(row.settled || 0) >= 2);
@@ -7906,50 +7898,18 @@ function renderTrackerAnalytics() {
     const strongTeam = [...eligibleTeams].sort((a, b) => Number(b.winRate || -1) - Number(a.winRate || -1))[0];
 
     if (strongTeam && Number(strongTeam.winRate || 0) >= 70) {
-      reviewRows.push(
-        makeReviewItem(
-          "Strong team signal",
-          "KEEP",
-          "Watching",
-          `${strongTeam.label || strongTeam.key} is trending strong at ${formatPct(strongTeam.winRate)} across ${Number(strongTeam.settled || 0)} settled picks.`,
-          "Treat this as a positive team note. Keep collecting more team-by-team evidence."
-        )
-      );
+      reviewRows.push(makeReviewItem("Strong team signal", "KEEP", "Watching", `${strongTeam.label || strongTeam.key} is trending strong at ${formatPct(strongTeam.winRate)} across ${Number(strongTeam.settled || 0)} settled picks.`, "Treat this as a positive team note. Keep collecting more team-by-team evidence."));
     }
 
     if (weakTeam && Number(weakTeam.winRate || 100) <= 45) {
-      reviewRows.push(
-        makeReviewItem(
-          "Weak team signal",
-          "WATCH",
-          Number(weakTeam.settled || 0) >= 4 ? "Candidate review" : "Watching",
-          `${weakTeam.label || weakTeam.key} is underperforming at ${formatPct(weakTeam.winRate)} across ${Number(weakTeam.settled || 0)} settled picks.`,
-          "Keep this team on watch. Do not apply a global engine edit from one team alone."
-        )
-      );
+      reviewRows.push(makeReviewItem("Weak team signal", "WATCH", Number(weakTeam.settled || 0) >= 4 ? "Candidate review" : "Watching", `${weakTeam.label || weakTeam.key} is underperforming at ${formatPct(weakTeam.winRate)} across ${Number(weakTeam.settled || 0)} settled picks.`, "Keep this team on watch. Do not apply a global engine edit from one team alone."));
     }
 
     if (bestLeague && bestLeague.settled >= 4) {
-      reviewRows.push(
-        makeReviewItem(
-          "Best league",
-          "KEEP",
-          "Watching",
-          `${bestLeague.label} is the strongest tracked league so far at ${formatPct(bestLeague.winPct)}.`,
-          "Use this as context only. Do not add an automatic league boost."
-        )
-      );
+      reviewRows.push(makeReviewItem("Best league", "KEEP", "Watching", `${bestLeague.label} is the strongest tracked league so far at ${formatPct(bestLeague.winPct)}.`, "Use this as context only. Do not add an automatic league boost."));
     }
   } else {
-    reviewRows.push(
-      makeReviewItem(
-        "Checkpoint",
-        "COLLECT MORE",
-        "Watching",
-        `${settled}/${trackerMin} settled picks collected so far.`,
-        `${checkpointLeft} more settled picks are needed before the tracker can give a full review.`
-      )
-    );
+    reviewRows.push(makeReviewItem("Checkpoint", "COLLECT MORE", "Watching", `${settled}/${trackerMin} settled picks collected so far.`, `${checkpointLeft} more settled picks are needed before the tracker can give a full review.`));
   }
 
   const teamDisplayRows = teamRows.slice(0, 8);
@@ -7972,11 +7932,9 @@ function renderTrackerAnalytics() {
     if (!importantTrackerLines.includes(line)) importantTrackerLines.push(line);
   });
 
-    syncTrackerModalView();
-  // FIX: Removed the duplicate 'const currentView' declaration that was crashing the parser
+  syncTrackerModalView();
   panel.classList.toggle("tracker-hidden", currentView === "picks");
   panel.style.display = currentView === "picks" ? "none" : "block";
-
 
   const debugBodyHtml = `
       <div class="report-debug-grid">
@@ -8491,17 +8449,17 @@ function renderTrackerAnalytics() {
       </div>
     `;
   } else if (currentView === "debug") {
-    const archiveDebugHtml = buildArchiveDebugHtml();
+    const godFatherDebugHtml = buildGodFatherDebugHtml();
     panel.innerHTML = `
       <div class="tracker-analytics-shell">
         <div class="tracker-analytics-topbar">
           <div class="tracker-analytics-heading">
-            <div class="tracker-analytics-kicker">Engine Security</div>
-            <div class="tracker-analytics-title">Watch Dog 🐶</div>
-            <div class="tracker-analytics-subtitle">Critical system alerts and completion status.</div>
+            <div class="tracker-analytics-kicker">Immune System</div>
+            <div class="tracker-analytics-title">God Father 🛡️</div>
+            <div class="tracker-analytics-subtitle">Core engine diagnostics and health checks.</div>
           </div>
         </div>
-        ${archiveDebugHtml}
+        ${godFatherDebugHtml}
         ${debugBodyHtml}
       </div>
     `;
@@ -8512,6 +8470,7 @@ function renderTrackerAnalytics() {
   }
   updateTrackerInsightsButton();
 }
+
 
 
 function clampNumber(val, min, max) {
