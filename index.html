@@ -3049,8 +3049,8 @@ const CACHE_MAX = 120;
     // Keep non-math constants here
     const MODEL_CONFIG = {
       H2H_DIVERGE_THRESHOLD: 0.20,
-      LINE_ANCHOR_NBA: 0.38,  // FIX #1: was 0.65 — engine signal now dominates
-      LINE_ANCHOR_OTHER: 0.28, // FIX #1: was 0.50
+      LINE_ANCHOR_NBA: 0.38,
+      LINE_ANCHOR_OTHER: 0.28,
       MULTI_GOAL_SUPPRESS: 0.98,
       PACE_SUPPRESS: 0.97
     };
@@ -3424,8 +3424,8 @@ const LEAGUE_FETCH_RULES = {
     const _schedCache = new Map();
     const _summaryCache = new Map();
     const _fixtureCache = new Map();
-    const _fixtureCacheTimes = new Map(); // FIX: tracks cache entry timestamps for TTL
-    const FIXTURE_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes — busts stale pre-game status
+    const _fixtureCacheTimes = new Map();
+    const FIXTURE_CACHE_TTL_MS = 3 * 60 * 1000; // 3 min TTL — busts stale pre-game status
     const _teamCatalogCache = new Map();
 let g_activeFetchController = null;
 
@@ -3844,9 +3844,9 @@ function upsertEngineLineMemory({
       line: cleanLine,
       bestLine: cleanLine,
       latestLine: cleanLine,
-      firstLine: cleanLine,         // FIX #19: opening line anchor for movement tracking
-      lineMovement: 0,              // FIX #19: delta from opening line to current
-      sharpSide: null,              // FIX #19: inferred sharp money side
+      firstLine: cleanLine,
+      lineMovement: 0,
+      sharpSide: null,
       homeTeam: homeTeam || "",
       awayTeam: awayTeam || "",
       createdAt: nowIso,
@@ -3863,16 +3863,12 @@ function upsertEngineLineMemory({
 
   existing.latestLine = cleanLine;
   existing.lastSeenAt = nowIso;
-  // FIX #19: Recalculate line movement delta and infer sharp side
   if (isFinite(existing.firstLine) && existing.firstLine > 0) {
     existing.lineMovement = Number((cleanLine - existing.firstLine).toFixed(2));
-    // Sharp money moves lines: if over line rises → sharp money on OVER
-    // if under line rises → sharp money on UNDER (from their perspective line moved against them)
     if (Math.abs(existing.lineMovement) >= 0.5) {
       existing.sharpSide = (existing.side === "over" && existing.lineMovement > 0) ? "over"
         : (existing.side === "under" && existing.lineMovement < 0) ? "under"
-        : (existing.side === "over" && existing.lineMovement < 0) ? "under"
-        : "over";
+        : (existing.side === "over" && existing.lineMovement < 0) ? "under" : "over";
     }
   }
 
@@ -4345,24 +4341,16 @@ function getStabilizedBucketWinRate(wins = 0, losses = 0, priorGames = 12, prior
   const w = Number(wins) || 0;
   const l = Number(losses) || 0;
   const n = w + l;
-
   if (!n) return null;
-
-  // FIX #18 — WILSON SCORE lower bound (z=1.28, 80% CI).
-  // 8 games at 75% (n=8, p=0.75) → Wilson lower = 0.478 (conservative)
-  // 20 games at 72% (n=20, p=0.72) → Wilson lower = 0.554 (stronger)
-  // This correctly gives MORE credit to larger samples with similar rates.
+  // FIX #18 — Wilson score lower bound (z=1.28, 80% CI) blended with Bayesian prior
   const p = w / n;
-  const z = 1.28;              // 80% confidence interval
-  const z2 = z * z;
+  const z = 1.28, z2 = z * z;
   const centre = (p + z2 / (2 * n)) / (1 + z2 / n);
   const margin = (z / (1 + z2 / n)) * Math.sqrt((p * (1 - p) / n) + z2 / (4 * n * n));
-  const wilsonLower = Number(((centre - margin) * 100).toFixed(2));
-
-  // Blend Wilson lower bound with Bayesian prior (50/50 blend for stability)
+  const wilson = Number(((centre - margin) * 100).toFixed(2));
   const priorWins = priorGames * (priorWinRate / 100);
   const bayesian = Number((((w + priorWins) / (n + priorGames)) * 100).toFixed(2));
-  return Number(((wilsonLower * 0.60 + bayesian * 0.40)).toFixed(2));
+  return Number((wilson * 0.60 + bayesian * 0.40).toFixed(2));
 }
 
 function getBucketSignalStrength(stabilizedWinRate = null, reliabilityScore = 0) {
@@ -7098,13 +7086,10 @@ async function flushTrackerSave() {
         applied: getTrackerStateDebugScore(data.state),
         snapshot: getTrackerStateDebugScore(stateSnapshot)
       });
-      // FIX — SETTLEMENT GUARD: merge server response with live local state.
-      // This prevents settled picks from regressing to "pending" if the server
-      // returns a stale payload that hasn't processed our settled status yet.
-      const _serverResponseToMerge = data.state;
-      const _currentStateCopy = JSON.parse(JSON.stringify(g_trackerState));
-      const _safeMergedState = mergeTrackerStates(_currentStateCopy, _serverResponseToMerge);
-      normalizeTrackerState(_safeMergedState);
+      // FIX — SETTLEMENT GUARD: merge server response before overwriting local state
+      // Prevents settled picks regressing to "pending" from stale server response
+      const _safeMerged = mergeTrackerStates(JSON.parse(JSON.stringify(g_trackerState)), data.state);
+      normalizeTrackerState(_safeMerged);
       saveTrackerStateToLocal();
     }
 
@@ -9190,8 +9175,7 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
       // BEFORE it attempts to push to the server. This stops the database crash.
       await saveTrackerStateToLocal();
       
-      // FIX — SETTLEMENT GUARD: await the server push so a fast reload
-      // cannot catch the server still holding the "pending" version.
+      // FIX — SETTLEMENT GUARD: await push so fast reload can't catch server mid-push
       await forceTrackerSaveNow();
       
       renderTrackedPicks(); 
@@ -9314,9 +9298,9 @@ function addTrackedPicks(newPicks) {
 
   if (isFinite(divergence)) {
     const diff = Math.abs(divergence);
-    if (diff >= 18) base *= 0.60; // FIX #8: was 0.45 — preserves consistent domination signal
-    else if (diff >= 12) base *= 0.74; // was 0.62
-    else if (diff >= 8) base *= 0.88;  // was 0.80
+    if (diff >= 18) base *= 0.60;
+    else if (diff >= 12) base *= 0.74;
+    else if (diff >= 8) base *= 0.88;
   }
 
   const maxCap =
@@ -9332,7 +9316,7 @@ function addTrackedPicks(newPicks) {
   if (std <= limit) return proj;
 
   const excess = clampNumber((std - limit) / Math.max(1, limit), 0, 0.50);
-  const shrink = 1 - Math.min(excess * 0.25 + excess * excess * 0.20, 0.22); // FIX #5: stronger non-linear vol shrink
+  const shrink = 1 - Math.min(excess * 0.25 + excess * excess * 0.20, 0.22);
   return proj * shrink;
 }
 
@@ -9466,7 +9450,7 @@ function addTrackedPicks(newPicks) {
     const aEdgePct = Math.abs(a.edge / a.line) * 100;
     const bEdgePct = Math.abs(b.edge / b.line) * 100;
 
-    const aFullModelBonus = a.fullModel ? (aEdgePct * 0.10) : 0; // FIX #6: proportional, not flat 0.6
+    const aFullModelBonus = a.fullModel ? (aEdgePct * 0.10) : 0;
     const bFullModelBonus = b.fullModel ? (bEdgePct * 0.10) : 0;
 
     const aMassacreBonus = isFinite(Number(a.lockStrength)) ? Number(a.lockStrength) : 0;
@@ -9532,13 +9516,12 @@ function getConfidenceGrade({
       if (isPeriodMarket && paceGapRisk) score -= 1;
       if (isPeriodMarket && defensiveFloorFlag) score -= 1;
       if (isPeriodMarket && isFinite(blowoutGap) && blowoutGap > 20) score -= 1;
-      // FIX #10: Removed blanket isH2 score -= 1. Let the data quality decide.
-      // (The sampleTier penalty + hasH2H check already penalize weak 2H data)
+      // FIX #10: Removed blanket 2H penalty — let data quality decide
 
       if (isH2 && score >= 5) return "B";
       if (score >= 5) return "A";
       if (score >= 3) return "B";
-      if (score >= 0) return "C"; // FIX #7: was >= 1, reduces cliff effect
+      if (score >= 0) return "C"; // FIX #7: was >= 1
       return "D";
     }
 
@@ -9557,7 +9540,7 @@ function getConfidenceGrade({
 
   const scale = Number(MODEL_TUNING.anchorScale?.[marketType] || 0.75);
   const excess = clampNumber((diff - diffGate) / Math.max(1, diffGate * 1.5), 0, 1);
-  const weight = clampNumber(baseWeight * scale * excess, 0, 0.40); // FIX #1: hard cap 0.70→0.40
+  const weight = clampNumber(baseWeight * scale * excess, 0, 0.40);
 
   return (proj * (1 - weight)) + (line * weight);
 }
@@ -9686,25 +9669,12 @@ function buildTotalMarketIntelSignal(aSc, aAll, bSc, bAll, line, teamBase) {
   let signed = 0;
   const reasons = [];
 
-  // FIX #11 — SOS CORRECTION: If opponent-allowed series is ALSO elevated,
-  // both teams were scoring big partly because they faced weak defenses.
-  // Apply a conservative -1 signal to prevent double-counting soft schedules.
-  if (isFinite(aa) && isFinite(ba) && isFinite(as) && isFinite(bs)) {
-    const avgOppAllowed = (aa + ba) / 2;
-    const avgTeamScored = (as + bs) / 2;
-    // Both teams scored well AND both faced porous defenses → SOS inflation
-    if (avgTeamScored >= teamBase * 1.07 && avgOppAllowed >= teamBase * 1.07) {
-      signed -= 1; // cancel the upcoming "offense hot" signal — it's schedule-inflated
-      reasons.push("sos-adjusted");
-    }
-  }
-
   if (isFinite(as) && isFinite(bs)) {
     const avgOff = (as + bs) / 2;
-    if (avgOff >= teamBase * 1.07  /* FIX #9: was 1.03, 7% = meaningful signal */) {
+    if (avgOff >= teamBase * 1.07) {
       signed += 1;
       reasons.push("offense hot");
-    } else if (avgOff <= teamBase * 0.93  /* FIX #9: was 0.97, 7% = meaningful signal */) {
+    } else if (avgOff <= teamBase * 0.93) {
       signed -= 1;
       reasons.push("offense cold");
     }
@@ -9712,10 +9682,10 @@ function buildTotalMarketIntelSignal(aSc, aAll, bSc, bAll, line, teamBase) {
 
   if (isFinite(aa) && isFinite(ba)) {
     const avgLeak = (aa + ba) / 2;
-    if (avgLeak >= teamBase * 1.07  /* FIX #9: was 1.03, 7% = meaningful signal */) {
+    if (avgLeak >= teamBase * 1.07) {
       signed += 1;
       reasons.push("defense leak");
-    } else if (avgLeak <= teamBase * 0.93  /* FIX #9: was 0.97, 7% = meaningful signal */) {
+    } else if (avgLeak <= teamBase * 0.93) {
       signed -= 1;
       reasons.push("defense tight");
     }
@@ -9754,20 +9724,20 @@ function buildTeamMarketIntelSignal(teamSc, teamAll, oppAll, line, teamBase) {
   const reasons = [];
 
   if (isFinite(off)) {
-    if (off >= teamBase * 1.07  /* FIX #9: was 1.03, 7% = meaningful signal */) {
+    if (off >= teamBase * 1.07) {
       signed += 1;
       reasons.push("team offense strong");
-    } else if (off <= teamBase * 0.93  /* FIX #9: was 0.97, 7% = meaningful signal */) {
+    } else if (off <= teamBase * 0.93) {
       signed -= 1;
       reasons.push("team offense weak");
     }
   }
 
   if (isFinite(oppLeak)) {
-    if (oppLeak >= teamBase * 1.07  /* FIX #9: was 1.03, 7% = meaningful signal */) {
+    if (oppLeak >= teamBase * 1.07) {
       signed += 1;
       reasons.push("opponent defense weak");
-    } else if (oppLeak <= teamBase * 0.93  /* FIX #9: was 0.97, 7% = meaningful signal */) {
+    } else if (oppLeak <= teamBase * 0.93) {
       signed -= 1;
       reasons.push("opponent defense strong");
     }
@@ -11109,15 +11079,11 @@ validateFetchSection();
 
         const payloadResults = await Promise.allSettled(queryDates.map(dateStr => {
   const cacheKey = "fixtures:" + league + ":" + dateStr;
-  // FIX: Expire fixture cache entries older than 3 minutes
   if (_fixtureCache.has(cacheKey)) {
-    const cacheAge = Date.now() - (_fixtureCacheTimes.get(cacheKey) || 0);
-    if (cacheAge < FIXTURE_CACHE_TTL_MS) {
-      return _fixtureCache.get(cacheKey); // still fresh — use it
-    } else {
-      _fixtureCache.delete(cacheKey);     // stale — bust it and re-fetch
-      _fixtureCacheTimes.delete(cacheKey);
-    }
+    const age = Date.now() - (_fixtureCacheTimes.get(cacheKey) || 0);
+    if (age < FIXTURE_CACHE_TTL_MS) return _fixtureCache.get(cacheKey);
+    _fixtureCache.delete(cacheKey);
+    _fixtureCacheTimes.delete(cacheKey);
   }
 
   const p = proxyFetch(base + "/scoreboard?dates=" + dateStr + "&limit=200").catch(err => {
@@ -11126,7 +11092,7 @@ validateFetchSection();
   });
 
   cacheSet(_fixtureCache, cacheKey, p);
-  _fixtureCacheTimes.set(cacheKey, Date.now()); // FIX: record insertion time for TTL
+  _fixtureCacheTimes.set(cacheKey, Date.now());
   return p;
 }));
 
@@ -11163,14 +11129,8 @@ const isPreGame =
   state === "pre" ||
   statusName === "STATUS_SCHEDULED" ||
   statusName === "STATUS_PRE";
-
-// FIX: Hard time gate — exclude any game whose scheduled start has already passed.
-// 2-minute grace window handles tipoff delays and timezone clock skew.
-// This is the definitive safety net: even a "pre" status from a stale cache
-// cannot sneak a live/started game back onto the list.
-const TIPOFF_GRACE_MS = 2 * 60 * 1000; // 2 minutes
-const gameHasStarted = eventTime.getTime() <= (Date.now() - TIPOFF_GRACE_MS);
-
+// FIX: Hard time gate — exclude games whose tipoff has already passed (2-min grace window)
+const gameHasStarted = eventTime.getTime() <= (Date.now() - 2 * 60 * 1000);
 return isPreGame && !gameHasStarted;
         }).sort((a, b) => new Date(a.date) - new Date(b.date));
 
@@ -11690,27 +11650,11 @@ function buildTeamMarketProjection({
 
 
 function computePaceSignal(league, teamAProj, teamBProj, marketKey = "ft") {
-  const clampRange = getEffectivePaceClamp(league);
-
-  // FIX #3: Use raw pace10 series first — avoids circular derivation from projections
-  const aPace10 = g_massacreFetchContext?.A?.pace10 || [];
-  const bPace10 = g_massacreFetchContext?.B?.pace10 || [];
-  if (aPace10.length >= 2 && bPace10.length >= 2) {
-    const avgAPace = avgOrNaN(aPace10);
-    const avgBPace = avgOrNaN(bPace10);
-    if (isFinite(avgAPace) && isFinite(avgBPace) && avgAPace > 0 && avgBPace > 0) {
-      // pace10 is in possessions/game (~95-110 for NBA). Normalize to ratio.
-      const leaguePaceBase = league === "nba" ? 99.5 : league === "ncaa" ? 67.5 : 80.0;
-      const raw = ((avgAPace + avgBPace) / 2) / leaguePaceBase;
-      return clampNumber(raw, clampRange.min, clampRange.max);
-    }
-  }
-
-  // Fallback: projection-based estimate (only fires when no API pace data)
   const base = Number(LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160);
   const baseline = marketKey === "ft" ? base : base / 2;
   if (!isFinite(teamAProj) || !isFinite(teamBProj) || !isFinite(baseline) || baseline <= 0) return NaN;
   const raw = (teamAProj + teamBProj) / baseline;
+  const clampRange = getEffectivePaceClamp(league);
   return clampNumber(raw, clampRange.min, clampRange.max);
 }
 
@@ -11862,16 +11806,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let projAFT, projBFT, estMatchPace, synNetA = null, synNetB = null;
 
   if (aORTG.length >= 2 && bORTG.length >= 2) {
-    // FIX #12: 60/40 ORTG/DRTG blend — ORTG is more predictable than raw DRTG
+    // FIX #12: 60/40 — ORTG is more predictive than raw unadjusted DRTG
     const expEffA = (avgOrNaN(aORTG) * 0.60 + avgOrNaN(bDRTG) * 0.40);
     const expEffB = (avgOrNaN(bORTG) * 0.60 + avgOrNaN(aDRTG) * 0.40);
-    // FIX #14 — HOLLINGER PACE CORRECTION: (pA * pB) / leaguePace
-    const _ftPaceA = avgOrNaN(aPace);
-    const _ftPaceB = avgOrNaN(bPace);
-    const _ftLeaguePace = league === "nba" ? 99.5 : league === "ncaa" ? 67.5 : 80.0;
-    const rawPace = (isFinite(_ftPaceA) && isFinite(_ftPaceB) && _ftLeaguePace > 0)
-      ? (_ftPaceA * _ftPaceB) / _ftLeaguePace  // Hollinger: interaction formula
-      : (_ftPaceA + _ftPaceB) / 2;             // fallback
+    const rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
     estMatchPace = clampNumber(rawPace, cl.min * 100, cl.max * 100);
     projAFT = (expEffA / 100) * estMatchPace * injMultA;
     projBFT = (expEffB / 100) * estMatchPace * injMultB;
@@ -11886,30 +11824,24 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     // Assign a true possession baseline based on league norms.
     const basePace = league === "nba" ? 99.5 : league === "ncaa" ? 67.5 : 80.0;
     
-    // FIX #4: Separate offensive/defensive identity. Old code: (aS+aA)/eb
-    // made a 115-scoring/105-allowing team identical to 105/115.
-    // Now ORTG & DRTG are derived independently per team.
-    const offPaceA = clampNumber(aS / (eb / 2), cl.min, cl.max);
-    const defPaceA = clampNumber(aA / (eb / 2), cl.min, cl.max);
-    const offPaceB = clampNumber(bS / (eb / 2), cl.min, cl.max);
-    const defPaceB = clampNumber(bA / (eb / 2), cl.min, cl.max);
+    const paceFactorA = (aS + aA) / eb;
+    const paceFactorB = (bS + bA) / eb;
+    
+    // Dampen the pace factor so extreme scores translate to efficiency, not just hyper-speed
+    const dampenedPaceA = 1 + ((paceFactorA - 1) * 0.4);
+    const dampenedPaceB = 1 + ((paceFactorB - 1) * 0.4);
 
-    // Asymmetric dampening: offense stickier (0.45), defense regresses faster (0.35)
-    const synOrtgA = (1 + ((offPaceA - 1) * 0.45)) * 100;
-    const synDrtgA = (1 + ((defPaceA - 1) * 0.35)) * 100;
-    const synOrtgB = (1 + ((offPaceB - 1) * 0.45)) * 100;
-    const synDrtgB = (1 + ((defPaceB - 1) * 0.35)) * 100;
-
+    estMatchPace = clampNumber(basePace * ((dampenedPaceA + dampenedPaceB) / 2), basePace * cl.min, basePace * cl.max);
+    
+    const synOrtgA = (aS / (basePace * dampenedPaceA)) * 100;
+    const synDrtgA = (aA / (basePace * dampenedPaceA)) * 100;
+    const synOrtgB = (bS / (basePace * dampenedPaceB)) * 100;
+    const synDrtgB = (bA / (basePace * dampenedPaceB)) * 100;
+    
     synNetA = synOrtgA - synDrtgA;
     synNetB = synOrtgB - synDrtgB;
-
-    // Match pace driven by offensive tempo
-    const _blendedPF = ((1 + ((offPaceA - 1) * 0.45)) + (1 + ((offPaceB - 1) * 0.45))) / 2;
-    estMatchPace = clampNumber(basePace * _blendedPF, basePace * cl.min, basePace * cl.max);
-
-    // FIX #20 applied: 65/35 offense-dominant blend (was 50/50 via avgOrNaN)
-    projAFT = ((synOrtgA * 0.65 + synDrtgB * 0.35) / 100) * estMatchPace * injMultA;
-    projBFT = ((synOrtgB * 0.65 + synDrtgA * 0.35) / 100) * estMatchPace * injMultB;
+    projAFT = ((synOrtgA + synDrtgB) / 2 / 100) * estMatchPace * injMultA;
+    projBFT = ((synOrtgB + synDrtgA) / 2 / 100) * estMatchPace * injMultB;
   }
 
   // --- H2H INJECTION FOR FT, TEAM A, AND TEAM B ---
@@ -11932,16 +11864,6 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
 
-
-  // FIX #2 — REST DAYS FACTOR (B2B teams avg ~3.5 fewer pts, now wired in)
-  const _restDaysA_ft = Number(g_massacreFetchContext?.A?.restDays);
-  const _restDaysB_ft = Number(g_massacreFetchContext?.B?.restDays);
-  if (isFinite(_restDaysA_ft) && _restDaysA_ft >= 0 && isFinite(projAFT)) {
-    projAFT *= (_restDaysA_ft === 0 ? 0.984 : _restDaysA_ft === 1 ? 0.995 : 1.0);
-  }
-  if (isFinite(_restDaysB_ft) && _restDaysB_ft >= 0 && isFinite(projBFT)) {
-    projBFT *= (_restDaysB_ft === 0 ? 0.984 : _restDaysB_ft === 1 ? 0.995 : 1.0);
-  }
 
     // FIX 6: Apply Volatility Suppression before anchoring
   const vl = getMarketVolLimit(league, "ft");
@@ -12017,18 +11939,11 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let projA1H, projB1H, estHalfPace;
 
   if (aORTG.length >= 2 && bORTG.length >= 2) {
-    // FIX #12: 60/40 ORTG/DRTG blend for 1H Level 1 path
+    // FIX #12: 60/40 — ORTG is more predictive than raw unadjusted DRTG
     const expEffA = (avgOrNaN(aORTG) * 0.60 + avgOrNaN(bDRTG) * 0.40);
     const expEffB = (avgOrNaN(bORTG) * 0.60 + avgOrNaN(aDRTG) * 0.40);
-    // FIX #14 — HOLLINGER PACE CORRECTION: (pA * pB) / leaguePace
-    // Two fast teams interact via shared possessions, not simple average.
-    const _avgPaceA = avgOrNaN(aPace);
-    const _avgPaceB = avgOrNaN(bPace);
-    const _leaguePaceBase = league === "nba" ? 99.5 : league === "ncaa" ? 67.5 : 80.0;
-    const rawPace = (isFinite(_avgPaceA) && isFinite(_avgPaceB) && _leaguePaceBase > 0)
-      ? (_avgPaceA * _avgPaceB) / _leaguePaceBase  // Hollinger formula
-      : (_avgPaceA + _avgPaceB) / 2;               // fallback: simple average
-    estHalfPace = (rawPace / 2);
+    const rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
+    estHalfPace = (rawPace / 2); 
     projA1H = (expEffA / 100) * estHalfPace * injMultA;
     projB1H = (expEffB / 100) * estHalfPace * injMultB;
      } else {
@@ -12049,7 +11964,7 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const aDef = isFinite(avgA1HAllowed) ? avgA1HAllowed : baseTeam1H;
 
     // Apply the 55/45 Offense/Defense blend and the injury multiplier
-    projA1H = ((aOff * 0.65) + (bDef * 0.35)) * injMultA; // FIX #20: 65/35 offense-dominant blend
+    projA1H = ((aOff * 0.65) + (bDef * 0.35)) * injMultA;
     projB1H = ((bOff * 0.65) + (aDef * 0.35)) * injMultB;
   }
 
@@ -12076,16 +11991,6 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     else if (roleA === "away") { projA1H -= (homeEdge / 2); projB1H += (homeEdge / 2); }
   }
 
-
-  // FIX #2 — REST DAYS FACTOR for 1H
-  const _restDaysA_1h = Number(g_massacreFetchContext?.A?.restDays);
-  const _restDaysB_1h = Number(g_massacreFetchContext?.B?.restDays);
-  if (isFinite(_restDaysA_1h) && _restDaysA_1h >= 0 && isFinite(projA1H)) {
-    projA1H *= (_restDaysA_1h === 0 ? 0.984 : _restDaysA_1h === 1 ? 0.995 : 1.0);
-  }
-  if (isFinite(_restDaysB_1h) && _restDaysB_1h >= 0 && isFinite(projB1H)) {
-    projB1H *= (_restDaysB_1h === 0 ? 0.984 : _restDaysB_1h === 1 ? 0.995 : 1.0);
-  }
 
     // FIX 6: Apply Volatility Suppression before anchoring
   const h1Vl = getMarketVolLimit(league, "h1");
@@ -12257,17 +12162,6 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const pace = computePaceSignal(league, aTeam.proj, bTeam.proj, "h2");
   if (isFinite(pace)) h2Proj *= (1 + ((pace - 1) * 0.10));
   
-  // FIX #2 — REST DAYS FACTOR for 2H (applied at team-proj level via aTeam/bTeam)
-  const _restDaysA_2h = Number(g_massacreFetchContext?.A?.restDays);
-  const _restDaysB_2h = Number(g_massacreFetchContext?.B?.restDays);
-  if (isFinite(_restDaysA_2h) && _restDaysA_2h >= 0 && isFinite(aTeam?.proj)) {
-    aTeam.proj *= (_restDaysA_2h === 0 ? 0.984 : _restDaysA_2h === 1 ? 0.995 : 1.0);
-  }
-  if (isFinite(_restDaysB_2h) && _restDaysB_2h >= 0 && isFinite(bTeam?.proj)) {
-    bTeam.proj *= (_restDaysB_2h === 0 ? 0.984 : _restDaysB_2h === 1 ? 0.995 : 1.0);
-  }
-  if (isFinite(aTeam?.proj) && isFinite(bTeam?.proj)) h2Proj = aTeam.proj + bTeam.proj;
-
   // FIX 6: Apply Volatility Suppression before anchoring
   const h2Vl = getMarketVolLimit(league, "h2");
   if (isFinite(h2Proj)) {
@@ -12565,10 +12459,8 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
         while (u1 === 0) u1 = Math.random();
         
         let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-        // FIX #13: Apply right-skew (basketball totals are right-skewed, ~0.28).
-        // Wilson-Hilferty approximation: skew the normal draw toward higher scores.
-        const skew = 0.28;
-        const skewAdj = z0 + skew * (z0 * z0 - 1) / 6;
+        // FIX #13: Basketball totals are right-skewed (skew≈0.28). Pure Gaussian underprices OVER.
+        const skewAdj = z0 + 0.28 * (z0 * z0 - 1) / 6;
         let simulatedScore = mean + (stdDev * skewAdj);
         
         if (simulatedScore > line) overHits++;
@@ -14021,7 +13913,7 @@ if (trackedToSave.length) {
       _schedCache.clear();
       _summaryCache.clear();
       _fixtureCache.clear();
-      _fixtureCacheTimes.clear(); // FIX: also clear TTL timestamps on full cache reset
+      _fixtureCacheTimes.clear();
 
       setStatusText("", "");
       setFetchAuditIssues([]);
