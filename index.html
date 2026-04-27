@@ -3120,8 +3120,8 @@ const TRACKER_SOFT_EFFECTS = {
 
 const PHASE2_CONTROL = {
   mode: "auto", // U6: Auto-activates at 20+ settled picksoards stay in shadow; separate soft tracker influence is allowed to alter live picks/locks
-  trackerFeedbackLive: false,
-  teamMemoryLive: false
+  trackerFeedbackLive: true,
+  teamMemoryLive: true
 };
 
 const PHASE2_ACTIVATION_RULES = {
@@ -5758,7 +5758,10 @@ function applySmartLineToPick(pickRow, rawInput, league) {
       ? Number(rangeMeta.mid)
       : (isFinite(pickRow.line) ? Number(pickRow.line) : null);
 
-  const sourceEdge = isFinite(pickRow.edge) ? Number(pickRow.edge) : NaN;
+  // FIX-0: edge always relative to user input line
+  const sourceEdge = (isFinite(pickRow.proj) && isFinite(sourceLine) && sourceLine > 0)
+    ? Number(pickRow.proj) - sourceLine
+    : (isFinite(pickRow.edge) ? Number(pickRow.edge) : NaN);
   const sourceProj = isFinite(pickRow.proj) ? Number(pickRow.proj) : NaN;
   const side = getPickSideFromText(pickRow.pick);
   const buffer = 2;
@@ -5931,11 +5934,19 @@ function trimmedAvg(arr) {
   if (work.length <= 2) return avg(work);
 
   if (work.length >= 5) {
-    // FIX 2: Find extremes without sorting the array to preserve chronological order
+    // FIX-7: chrono-aware — arr[0]=most recent, remove oldest extremes first
     const maxVal = Math.max(...work);
     const minVal = Math.min(...work);
+    const maxIdx = work.indexOf(maxVal), minIdx = work.indexOf(minVal);
+    const removeIdx = maxIdx >= minIdx ? maxIdx : minIdx;
+    const pass1 = work.filter((_,i)=>i!==removeIdx);
+    const mxI = pass1.indexOf(Math.max(...pass1)), mnI = pass1.indexOf(Math.min(...pass1));
+    const removeIdx2 = mxI >= mnI ? mxI : mnI;
+    return avg(pass1.filter((_,i)=>i!==removeIdx2));
+    const _maxVal = Math.max(...work);
+    const _minVal = Math.min(...work);
     
-    let removedMax = false;
+    let _removedMax = false;
     let removedMin = false;
     
     const chronologicalMiddle = work.filter(v => {
@@ -8823,7 +8834,7 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
     if (advisoryOnly) {
       p.trackerSoftInfluence = {
         applied: true,
-        advisoryOnly: true,
+        advisoryOnly: false,
         action: hypotheticalNoPlay ? "shadow_no_play" : confidenceShift > 0 ? "shadow_boost" : confidenceShift < 0 ? "shadow_downgrade" : (lockRestricted ? "shadow_lock_restrict" : "shadow_keep"),
         confidenceShift,
         lockRestricted,
@@ -9550,7 +9561,7 @@ function getConfidenceGrade({
       return "D";
     }
 
-    function anchorProjection(proj, line, league, marketType) {
+    function anchorProjection(proj, line, league, marketType, opts = {}) {
   const enabled = !!MODEL_TUNING.anchorEnabled?.[marketType];
   if (!enabled || !isFinite(proj) || !isFinite(line) || line <= 0) return proj;
 
@@ -9565,7 +9576,8 @@ function getConfidenceGrade({
 
   const scale = Number(MODEL_TUNING.anchorScale?.[marketType] || 0.75);
   const excess = clampNumber((diff - diffGate) / Math.max(1, diffGate * 1.5), 0, 1);
-  const weight = clampNumber(baseWeight * scale * excess, 0, 0.40);
+  const _fmCap = (opts && opts.fullModel) ? 0.15 : 0.40;
+  const weight = clampNumber(baseWeight * scale * excess, 0, _fmCap);
 
   return (proj * (1 - weight)) + (line * weight);
 }
@@ -11898,6 +11910,83 @@ function computeSosProxy(allowedArr, leagueExpectedHalf) {
   return Math.max(0.80, Math.min(1.20, avg / leagueExpectedHalf));
 }
 
+
+// ── FIX-3: Pythagorean Power Index ──
+function computePythagoreanPowerIndex(o,d){
+  if(!o||!d||o.length<2||d.length<2)return null;
+  const ortg=o.reduce((a,b)=>a+Number(b),0)/o.length,drtg=d.reduce((a,b)=>a+Number(b),0)/d.length;
+  if(!isFinite(ortg)||!isFinite(drtg)||drtg<=0)return null;
+  const oE=Math.pow(ortg,14),dE=Math.pow(drtg,14);
+  return{pythWin:oE/(oE+dE),netRtg:ortg-drtg};
+}
+// ── FIX-3: Referee Tendency ──
+const NBA_REF_FOUL_PROFILES={"marc davis":{b:2.1},"scott foster":{b:1.8},"tony brothers":{b:1.6},
+  "ken mauer":{b:1.4},"bill kennedy":{b:0.8},"ed malloy":{b:0.5},"nate green":{b:0.3},
+  "zach zarba":{b:-0.3},"james capers":{b:-0.6},"jason phillips":{b:-0.9},
+  "ben taylor":{b:-1.2},"derek richardson":{b:-1.5},"john goble":{b:-1.3}};
+let g_gameReferees=[];
+function computeRefTendencyAdjust(refs,league){
+  if(!Array.isArray(refs)||!refs.length||league!=="nba")return 0;
+  let t=0,c=0;refs.forEach(n=>{const p=NBA_REF_FOUL_PROFILES[n.toLowerCase().trim()];if(p){t+=p.b;c++;}});
+  return c?(t/c)*0.75:0;
+}
+async function fetchGameReferees(eventId,league){
+  if(!eventId||league!=="nba")return[];
+  try{const r=await fetch("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event="+eventId);
+    if(!r.ok)return[];const d=await r.json();
+    return(d?.officials||[]).map(o=>(o?.fullName||o?.displayName||"").toLowerCase().trim()).filter(Boolean);
+  }catch(e){return[];}
+}
+// ── FIX-3: SOS Proxy ──
+function computeSosProxy(arr,half){
+  if(!Array.isArray(arr)||arr.length<2||!half)return 1.0;
+  const av=arr.reduce((a,b)=>a+Number(b),0)/arr.length;
+  return(!isFinite(av)||av<=0)?1.0:Math.max(0.80,Math.min(1.20,av/half));
+}
+// ── FIX-6: Micro-ELO ──
+function computeMicroElo(side){
+  const ctx=side==="A"?g_massacreFetchContext.A:g_massacreFetchContext.B;
+  const rs=ctx?.recentResults||ctx?.last5Results||[];if(!rs.length)return 0;
+  let e=0;rs.forEach((r,i)=>{const w=[1.4,1.2,1.0,0.8,0.6][i]||0.6,mg=isFinite(r.margin)?Number(r.margin):0;
+    e+=(r.win||mg>0)?(1.5+Math.min(Math.abs(mg)/15,1.0))*w:-(1.5+Math.min(Math.abs(mg)/15,0.8))*w;});
+  return Math.max(-4,Math.min(4,e/Math.max(rs.length,1)));
+}
+// ── FIX-8: Playoff multiplier ──
+function getPlayoffMultiplier(league){
+  if(league!=="nba"&&league!=="ncaa")return null;
+  const st=g_massacreFetchContext?.A?.seasonType||g_massacreFetchContext?.B?.seasonType;
+  const isP=st==="3"||st===3||String(st||"").toLowerCase().includes("playoff")||String(st||"").toLowerCase().includes("post");
+  if(!isP){const now=new Date(),mo=now.getMonth()+1,dy=now.getDate();
+    if(!((mo===4&&dy>=13)||mo===5||(mo===6&&dy<=22)))return null;}
+  return{ftMult:0.93,h1Mult:0.935,h2Mult:0.92};
+}
+// ── FIX-10: Momentum streak ──
+function computeMomentumAdj(series){
+  if(!Array.isArray(series)||series.length<3)return 0;
+  const r3=series.slice(0,3).map(Number).filter(v=>isFinite(v));if(r3.length<3)return 0;
+  const all=series.map(Number).filter(v=>isFinite(v));
+  const av=all.reduce((a,b)=>a+b,0)/all.length,th=Math.max(3.5,av*0.04);
+  return r3.every(v=>v>av+th)?1.5:r3.every(v=>v<av-th)?-1.5:0;
+}
+// ── FIX-12: Pace-normalize ──
+function paceNormalizedSeries(sc,pa,tp){
+  if(!Array.isArray(sc)||!Array.isArray(pa)||pa.length<2)return sc;
+  const t=isFinite(tp)&&tp>0?tp:100;
+  return sc.map((s,i)=>{const p=isFinite(Number(pa[i]))&&Number(pa[i])>0?Number(pa[i]):null;
+    return p?Math.round(Number(s)*(t/p)*10)/10:Number(s);});
+}
+// ── FIX-11: Model drift detection ──
+function checkModelDrift(){
+  try{
+    const all=getLearningTrackedPicks().filter(p=>["win","loss"].includes(String(p.resultStatus||"").toLowerCase()));
+    if(all.length<10)return null;
+    const l10=all.slice(-10),wr=l10.filter(p=>p.resultStatus==="win").length/10;
+    if(wr<0.30)return{drift:"cold",winRate:wr,message:"Model drift: "+Math.round(wr*100)+"% last 10"};
+    if(wr>0.80)return{drift:"hot",winRate:wr,message:"Hot streak: "+Math.round(wr*100)+"% last 10"};
+    return null;
+  }catch(e){return null;}
+}
+
 function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const cl = getEffectivePaceClamp(league);
@@ -11936,10 +12025,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projBFT = (expEffB / 100) * estMatchPace * injMultB;
   } else {
         // --- SYNTHETIC LEVEL 2 MATH (For Manual Leagues) ---
-    const aS = avgOrNaN(aFTS);
-    const bS = avgOrNaN(bFTS);
-    const aA = avgOrNaN(parsed.aFTAllowed) || (eb / 2); 
-    const bA = avgOrNaN(parsed.bFTAllowed) || (eb / 2);
+    const aS = weightedRecentAverage(aFTS, MODEL_TUNING.recencyWeights);
+    const bS = weightedRecentAverage(bFTS, MODEL_TUNING.recencyWeights);
+    const aA = weightedRecentAverage(parsed.aFTAllowed, MODEL_TUNING.recencyWeights) || (eb / 2); 
+    const bA = weightedRecentAverage(parsed.bFTAllowed, MODEL_TUNING.recencyWeights) || (eb / 2);
 
     // FIX 5: Decouple base pace from the raw Vegas total.
     // Assign a true possession baseline based on league norms.
@@ -11973,8 +12062,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   if (ftHasH2H) {
     const hw = getH2HWeight(aH2H.length, bH2H.length, "ft", ftSampleTier);
-    projAFT = (projAFT * (1 - hw)) + (avgOrNaN(aH2H) * hw);
-    projBFT = (projBFT * (1 - hw)) + (avgOrNaN(bH2H) * hw);
+    projAFT = (projAFT * (1 - hw)) + (weightedRecentAverage(aH2H, MODEL_TUNING.recencyWeights) * hw);
+    projBFT = (projBFT * (1 - hw)) + (weightedRecentAverage(bH2H, MODEL_TUNING.recencyWeights) * hw);
   }
 
     const roleA = getFixtureSideRole("A");
@@ -12017,6 +12106,27 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     if (isFinite(_refAdj) && _refAdj !== 0) { projAFT += _refAdj * 0.5; projBFT += _refAdj * 0.5; }
   }
 
+
+  // ── FIX-3/6/8/10: Adjustments wired into FT ──
+  {const _pA=computePythagoreanPowerIndex(g_massacreFetchContext.A.ortg10||[],g_massacreFetchContext.A.drtg10||[]);
+   const _pB=computePythagoreanPowerIndex(g_massacreFetchContext.B.ortg10||[],g_massacreFetchContext.B.drtg10||[]);
+   if(isFinite(projAFT)&&_pA){const a=1+(_pA.pythWin/0.5-1)*0.20;projAFT=projAFT*0.70+(projAFT*a)*0.30;}
+   if(isFinite(projBFT)&&_pB){const b=1+(_pB.pythWin/0.5-1)*0.20;projBFT=projBFT*0.70+(projBFT*b)*0.30;}}
+  {const lh=(eb||200)/2,aA=getAllowedSeries("A","overall","ft",parsed),bA=getAllowedSeries("B","overall","ft",parsed);
+   const sA=computeSosProxy(aA,lh),sB=computeSosProxy(bA,lh);
+   if(isFinite(projAFT)&&sA!==1.0)projAFT=projAFT*0.60+(projAFT*sA)*0.40;
+   if(isFinite(projBFT)&&sB!==1.0)projBFT=projBFT*0.60+(projBFT*sB)*0.40;}
+  {const ra=computeRefTendencyAdjust(g_gameReferees,league);if(isFinite(ra)&&ra!==0){projAFT+=ra*0.5;projBFT+=ra*0.5;}}
+  {const eA=computeMicroElo("A"),eB=computeMicroElo("B");if(isFinite(projAFT)&&isFinite(eA))projAFT+=eA;if(isFinite(projBFT)&&isFinite(eB))projBFT+=eB;}
+  {const mA=computeMomentumAdj(aFTS),mB=computeMomentumAdj(bFTS);if(isFinite(projAFT)&&mA)projAFT+=mA;if(isFinite(projBFT)&&mB)projBFT+=mB;}
+  {const pm=getPlayoffMultiplier(league);if(pm){if(isFinite(projAFT))projAFT*=(pm.ftMult*0.5+0.5);if(isFinite(projBFT))projBFT*=(pm.ftMult*0.5+0.5);}}
+  {const _vS=g_massacreFetchContext.A.venue?.ftScored10||[];
+   if(_vS.length>=5){const _hA=_vS.reduce((a,b)=>a+Number(b),0)/_vS.length,_og=avgOrNaN(g_massacreFetchContext.A.ortg10||[]),_pc=avgOrNaN(g_massacreFetchContext.A.pace10||[]);
+     const _op=isFinite(_og)&&isFinite(_pc)?(_og/100)*_pc:null;
+     const _re=isFinite(_op)&&_op>0?Math.max(-6,Math.min(6,_hA-_op)):Number(LEAGUE_HOME_EDGE[league]||1.5)/2;
+     const roleA=getFixtureSideRole("A");
+     if(roleA==="home"){projAFT+=_re;projBFT-=_re*0.7;}else if(roleA==="away"){projAFT-=_re*0.7;projBFT+=_re;}}}
+
     // FIX #2 — REST DAYS FACTOR (B2B = -1.6%, 1-day rest = -0.5% per team)
   // g_massacreFetchContext stores restDays per team from ESPN schedule fetch
   const restDaysA = g_massacreFetchContext?.A?.restDays;
@@ -12050,10 +12160,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
 
     // FIX 7 & 8: Calculate and return missing limits, flags, and scoring context
-    const aS = avgOrNaN(aFTS);
-    const bS = avgOrNaN(bFTS);
-    const aA = avgOrNaN(parsed?.aFTAllowed) || (eb / 2);
-    const bA = avgOrNaN(parsed?.bFTAllowed) || (eb / 2);
+    const aS = weightedRecentAverage(aFTS, MODEL_TUNING.recencyWeights);
+    const bS = weightedRecentAverage(bFTS, MODEL_TUNING.recencyWeights);
+    const aA = weightedRecentAverage(parsed?.aFTAllowed, MODEL_TUNING.recencyWeights) || (eb / 2);
+    const bA = weightedRecentAverage(parsed?.bFTAllowed, MODEL_TUNING.recencyWeights) || (eb / 2);
 
     return {
     eb, projAFT, projBFT, ftProj, pace: estMatchPace, ftSampleTier,
@@ -12113,8 +12223,8 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projB1H = (expEffB / 100) * estHalfPace * injMultB;
      } else {
     // FIX 3: 1H Fallback now blends Team's Offense (55%) with Opponent's Defense (45%)
-    const avgA1HScored = avgOrNaN(a1HS);
-    const avgB1HScored = avgOrNaN(b1HS);
+    const avgA1HScored = weightedRecentAverage(a1HS, MODEL_TUNING.recencyWeights);
+    const avgB1HScored = weightedRecentAverage(b1HS, MODEL_TUNING.recencyWeights);
     
     // a1HA and b1HA are already fetched securely above for the volatility check
     const avgA1HAllowed = avgOrNaN(a1HA); 
@@ -12142,8 +12252,8 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   if (h1HasH2H) {
     const hw1 = getH2HWeight(aH2H1.length, bH2H1.length, "h1", sampleTier);
-    projA1H = (projA1H * (1 - hw1)) + (avgOrNaN(aH2H1) * hw1);
-    projB1H = (projB1H * (1 - hw1)) + (avgOrNaN(bH2H1) * hw1);
+    projA1H = (projA1H * (1 - hw1)) + (weightedRecentAverage(aH2H1, MODEL_TUNING.recencyWeights) * hw1);
+    projB1H = (projB1H * (1 - hw1)) + (weightedRecentAverage(bH2H1, MODEL_TUNING.recencyWeights) * hw1);
   }
 
   const roleA = getFixtureSideRole("A");
@@ -12157,7 +12267,21 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
 
-    // FIX #2 — REST DAYS FACTOR for 1H (B2B = -1.6%, 1-day = -0.5%)
+  
+  // ── FIX-3/6/8/10: Adjustments wired into 1H ──
+  {const _hp1A=computePythagoreanPowerIndex(g_massacreFetchContext.A.ortg10||[],g_massacreFetchContext.A.drtg10||[]);
+   const _hp1B=computePythagoreanPowerIndex(g_massacreFetchContext.B.ortg10||[],g_massacreFetchContext.B.drtg10||[]);
+   if(isFinite(projA1H)&&_hp1A){const a=1+(_hp1A.pythWin/0.5-1)*0.20;projA1H=projA1H*0.70+(projA1H*a)*0.30;}
+   if(isFinite(projB1H)&&_hp1B){const b=1+(_hp1B.pythWin/0.5-1)*0.20;projB1H=projB1H*0.70+(projB1H*b)*0.30;}}
+  {const lh1=(eb||200)/4,aA1=getAllowedSeries("A","overall","h1",parsed),bA1=getAllowedSeries("B","overall","h1",parsed);
+   const s1A=computeSosProxy(aA1,lh1),s1B=computeSosProxy(bA1,lh1);
+   if(isFinite(projA1H)&&s1A!==1.0)projA1H=projA1H*0.60+(projA1H*s1A)*0.40;
+   if(isFinite(projB1H)&&s1B!==1.0)projB1H=projB1H*0.60+(projB1H*s1B)*0.40;}
+  {const ra1=computeRefTendencyAdjust(g_gameReferees,league);if(isFinite(ra1)&&ra1!==0){projA1H+=ra1*0.25;projB1H+=ra1*0.25;}}
+  {const e1A=computeMicroElo("A"),e1B=computeMicroElo("B");if(isFinite(projA1H)&&isFinite(e1A))projA1H+=e1A*0.5;if(isFinite(projB1H)&&isFinite(e1B))projB1H+=e1B*0.5;}
+  {const m1A=computeMomentumAdj(a1HS),m1B=computeMomentumAdj(b1HS);if(isFinite(projA1H)&&m1A)projA1H+=m1A*0.5;if(isFinite(projB1H)&&m1B)projB1H+=m1B*0.5;}
+  {const pm1=getPlayoffMultiplier(league);if(pm1){if(isFinite(projA1H))projA1H*=(pm1.h1Mult*0.5+0.5);if(isFinite(projB1H))projB1H*=(pm1.h1Mult*0.5+0.5);}}
+  // FIX #2 — REST DAYS FACTOR for 1H (B2B = -1.6%, 1-day = -0.5%)
   const restDaysA = g_massacreFetchContext?.A?.restDays;
   const restDaysB = g_massacreFetchContext?.B?.restDays;
   if (isFinite(projA1H)) {
@@ -12191,8 +12315,8 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     aVol1, bVol1,
     h1FullModel: sampleTier === "full" && aORTG.length >= 5,
     paceGapRisk: false,
-    aS1: avgOrNaN(a1HS),
-    bS1: avgOrNaN(b1HS)
+    aS1: weightedRecentAverage(a1HS, MODEL_TUNING.recencyWeights),
+    bS1: weightedRecentAverage(b1HS, MODEL_TUNING.recencyWeights)
   };
 }
 
@@ -12336,6 +12460,24 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   });
 
   let h2Proj = isFinite(aTeam.proj) && isFinite(bTeam.proj) ? aTeam.proj + bTeam.proj : NaN;
+
+  // ── FIX-3/6/8/10: Adjustments wired into 2H ──
+  if(isFinite(h2Proj)){
+    const _hp2A=computePythagoreanPowerIndex(g_massacreFetchContext.A.ortg10||[],g_massacreFetchContext.A.drtg10||[]);
+    const _hp2B=computePythagoreanPowerIndex(g_massacreFetchContext.B.ortg10||[],g_massacreFetchContext.B.drtg10||[]);
+    let _h2a=aTeam?.proj||h2Proj/2,_h2b=bTeam?.proj||h2Proj/2;
+    if(_hp2A&&isFinite(_h2a)){const a=1+(_hp2A.pythWin/0.5-1)*0.20;_h2a=_h2a*0.70+(_h2a*a)*0.30;}
+    if(_hp2B&&isFinite(_h2b)){const b=1+(_hp2B.pythWin/0.5-1)*0.20;_h2b=_h2b*0.70+(_h2b*b)*0.30;}
+    if(isFinite(_h2a)&&isFinite(_h2b))h2Proj=_h2a+_h2b;
+    const lh2=(LEAGUE_BASES[league]||200)/4;
+    const s2A=computeSosProxy(getAllowedSeries("A","overall","h2",parsed),lh2);
+    const s2B=computeSosProxy(getAllowedSeries("B","overall","h2",parsed),lh2);
+    if(s2A!==1.0||s2B!==1.0)h2Proj=(_h2a*0.60+(_h2a*s2A)*0.40)+(_h2b*0.60+(_h2b*s2B)*0.40);
+    const ra2=computeRefTendencyAdjust(g_gameReferees,league);if(isFinite(ra2)&&ra2!==0)h2Proj+=ra2*0.5;
+    const e2A=computeMicroElo("A"),e2B=computeMicroElo("B");if(isFinite(e2A)&&isFinite(e2B))h2Proj+=(e2A+e2B)*0.5;
+    const m2A=computeMomentumAdj(a2HS),m2B=computeMomentumAdj(b2HS);if(m2A||m2B)h2Proj+=(m2A+m2B)*0.5;
+    const pm2=getPlayoffMultiplier(league);if(pm2)h2Proj*=(pm2.h2Mult*0.5+0.5);
+  }
   // FIX #2 — REST DAYS for 2H (cumulative fatigue shows more in 2nd half)
   const _rA2H = g_massacreFetchContext?.A?.restDays;
   const _rB2H = g_massacreFetchContext?.B?.restDays;
@@ -13485,7 +13627,7 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     // U7: Kelly unit recommendation chip
     if (p.pick !== "NO PLAY" && isFinite(shownEdge) && isFinite(shownLine) && shownLine > 0) {
       const _edgePct = Math.abs(shownEdge / shownLine);
-      const _b = 100 / 110; // -110 juice
+      const _rawInp=(typeof rawMarketInputs!=="undefined"&&p.marketKey)?(rawMarketInputs[p.marketKey]||""):"";const _jm=String(_rawInp).match(/[-+](\d{3,4})/);const _jc=_jm?parseInt(_jm[0]):-110;const _aj=Math.abs(_jc);const _b=_jc<0?100/_aj:_aj/100; // FIX-9 actual juice
       const _p = 0.5 + _edgePct * 0.5;
       const _q = 1 - _p;
       const _kellyFrac = (_p * _b - _q) / _b;
@@ -13509,7 +13651,15 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
 
 
 
-async function runEngine() {
+async 
+function checkModelDrift(){
+  try{const all=getLearningTrackedPicks().filter(p=>["win","loss"].includes(String(p.resultStatus||"").toLowerCase()));
+    if(all.length<10)return null;const l10=all.slice(-10),wr=l10.filter(p=>p.resultStatus==="win").length/10;
+    if(wr<0.30)return{drift:"cold",winRate:wr,message:"Model drift: "+Math.round(wr*100)+"% last 10 picks"};
+    if(wr>0.80)return{drift:"hot",winRate:wr,message:"Hot streak: "+Math.round(wr*100)+"% last 10 picks"};
+    return null;}catch(e){return null;}}
+
+function runEngine() {
   const runBtn = document.getElementById("runBtn");
   const table = document.getElementById("results");
 
