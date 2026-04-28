@@ -6592,15 +6592,26 @@ if (!data?.state) {
 }
 
       const serverState = data.state || {};
+      
+      // 🚨 CLOUD CACHE SHIELD: If the server is serving stale data, reject it instantly.
+      const localVersion = Number(localState?.vId || 0);
+      const serverVersion = Number(serverState?.vId || 0);
+      
+      if (localState && localVersion > serverVersion) {
+        trackerDebug("Cloud cache is stale. Rejecting server data to protect local state.", { localVId: localVersion, serverVId: serverVersion });
+        engineDebug("Cloud cache is stale. Rejecting server data.", { localVId: localVersion, serverVId: serverVersion });
+        
+        // Force the fresh local state back to the server to overwrite the bad cache
+        g_trackerState.updatedAt = new Date().toISOString();
+        pushTrackerStateToServer(JSON.parse(JSON.stringify(g_trackerState)));
+        
+        return g_trackerState;
+      }
+
       engineDebug("hydrate state snapshot", {
         local: getTrackerStateDebugScore(localState || {}),
         server: getTrackerStateDebugScore(serverState || {})
       });
-      if (localState && isBetterTrackerStateCandidate(localState, serverState)) {
-        trackerDebug("hydrate local outranks server before merge", {
-          local: getTrackerStateDebugScore(localState || {}),
-          server: getTrackerStateDebugScore(serverState || {})
-        });
       }
       trackerDebug("hydrate server state loaded", {
         active: getTrackerActivePickCount(serverState),
@@ -6816,29 +6827,10 @@ function choosePreferredActivePick(existingPick, incomingPick) {
   const currentStatus = String(current.resultStatus || "pending").toLowerCase();
   const incomingStatus = String(incoming.resultStatus || "pending").toLowerCase();
 
-  // PERMANENT SETTLEMENT RULE: Once a pick is settled (win/loss/push), it can NEVER
-  // be reverted to pending by any merge — regardless of source (manual or API).
-  // This is the root cause of the flickering: server still has the old pending copy,
-  // hydrate merges it in, and the pending copy was winning the timestamp race.
+  // PERMANENT SETTLEMENT RULE: Settled always beats pending
   const SETTLED = ["win", "loss", "push"];
-  if (SETTLED.includes(currentStatus) && !SETTLED.includes(incomingStatus)) {
-    trackerDebug("merge: settled pick protected from pending overwrite", {
-      eventId: current.eventId || incoming.eventId || "",
-      market: current.marketKey || incoming.marketKey || "",
-      kept: currentStatus,
-      dropped: incomingStatus
-    });
-    return current; // settled always beats pending — no exceptions
-  }
-  if (SETTLED.includes(incomingStatus) && !SETTLED.includes(currentStatus)) {
-    trackerDebug("merge: pending pick replaced by settled", {
-      eventId: incoming.eventId || current.eventId || "",
-      market: incoming.marketKey || current.marketKey || "",
-      kept: incomingStatus,
-      dropped: currentStatus
-    });
-    return incoming; // settled always beats pending — no exceptions
-  }
+  if (SETTLED.includes(currentStatus) && !SETTLED.includes(incomingStatus)) return current; 
+  if (SETTLED.includes(incomingStatus) && !SETTLED.includes(currentStatus)) return incoming; 
 
   const sameSide = String(current.side || "") === String(incoming.side || "");
   if (sameSide && ["over", "under"].includes(String(current.side || "").toLowerCase())) {
@@ -6850,8 +6842,39 @@ function choosePreferredActivePick(existingPick, incomingPick) {
   const currentStamp = getTrackerPickStamp(current);
   if (incomingStamp !== currentStamp) return incomingStamp > currentStamp ? incoming : current;
 
+  // 🚨 TIEBREAKER FIX: If stamps and status are identical, the newest UPDATE wins!
+  if (currentStatus === incomingStatus) {
+    const inUpdate = Date.parse(incoming.updatedAt || incoming.createdAt || "") || 0;
+    const curUpdate = Date.parse(current.updatedAt || current.createdAt || "") || 0;
+    if (inUpdate !== curUpdate) return inUpdate > curUpdate ? incoming : current;
+  }
+
   const incomingEdge = Math.abs(Number(incoming.edgePct || 0));
   const currentEdge = Math.abs(Number(current.edgePct || 0));
+  if (incomingEdge !== currentEdge) return incomingEdge > currentEdge ? incoming : current;
+
+  return current;
+}
+
+function choosePreferredBucketPick(existingPick, incomingPick) {
+  const current = ensureTrackedPickKeys(existingPick || {});
+  const incoming = ensureTrackedPickKeys(incomingPick || {});
+
+  const currentSettled = isTrackedPickSettled(current);
+  const incomingSettled = isTrackedPickSettled(incoming);
+  if (currentSettled !== incomingSettled) return incomingSettled ? incoming : current;
+
+  const currentStamp = getTrackerPickStamp(current);
+  const incomingStamp = getTrackerPickStamp(incoming);
+  if (incomingStamp !== currentStamp) return incomingStamp > currentStamp ? incoming : current;
+
+  // 🚨 TIEBREAKER FIX: Archive bucket strict update check
+  const inUpdate = Date.parse(incoming.updatedAt || incoming.createdAt || "") || 0;
+  const curUpdate = Date.parse(current.updatedAt || current.createdAt || "") || 0;
+  if (inUpdate !== curUpdate) return inUpdate > curUpdate ? incoming : current;
+
+  const currentEdge = Math.abs(Number(current.edgePct || 0));
+  const incomingEdge = Math.abs(Number(incoming.edgePct || 0));
   if (incomingEdge !== currentEdge) return incomingEdge > currentEdge ? incoming : current;
 
   return current;
@@ -7697,31 +7720,39 @@ function buildGodFatherDebugHtml() {
       </div>
     </div>`;
 
-  // ==========================================
-  // 4. CLOUD SYNC & PERSISTENCE
+    // ==========================================
+  // 4. CLOUD SYNC & PERSISTENCE (UPGRADED)
   // ==========================================
   const isSyncRed = (typeof g_trackerSaveFailureCount !== 'undefined' && g_trackerSaveFailureCount > 0);
-  const syncBorder = isSyncRed ? "#f44336" : "#333";
-  const syncLeft = isSyncRed ? "#f44336" : "#4caf50";
-  const syncBadge = isSyncRed ? badge("#f44336", "SYNC FAILING") : badge("#4caf50", "SYNCED");
+  
+  // Extract real version differences to spot caching conflicts
+  const localVId = g_trackerState?.vId || 0;
+  const cloudVId = g_trackerPersistedVersion || 0;
+  const isDesynced = localVId !== cloudVId && !g_trackerSaveInFlight;
 
-  const forceSyncBtn = isSyncRed ? `<button style="${btnStyles}" onclick="g_trackerSaveFailureCount = 0; forceTrackerSaveNow(); alert('Manual Sync Forced!'); renderTrackerAnalytics();">🩹 Force Hard Sync</button>` : "";
+  const syncBorder = isSyncRed || isDesynced ? "#f44336" : "#333";
+  const syncLeft = isSyncRed || isDesynced ? "#f44336" : "#4caf50";
+  const syncBadge = isSyncRed ? badge("#f44336", "SYNC FAILING") : isDesynced ? badge("#ff9800", "DESYNCED") : badge("#4caf50", "SYNCED");
+
+  const forceSyncBtn = `<button style="${btnStyles}" onclick="g_trackerSaveFailureCount = 0; forceTrackerSaveNow(); alert('Forced Hard Sync to Cloud!'); renderTrackerAnalytics();">🩹 Force Hard Sync</button>`;
 
   const syncHealthHtml = `
-    <div class="godfather-box" data-has-error="${isSyncRed}" data-keywords="cloud sync network save failure persistence version" style="background:#111; border:1px solid ${syncBorder}; border-left:4px solid ${syncLeft}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+    <div class="godfather-box" data-has-error="${isSyncRed || isDesynced}" data-keywords="cloud sync network save failure persistence version desync" style="background:#111; border:1px solid ${syncBorder}; border-left:4px solid ${syncLeft}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
       <div style="display:flex; justify-content:space-between; align-items:center;">
-        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">☁️ Cloud Sync Core</div>
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">☁️ Cloud Sync Core X-Ray</div>
         <div style="display:flex; gap:6px; align-items:center;">${forceSyncBtn} ${syncBadge}</div>
       </div>
-      <div style="font-size:9px; color:#666;">Monitors the connection to the backend storage.</div>
+      <div style="font-size:9px; color:#666;">Monitors the connection and version history to the backend storage.</div>
       <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size:10px; color:#aaa; background:#0a0a0a; padding:10px; border-radius:4px; border:1px solid #222;">
         <div>Save Failures: <b style="color:${isSyncRed?'#f44336':'#fff'}">${typeof g_trackerSaveFailureCount !== 'undefined' ? g_trackerSaveFailureCount : 0}</b></div>
         <div>In Flight: <b style="color:#fff">${typeof g_trackerSaveInFlight !== 'undefined' && g_trackerSaveInFlight ? "YES" : "NO"}</b></div>
-        <div>Local Version: <b style="color:#fff">${typeof g_trackerSaveVersion !== 'undefined' ? g_trackerSaveVersion : 0}</b></div>
-        <div>Persisted Version: <b style="color:#fff">${typeof g_trackerPersistedVersion !== 'undefined' ? g_trackerPersistedVersion : 0}</b></div>
+        <div>Local DB Version: <b style="color:${isDesynced?'#ff9800':'#4caf50'}">${localVId}</b></div>
+        <div>Cloud DB Version: <b style="color:${isDesynced?'#ff9800':'#4caf50'}">${cloudVId}</b></div>
       </div>
+      ${isDesynced ? `<div style="color:#ff9800; font-size:9px; font-weight:bold; margin-top:4px;">⚠️ Version mismatch detected. If scores are rolling back, the Cloudflare worker might be serving a stale cache.</div>` : ''}
     </div>
   `;
+
 
   // ==========================================
   // 5. PHASE 2 LEARNING MATRIX
