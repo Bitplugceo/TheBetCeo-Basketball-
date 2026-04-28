@@ -2855,7 +2855,7 @@ body.dark-mode .tracker-analytics-section-head {
       if (!window.__BETCEO_ENGINE_BOOT_SEEN) {
         spawnFatalTerminal("Initialization Failure", "Core Logic", "Check Syntax", "N/A", "The script stopped running immediately after load. Check for missing '}' or illegal characters like '!!!' in the code.");
       }
-    }, 1500);
+    }, 5000);
   });
 })();
 </script>
@@ -6605,18 +6605,17 @@ if (!data?.state) {
 
       const serverState = data.state || {};
       
-      // 🚨 CLOUD CACHE SHIELD: If the server is serving stale data, reject it instantly.
-      const localVersion = Number(localState?.vId || 0);
-      const serverVersion = Number(serverState?.vId || 0);
+            // 🚨 TIMED CACHE SHIELD: Only reject server data if local is drastically newer
+      const localTime = Date.parse(localState?.updatedAt || "") || 0;
+      const serverTime = Date.parse(serverState?.updatedAt || "") || 0;
       
-      if (localState && localVersion > serverVersion) {
-        trackerDebug("Cloud cache is stale. Rejecting server data to protect local state.", { localVId: localVersion, serverVId: serverVersion });
-        engineDebug("Cloud cache is stale. Rejecting server data.", { localVId: localVersion, serverVId: serverVersion });
+      // If local data is more than 15 seconds newer than the server, protect it
+      if (localState && (localTime - serverTime > 15000)) {
+        trackerDebug("Cloud cache is stale. Rejecting server data to protect local state.");
+        engineDebug("Cloud cache is stale. Rejecting server data.");
         
-        // Force the fresh local state back to the server to overwrite the bad cache
         g_trackerState.updatedAt = new Date().toISOString();
         pushTrackerStateToServer(JSON.parse(JSON.stringify(g_trackerState)));
-        
         return g_trackerState;
       }
 
@@ -7719,10 +7718,11 @@ function buildGodFatherDebugHtml() {
   // ==========================================
   const isSyncRed = (typeof g_trackerSaveFailureCount !== 'undefined' && g_trackerSaveFailureCount > 0);
   
-  // Extract real version differences to spot caching conflicts
-  const localVId = g_trackerState?.vId || 0;
-  const cloudVId = g_trackerPersistedVersion || 0;
-  const isDesynced = localVId !== cloudVId && !g_trackerSaveInFlight;
+    // Track internal save queue to see if we are waiting on the network
+  const localQueue = typeof g_trackerSaveVersion !== 'undefined' ? g_trackerSaveVersion : 0;
+  const cloudQueue = typeof g_trackerPersistedVersion !== 'undefined' ? g_trackerPersistedVersion : 0;
+  const isDesynced = localQueue > cloudQueue && !g_trackerSaveInFlight;
+
 
   const syncBorder = isSyncRed || isDesynced ? "#f44336" : "#333";
   const syncLeft = isSyncRed || isDesynced ? "#f44336" : "#4caf50";
@@ -7740,10 +7740,10 @@ function buildGodFatherDebugHtml() {
       <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size:10px; color:#aaa; background:#0a0a0a; padding:10px; border-radius:4px; border:1px solid #222;">
         <div>Save Failures: <b style="color:${isSyncRed?'#f44336':'#fff'}">${typeof g_trackerSaveFailureCount !== 'undefined' ? g_trackerSaveFailureCount : 0}</b></div>
         <div>In Flight: <b style="color:#fff">${typeof g_trackerSaveInFlight !== 'undefined' && g_trackerSaveInFlight ? "YES" : "NO"}</b></div>
-        <div>Local DB Version: <b style="color:${isDesynced?'#ff9800':'#4caf50'}">${localVId}</b></div>
-        <div>Cloud DB Version: <b style="color:${isDesynced?'#ff9800':'#4caf50'}">${cloudVId}</b></div>
+               <div>Local Save Queue: <b style="color:${isDesynced?'#ff9800':'#4caf50'}">${localQueue}</b></div>
+        <div>Cloud Confirmed: <b style="color:${isDesynced?'#ff9800':'#4caf50'}">${cloudQueue}</b></div>
       </div>
-      ${isDesynced ? `<div style="color:#ff9800; font-size:9px; font-weight:bold; margin-top:4px;">⚠️ Version mismatch detected. If scores are rolling back, the Cloudflare worker might be serving a stale cache.</div>` : ''}
+      ${isDesynced ? `<div style="color:#ff9800; font-size:9px; font-weight:bold; margin-top:4px;">⚠️ Sync lagging. The device has fresh data that hasn't successfully reached Cloudflare yet.</div>` : ''}
     </div>
   `;
 
