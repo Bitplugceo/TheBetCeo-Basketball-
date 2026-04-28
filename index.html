@@ -2806,17 +2806,16 @@ body.dark-mode .tracker-analytics-section-head {
   }
 
     // 2. RAW ERROR INTERCEPTOR
-  window.addEventListener("error", function (e) {
-    // FIX: Ignore Safari's silent "Share Sheet" ghost errors
+    window.addEventListener("error", function (e) {
     if (e.message === "Script error." && e.lineno === 0) return;
-    
     const file = e.filename ? e.filename.split('/').pop() : "Inline Script";
-    spawnFatalTerminal(e.message, file, e.lineno, e.colno, e.error?.stack);
-    
+
+    // 🛡️ RED TERMINAL DISABLED: Redirecting to the Godfather
     if (typeof window.engineDebug === "function") {
-        window.engineDebug("BROWSER FATAL", { msg: e.message, line: e.lineno, file: file });
+        window.engineDebug("ENGINE BREAKDOWN", `${e.message} | Loc: ${file}:${e.lineno}`);
     }
   });
+
 
 
   // 3. NETWORK & PROMISE INTERCEPTOR
@@ -3638,13 +3637,19 @@ async function writeAsyncStorage(key, value) {
           if (parsed.archivedPicks && parsed.archivedPicks.length > 150) {
             console.warn("[BB Engine] Quota exceeded. Slicing archive down to 150 to survive 5MB limit.");
             engineDebug("Quota Rescue", "Sliced archive to 150 picks to survive localStorage 5MB limit.");
-            
+
             parsed.archivedPicks = parsed.archivedPicks.slice(0, 150);
             localStorage.setItem(key, JSON.stringify(parsed));
+
+            // FIX: Mutate the live state so the engine stops trying to save 2000 items
+            if (typeof g_trackerState !== "undefined" && g_trackerState) {
+              g_trackerState.archivedPicks = parsed.archivedPicks;
+            }
+
             return true;
           }
         } catch (rescueErr) {
-          // If rescue parsing fails, drop down to the standard error log
+          // Fall through to standard error log
         }
       }
 
@@ -3654,6 +3659,7 @@ async function writeAsyncStorage(key, value) {
     }
   }
 }
+
 
 
 const TRACKER_USER_KEY_STORAGE = "bb_engine_tracker_user_key";
@@ -4591,6 +4597,7 @@ let g_trackerSaveInFlight = false;
 let g_trackerModalView = "picks";
 const TRACKER_DEBUG_LIMIT = 40;
 let g_trackerDebugLog = [];
+const g_settlementDebugLog = new Map(); // key: league:eventId:market → last attempt result
 
 function isTrackerPicksView() {
   return g_trackerModalView === "picks";
@@ -4689,7 +4696,24 @@ function triggerGlobalEngineAlert(line = "") {
     g_engineAlertNeedsReview = true;
   }
   applyGlobalEngineAlertState();
+
+  // 🛡️ GOD FATHER AUTO-WAKE TRIGGER
+  const errLower = String(line).toLowerCase();
+  const isCritical = errLower.includes("fail") || errLower.includes("error") || 
+                     errLower.includes("critical") || errLower.includes("breakdown") || 
+                     errLower.includes("watchdog");
+
+  if (isCritical) {
+    if (typeof openTrackerModal === "function") {
+      openTrackerModal();
+      setTrackerModalView("debug");
+      // Force instant refresh so the red box jumps to the top immediately
+      renderTrackerAnalytics(); 
+    }
+  }
 }
+
+
 
 function acknowledgeGlobalEngineAlert() {
   g_engineAlertNeedsReview = false;
@@ -4811,54 +4835,115 @@ function prioritizeDebugLines(lines = [], limit = 10) {
     });
 }
 
-function buildReportDebugCard(title, lines = [], limit = 10, emptyText = "No debug events yet.") {
+function buildReportDebugCard(title, lines = [], limit = 10, emptyText = "No active errors.") {
   const safeLines = prioritizeDebugLines(lines, limit);
-  
+  let hasError = false;
   let listHtml = "";
-  if (safeLines.length) {
-    listHtml = safeLines.map(line => {
-      let color = "#0f0"; // OK Green
-      let rawText = line;
-      const textLower = rawText.toLowerCase();
-      
-      // Mimic the front-page color logic
-      if (textLower.includes("fail") || textLower.includes("error") || textLower.includes("critical")) color = "#ff5c61"; // Red
-      else if (textLower.includes("warn") || textLower.includes("fallback") || textLower.includes("pending")) color = "#ffcf73"; // Yellow
+  let autopsyHtml = "";
 
-      // Extract the timestamp to color it gray
-      let timeStr = "";
-      const timeMatch = rawText.match(/^(\[\d{1,2}:\d{2}:\d{2}\s?(?:AM|PM)?\])\s?(.*)/);
-      if (timeMatch) {
-        timeStr = `<span style="color:#777;">${safeText(timeMatch[1])}</span> `;
-        rawText = timeMatch[2];
-      }
+  // 1. SCAN FOR ERRORS TO BUILD THE TOP "SYSTEM BREAKDOWN" CARD
+  const errorLine = safeLines.find(l => {
+    const tl = typeof l === 'string' ? l.toLowerCase() : l.line.toLowerCase();
+    return tl.includes("fail") || tl.includes("error") || tl.includes("breakdown") || tl.includes("blocked");
+  });
 
-      // Split the main log message from the JSON payload (separated by \n)
-      const parts = rawText.split("\n");
-      const msgPart = parts[0];
-      const dataPart = parts.length > 1 
-        ? `<br><span style="color:#aaa; white-space:pre-wrap; display:block; margin-top:4px;">${safeText(parts.slice(1).join("\n"))}</span>` 
-        : "";
+  if (errorLine) {
+    hasError = true;
+    let moduleName = "CORE ENGINE";
+    let fixAdvice = "Review the recent logic changes. A code snippet is breaking the engine.";
+    
+    const rawText = typeof errorLine === 'string' ? errorLine.toLowerCase() : errorLine.line.toLowerCase();
 
-      return `<div style="border-bottom: 1px solid #333; padding: 6px 0;">${timeStr}<strong style="color:${color}">${safeText(msgPart)}</strong>${dataPart}</div>`;
-    }).join("");
-  } else {
-    listHtml = `<div style="color:#888;">${safeText(emptyText)}</div>`;
+    // 🕵️ MODULE DETECTOR
+    if (rawText.includes("toggletheme") || rawText.includes("dark-mode")) {
+      moduleName = "UI THEME / ICON SYSTEM";
+      fixAdvice = "Check the Basketball Icon logic. Fix the specific text to restore the UI Theme.";
+    } else if (rawText.includes("runengine") || rawText.includes("massacre")) {
+      moduleName = "PREDICTION INTELLIGENCE";
+      fixAdvice = "A math formula or data input in the Run button is invalid. Trace the calculation block.";
+    } else if (rawText.includes("fetch") || rawText.includes("network") || rawText.includes("promise") || rawText.includes("cloudflare")) {
+      moduleName = "CLOUD SYNC / NETWORK";
+      fixAdvice = "The engine lost connection to the server or Cloudflare. Check your internet or wait for the backend to reboot.";
+    }
+    
+    // 🔎 CULPRIT EXTRACTOR
+    const varMatch = rawText.match(/variable:\s*([a-zA-Z0-9_$]+)/i) || 
+                     rawText.match(/([a-zA-Z0-9_$]+)\s+is/i) || 
+                     rawText.match(/reading\s+'([a-zA-Z0-9_$]+)'/i);
+    const culprit = varMatch ? varMatch[1] : "Execution_Flow";
+
+    autopsyHtml = `
+      <div style="background:rgba(20,20,20,0.4); border:1px solid rgba(244,67,54,0.4); border-radius:6px; padding:15px; margin-bottom:15px;">
+        <div style="color:#f44336; font-size:11px; font-weight:900; text-transform:uppercase; letter-spacing:1px; margin-bottom:12px; display:flex; align-items:center; gap:8px;">
+          🚨 SYSTEM BREAKDOWN: ${moduleName}
+        </div>
+        <div style="color:#eee; font-size:11px; margin-bottom:10px;">
+          <strong>THE BREAK:</strong> The system died because of this code:
+        </div>
+        <div style="margin-bottom:15px;">
+          <span style="background:#f44336; color:#fff; padding:3px 10px; border-radius:4px; font-family:monospace; font-weight:bold; font-size:11px; display:inline-block;">
+            ${culprit}
+          </span>
+        </div>
+        <div style="background:#000; border:1px solid #333; border-radius:6px; padding:12px;">
+          <div style="color:#fff; font-size:11px; font-weight:900; margin-bottom:6px; display:flex; align-items:center; gap:6px;">
+            🛠️ HOW TO FIX:
+          </div>
+          <div style="color:#aaa; font-size:10px; line-height:1.6;">
+            ${fixAdvice}
+          </div>
+        </div>
+      </div>
+    `;
   }
 
-  // Wrap it in the exact same dark terminal UI box
+  // 2. BUILD THE LOG LIST
+  if (safeLines.length) {
+    listHtml = safeLines.map(item => {
+      let color = "#4caf50";
+      let rawText = typeof item === 'string' ? item : item.line;
+      
+      let cleanText = rawText
+        .replace(/ReferenceError:\s*/gi, "")
+        .replace(/TypeError:\s*/gi, "")
+        .replace(/Can't find variable:\s*/gi, "Missing Reference: ")
+        .replace(/is not defined/gi, "is missing")
+        .split("| Loc:")[0];
+
+      const textLower = rawText.toLowerCase();
+      if (textLower.includes("fail") || textLower.includes("error") || textLower.includes("breakdown") || textLower.includes("blocked")) {
+        color = "#f44336"; 
+      } else if (textLower.includes("warn") || textLower.includes("pending") || textLower.includes("fallback")) {
+        color = "#ff9800";
+      }
+
+      let timeStr = "";
+      const timeMatch = cleanText.match(/^(\[\d{1,2}:\d{2}:\d{2}\s?(?:AM|PM)?\])\s?(.*)/);
+      if (timeMatch) {
+        timeStr = `<span style="color:#555;margin-right:6px;">${timeMatch[1]}</span>`;
+        cleanText = timeMatch[2];
+      }
+
+      return `<div style="border-bottom: 1px solid #1a1a1a; padding: 6px 0; font-size:10px;">${timeStr}<strong style="color:${color}">${safeText(cleanText)}</strong></div>`;
+    }).join("");
+  } else {
+    listHtml = `<div style="color:#4caf50; font-size:11px; font-weight:bold; padding:10px 0; text-align:center;">✅ System Clean</div>`;
+  }
+
   return `
-    <div style="background:#111; color:#0f0; border:2px solid #444; margin-bottom:10px; box-shadow:0 4px 10px rgba(0,0,0,0.5); text-align: left;">
-      <div style="background:#333; color:#fff; padding:6px 10px; font-size:11px; font-weight:900; display:flex; justify-content:space-between; text-transform:uppercase;">
-        <span>📡 ${safeText(title)}</span>
-        <span style="color:#aaa; font-weight:700;">[LATEST ${safeLines.length}]</span>
+    <div class="godfather-box" data-has-error="${hasError}" style="background:#111; border:1px solid ${hasError ? "#f44336" : "#333"}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">☄️ ${safeText(title)}</div>
       </div>
-      <div style="padding:10px; font-family:ui-monospace, Consolas, monospace; font-size:10px; max-height:400px; overflow-y:auto; word-wrap:break-word;">
+      ${autopsyHtml}
+      <div style="background:#0a0a0a; border:1px solid #222; border-radius:4px; padding:4px 10px; max-height:200px; overflow-y:auto;">
         ${listHtml}
       </div>
     </div>
   `;
 }
+
+
 
 
 function isIgnoredEngineWatchLine(line = "") {
@@ -6014,6 +6099,16 @@ function ensureTrackedPickKeys(pick = {}) {
   next.trackerImpactLabel = next.trackerImpactLabel || next?.diagnostics?.trackerImpactLabel || getTrackerImpactLabel(next.trackerImpactKey);
 
   next.resultStatus = String(next.resultStatus || "pending").toLowerCase();
+  // FIX 2: Backfill settledAt so the 10-hour archive clock has a valid anchor
+  // for picks settled before the settledAt field existed or synced without it.
+  // IMPORTANT: Do NOT use updatedAt here — it is bumped on every sync cycle
+  // and would make the clock start 'now' instead of when the game ended.
+  // Use only createdAt or eventDate, which are immutable.
+  if (["win", "loss", "push"].includes(next.resultStatus) && !next.settledAt) {
+    // Use eventDate first (when the game was played) so the 10h archive clock
+    // starts from game time — not from when the pick was created or the field backfilled.
+    next.settledAt = next.eventDate || next.createdAt || null;
+  }
   next.modelVersion = normalizeModelVersion(next.modelVersion);
   next.createdAt = next.createdAt || new Date().toISOString();
   next.signature = next.signature || makeTrackedSignature(next);
@@ -6646,6 +6741,9 @@ catch (err) {
   return createEmptyTrackerState();
 } finally {
   // FIX 10: Moved dead code into a finally block so the UI actually updates
+  // FIX 3: Sweep archive immediately after every hydrate/merge so settled picks
+  // that arrive pre-settled from the server don't stay in activePicks forever.
+  archiveExpiredTrackedPicks();
   renderTrackedPicks();
   g_trackerHydratePromise = null;
 }
@@ -6686,8 +6784,11 @@ function getTrackerStateUpdatedAtMs(state) {
 }
 
 function getTrackerPickStamp(pick) {
+  // IMPORTANT: updatedAt is intentionally excluded here.
+  // updatedAt is bumped on every sync/merge, which causes a stale server pending
+  // copy to have a newer stamp than the locally-settled copy → server wins → flicker.
+  // Settlement authority order: settledAt → createdAt → eventDate only.
   return (
-    Date.parse(pick?.updatedAt || "") ||
     Date.parse(pick?.settledAt || "") ||
     Date.parse(pick?.createdAt || "") ||
     Date.parse(pick?.eventDate || "") ||
@@ -6716,31 +6817,28 @@ function choosePreferredActivePick(existingPick, incomingPick) {
   const currentStatus = String(current.resultStatus || "pending").toLowerCase();
   const incomingStatus = String(incoming.resultStatus || "pending").toLowerCase();
 
-  // FIX: Protect manual settlements from being overwritten by stale background data
-  if (current.settlementSource === "manual" && incoming.settlementSource !== "manual" && incomingStatus === "pending") {
-    return current;
-  }
-  if (incoming.settlementSource === "manual" && current.settlementSource !== "manual" && currentStatus === "pending") {
-    return incoming;
-  }
-
-  if (incomingStatus === "pending" && currentStatus !== "pending") {
-    trackerDebug("merge kept settled pick over pending", {
+  // PERMANENT SETTLEMENT RULE: Once a pick is settled (win/loss/push), it can NEVER
+  // be reverted to pending by any merge — regardless of source (manual or API).
+  // This is the root cause of the flickering: server still has the old pending copy,
+  // hydrate merges it in, and the pending copy was winning the timestamp race.
+  const SETTLED = ["win", "loss", "push"];
+  if (SETTLED.includes(currentStatus) && !SETTLED.includes(incomingStatus)) {
+    trackerDebug("merge: settled pick protected from pending overwrite", {
       eventId: current.eventId || incoming.eventId || "",
       market: current.marketKey || incoming.marketKey || "",
       kept: currentStatus,
       dropped: incomingStatus
     });
-    return current;
+    return current; // settled always beats pending — no exceptions
   }
-  if (currentStatus === "pending" && incomingStatus !== "pending") {
-    trackerDebug("merge replaced pending pick with settled", {
+  if (SETTLED.includes(incomingStatus) && !SETTLED.includes(currentStatus)) {
+    trackerDebug("merge: pending pick replaced by settled", {
       eventId: incoming.eventId || current.eventId || "",
       market: incoming.marketKey || current.marketKey || "",
       kept: incomingStatus,
       dropped: currentStatus
     });
-    return incoming;
+    return incoming; // settled always beats pending — no exceptions
   }
 
   const sameSide = String(current.side || "") === String(incoming.side || "");
@@ -6866,6 +6964,11 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
       }
 
       if (archivedSettled && activeSettled) {
+        // FIX 4: If the archived copy has already passed the 10-hour cutoff,
+        // never let the active copy win — it would reset the archive clock.
+        const _archiveTs = Date.parse(archivedPick.settledAt || archivedPick.createdAt || '') || 0;
+        const _cutoffMs  = TRACKER_ARCHIVE_AFTER_HOURS * 60 * 60 * 1000;
+        if (_archiveTs > 0 && (Date.now() - _archiveTs) >= _cutoffMs) return;
         const preferred = choosePreferredBucketPick(pick, archivedPick);
         if (preferred === archivedPick) return;
       }
@@ -6890,22 +6993,16 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
     keepActiveBySlot.set(slotKey, pick);
   });
 
-    const keepArchived = archived.filter(pick => {
+  const keepArchived = archived.filter(pick => {
     const slotKey = makeTrackerActiveMergeKey(pick);
     if (!slotKey) return true;
 
+    // If this pick is already being kept in the active bucket,
+    // drop it from the archive unconditionally to prevent duplicates.
     const activePick = keepActiveBySlot.get(slotKey);
-    if (!activePick) return true;
+    if (activePick) return false;
 
-    const archivedSettled = isTrackedPickSettled(pick);
-    const activeSettled = isTrackedPickSettled(activePick);
-
-    if (archivedSettled && !activeSettled) return true;
-    if (!archivedSettled && activeSettled) return false;
-
-    const preferred = choosePreferredBucketPick(activePick, pick);
-    // FIX 9: Compare unique string signatures instead of object memory references
-    return makeTrackedSignature(preferred) === makeTrackedSignature(pick);
+    return true;
   });
 
   const dedupedArchived = mergeTrackerArchivedPicks([], keepArchived);
@@ -6915,6 +7012,7 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
     archivedPicks: dedupedArchived
   };
 }
+
 
 function mergeTrackerStates(localState, serverState) {
   const local = localState && typeof localState === "object" ? localState : {};
@@ -7128,9 +7226,10 @@ function archiveExpiredTrackedPicks() {
   const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
   const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
   const now = Date.now();
-  const cutoffMs = 10 * 60 * 60 * 1000; // 10 hours
+  
+  // Expire 14 hours after game tip-off (approx 3h game + 11h buffer)
+  const cutoffMs = 14 * 60 * 60 * 1000; 
 
-  // Helper to remove massive diagnostic objects to prevent storage bloat and UI lag
   const stripHeavyData = (pick) => {
     const lean = { ...pick };
     if (lean.diagnostics) {
@@ -7160,9 +7259,9 @@ function archiveExpiredTrackedPicks() {
     const p = ensureTrackedPickKeys({ ...pick });
     const isSettled = ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase());
     
-    // FIX: STRICTLY use settledAt. Do not fall back to createdAt.
-    const settleTs = p.settledAt ? Date.parse(p.settledAt) : 0;
-    const isExpired = isSettled && settleTs > 0 && (now - settleTs) > cutoffMs;
+    // Base the archive sweep strictly on the game time, so old games sweep immediately
+    const gameTs = Date.parse(p.eventDate || p.createdAt || '') || 0;
+    const isExpired = gameTs > 0 && (now - gameTs) >= cutoffMs;
 
     if (isSettled && isExpired) {
       moveToArchived.push(stripHeavyData(p));
@@ -7191,6 +7290,7 @@ function archiveExpiredTrackedPicks() {
 
 
 
+
 function makeTrackedSignature(pick) {
       return [
         pick.eventId || "",
@@ -7208,10 +7308,9 @@ function getTrackedPickTimeMs(pick) {
   if (!pick) return 0;
 
   // FIX: Prioritize settledAt so the 10-hour archive clock starts 
-  // exactly when the game is actually graded.
+  // exactly when the game is actually graded. updatedAt is excluded.
   const candidates = [
     pick.settledAt,
-    pick.updatedAt,
     pick.createdAt,
     pick.eventDate
   ];
@@ -7228,22 +7327,25 @@ function getTrackedPickTimeMs(pick) {
 
 
 
+
 function isTrackedPickVisibleOnPage(pick) {
   if (!pick) return false;
   const status = String(pick.resultStatus || "pending").toLowerCase();
+  
+  // Anchor everything to the game tip-off time (eventDate)
+  const gameTs = Date.parse(pick.eventDate || pick.createdAt || '') || 0;
 
   if (status === "pending") {
     // Keep pending games visible for up to 48 hours just in case of API delays
-    const ts = pick.createdAt ? Date.parse(pick.createdAt) : (pick.eventDate ? Date.parse(pick.eventDate) : 0);
-    if (!ts) return false;
-    return (Date.now() - ts) / (1000 * 60 * 60) < 48; 
+    if (!gameTs) return false;
+    return (Date.now() - gameTs) / (1000 * 60 * 60) < 48; 
   } else {
-    // FIX: Hide settled picks exactly 10 hours after they are graded
-    const settleTs = pick.settledAt ? Date.parse(pick.settledAt) : 0;
-    if (!settleTs) return true; 
-    return (Date.now() - settleTs) / (1000 * 60 * 60) < 10;
+    // Hide settled picks exactly 14 hours after game tip-off (3h game + 11h buffer)
+    if (!gameTs) return true;
+    return (Date.now() - gameTs) / (1000 * 60 * 60) < 14;
   }
 }
+
 
 function getCurrentFixtureMeta() {
   const fixtureSelect = document.getElementById("fixtureSelect");
@@ -7351,8 +7453,10 @@ function renderTrackedPicks() {
   const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
   const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
   
-  // FIX: Pull from BOTH buckets so syncing never makes a pick under 10 hours old vanish
-  const allPicks = [...active, ...archived].filter(p => supportedTrackerMarkets.includes(String(p?.marketKey || "")));
+  // Only show activePicks in the live view. Archived picks have already passed
+  // the 10-hour window and must not be pulled back into the display pool.
+  // Archived picks are visible in the Report tab only.
+  const allPicks = [...active].filter(p => supportedTrackerMarkets.includes(String(p?.marketKey || "")));
   
   // Deduplicate in case a pick exists in both buckets during a sync merge
   const uniquePicksMap = new Map();
@@ -7436,13 +7540,427 @@ function renderTrackedPicks() {
 let g_lastRenderedTrackerVersion = null;
 let g_lastRenderedTrackerView = null;
 
+
+
+// ── POWER DEBUG PANEL ────────────────────────────────────────────────────────
+function buildGodFatherDebugHtml() {
+  const now = Date.now();
+  const cutoffMs = 14 * 60 * 60 * 1000;
+  const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
+  const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
+  
+  function safeMs(v) { if (!v) return 0; const ms = Date.parse(String(v)); return isFinite(ms) ? ms : 0; }
+  function ts(v) { return v ? String(v).substring(5,16).replace("T"," ") : `<span style="color:#555">-</span>`; }
+  function badge(color, text) { return `<span style="background:${color};color:#000;padding:2px 5px;border-radius:3px;font-size:9px;font-weight:900;letter-spacing:0.5px;text-transform:uppercase;">${text}</span>`; }
+  
+  const tableStyles = `width:100%; table-layout:fixed; border-collapse:collapse; font-size:10px; font-family:ui-monospace, monospace;`;
+  const btnStyles = `background:#f44336; color:#fff; border:1px solid #d32f2f; padding:4px 8px; border-radius:4px; font-size:9px; font-weight:bold; cursor:pointer; text-transform:uppercase; letter-spacing:0.5px;`;
+
+  // ==========================================
+  // 1. SYSTEM & MEMORY CORE
+  // ==========================================
+  const lineMemSize = Object.keys(g_engineLineMemory || {}).length;
+  const memNearLimit = archived.length >= 1900 || lineMemSize >= 190;
+  const memStatus = memNearLimit ? "⚠️ NEAR LIMIT" : "✅ HEALTHY";
+  const memColor = memNearLimit ? "#ff9800" : "#333";
+  const memLeftBorder = memNearLimit ? "#ff9800" : "#4caf50";
+  const memBadge = memNearLimit ? badge("#ff9800", "WARNING") : badge("#4caf50", "CLEAR");
+
+  const pruneBtn = memNearLimit ? `<button style="${btnStyles} background:#ff9800; color:#000; border-color:#cc7a00;" onclick="g_trackerState.archivedPicks = g_trackerState.archivedPicks.slice(0, 1000); saveTrackerStateToLocal(); alert('Archive Pruned!'); renderTrackerAnalytics();">🩹 Prune Archive</button>` : "";
+
+  const sysHealthHtml = `
+    <div class="godfather-box" data-has-error="${memNearLimit}" data-keywords="system memory core storage database limit capacity" style="background:#111; border:1px solid ${memColor}; border-left:4px solid ${memLeftBorder}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">🖥️ System & Memory</div>
+        <div style="display:flex; gap:6px; align-items:center;">${pruneBtn} ${memBadge}</div>
+      </div>
+      <div style="font-size:9px; color:#666;">Tracks local database capacity.</div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size:10px; color:#aaa; background:#0a0a0a; padding:10px; border-radius:4px; border:1px solid #222;">
+        <div>Active Picks: <b style="color:#fff">${active.length} / 500</b></div>
+        <div>Archive Size: <b style="color:#fff">${archived.length} / 2000</b></div>
+        <div>Line Memory: <b style="color:#fff">${lineMemSize} / 200</b></div>
+        <div>Engine Status: <b style="color:${memNearLimit?'#ff9800':'#4caf50'}">${memStatus}</b></div>
+      </div>
+    </div>
+  `;
+
+  // ==========================================
+  // 2. QUEUE DIAGNOSTICS
+  // ==========================================
+  const pending = active.filter(p => !["win","loss","push"].includes(p.resultStatus));
+  const stuck = active.filter(p => {
+    if (!["win","loss","push"].includes(p.resultStatus)) return false;
+    const st = safeMs(p.eventDate) || safeMs(p.createdAt);
+    return st > 0 && (now - st) >= cutoffMs;
+  });
+
+  let archiveRows = "";
+  if (stuck.length === 0 && pending.length === 0) {
+    archiveRows = `<tr><td colspan="4" style="padding:10px;color:#4caf50;text-align:center;font-weight:bold;">✅ All queues clear. No stuck data.</td></tr>`;
+  } else {
+    [...stuck, ...pending].forEach(p => {
+      const isSettled = ["win","loss","push"].includes(p.resultStatus);
+      const gameTs = safeMs(p.eventDate) || safeMs(p.createdAt);
+      const isExpired = gameTs > 0 && (now - gameTs) >= cutoffMs;
+      const label = `${(p.homeTeam||"?").substring(0,12)} vs ${(p.awayTeam||"?").substring(0,12)}`;
+
+      let alertBadge = "";
+      let rowColor = "#aaa";
+      
+      if (!isSettled && isExpired) {
+        alertBadge = badge("#f44336","API FAILED"); 
+        rowColor = "#f44336";
+      } else if (!isSettled) {
+        alertBadge = badge("#ff9800","WAITING");
+      } else if (isSettled && isExpired) {
+        alertBadge = badge("#f44336","STUCK IN UI"); 
+        rowColor = "#f44336";
+      }
+
+      archiveRows += `<tr style="border-bottom:1px solid #1e1e1e; color:${rowColor}">
+        <td style="padding:6px 4px;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${label}</td>
+        <td style="padding:6px 4px;font-size:9px">${(p.resultStatus||"pend").toUpperCase()}</td>
+        <td style="padding:6px 4px;font-size:9px">${ts(p.eventDate)}</td>
+        <td style="padding:6px 4px">${alertBadge}</td>
+      </tr>`;
+    });
+  }
+
+  const isArchiveRed = stuck.length > 0 || pending.some(p => (safeMs(p.eventDate) > 0 && (now - safeMs(p.eventDate)) >= cutoffMs));
+  const archiveBorderCol = isArchiveRed ? "#f44336" : "#333";
+  const archiveLeftCol = isArchiveRed ? "#f44336" : "#4caf50";
+  const archiveBadge = isArchiveRed ? badge("#f44336", "ACTION NEEDED") : badge("#4caf50", "CLEAR");
+
+  const sweepBtn = isArchiveRed ? `<button style="${btnStyles}" onclick="archiveExpiredTrackedPicks(); renderTrackerAnalytics();">🩹 Force Sweep</button>` : "";
+
+  const archiveSection = `
+    <div class="godfather-box" data-has-error="${isArchiveRed}" data-keywords="queue diagnostics archive stuck pending settlement time sweep" style="background:#111; border:1px solid ${archiveBorderCol}; border-left:4px solid ${archiveLeftCol}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">🗂️ Queue Diagnostics</div>
+        <div style="display:flex; gap:6px; align-items:center;">${sweepBtn} ${archiveBadge}</div>
+      </div>
+      <div style="font-size:9px; color:#666;">Scans for picks that failed to settle or archive.</div>
+      <div style="background:#0a0a0a; border:1px solid #222; border-radius:4px; max-height:250px; overflow-y:auto;">
+        <table style="${tableStyles}">
+          <thead><tr style="color:#555; background:#151515; border-bottom:1px solid #2a2a2a">
+            <th style="padding:6px 4px;text-align:left;width:40%">Match</th>
+            <th style="padding:6px 4px;text-align:left;width:20%">Status</th>
+            <th style="padding:6px 4px;text-align:left;width:20%">Tip-Off</th>
+            <th style="padding:6px 4px;text-align:left;width:20%">Alert</th>
+          </tr></thead>
+          <tbody>${archiveRows}</tbody>
+        </table>
+      </div>
+    </div>`;
+
+  // ==========================================
+  // 3. ESPN API RESPONSE LOG
+  // ==========================================
+  let attemptRows = "";
+  let apiErrors = 0;
+  g_settlementDebugLog.forEach((entry) => {
+    const isErr = entry.status.includes("❌");
+    if (isErr) apiErrors++;
+    const statusColor = entry.status.startsWith("✅") ? "#4caf50" : entry.status.startsWith("⏳") ? "#ff9800" : "#f44336";
+    const cleanPick = entry.pick.replace(" · ", "<br>").substring(0, 35);
+    
+    attemptRows += `<tr style="border-bottom:1px solid #1e1e1e">
+      <td style="padding:6px 4px;color:#aaa;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cleanPick}</td>
+      <td style="padding:6px 4px;color:${statusColor};font-size:9px;font-weight:bold;">${entry.status.replace("SETTLED: ", "")}</td>
+      <td style="padding:6px 4px;color:#555;font-size:9px">${entry.stateName||"—"}</td>
+      <td style="padding:6px 4px;color:#555;font-size:9px">${entry.actual ?? "—"}/${entry.line ?? "—"}</td>
+    </tr>`;
+  });
+
+  const isApiRed = apiErrors > 0;
+  const apiBorderCol = isApiRed ? "#f44336" : "#333";
+  const apiLeftCol = isApiRed ? "#f44336" : "#2196f3";
+  const apiBadge = isApiRed ? badge("#f44336", "API ERROR") : badge("#2196f3", "CONNECTED");
+
+  const clearCacheBtn = isApiRed ? `<button style="${btnStyles}" onclick="_schedCache.clear(); _summaryCache.clear(); _fixtureCache.clear(); g_settlementDebugLog.clear(); alert('API Cache Wiped!'); renderTrackerAnalytics();">🩹 Clear API Cache</button>` : "";
+
+  const attemptSection = `
+    <div class="godfather-box" data-has-error="${isApiRed}" data-keywords="espn network log api fetch response connection cache" style="background:#111; border:1px solid ${apiBorderCol}; border-left:4px solid ${apiLeftCol}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">📡 ESPN Network Log</div>
+        <div style="display:flex; gap:6px; align-items:center;">${clearCacheBtn} ${apiBadge}</div>
+      </div>
+      <div style="font-size:9px; color:#666;">Checks if the server is responding to settlement requests.</div>
+      <div style="background:#0a0a0a; border:1px solid #222; border-radius:4px; max-height:250px; overflow-y:auto;">
+        ${attemptRows ? `<table style="${tableStyles}">
+          <thead><tr style="color:#555; background:#151515; border-bottom:1px solid #2a2a2a">
+            <th style="padding:6px 4px;text-align:left;width:40%">Pick</th>
+            <th style="padding:6px 4px;text-align:left;width:25%">API</th>
+            <th style="padding:6px 4px;text-align:left;width:15%">State</th>
+            <th style="padding:6px 4px;text-align:left;width:20%">Act/Line</th>
+          </tr></thead><tbody>${attemptRows}</tbody></table>`
+          : `<div style="color:#aaa;font-size:10px;text-align:center;padding:10px;">Waiting for next auto-refresh cycle...</div>`}
+      </div>
+    </div>`;
+
+  // ==========================================
+  // 4. CLOUD SYNC & PERSISTENCE
+  // ==========================================
+  const isSyncRed = (typeof g_trackerSaveFailureCount !== 'undefined' && g_trackerSaveFailureCount > 0);
+  const syncBorder = isSyncRed ? "#f44336" : "#333";
+  const syncLeft = isSyncRed ? "#f44336" : "#4caf50";
+  const syncBadge = isSyncRed ? badge("#f44336", "SYNC FAILING") : badge("#4caf50", "SYNCED");
+
+  const forceSyncBtn = isSyncRed ? `<button style="${btnStyles}" onclick="g_trackerSaveFailureCount = 0; forceTrackerSaveNow(); alert('Manual Sync Forced!'); renderTrackerAnalytics();">🩹 Force Hard Sync</button>` : "";
+
+  const syncHealthHtml = `
+    <div class="godfather-box" data-has-error="${isSyncRed}" data-keywords="cloud sync network save failure persistence version" style="background:#111; border:1px solid ${syncBorder}; border-left:4px solid ${syncLeft}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">☁️ Cloud Sync Core</div>
+        <div style="display:flex; gap:6px; align-items:center;">${forceSyncBtn} ${syncBadge}</div>
+      </div>
+      <div style="font-size:9px; color:#666;">Monitors the connection to the backend storage.</div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size:10px; color:#aaa; background:#0a0a0a; padding:10px; border-radius:4px; border:1px solid #222;">
+        <div>Save Failures: <b style="color:${isSyncRed?'#f44336':'#fff'}">${typeof g_trackerSaveFailureCount !== 'undefined' ? g_trackerSaveFailureCount : 0}</b></div>
+        <div>In Flight: <b style="color:#fff">${typeof g_trackerSaveInFlight !== 'undefined' && g_trackerSaveInFlight ? "YES" : "NO"}</b></div>
+        <div>Local Version: <b style="color:#fff">${typeof g_trackerSaveVersion !== 'undefined' ? g_trackerSaveVersion : 0}</b></div>
+        <div>Persisted Version: <b style="color:#fff">${typeof g_trackerPersistedVersion !== 'undefined' ? g_trackerPersistedVersion : 0}</b></div>
+      </div>
+    </div>
+  `;
+
+  // ==========================================
+  // 5. PHASE 2 LEARNING MATRIX
+  // ==========================================
+  const p2 = typeof getPhase2ActivationState === 'function' ? getPhase2ActivationState() : null;
+  const isP2Red = p2 && (!p2.trackerReady && p2.settled >= p2.reviewCheckpointSettled); 
+  const p2Border = isP2Red ? "#ff9800" : "#333";
+  const p2Left = isP2Red ? "#ff9800" : "#2196f3";
+  const p2Badge = p2?.trackerReady ? badge("#2196f3", "ACTIVE") : badge("#555", "BUILDING");
+
+  let p2Reasons = "";
+  if (p2) {
+    p2Reasons = p2.trackerReasons.map(r => `<div style="padding:4px 0; border-bottom:1px solid #1e1e1e; color:#aaa;">${safeText(r)}</div>`).join("");
+  }
+
+  const learningMatrixHtml = `
+    <div class="godfather-box" data-has-error="${isP2Red}" data-keywords="phase 2 learning matrix tracker shadow live feedback" style="background:#111; border:1px solid ${p2Border}; border-left:4px solid ${p2Left}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">🧠 Learning Matrix</div>
+        ${p2Badge}
+      </div>
+      <div style="font-size:9px; color:#666;">State of the Phase 2 Tracker Feedback loop.</div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size:10px; color:#aaa; background:#0a0a0a; padding:10px; border-radius:4px; border:1px solid #222; margin-bottom:4px;">
+        <div>Engine Mode: <b style="color:#fff; text-transform:uppercase;">${p2?.phase2Mode || "UNKNOWN"}</b></div>
+        <div>Tracker Live: <b style="color:${p2?.trackerFeedbackLive ? '#4caf50' : '#fff'}">${p2?.trackerFeedbackLive ? "YES" : "NO"}</b></div>
+      </div>
+      <div style="font-size:9px; color:#888; background:#0a0a0a; border:1px solid #222; border-radius:4px; padding:4px 10px; max-height:150px; overflow-y:auto;">
+        ${p2Reasons || "No matrix data available."}
+      </div>
+    </div>
+  `;
+
+  // ==========================================
+  // 6. UI INPUT SANITY
+  // ==========================================
+  const inputErrCount = (typeof g_fetchInputErrors !== 'undefined' ? g_fetchInputErrors.length : 0);
+  const auditErrCount = (typeof g_fetchAuditIssues !== 'undefined' ? g_fetchAuditIssues.length : 0);
+  const isInputRed = inputErrCount > 0 || auditErrCount > 0;
+  const inputBorder = isInputRed ? "#f44336" : "#333";
+  const inputLeft = isInputRed ? "#f44336" : "#4caf50";
+  const inputBadge = isInputRed ? badge("#f44336", "INPUT ERROR") : badge("#4caf50", "VALID");
+
+  let inputDetails = "";
+  if (isInputRed) {
+     const allErrs = [...(typeof g_fetchInputErrors !== 'undefined' ? g_fetchInputErrors : []), ...(typeof g_fetchAuditIssues !== 'undefined' ? g_fetchAuditIssues : [])];
+     inputDetails = allErrs.map(e => `<div style="padding:4px 0; border-bottom:1px solid #1e1e1e; color:#f44336;">• ${safeText(e)}</div>`).join("");
+  } else {
+     inputDetails = `<div style="color:#4caf50; text-align:center; padding:6px; font-weight:bold;">✅ All current UI inputs are clean.</div>`;
+  }
+
+  const liveInputHtml = `
+    <div class="godfather-box" data-has-error="${isInputRed}" data-keywords="input validation sanity errors ui fetch" style="background:#111; border:1px solid ${inputBorder}; border-left:4px solid ${inputLeft}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">🚦 UI Input Sanity</div>
+        ${inputBadge}
+      </div>
+      <div style="font-size:9px; color:#666;">Watches the main screen for missing or contradictory data.</div>
+      <div style="background:#0a0a0a; border:1px solid #222; border-radius:4px; padding:4px 10px; font-size:9px; max-height:150px; overflow-y:auto;">
+        ${inputDetails}
+      </div>
+    </div>
+  `;
+
+  // ==========================================
+  // 7. INJURY MATRIX
+  // ==========================================
+  const injA_un = typeof g_injA !== 'undefined' && (g_injA?.highUncertainty || g_injA?.hasUnknownImpact);
+  const injB_un = typeof g_injB !== 'undefined' && (g_injB?.highUncertainty || g_injB?.hasUnknownImpact);
+  const isInjRed = injA_un || injB_un;
+  const injBorder = isInjRed ? "#ff9800" : "#333";
+  const injLeft = isInjRed ? "#ff9800" : "#4caf50";
+  const injBadge = isInjRed ? badge("#ff9800", "CAUTION") : badge("#4caf50", "CLEAN");
+
+  let injDetails = "";
+  if ((typeof g_injA !== 'undefined' && g_injA?.notes?.length) || (typeof g_injB !== 'undefined' && g_injB?.notes?.length)) {
+     const aNotes = (g_injA?.notes||[]).map(n => `<div style="padding:4px 0; border-bottom:1px solid #1e1e1e;">Team A: ${safeText(n.text)}</div>`).join("");
+     const bNotes = (g_injB?.notes||[]).map(n => `<div style="padding:4px 0; border-bottom:1px solid #1e1e1e;">Team B: ${safeText(n.text)}</div>`).join("");
+     injDetails = `<div style="color:#aaa;">${aNotes}${bNotes}</div>`;
+  } else {
+     injDetails = `<div style="color:#aaa; text-align:center; padding:6px;">No significant injuries detected in current fetch.</div>`;
+  }
+
+  const injuryDiagnosticsHtml = `
+    <div class="godfather-box" data-has-error="${isInjRed}" data-keywords="injury out dtd uncertainty matrix impact players" style="background:#111; border:1px solid ${injBorder}; border-left:4px solid ${injLeft}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">🏥 Injury Matrix</div>
+        ${injBadge}
+      </div>
+      <div style="font-size:9px; color:#666;">Watches for hidden impacts or high uncertainty.</div>
+      <div style="background:#0a0a0a; border:1px solid #222; border-radius:4px; padding:8px 10px; font-size:9px; max-height:150px; overflow-y:auto;">
+        <div style="margin-bottom:8px; color:#fff; display:flex; justify-content:space-between; border-bottom:1px solid #333; padding-bottom:6px;">
+          <span>A Mult: <b>${(typeof g_injA !== 'undefined' ? (g_injA?.scoringMult||1) : 1).toFixed(2)}</b></span>
+          <span>B Mult: <b>${(typeof g_injB !== 'undefined' ? (g_injB?.scoringMult||1) : 1).toFixed(2)}</b></span>
+        </div>
+        ${injDetails}
+      </div>
+    </div>
+  `;
+
+  // ==========================================
+  // 8. VEGAS LINE (CLV) RADAR
+  // ==========================================
+  let clvRows = "";
+  let clvAlerts = 0;
+  active.filter(p => p.resultStatus === "pending").forEach(p => {
+    const move = typeof getTrackedPickLineMoveProxy === 'function' ? getTrackedPickLineMoveProxy(p) : null;
+    if (move && move.state === "unfavorable" && Math.abs(move.delta) >= 1.5) {
+      clvAlerts++;
+      const cleanPick = (p.homeTeam + " vs " + p.awayTeam).substring(0, 20);
+      clvRows += `<tr style="border-bottom:1px solid #1e1e1e">
+        <td style="padding:6px 4px;color:#aaa;font-size:10px;">${cleanPick}...</td>
+        <td style="padding:6px 4px;color:#fff;font-size:9px;font-weight:bold;">${p.predictionText}</td>
+        <td style="padding:6px 4px;color:#f44336;font-size:9px;font-weight:bold;">${move.delta > 0 ? '+'+move.delta : move.delta} pts</td>
+      </tr>`;
+    }
+  });
+
+  const isClvRed = clvAlerts > 0;
+  const clvBorder = isClvRed ? "#f44336" : "#333";
+  const clvLeft = isClvRed ? "#f44336" : "#4caf50";
+  const clvBadge = isClvRed ? badge("#f44336", "LINE MOVED AGAINST YOU") : badge("#4caf50", "LINES STABLE");
+
+  const vegasRadarHtml = `
+    <div class="godfather-box" data-has-error="${isClvRed}" data-keywords="vegas line radar clv movement sharp money odds" style="background:#111; border:1px solid ${clvBorder}; border-left:4px solid ${clvLeft}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">📉 Vegas Line Radar</div>
+        ${clvBadge}
+      </div>
+      <div style="font-size:9px; color:#666;">Detects if Vegas moves a line by 1.5+ points against your active picks.</div>
+      <div style="background:#0a0a0a; border:1px solid #222; border-radius:4px; max-height:200px; overflow-y:auto;">
+        ${clvRows ? `<table style="${tableStyles}">
+          <thead><tr style="color:#555; background:#151515; border-bottom:1px solid #2a2a2a">
+            <th style="padding:6px 4px;text-align:left;width:45%">Match</th>
+            <th style="padding:6px 4px;text-align:left;width:30%">Pick</th>
+            <th style="padding:6px 4px;text-align:left;width:25%">Line Move</th>
+          </tr></thead><tbody>${clvRows}</tbody></table>`
+          : `<div style="color:#4caf50;font-size:10px;text-align:center;padding:10px;font-weight:bold;">✅ No sharp line movement detected against active picks.</div>`}
+      </div>
+    </div>
+  `;
+
+  // ==========================================
+  // 9. MASSACRE (MONTE CARLO) MONITOR
+  // ==========================================
+  let mcRows = "";
+  let mcAlerts = 0;
+  active.filter(p => p.resultStatus === "pending").forEach(p => {
+    const diag = p.diagnostics?.massacre;
+    if (diag && diag.failedReasons && diag.failedReasons.length > 0) {
+      mcAlerts++;
+      const cleanPick = (p.homeTeam + " vs " + p.awayTeam).substring(0, 20);
+      mcRows += `<tr style="border-bottom:1px solid #1e1e1e">
+        <td style="padding:6px 4px;color:#aaa;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cleanPick}...</td>
+        <td style="padding:6px 4px;color:#f44336;font-size:9px">${diag.failedReasons.slice(0,2).join(" • ")}</td>
+      </tr>`;
+    }
+  });
+
+  const isMcRed = mcAlerts > 0;
+  const mcBorder = isMcRed ? "#ff9800" : "#333";
+  const mcLeft = isMcRed ? "#ff9800" : "#4caf50";
+  const mcBadge = isMcRed ? badge("#ff9800", "SIM ERRORS") : badge("#4caf50", "HEALTHY");
+
+  const massacreHtml = `
+    <div class="godfather-box" data-has-error="${isMcRed}" data-keywords="massacre monte carlo simulation math brutality agreement" style="background:#111; border:1px solid ${mcBorder}; border-left:4px solid ${mcLeft}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">🎲 Massacre Monitor</div>
+        ${mcBadge}
+      </div>
+      <div style="font-size:9px; color:#666;">Tracks if active picks have failing simulation/math triggers.</div>
+      <div style="background:#0a0a0a; border:1px solid #222; border-radius:4px; max-height:200px; overflow-y:auto;">
+        ${mcRows ? `<table style="${tableStyles}">
+          <thead><tr style="color:#555; background:#151515; border-bottom:1px solid #2a2a2a">
+            <th style="padding:6px 4px;text-align:left;width:45%">Match</th>
+            <th style="padding:6px 4px;text-align:left;width:55%">Failed Sim Triggers</th>
+          </tr></thead><tbody>${mcRows}</tbody></table>`
+          : `<div style="color:#4caf50;font-size:10px;text-align:center;padding:10px;font-weight:bold;">✅ All active simulations passed cleanly.</div>`}
+      </div>
+    </div>
+  `;
+
+  // ==========================================
+  // 10. BUSTED LOCK AUTOPSY
+  // ==========================================
+  let bustRows = "";
+  let bustAlerts = 0;
+  const bustedLocks = archived
+    .filter(p => p.isLock && p.resultStatus === "loss")
+    .sort((a,b) => safeMs(b.eventDate) - safeMs(a.eventDate))
+    .slice(0, 5);
+
+  bustedLocks.forEach(p => {
+    bustAlerts++;
+    const mem = p.godsEyeMemory || p.diagnostics || {};
+    const edge = p.edgePct ? p.edgePct.toFixed(1)+'%' : '—';
+    const cleanPick = (p.homeTeam + " vs " + p.awayTeam).substring(0, 16);
+    
+    bustRows += `<tr style="border-bottom:1px solid #1e1e1e">
+      <td style="padding:6px 4px;color:#aaa;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${cleanPick}</td>
+      <td style="padding:6px 4px;color:#fff;font-size:9px;font-weight:bold;">${p.marketKey.toUpperCase()}</td>
+      <td style="padding:6px 4px;color:#f44336;font-size:9px">Edge: ${edge}<br>Pace: ${mem.pace ? Number(mem.pace).toFixed(1) : '—'}</td>
+    </tr>`;
+  });
+
+  const isBustRed = bustAlerts > 0;
+  const bustBorder = isBustRed ? "#c91920" : "#333";
+  const bustLeft = isBustRed ? "#c91920" : "#4caf50";
+  const bustBadge = isBustRed ? badge("#c91920", "BUSTED LOCKS") : badge("#4caf50", "NO DEAD LOCKS");
+
+  const bustedLockHtml = `
+    <div class="godfather-box" data-has-error="${isBustRed}" data-keywords="busted lock autopsy failure post mortem loss" style="background:#111; border:1px solid ${bustBorder}; border-left:4px solid ${bustLeft}; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-size:12px; font-weight:900; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">💀 Busted Lock Autopsy</div>
+        ${bustBadge}
+      </div>
+      <div style="font-size:9px; color:#666;">Automatically pulls the last 5 Locks (🔒) that lost for review.</div>
+      <div style="background:#0a0a0a; border:1px solid #222; border-radius:4px; max-height:200px; overflow-y:auto;">
+        ${bustRows ? `<table style="${tableStyles}">
+          <thead><tr style="color:#555; background:#151515; border-bottom:1px solid #2a2a2a">
+            <th style="padding:6px 4px;text-align:left;width:40%">Match</th>
+            <th style="padding:6px 4px;text-align:left;width:20%">Market</th>
+            <th style="padding:6px 4px;text-align:left;width:40%">Engine State at Lock</th>
+          </tr></thead><tbody>${bustRows}</tbody></table>`
+          : `<div style="color:#4caf50;font-size:10px;text-align:center;padding:10px;font-weight:bold;">✅ No dead locks in recent archive.</div>`}
+      </div>
+    </div>
+  `;
+
+    return sysHealthHtml + archiveSection + attemptSection + syncHealthHtml + learningMatrixHtml + liveInputHtml + injuryDiagnosticsHtml + vegasRadarHtml + massacreHtml + bustedLockHtml;
+}
+
 function renderTrackerAnalytics() {
+
   const panel = document.getElementById("trackerAnalyticsPanel");
   if (!panel) return;
 
   const currentView = g_trackerModalView;
 
-  // FIX: If we are on the picks view, clear the panel and exit immediately. No heavy math needed.
   if (currentView === "picks") {
     syncTrackerModalView();
     panel.classList.add("tracker-hidden");
@@ -7452,7 +7970,6 @@ function renderTrackerAnalytics() {
     return;
   }
 
-    // FIX: Use 'updatedAt' instead of 'vId' so local settlements instantly break the cache
   if (g_lastRenderedTrackerVersion === g_trackerState.updatedAt && g_lastRenderedTrackerView === currentView) {
      syncTrackerModalView();
      panel.classList.remove("tracker-hidden");
@@ -7462,7 +7979,6 @@ function renderTrackerAnalytics() {
 
   g_lastRenderedTrackerVersion = g_trackerState.updatedAt;
   g_lastRenderedTrackerView = currentView;
-
 
   const allReportPicks = getAllTrackedPicksForReport().map(p => ensureTrackedPickKeys(p));
 
@@ -7488,37 +8004,18 @@ function renderTrackerAnalytics() {
 
   function marketLabel(key) {
     const map = {
-      ft: "FT Total",
-      h1: "1H Total",
-      h2: "2H Total",
-      team_a: "Team A Total",
-      team_b: "Team B Total"
+      ft: "FT Total", h1: "1H Total", h2: "2H Total", team_a: "Team A Total", team_b: "Team B Total"
     };
     return map[String(key || "")] || String(key || "Other");
   }
 
-  function formatPct(value) {
-    return isFinite(value) ? `${Number(value).toFixed(1)}%` : "—";
-  }
+  function formatPct(value) { return isFinite(value) ? `${Number(value).toFixed(1)}%` : "—"; }
 
   function getLeagueActionMeta(trustMeta) {
     const mode = String(trustMeta?.mode || "advisory").toLowerCase();
-    if (mode === "full") {
-      return {
-        label: "Use",
-        note: "Full plays allowed"
-      };
-    }
-    if (mode === "block") {
-      return {
-        label: "Block",
-        note: "Forced no-play"
-      };
-    }
-    return {
-      label: "Advisory",
-      note: "Lean only"
-    };
+    if (mode === "full") return { label: "Use", note: "Full plays allowed" };
+    if (mode === "block") return { label: "Block", note: "Forced no-play" };
+    return { label: "Advisory", note: "Lean only" };
   }
 
   function buildRecord(items = []) {
@@ -7570,55 +8067,17 @@ function renderTrackerAnalytics() {
     return { area, decision, status, review, action };
   }
 
-  const marketRows = buildGroupedRows(
-    learningPicks,
-    pick => pick.marketKey || "other",
-    key => marketLabel(key),
-    1
-  ).sort((a, b) => b.winPct - a.winPct || b.settled - a.settled);
-
-  const leagueRows = buildGroupedRows(
-    learningPicks,
-    pick => pick.league || "unknown",
-    key => String(key || "unknown").toUpperCase(),
-    1
-  ).filter(row => row.key !== "unknown")
-   .sort((a, b) => b.winPct - a.winPct || b.settled - a.settled);
-
-  const reportLeagueRows = buildGroupedRows(
-    fallbackSettledPicks,
-    pick => pick.league || "unknown",
-    key => String(key || "unknown").toUpperCase(),
-    1
-  ).filter(row => row.key !== "unknown")
-   .sort((a, b) => b.settled - a.settled || b.winPct - a.winPct);
-
-  const confidenceRows = buildGroupedRows(
-    learningPicks,
-    pick => String(pick.confidenceGrade || pick.confidence || "—").toUpperCase() || "—",
-    key => key === "—" ? "Unrated" : `Grade ${key}`,
-    1
-  ).sort((a, b) => getConfidenceRank(b.key) - getConfidenceRank(a.key) || b.settled - a.settled);
-
-  const edgeRows = buildGroupedRows(
-    learningPicks,
-    pick => pick.edgeBucket || "unknown",
-    key => getTrackedPickEdgeBucketLabel(key),
-    1
-  ).sort((a, b) => getEdgeBucketSortRank(a.key) - getEdgeBucketSortRank(b.key) || b.settled - a.settled);
-
-  const trackerImpactRows = buildGroupedRows(
-    learningPicks,
-    pick => getTrackerImpactKeyFromPickLike(pick),
-    key => getTrackerImpactLabel(key),
-    1
-  ).sort((a, b) => b.settled - a.settled || b.winPct - a.winPct);
-
+  const marketRows = buildGroupedRows(learningPicks, pick => pick.marketKey || "other", key => marketLabel(key), 1).sort((a, b) => b.winPct - a.winPct || b.settled - a.settled);
+  const leagueRows = buildGroupedRows(learningPicks, pick => pick.league || "unknown", key => String(key || "unknown").toUpperCase(), 1).filter(row => row.key !== "unknown").sort((a, b) => b.winPct - a.winPct || b.settled - a.settled);
+  const reportLeagueRows = buildGroupedRows(fallbackSettledPicks, pick => pick.league || "unknown", key => String(key || "unknown").toUpperCase(), 1).filter(row => row.key !== "unknown").sort((a, b) => b.settled - a.settled || b.winPct - a.winPct);
+  const confidenceRows = buildGroupedRows(learningPicks, pick => String(pick.confidenceGrade || pick.confidence || "—").toUpperCase() || "—", key => key === "—" ? "Unrated" : `Grade ${key}`, 1).sort((a, b) => getConfidenceRank(b.key) - getConfidenceRank(a.key) || b.settled - a.settled);
+  const edgeRows = buildGroupedRows(learningPicks, pick => pick.edgeBucket || "unknown", key => getTrackedPickEdgeBucketLabel(key), 1).sort((a, b) => getEdgeBucketSortRank(a.key) - getEdgeBucketSortRank(b.key) || b.settled - a.settled);
+  const trackerImpactRows = buildGroupedRows(learningPicks, pick => getTrackerImpactKeyFromPickLike(pick), key => getTrackerImpactLabel(key), 1).sort((a, b) => b.settled - a.settled || b.winPct - a.winPct);
+  
   const lineMoveRows = buildGroupedRows(
     learningPicks.filter(pick => getTrackedPickLineMoveProxy(pick).state !== "unknown"),
     pick => getTrackedPickLineMoveProxy(pick).state,
-    key => key === "favorable" ? "Favorable latest-line move" : key === "unfavorable" ? "Unfavorable latest-line move" : "Flat latest-line move",
-    1
+    key => key === "favorable" ? "Favorable latest-line move" : key === "unfavorable" ? "Unfavorable latest-line move" : "Flat latest-line move", 1
   ).sort((a, b) => {
     const rank = { favorable: 0, flat: 1, unfavorable: 2 };
     return (rank[a.key] ?? 9) - (rank[b.key] ?? 9) || b.settled - a.settled;
@@ -7627,9 +8086,7 @@ function renderTrackerAnalytics() {
   const bestPickShadow = buildBestPickOnlyShadowExperiment(learningPicks);
 
   const selectedLeagueKey = normalizeLeagueTrustKey(document.getElementById("leagueSelect")?.value || "unknown");
-  const trackedLeagueKeys = [...new Set(allReportPicks
-    .map(p => normalizeLeagueTrustKey(p?.league || "unknown"))
-    .filter(key => key && key !== "unknown"))];
+  const trackedLeagueKeys = [...new Set(allReportPicks.map(p => normalizeLeagueTrustKey(p?.league || "unknown")).filter(key => key && key !== "unknown"))];
   const trustLeagueKeys = [...new Set([selectedLeagueKey, ...trackedLeagueKeys].filter(k => k && k !== "unknown"))];
 
   const leagueRecordMap = new Map(reportLeagueRows.map(row => [normalizeLeagueTrustKey(row.key), row]));
@@ -7639,15 +8096,8 @@ function renderTrackerAnalytics() {
       const record = leagueRecordMap.get(key) || buildRecord([]);
       const action = getLeagueActionMeta(trust);
       return {
-        key,
-        label: String(key || "unknown").toUpperCase(),
-        trust,
-        action,
-        settled: Number(record.settled || 0),
-        wins: Number(record.wins || 0),
-        losses: Number(record.losses || 0),
-        pushes: Number(record.pushes || 0),
-        winPct: isFinite(record.winPct) ? Number(record.winPct) : NaN
+        key, label: String(key || "unknown").toUpperCase(), trust, action,
+        settled: Number(record.settled || 0), wins: Number(record.wins || 0), losses: Number(record.losses || 0), pushes: Number(record.pushes || 0), winPct: isFinite(record.winPct) ? Number(record.winPct) : NaN
       };
     })
     .sort((a, b) => {
@@ -7678,180 +8128,66 @@ function renderTrackerAnalytics() {
 
   const checkpointStatus = settled >= trackerMin ? "Review ready" : "Building";
   const checkpointLeft = Math.max(0, trackerMin - settled);
-  const reviewVersionSub = useFallbackReport
-    ? "Fallback: all tracked picks"
-    : (priorVersions.length ? `${priorVersions.length + 1} tracked versions` : "Current version only");
+  const reviewVersionSub = useFallbackReport ? "Fallback: all tracked picks" : (priorVersions.length ? `${priorVersions.length + 1} tracked versions` : "Current version only");
 
   const reviewRows = [];
 
   if (selectedLeagueKey !== "unknown") {
     if (selectedLeagueTrust.level === "blocked") {
-      reviewRows.push(
-        makeReviewItem(
-          "League trust",
-          "NO PLAY",
-          "Candidate review",
-          `${String(selectedLeagueKey).toUpperCase()} is currently blocked from full plays.`,
-          selectedLeagueTrust.guidance
-        )
-      );
+      reviewRows.push(makeReviewItem("League trust", "NO PLAY", "Candidate review", `${String(selectedLeagueKey).toUpperCase()} is currently blocked from full plays.`, selectedLeagueTrust.guidance));
     } else if (selectedLeagueTrust.level === "advisory") {
-      reviewRows.push(
-        makeReviewItem(
-          "League trust",
-          "ADVISORY ONLY",
-          "Watching",
-          `${String(selectedLeagueKey).toUpperCase()} is still in the retune bucket.`,
-          selectedLeagueTrust.guidance
-        )
-      );
+      reviewRows.push(makeReviewItem("League trust", "ADVISORY ONLY", "Watching", `${String(selectedLeagueKey).toUpperCase()} is still in the retune bucket.`, selectedLeagueTrust.guidance));
     } else {
-      reviewRows.push(
-        makeReviewItem(
-          "League trust",
-          "TRUSTED",
-          "Watching",
-          `${String(selectedLeagueKey).toUpperCase()} is allowed for full plays with ongoing review.`,
-          selectedLeagueTrust.guidance
-        )
-      );
+      reviewRows.push(makeReviewItem("League trust", "TRUSTED", "Watching", `${String(selectedLeagueKey).toUpperCase()} is allowed for full plays with ongoing review.`, selectedLeagueTrust.guidance));
     }
   }
 
   if (settled >= trackerMin) {
     if (bestMarket && bestMarket.settled >= 4 && bestMarket.winPct >= 70) {
-      reviewRows.push(
-        makeReviewItem(
-          "Best market",
-          "KEEP",
-          bestMarket.settled >= 6 ? "Confirmed strength" : "Candidate strength",
-          `${bestMarket.label} is leading at ${formatPct(bestMarket.winPct)} with ${bestMarket.wins} wins and ${bestMarket.losses} losses.`,
-          "Keep this market logic as it is. Do not weaken it from one bad day."
-        )
-      );
+      reviewRows.push(makeReviewItem("Best market", "KEEP", bestMarket.settled >= 6 ? "Confirmed strength" : "Candidate strength", `${bestMarket.label} is leading at ${formatPct(bestMarket.winPct)} with ${bestMarket.wins} wins and ${bestMarket.losses} losses.`, "Keep this market logic as it is. Do not weaken it from one bad day."));
     }
-
     if (weakMarket && weakMarket.settled >= 4 && weakMarket.winPct <= 45) {
-      reviewRows.push(
-        makeReviewItem(
-          "Weak market",
-          "REVIEW",
-          weakMarket.settled >= 6 ? "Candidate review" : "Watching",
-          `${weakMarket.label} is the weakest market so far at ${formatPct(weakMarket.winPct)} with ${weakMarket.losses} losses.`,
-          "Do not edit yet from this checkpoint alone. Keep it on review and only change if it repeats."
-        )
-      );
+      reviewRows.push(makeReviewItem("Weak market", "REVIEW", weakMarket.settled >= 6 ? "Candidate review" : "Watching", `${weakMarket.label} is the weakest market so far at ${formatPct(weakMarket.winPct)} with ${weakMarket.losses} losses.`, "Do not edit yet from this checkpoint alone. Keep it on review and only change if it repeats."));
     }
-
     if (lockRecord.settled >= 5) {
-      let decision = "NO CHANGE";
-      let status = "Watching";
-      let action = "Lock performance is acceptable. Keep monitoring instead of forcing a lock edit now.";
-
-      if (lockRecord.winPct <= 50) {
-        decision = "REVIEW";
-        status = "Candidate review";
-        action = "Lock performance is weak. Watch the next checkpoint before touching lock logic.";
-      } else if (lockRecord.winPct >= 65) {
-        decision = "KEEP";
-        status = "Confirmed strength";
-        action = "Lock performance is healthy. Keep the current lock behavior unless a later checkpoint says otherwise.";
-      }
-
-      reviewRows.push(
-        makeReviewItem(
-          "Lock icon",
-          decision,
-          status,
-          `Locks are ${lockRecord.wins} wins, ${lockRecord.losses} losses, ${lockRecord.pushes} pushes for ${formatPct(lockRecord.winPct)} win rate.`,
-          action
-        )
-      );
+      let decision = "NO CHANGE"; let status = "Watching"; let action = "Lock performance is acceptable. Keep monitoring instead of forcing a lock edit now.";
+      if (lockRecord.winPct <= 50) { decision = "REVIEW"; status = "Candidate review"; action = "Lock performance is weak. Watch the next checkpoint before touching lock logic."; }
+      else if (lockRecord.winPct >= 65) { decision = "KEEP"; status = "Confirmed strength"; action = "Lock performance is healthy. Keep the current lock behavior unless a later checkpoint says otherwise."; }
+      reviewRows.push(makeReviewItem("Lock icon", decision, status, `Locks are ${lockRecord.wins} wins, ${lockRecord.losses} losses, ${lockRecord.pushes} pushes for ${formatPct(lockRecord.winPct)} win rate.`, action));
     }
-
     const eligibleTeams = [...teamRows].filter(row => Number(row.settled || 0) >= 2);
     const weakTeam = [...eligibleTeams].sort((a, b) => Number(a.winRate || 999) - Number(b.winRate || 999))[0];
     const strongTeam = [...eligibleTeams].sort((a, b) => Number(b.winRate || -1) - Number(a.winRate || -1))[0];
 
     if (strongTeam && Number(strongTeam.winRate || 0) >= 70) {
-      reviewRows.push(
-        makeReviewItem(
-          "Strong team signal",
-          "KEEP",
-          "Watching",
-          `${strongTeam.label || strongTeam.key} is trending strong at ${formatPct(strongTeam.winRate)} across ${Number(strongTeam.settled || 0)} settled picks.`,
-          "Treat this as a positive team note. Keep collecting more team-by-team evidence."
-        )
-      );
+      reviewRows.push(makeReviewItem("Strong team signal", "KEEP", "Watching", `${strongTeam.label || strongTeam.key} is trending strong at ${formatPct(strongTeam.winRate)} across ${Number(strongTeam.settled || 0)} settled picks.`, "Treat this as a positive team note. Keep collecting more team-by-team evidence."));
     }
-
     if (weakTeam && Number(weakTeam.winRate || 100) <= 45) {
-      reviewRows.push(
-        makeReviewItem(
-          "Weak team signal",
-          "WATCH",
-          Number(weakTeam.settled || 0) >= 4 ? "Candidate review" : "Watching",
-          `${weakTeam.label || weakTeam.key} is underperforming at ${formatPct(weakTeam.winRate)} across ${Number(weakTeam.settled || 0)} settled picks.`,
-          "Keep this team on watch. Do not apply a global engine edit from one team alone."
-        )
-      );
+      reviewRows.push(makeReviewItem("Weak team signal", "WATCH", Number(weakTeam.settled || 0) >= 4 ? "Candidate review" : "Watching", `${weakTeam.label || weakTeam.key} is underperforming at ${formatPct(weakTeam.winRate)} across ${Number(weakTeam.settled || 0)} settled picks.`, "Keep this team on watch. Do not apply a global engine edit from one team alone."));
     }
-
     if (bestLeague && bestLeague.settled >= 4) {
-      reviewRows.push(
-        makeReviewItem(
-          "Best league",
-          "KEEP",
-          "Watching",
-          `${bestLeague.label} is the strongest tracked league so far at ${formatPct(bestLeague.winPct)}.`,
-          "Use this as context only. Do not add an automatic league boost."
-        )
-      );
+      reviewRows.push(makeReviewItem("Best league", "KEEP", "Watching", `${bestLeague.label} is the strongest tracked league so far at ${formatPct(bestLeague.winPct)}.`, "Use this as context only. Do not add an automatic league boost."));
     }
   } else {
-    reviewRows.push(
-      makeReviewItem(
-        "Checkpoint",
-        "COLLECT MORE",
-        "Watching",
-        `${settled}/${trackerMin} settled picks collected so far.`,
-        `${checkpointLeft} more settled picks are needed before the tracker can give a full review.`
-      )
-    );
+    reviewRows.push(makeReviewItem("Checkpoint", "COLLECT MORE", "Watching", `${settled}/${trackerMin} settled picks collected so far.`, `${checkpointLeft} more settled picks are needed before the tracker can give a full review.`));
   }
 
   const teamDisplayRows = teamRows.slice(0, 8);
   const marketDisplayRows = marketRows.slice(0, 5);
   const leagueDisplayRows = leagueRows.slice(0, 5);
-
-  const pendingActiveCount = Array.isArray(g_trackerState?.activePicks)
-    ? g_trackerState.activePicks.filter(p => !["win", "loss", "push"].includes(String(p?.resultStatus || "").toLowerCase())).length
-    : 0;
+  const pendingActiveCount = Array.isArray(g_trackerState?.activePicks) ? g_trackerState.activePicks.filter(p => !["win", "loss", "push"].includes(String(p?.resultStatus || "").toLowerCase())).length : 0;
 
   const importantEngineLines = [];
   const rawImportantEngineLines = getVisibleDebugLines(g_engineDebugLog, "engine", 6);
-  if (rawImportantEngineLines.length) {
-    importantEngineLines.push(...rawImportantEngineLines);
-  }
+  if (rawImportantEngineLines.length) importantEngineLines.push(...rawImportantEngineLines);
 
   const importantTrackerLines = [];
   const rawImportantTrackerLines = getVisibleDebugLines(g_trackerDebugLog, "tracker", 6);
-  rawImportantTrackerLines.forEach(line => {
-    if (!importantTrackerLines.includes(line)) importantTrackerLines.push(line);
-  });
+  rawImportantTrackerLines.forEach(line => { if (!importantTrackerLines.includes(line)) importantTrackerLines.push(line); });
 
-    syncTrackerModalView();
-  // FIX: Removed the duplicate 'const currentView' declaration that was crashing the parser
+  syncTrackerModalView();
   panel.classList.toggle("tracker-hidden", currentView === "picks");
   panel.style.display = currentView === "picks" ? "none" : "block";
-
-
-  const debugBodyHtml = `
-      <div class="report-debug-grid">
-        ${buildReportDebugCard("Important engine errors", importantEngineLines, 6, "No active engine errors. The watchdog is quiet.")}
-        ${buildReportDebugCard("Important tracker errors", importantTrackerLines, 6, "No active tracker errors. Nothing urgent needs review.")}
-      </div>
-  `;
 
   const reportBodyHtml = `
       <div class="tracker-kpi-grid">
@@ -7931,11 +8267,7 @@ function renderTrackerAnalytics() {
                     <td class="rate">${safeText(formatPct(row.winPct))}</td>
                     <td class="num">${isFinite(row.netWins) ? safeText(Number(row.netWins).toFixed(0)) : "—"}</td>
                   </tr>
-                `).join("") : `
-                  <tr>
-                    <td colspan="8" class="note">Need settled tracked picks before the best-pick-only shadow test can say anything useful.</td>
-                  </tr>
-                `}
+                `).join("") : `<tr><td colspan="8" class="note">Need settled tracked picks before the best-pick-only shadow test can say anything useful.</td></tr>`}
               </tbody>
             </table>
           </div>
@@ -7971,11 +8303,7 @@ function renderTrackerAnalytics() {
                       <td class="num">${Number(row.pushes || 0)}</td>
                       <td class="rate">${safeText(formatPct(row.winPct))}</td>
                     </tr>
-                  `).join("") : `
-                    <tr>
-                      <td colspan="6" class="note">No confidence-grade data yet.</td>
-                    </tr>
-                  `}
+                  `).join("") : `<tr><td colspan="6" class="note">No confidence-grade data yet.</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -8010,11 +8338,7 @@ function renderTrackerAnalytics() {
                       <td class="num">${Number(row.pushes || 0)}</td>
                       <td class="rate">${safeText(formatPct(row.winPct))}</td>
                     </tr>
-                  `).join("") : `
-                    <tr>
-                      <td colspan="6" class="note">No settled edge-bucket data yet.</td>
-                    </tr>
-                  `}
+                  `).join("") : `<tr><td colspan="6" class="note">No settled edge-bucket data yet.</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -8051,11 +8375,7 @@ function renderTrackerAnalytics() {
                       <td class="num">${Number(row.pushes || 0)}</td>
                       <td class="rate">${safeText(formatPct(row.winPct))}</td>
                     </tr>
-                  `).join("") : `
-                    <tr>
-                      <td colspan="6" class="note">Tracker has not influenced any settled picks yet.</td>
-                    </tr>
-                  `}
+                  `).join("") : `<tr><td colspan="6" class="note">Tracker has not influenced any settled picks yet.</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -8090,11 +8410,7 @@ function renderTrackerAnalytics() {
                       <td class="num">${Number(row.pushes || 0)}</td>
                       <td class="rate">${safeText(formatPct(row.winPct))}</td>
                     </tr>
-                  `).join("") : `
-                    <tr>
-                      <td colspan="6" class="note">The engine has not seen enough later line updates for a movement check yet.</td>
-                    </tr>
-                  `}
+                  `).join("") : `<tr><td colspan="6" class="note">The engine has not seen enough later line updates for a movement check yet.</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -8150,11 +8466,7 @@ function renderTrackerAnalytics() {
                       <td class="num">${Number(row.pushes || 0)}</td>
                       <td class="rate">${safeText(formatPct(row.winPct))}</td>
                     </tr>
-                  `).join("") : `
-                    <tr>
-                      <td colspan="5" class="note">No settled league data yet.</td>
-                    </tr>
-                  `}
+                  `).join("") : `<tr><td colspan="5" class="note">No settled league data yet.</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -8196,11 +8508,7 @@ function renderTrackerAnalytics() {
                     <td><span class="league-trust-pill ${safeText(getLeagueTrustCssClass(row.trust.level))}">${safeText(row.action.label)}</span></td>
                     <td class="note">${safeText(row.trust.guidance)}</td>
                   </tr>
-                `).join("") : `
-                  <tr>
-                    <td colspan="9" class="note">Pick a league or settle some results to start building the trust board.</td>
-                  </tr>
-                `}
+                `).join("") : `<tr><td colspan="9" class="note">Pick a league or settle some results to start building the trust board.</td></tr>`}
               </tbody>
             </table>
           </div>
@@ -8212,30 +8520,12 @@ function renderTrackerAnalytics() {
                   <span class="league-trust-pill ${safeText(getLeagueTrustCssClass(row.trust.level))}">${safeText(row.trust.label)}</span>
                 </div>
                 <div class="league-trust-mobile-grid">
-                  <div class="league-trust-mobile-stat">
-                    <strong>Settled</strong>
-                    <span>${Number(row.settled || 0)}</span>
-                  </div>
-                  <div class="league-trust-mobile-stat">
-                    <strong>Wins</strong>
-                    <span>${Number(row.wins || 0)}</span>
-                  </div>
-                  <div class="league-trust-mobile-stat">
-                    <strong>Losses</strong>
-                    <span>${Number(row.losses || 0)}</span>
-                  </div>
-                  <div class="league-trust-mobile-stat">
-                    <strong>Pushes</strong>
-                    <span>${Number(row.pushes || 0)}</span>
-                  </div>
-                  <div class="league-trust-mobile-stat">
-                    <strong>Win rate</strong>
-                    <span>${row.settled ? safeText(formatPct(row.winPct)) : "—"}</span>
-                  </div>
-                  <div class="league-trust-mobile-stat">
-                    <strong>Action</strong>
-                    <span>${safeText(row.action.label)}</span>
-                  </div>
+                  <div class="league-trust-mobile-stat"><strong>Settled</strong><span>${Number(row.settled || 0)}</span></div>
+                  <div class="league-trust-mobile-stat"><strong>Wins</strong><span>${Number(row.wins || 0)}</span></div>
+                  <div class="league-trust-mobile-stat"><strong>Losses</strong><span>${Number(row.losses || 0)}</span></div>
+                  <div class="league-trust-mobile-stat"><strong>Pushes</strong><span>${Number(row.pushes || 0)}</span></div>
+                  <div class="league-trust-mobile-stat"><strong>Win rate</strong><span>${row.settled ? safeText(formatPct(row.winPct)) : "—"}</span></div>
+                  <div class="league-trust-mobile-stat"><strong>Action</strong><span>${safeText(row.action.label)}</span></div>
                 </div>
                 <div class="league-trust-mobile-guidance">${safeText(row.trust.guidance)}</div>
               </div>
@@ -8274,17 +8564,13 @@ function renderTrackerAnalytics() {
                     <td class="rate">${safeText(formatPct(row.winRate))}</td>
                     <td>${safeText(statusFromTeamRow(row))}</td>
                   </tr>
-                `).join("") : `
-                  <tr>
-                    <td colspan="6" class="note">Tracker is checking teams one by one already. More settled picks will make this table stronger.</td>
-                  </tr>
-                `}
+                `).join("") : `<tr><td colspan="6" class="note">Tracker is checking teams one by one already. More settled picks will make this table stronger.</td></tr>`}
               </tbody>
             </table>
           </div>
         </div>
       </div>
-        <div class="tracker-analytics-card" style="margin-top: 10px; border-color: #d4af37;">
+      <div class="tracker-analytics-card" style="margin-top: 10px; border-color: #d4af37;">
         <div class="tracker-analytics-card-head" style="background: linear-gradient(90deg, #333 0%, #111 100%);">
           <div class="tracker-analytics-card-title" style="color: #ffd700;">👁️ GOD'S EYE: POST-MORTEM LOG</div>
           <div class="tracker-analytics-card-meta">Game-by-game diagnostic archive</div>
@@ -8304,7 +8590,7 @@ function renderTrackerAnalytics() {
               <tbody>
                 ${fallbackSettledPicks.length ? [...fallbackSettledPicks].sort((a,b) => getTrackedPickTimeMs(b) - getTrackedPickTimeMs(a)).slice(0, 40).map(p => {
                   const statusClass = p.resultStatus === 'win' ? 'color: #3a9c35;' : p.resultStatus === 'loss' ? 'color: #c91920;' : 'color: #888;';
-                                                                        const diag = p.diagnostics || p.godsEyeMemory || {};
+                  const diag = p.diagnostics || p.godsEyeMemory || {};
                   const pace = diag.pace ? diag.pace.toFixed(1) : "—";
                   const aVol = diag.aVol ? diag.aVol.toFixed(1) : "—";
                   const bVol = diag.bVol ? diag.bVol.toFixed(1) : "—";
@@ -8313,8 +8599,6 @@ function renderTrackerAnalytics() {
                   const edge = p.edgePct ? (p.edgePct > 0 ? '+' : '') + p.edgePct.toFixed(1) + '%' : '—';
                   
                   return `
-
-
                     <tr>
                       <td>
                         <strong>${safeText(p.fixtureLabel || p.homeTeam + " vs " + p.awayTeam)}</strong><br>
@@ -8325,7 +8609,6 @@ function renderTrackerAnalytics() {
                         ${safeText(p.resultStatus)}
                         ${p.actualScore ? `<br><span style="font-size:9px; color:var(--muted);">Score: ${p.actualScore}</span>` : ''}
                       </td>
-
                       <td style="font-size: 9px; color: var(--muted); line-height: 1.4;">
                         <strong>Edge:</strong> <span style="color:var(--text)">${edge}</span> | <strong>Grade:</strong> <span style="color:var(--text)">${p.confidenceGrade}</span><br>
                         <strong>Pace:</strong> ${pace} | <strong>Net:</strong> A:${nA} B:${nB}<br>
@@ -8333,16 +8616,12 @@ function renderTrackerAnalytics() {
                       </td>
                     </tr>
                   `;
-
-                }).join("") : `
-                  <tr><td colspan="4" class="note">No settled picks yet. The Eye is waiting.</td></tr>
-                `}
+                }).join("") : `<tr><td colspan="4" class="note">No settled picks yet. The Eye is waiting.</td></tr>`}
               </tbody>
             </table>
           </div>
         </div>
       </div>
-
   `;
 
   if (currentView === "report") {
@@ -8359,25 +8638,59 @@ function renderTrackerAnalytics() {
       </div>
     `;
   } else if (currentView === "debug") {
+    const godFatherDebugHtml = buildGodFatherDebugHtml();
+    
+    // We pass our live logs into the newly standardized Report cards
+    const engineErrorsHtml = buildReportDebugCard("Important Engine Errors", importantEngineLines, 6, "No active engine errors. The watchdog is quiet.");
+    const trackerErrorsHtml = buildReportDebugCard("Important Tracker Errors", importantTrackerLines, 6, "No active tracker errors. Nothing urgent needs review.");
+
     panel.innerHTML = `
-      <div class="tracker-analytics-shell">
-        <div class="tracker-analytics-topbar">
-          <div class="tracker-analytics-heading">
-            <div class="tracker-analytics-kicker">Engine Security</div>
-            <div class="tracker-analytics-title">Watch Dog 🐶</div>
-            <div class="tracker-analytics-subtitle">Critical system alerts and completion status.</div>
+      <style>
+        #godfatherGrid { display: flex; flex-direction: column; gap: 12px; padding: 12px; padding-bottom: 30px; }
+        .godfather-box { order: 5; transition: box-shadow 0.2s ease, border-color 0.2s ease; }
+        /* The Auto-Sort Magic: Any box with an error instantly moves to order 1 (top of page) */
+        .godfather-box[data-has-error="true"] { 
+          order: 1; 
+          box-shadow: 0 0 15px rgba(244, 67, 54, 0.15); 
+        }
+        .godfather-box:hover { border-color: #666 !important; }
+        .godfather-box[data-has-error="true"]:hover { border-color: #ff5c61 !important; }
+      </style>
+
+      <div class="tracker-analytics-shell" style="height:100%; display:flex; flex-direction:column; overflow:hidden;">
+        <div class="tracker-analytics-topbar" style="padding:12px; border-bottom:1px solid #333; background:#1a1a1a; z-index:2; position:sticky; top:0;">
+          <div class="tracker-analytics-heading" style="margin-bottom:10px;">
+            <div class="tracker-analytics-kicker" style="color:#f44336;">Immune System</div>
+            <div class="tracker-analytics-title" style="color:#fff;">God Father 🛡️</div>
+            <div class="tracker-analytics-subtitle" style="color:#888;">Core engine diagnostics and auto-sorting health checks.</div>
           </div>
+          
+          <input type="text" placeholder="🔍 Search diagnostics (e.g. 'queue', 'error', 'espn')..." 
+            oninput="
+              const q = this.value.toLowerCase().trim();
+              document.querySelectorAll('.godfather-box').forEach(b => {
+                const txt = (b.dataset.keywords + ' ' + b.innerText).toLowerCase();
+                b.style.display = (!q || txt.includes(q)) ? 'flex' : 'none';
+              });
+            "
+            style="width:100%; background:#0a0a0a; color:#fff; border:1px solid #444; padding:10px 12px; border-radius:6px; font-size:12px; font-family:monospace; outline:none;" autocomplete="off" spellcheck="false">
         </div>
-        ${debugBodyHtml}
+        
+        <div id="godfatherGrid" style="flex:1; overflow-y:auto;">
+          ${godFatherDebugHtml}
+          ${engineErrorsHtml}
+          ${trackerErrorsHtml}
+        </div>
       </div>
     `;
 
   } else {
-
     panel.innerHTML = "";
   }
   updateTrackerInsightsButton();
 }
+
+
 
 
 function clampNumber(val, min, max) {
@@ -9126,20 +9439,38 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
       pendingPicks.forEach(pick => {
         const data = eventMap.get(pick.eventId);
         const competition = data?.header?.competitions?.[0];
-        if (!competition) return;
+
+        // ── SETTLEMENT DEBUG LOG ──
+        const _dbgKey = `${pick.league}:${pick.eventId}:${pick.marketKey}`;
+        if (!data) {
+          g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: "❌ NO API RESPONSE", apiFinal: false, clock: null, period: null, settled: null, actual: null, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
+          return;
+        }
+        if (!competition) {
+          g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: "❌ NO COMPETITION IN RESPONSE", apiFinal: false, clock: null, period: null, settled: null, actual: null, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
+          return;
+        }
 
         const apiFinal = competition?.status?.type?.completed || competition?.status?.type?.state === "post" || competition?.status?.type?.name === "STATUS_FINAL";
         const clock = competition?.status?.displayClock;
         const period = competition?.status?.period;
+        const stateName = competition?.status?.type?.state;
+        const statusName = competition?.status?.type?.name;
         const forceSettle = (clock === "0.0" || clock === "0:00") && period >= (pick.league === "nba" ? 4 : 2);
 
         if (apiFinal || forceSettle) {
           const settled = settleTrackedPickFromCompetition(pick, competition, data?.boxscore);
-          if (settled !== "pending" && pick.resultStatus !== settled) {
+          g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: settled && settled !== "pending" ? `✅ SETTLED: ${settled.toUpperCase()}` : `⚠️ GAME FINAL BUT SETTLED=${settled}`, apiFinal, clock, period, stateName, statusName, settled, actual: pick.actualScore, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
+          if (settled && settled !== "pending" && pick.resultStatus !== settled) {
             pick.resultStatus = settled;
             pick.settledAt = new Date().toISOString();
+            pick.settlementSource = "api";
+            pick.settledVersion = ENGINE_MODEL_VERSION;
             changed = true;
+            trackerDebug("auto-settled pick", { eventId: pick.eventId, market: pick.marketKey, result: settled, actual: pick.actualScore, line: pick.lineAtPick || pick.line });
           }
+        } else {
+          g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: `⏳ NOT FINAL`, apiFinal, clock, period, stateName, statusName, settled: null, actual: null, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
         }
       });
     }
@@ -9290,13 +9621,40 @@ function addTrackedPicks(newPicks) {
   return clampNumber(base, 0, maxCap);
 }
 
-    function applyVolatility(proj, std, limit) {
-  if (!isFinite(proj) || !isFinite(std) || !isFinite(limit) || std <= 0 || limit <= 0) return proj;
-  if (std <= limit) return proj;
+    // ── FIX #1: Volatility no longer shrinks the projection value.
+// High variance lowers CONFIDENCE (grade), not the projected number.
+// getVolatilityRating() feeds into getConfidenceGrade() as-is.
+function applyVolatility(proj, std, limit) {
+  return proj; // Passthrough — projection is market-independent
+}
 
-  const excess = clampNumber((std - limit) / Math.max(1, limit), 0, 0.50);
-  const shrink = 1 - (excess * 0.12);
-  return proj * shrink;
+// ── FIX #2a: Volatility rating for confidence scoring ──
+function getVolatilityRating(std, limit) {
+  if (!isFinite(std) || !isFinite(limit) || limit === 0) return "NORMAL";
+  const ratio = std / limit;
+  if (ratio <= 1.0) return "LOW";
+  if (ratio <= 1.20) return "MEDIUM";
+  return "HIGH";
+}
+
+// ── FIX #2b: Controlled context adjustment layer (±6% hard cap) ──
+// Place AFTER base projection, BEFORE edge calculation.
+// All adjustments combined cannot exceed ±6% of base projection.
+function applyContextAdjustments(baseProjection, ctx) {
+  if (!isFinite(baseProjection)) return baseProjection;
+  let adj = 0;
+  // Injury (replacement-adjusted — dampened to 50% of raw impact, max 3%)
+  if (ctx.injuryImpact) adj -= Math.min(ctx.injuryImpact * 0.5, 0.03);
+  // Rest/fatigue
+  if (ctx.backToBack) adj -= 0.01;
+  // Strength of Schedule
+  if (ctx.sosHarder) adj += 0.01;
+  if (ctx.sosEasier) adj -= 0.01;
+  // Recency (capped at ±2% to prevent recent hot/cold streaks from dominating)
+  if (ctx.recencyBias) adj += Math.max(Math.min(ctx.recencyBias, 0.02), -0.02);
+  // HARD CAP: total context adjustment cannot exceed ±6%
+  adj = Math.max(-0.06, Math.min(0.06, adj));
+  return baseProjection * (1 + adj);
 }
 
     function getSampleTier(...arrays) {
@@ -9504,7 +9862,8 @@ function getConfidenceGrade({
       return "D";
     }
 
-    function anchorProjection(proj, line, league, marketType) {
+    // ── HYBRID FIX: Restored Market Anchoring (Vegas Safety Net) ──
+function anchorProjection(proj, line, league, marketType) {
   const enabled = !!MODEL_TUNING.anchorEnabled?.[marketType];
   if (!enabled || !isFinite(proj) || !isFinite(line) || line <= 0) return proj;
 
@@ -9522,6 +9881,14 @@ function getConfidenceGrade({
   const weight = clampNumber(baseWeight * scale * excess, 0, 0.70);
 
   return (proj * (1 - weight)) + (line * weight);
+}
+
+
+// Edge detection (use this to find value, never to correct projection)
+function calculateEdge(projection, marketLine) {
+  return isFinite(projection) && isFinite(marketLine) && marketLine !== 0
+    ? projection - marketLine
+    : NaN;
 }
 
 function readLooseSeries(id) {
@@ -11836,15 +12203,17 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
 
 
-    // FIX 6: Apply Volatility Suppression before anchoring
+      // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
   const vl = getMarketVolLimit(league, "ft");
 
   if (isFinite(projAFT)) {
     projAFT = applyVolatility(projAFT, aVol, vl);
+    projAFT = applyContextAdjustments(projAFT, { injuryImpact: 1 - injMultA });
     projAFT = anchorProjection(projAFT, lines.aLine, league, "team");
   }
   if (isFinite(projBFT)) {
     projBFT = applyVolatility(projBFT, bVol, vl);
+    projBFT = applyContextAdjustments(projBFT, { injuryImpact: 1 - injMultB });
     projBFT = anchorProjection(projBFT, lines.bLine, league, "team");
   }
 
@@ -11853,6 +12222,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     ftProj = applyVolatility(ftProj, Math.max(aVol, bVol), vl);
     ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
   }
+
 
 
     // FIX 7 & 8: Calculate and return missing limits, flags, and scoring context
@@ -11917,15 +12287,27 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projA1H = (expEffA / 100) * estHalfPace * injMultA;
     projB1H = (expEffB / 100) * estHalfPace * injMultB;
      } else {
-    // SYNC FIX: Reverting to Engine A's stable halftime fallback
-    const aS1 = avgOrNaN(a1HS);
-    const bS1 = avgOrNaN(b1HS);
-    projA1H = isFinite(aS1) ? aS1 : eb / 4;
-    projB1H = isFinite(bS1) ? bS1 : eb / 4;
-    // Apply injury context to the raw averages
-    projA1H *= injMultA;
-    projB1H *= injMultB;
+    // FIX 3: 1H Fallback now blends Team's Offense (55%) with Opponent's Defense (45%)
+    const avgA1HScored = avgOrNaN(a1HS);
+    const avgB1HScored = avgOrNaN(b1HS);
+    
+    // a1HA and b1HA are already fetched securely above for the volatility check
+    const avgA1HAllowed = avgOrNaN(a1HA); 
+    const avgB1HAllowed = avgOrNaN(b1HA);
+
+    const baseTeam1H = eb / 4; 
+
+    // Safe fallback if data is missing: use league baseline
+    const aOff = isFinite(avgA1HScored) ? avgA1HScored : baseTeam1H;
+    const bDef = isFinite(avgB1HAllowed) ? avgB1HAllowed : baseTeam1H;
+    const bOff = isFinite(avgB1HScored) ? avgB1HScored : baseTeam1H;
+    const aDef = isFinite(avgA1HAllowed) ? avgA1HAllowed : baseTeam1H;
+
+    // Apply the 55/45 Offense/Defense blend and the injury multiplier
+    projA1H = ((aOff * 0.55) + (bDef * 0.45)) * injMultA;
+    projB1H = ((bOff * 0.55) + (aDef * 0.45)) * injMultB;
   }
+
 
 
   // --- H2H INJECTION FOR 1H ---
@@ -11950,17 +12332,24 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
 
-    // FIX 6: Apply Volatility Suppression before anchoring
+      // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
   const h1Vl = getMarketVolLimit(league, "h1");
   
-  if (isFinite(projA1H)) projA1H = applyVolatility(projA1H, aVol1, h1Vl);
-  if (isFinite(projB1H)) projB1H = applyVolatility(projB1H, bVol1, h1Vl);
+  if (isFinite(projA1H)) {
+    projA1H = applyVolatility(projA1H, aVol1, h1Vl);
+    projA1H = applyContextAdjustments(projA1H, { injuryImpact: 1 - injMultA });
+  }
+  if (isFinite(projB1H)) {
+    projB1H = applyVolatility(projB1H, bVol1, h1Vl);
+    projB1H = applyContextAdjustments(projB1H, { injuryImpact: 1 - injMultB });
+  }
 
   let h1Proj = projA1H + projB1H;
   if (isFinite(h1Proj)) {
     h1Proj = applyVolatility(h1Proj, Math.max(aVol1, bVol1), h1Vl);
     h1Proj = anchorProjection(h1Proj, lines.h1Line, league, "h1");
   }
+
 
 
         // FIX 8: Return missing 1H scoring context
@@ -12116,16 +12505,21 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     sampleTier
   });
 
+    // HYBRID FIX: Wire in Context Adjustments for 2H teams
+  if (isFinite(aTeam.proj)) aTeam.proj = applyContextAdjustments(aTeam.proj, { injuryImpact: 1 - injMultA });
+  if (isFinite(bTeam.proj)) bTeam.proj = applyContextAdjustments(bTeam.proj, { injuryImpact: 1 - injMultB });
+
   let h2Proj = isFinite(aTeam.proj) && isFinite(bTeam.proj) ? aTeam.proj + bTeam.proj : NaN;
-    const pace = computePaceSignal(league, aTeam.proj, bTeam.proj, "h2");
+  const pace = computePaceSignal(league, aTeam.proj, bTeam.proj, "h2");
   if (isFinite(pace)) h2Proj *= (1 + ((pace - 1) * 0.10));
   
-  // FIX 6: Apply Volatility Suppression before anchoring
+  // Apply Anchor (Volatility remains a passthrough)
   const h2Vl = getMarketVolLimit(league, "h2");
   if (isFinite(h2Proj)) {
     h2Proj = applyVolatility(h2Proj, Math.max(aTeam.vol, bTeam.vol), h2Vl);
     h2Proj = anchorProjection(h2Proj, lines.h2Line, league, "h2");
   }
+
 
 
   const h2Edge = lines.h2Line !== null && isFinite(h2Proj) ? h2Proj - lines.h2Line : NaN;
@@ -13228,8 +13622,7 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     const row = table.insertRow();
     
     const tdPick = document.createElement("td");
-tdPick.innerHTML = p.name + (p.usedMemory ? ' 🧠' : '');
-
+    tdPick.textContent = p.name + (p.usedMemory ? ' 🧠' : '');
     row.appendChild(tdPick);
 
     const tdProj = document.createElement("td");
@@ -13577,10 +13970,56 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const intelligencePack = null;
     const phase2Activation = (typeof getPhase2ActivationState === "function") ? getPhase2ActivationState() : null;
 
+    // --- MICROSCOPIC STREAK RADAR ---
+    const ctxA = getMassacreTeamContext("A", parsed);
+    const ctxB = getMassacreTeamContext("B", parsed);
+
+    function getMicroStreakBadge(scA, alA, scB, alB, line, isTeamMarket) {
+      if (!line) return "";
+      const countHits = (sc, al) => {
+        if (!sc || !sc.length) return null;
+        let o=0, u=0;
+        const len = Math.min(sc.length, al ? al.length : sc.length);
+        if (len < 5) return null; // Need at least a 5-game sample to declare a streak
+        for(let i=0; i<len; i++) {
+          const pts = al ? (Number(sc[i]) + Number(al[i])) : Number(sc[i]);
+          if (pts > line) o++;
+          else if (pts < line) u++;
+        }
+        return {o, u, len};
+      };
+      
+      // 8px is the smallest text modern browsers will physically render before blurring it out
+      const css = "font-size:8px; padding:1px 3px; border-radius:2px; margin-left:4px; vertical-align:middle; font-weight:900; letter-spacing:0.2px;";
+      
+      if (isTeamMarket) {
+        const st = countHits(scA, alA);
+        if (!st) return "";
+        if (st.o / st.len >= 0.8) return `<span style="${css} background:rgba(216,67,21,0.1); color:#d84315;">🔥 ${st.o}-${st.u} O</span>`;
+        if (st.u / st.len >= 0.8) return `<span style="${css} background:rgba(21,101,192,0.1); color:#1565c0;">❄️ ${st.u}-${st.o} U</span>`;
+      } else {
+        const stA = countHits(scA, alA);
+        const stB = countHits(scB, alB);
+        if (!stA || !stB) return "";
+        const tO = stA.o + stB.o;
+        const tU = stA.u + stB.u;
+        const tLen = stA.len + stB.len;
+        if (tO / tLen >= 0.8) return `<span style="${css} background:rgba(216,67,21,0.1); color:#d84315;">🔥 ${tO}-${tU} O</span>`;
+        if (tU / tLen >= 0.8) return `<span style="${css} background:rgba(21,101,192,0.1); color:#1565c0;">❄️ ${tU}-${tO} U</span>`;
+      }
+      return "";
+    }
+
+    const ftBadge = getMicroStreakBadge(ctxA.ftScored10, ctxA.ftAllowed10, ctxB.ftScored10, ctxB.ftAllowed10, ftLine, false);
+    const h1Badge = getMicroStreakBadge(ctxA.h1Scored10, ctxA.h1Allowed10, ctxB.h1Scored10, ctxB.h1Allowed10, h1Line, false);
+    const h2Badge = getMicroStreakBadge(ctxA.h2Scored10, ctxA.h2Allowed10, ctxB.h2Scored10, ctxB.h2Allowed10, h2Line, false);
+    const aBadge = getMicroStreakBadge(ctxA.ftScored10, null, null, null, aLine, true);
+    const bBadge = getMicroStreakBadge(ctxB.ftScored10, null, null, null, bLine, true);
+
     const picks = [
   {
     _idx: 0,
-    name: "FT Total",
+    name: "FT Total" + ftBadge,
     marketKey: "ft",
     marketType: "ft",
     league,
@@ -13595,7 +14034,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
   },
   {
     _idx: 1,
-    name: "1H Total",
+    name: "1H Total" + h1Badge,
     marketKey: "h1",
     marketType: "h1",
     league,
@@ -13610,7 +14049,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
   },
   {
     _idx: 2,
-    name: "2H Total",
+    name: "2H Total" + h2Badge,
     marketKey: "h2",
     marketType: "h2",
     league,
@@ -13625,7 +14064,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
   },
   {
     _idx: 3,
-    name: "Team A Total",
+    name: "Team A Total" + aBadge,
     marketKey: "team_a",
     marketType: "team",
     league,
@@ -13640,7 +14079,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
   },
   {
     _idx: 4,
-    name: "Team B Total",
+    name: "Team B Total" + bBadge,
     marketKey: "team_b",
     marketType: "team",
     league,
@@ -13654,6 +14093,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     fullModel: ftCalc.teamFullModel
   }
 ];
+
     // FIX: Always show Halves for NBA/NCAA, even if lines are empty
     const includeH1 = isNbaOrNcaa;
     const includeH2 = isNbaOrNcaa;
@@ -13977,12 +14417,11 @@ if (trackedToSave.length) {
       validateFetchSection();
     }
 
+        function toggleTheme() {
+  const isDark = document.body.classList.toggle("dark-mode");
+  localStorage.setItem("theme", isDark ? "dark" : "light");
+}
 
-
-    function toggleTheme() {
-      const isDark = document.body.classList.toggle("dark-mode");
-      localStorage.setItem("theme", isDark ? "dark" : "light");
-    }
 
     (function applySavedTheme() {
       if (localStorage.getItem("theme") === "dark") document.body.classList.add("dark-mode");
@@ -14078,8 +14517,6 @@ if (headerErrorBtn) {
 
       const fetchBtn = document.getElementById("fetchBtn");
 if (fetchBtn) fetchBtn.addEventListener("click", fetchESPN);
-
-
 
 const SPORT_MODE_BASKETBALL = "basketball";
 
