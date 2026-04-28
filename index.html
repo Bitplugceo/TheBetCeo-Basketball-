@@ -6390,6 +6390,63 @@ function ensureFreshBuild() {
   return false;
 }
 
+// 🚨 CLOUD SYNC & NETWORK PUSH LOGIC (Restored)
+function isTrackerStateMeaningfullyEmpty(state) {
+  if (!state) return true;
+  const active = Array.isArray(state.activePicks) ? state.activePicks.length : 0;
+  const archived = Array.isArray(state.archivedPicks) ? state.archivedPicks.length : 0;
+  return (active === 0 && archived === 0);
+}
+
+async function pushTrackerStateToServer(state, isExit = false) {
+  if (isTrackerStateMeaningfullyEmpty(state)) return { ok: true };
+  
+  g_trackerSaveInFlight = true;
+  renderTrackerAnalytics();
+  
+  try {
+    const payload = JSON.stringify(state);
+    const { res, data } = await fetchTrackerJson(TRACKER_API_URL, {
+      method: "POST",
+      body: payload,
+      headers: getTrackerHeaders(true),
+      keepalive: !!isExit
+    });
+    
+    if (!res.ok) throw new Error("Cloudflare rejected push: " + res.status);
+    
+    g_trackerSaveFailureCount = 0;
+    g_trackerPersistedVersion = state.vId || g_trackerSaveVersion;
+    return { ok: true, state: data?.state };
+  } catch (err) {
+    g_trackerSaveFailureCount = (g_trackerSaveFailureCount || 0) + 1;
+    throw err;
+  } finally {
+    g_trackerSaveInFlight = false;
+    renderTrackerAnalytics();
+  }
+}
+
+async function flushTrackerSave() {
+  if (isTrackerStateMeaningfullyEmpty(g_trackerState)) return;
+  try {
+    const pushed = await pushTrackerStateToServer(g_trackerState);
+    if (pushed && pushed.state) {
+      normalizeTrackerState(pushed.state);
+      saveTrackerStateToLocal();
+    }
+  } catch (err) {
+    trackerDebug("flush save failed", { error: String(err) });
+  }
+}
+
+function scheduleTrackerSave(delayMs = TRACKER_SAVE_DEBOUNCE_MS) {
+  if (g_trackerSaveTimer) clearTimeout(g_trackerSaveTimer);
+  g_trackerSaveTimer = setTimeout(() => {
+    g_trackerSaveTimer = null;
+    flushTrackerSave();
+  }, delayMs);
+}
 
 async function forceTrackerSaveNow() {
   clearTrackerFollowupRefresh();
