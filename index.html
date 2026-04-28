@@ -5469,43 +5469,36 @@ function validateFetchSection() {
   return isValid;
 }
 
-    // --- LEVEL 2 MATH MODULE ---
-function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 48) {
-  const getStat = (key) => {
-    const val = stats[key] || "0/0";
-    if (typeof val === "string" && val.includes("/")) return parseFloat(val.split("/")[1]) || 0;
+    // --- LEVEL 2 MATH MODULE (SOCCER ADAPTED) ---
+function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 90) {
+  const getStat = (key, altKey) => {
+    let val = stats[key] || stats[altKey];
+    if (!val) return 0;
+    if (typeof val === "string" && val.includes("%")) return parseFloat(val.replace("%", "")) || 0;
     return parseFloat(val) || 0;
   };
 
-  const fga = getStat("fieldGoalsMadeAttempted");
-  const fta = getStat("freeThrowsMadeAttempted");
-  const orb = getStat("offensiveRebounds");
-  const tov = getStat("turnovers");
+  // Extract Soccer Metrics from ESPN JSON
+  let xG = getStat("expectedGoals", "expectedGoals");
+  let possession = getStat("possessionPct", "possessionPct");
+  let shotsOnTarget = getStat("shotsOnTarget", "shotsOnTarget");
 
-  // Hollinger Possession Formula: 0.96 * (FGA + (0.44 * FTA) - ORB + TOV)
-  let possessions = 0.96 * (fga + (0.44 * fta) - orb + tov);
+  // Fallback: If ESPN doesn't provide xG for a specific lower league, we synthesize a proxy
+  // using Shots on Target (roughly ~0.28 goals per SOT historically)
+  if (xG === 0 && shotsOnTarget > 0) {
+    xG = shotsOnTarget * 0.28; 
+  }
 
-  // Guard: negative or zero possessions means the stat block is unusable.
-  // Return null so the caller can exclude this game rather than storing fabricated ratings.
-  if (possessions <= 0) {
-    console.warn("[BB Engine] calculateAdvancedMetrics: invalid possessions (" + possessions.toFixed(2) + ") — game excluded from Level 2 memory.");
+  // Guard: If we have absolutely zero data, return null to exclude the game
+  if (possession <= 0 && xG === 0 && shotsOnTarget === 0) {
     return null;
   }
 
-  // Guard: suspiciously low possessions that aren't negative — fall back to league average.
-  if (possessions < 50) possessions = (minutes >= 40 ? 100 : 50);
-
-  const ortg = (pointsScored / possessions) * 100;
-  // NOTE: True DRtg requires opponent possessions. We use own possessions as a close approximation.
-  // In most games the two counts differ by ≤ 2, so the error is small for FT markets.
-  const drtg = (pointsAllowed / possessions) * 100;
-  const pace = (possessions / minutes) * 48;
-
   return {
-    possessions: parseFloat(possessions.toFixed(2)),
-    ortg: parseFloat(ortg.toFixed(2)),
-    drtg: parseFloat(drtg.toFixed(2)),
-    pace: parseFloat(pace.toFixed(2))
+    possessions: possession > 0 ? possession : 50, // We use possession% to represent 'control/pace'
+    ortg: parseFloat(xG.toFixed(2)),               // We store xG Created in 'ortg'
+    drtg: 0,                                       // We'll calculate drtg (xG conceded) dynamically in the fetcher
+    pace: parseFloat((possession > 0 ? possession : 50).toFixed(2))
   };
 }
 
@@ -10760,19 +10753,11 @@ updateIntelligencePack();
 
 
     function stripOTFromScores(scoreA, scoreB, linesA, linesB, regulationPeriods) {
-      let sA = scoreA, sB = scoreB;
-      if (linesA.length > regulationPeriods && linesB.length > regulationPeriods) {
-        const sumA = linesA.reduce((s, p) => s + readVal(p), 0);
-        const sumB = linesB.reduce((s, p) => s + readVal(p), 0);
-        if (Math.abs(sumA - sA) <= 3 && Math.abs(sumB - sB) <= 3) {
-          let otA = 0, otB = 0;
-          for (let i = regulationPeriods; i < linesA.length; i++) otA += readVal(linesA[i]);
-          for (let i = regulationPeriods; i < linesB.length; i++) otB += readVal(linesB[i]);
-          if (otA > 0 || otB > 0) { sA -= otA; sB -= otB; }
-        }
-      }
-      return [sA, sB];
-    }
+  // In league soccer, we just take the standard 90-minute Match Score.
+  // Cup games with Extra Time/Penalties might need deeper handling later, 
+  // but for primary markets, we just pass the standard goals through.
+  return [scoreA, scoreB];
+}
 
     // V3 + V6 + V7: shared fetch core using LEAGUE_FETCH_RULES
 
@@ -10895,7 +10880,7 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
           const mine = competitors.find(c => matchesTeam(c, tId));
           const opp = competitors.find(c => !matchesTeam(c, tId));
 
-          if (mine && opp) {
+                    if (mine && opp) {
             gotLS = true;
             ms = parseFloat(mine.score) || ms;
             os = parseFloat(opp.score) || os;
@@ -10903,31 +10888,37 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
             const lm = mine?.linescores || [];
             const lo = opp?.linescores || [];
 
+            // In soccer, linescores[0] is 1st Half goals.
+            // We map 1H goals to h2m/h2o so it hits the correct UI boxes we set up in Batch 1.
             if (lm.length >= 1 && lo.length >= 1) {
-              if (rules.regulationPeriods >= 4) {
-                h1m = (readVal(lm[0]) || 0) + (readVal(lm[1]) || 0);
-                h1o = (readVal(lo[0]) || 0) + (readVal(lo[1]) || 0);
-                h2m = (readVal(lm[2]) || 0) + (readVal(lm[3]) || 0);
-                h2o = (readVal(lo[2]) || 0) + (readVal(lo[3]) || 0);
-              } else {
-                [h1m, h1o] = extractFirstHalf(lm, lo);
-                [h2m, h2o] = extractSecondHalf(lm, lo);
-              }
-              [ms, os] = stripOTFromScores(ms, os, lm, lo, rules.regulationPeriods);
+              h2m = readVal(lm[0]) || 0; 
+              h2o = readVal(lo[0]) || 0; 
             }
 
-            // LEVEL 2 HIJACK: Advanced Box Score Extraction
+            // LEVEL 2 HIJACK: Advanced Box Score Extraction (xG)
             if (boxscore && boxscore.teams) {
               const myBox = boxscore.teams.find(t => matchesTeam(t, tId));
-              if (myBox && myBox.statistics) {
+              const oppBox = boxscore.teams.find(t => !matchesTeam(t, tId));
+
+              if (myBox && myBox.statistics && oppBox && oppBox.statistics) {
                 const sMap = {};
                 myBox.statistics.forEach(s => { sMap[s.name] = s.displayValue; });
-                const gameMinutes = leagueKey === "nba" ? 48 : 40;
-                const advResult = calculateAdvancedMetrics(sMap, ms, os, gameMinutes);
-                // Only store if valid — null means unusable stat block (negative possessions)
+                const oMap = {};
+                oppBox.statistics.forEach(s => { oMap[s.name] = s.displayValue; });
+
+                const advResult = calculateAdvancedMetrics(sMap, ms, os, 90);
+                const oppAdvResult = calculateAdvancedMetrics(oMap, os, ms, 90);
+
                 if (advResult) {
                   advanced = advResult;
-                  trackerDebug(`Level 2 Stats Extracted: ${ref.id}`, advanced);
+                  // Opponent's xG created becomes our xG conceded (drtg)
+                  advanced.drtg = oppAdvResult ? oppAdvResult.ortg : 0; 
+
+                  // Map xG to h1m / h1o so it populates the xG UI boxes
+                  h1m = advanced.ortg;
+                  h1o = advanced.drtg;
+
+                  trackerDebug(`Level 2 Soccer Stats Extracted: ${ref.id}`, advanced);
                 }
               }
             }
@@ -11395,9 +11386,8 @@ async function fetchESPN() {
 
   try {
     const isNcaa = league === "ncaa";
-    const isNba = league === "nba";
-    const leagueSlug = isNcaa ? "mens-college-basketball" : "nba";
-    const espnBase = `https://site.api.espn.com/apis/site/v2/sports/basketball/${leagueSlug}`;
+    const espnBase = getLeagueBase(league);
+    if (!espnBase) throw new Error("Invalid league routing.");
 
     let teamAId = selectedTeamIds.A || lookupTeamId(teamAName, league);
     if (!validateTeamId(teamAId, league)) teamAId = await searchTeamFromAPI(espnBase, teamAName, league);
@@ -11413,7 +11403,7 @@ async function fetchESPN() {
 
     selectedTeamIds.A = String(teamAId);
     selectedTeamIds.B = String(teamBId);
-    setStatusHTML('<span class="spinner"></span>Loading game stats...', "loading");
+    setStatusHTML('<span class="spinner"></span>Loading match stats...', "loading");
 
     const selectedFixture = getSelectedFixtureOption();
     const teamAVenue =
@@ -11426,11 +11416,12 @@ async function fetchESPN() {
       selectedFixture && String(selectedFixture.dataset.awayId || "") === String(teamBId) ? "away" :
       null;
 
+    // Use our generic fetchScheduleCore directly instead of basketball wrappers
     const [aStats, bStats, aVenueStats, bVenueStats] = await Promise.all([
-      isNcaa ? fetchNcaaSchedule(espnBase, teamAId, null) : fetchNbaSchedule(espnBase, teamAId, null),
-      isNcaa ? fetchNcaaSchedule(espnBase, teamBId, null) : fetchNbaSchedule(espnBase, teamBId, null),
-      teamAVenue ? (isNcaa ? fetchNcaaSchedule(espnBase, teamAId, teamAVenue, true) : fetchNbaSchedule(espnBase, teamAId, teamAVenue, true)) : Promise.resolve(null),
-      teamBVenue ? (isNcaa ? fetchNcaaSchedule(espnBase, teamBId, teamBVenue, true) : fetchNbaSchedule(espnBase, teamBId, teamBVenue, true)) : Promise.resolve(null)
+      fetchScheduleCore(espnBase, teamAId, league, null, true),
+      fetchScheduleCore(espnBase, teamBId, league, null, true),
+      teamAVenue ? fetchScheduleCore(espnBase, teamAId, league, teamAVenue, true) : Promise.resolve(null),
+      teamBVenue ? fetchScheduleCore(espnBase, teamBId, league, teamBVenue, true) : Promise.resolve(null)
     ]);
 
     // FIX: _fetchToken comparison removed
@@ -11493,7 +11484,7 @@ async function fetchESPN() {
 
     let h2hGames = [];
     try {
-      h2hGames = isNcaa ? await fetchNcaaH2H(espnBase, teamAId, teamBId) : await fetchNbaH2H(espnBase, teamAId, teamBId);
+      h2hGames = await fetchH2HCore(espnBase, teamAId, teamBId, league);
     } catch (e) {
       logDebug("H2H fetch failed", e);
     }
