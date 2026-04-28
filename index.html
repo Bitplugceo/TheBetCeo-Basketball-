@@ -6837,7 +6837,8 @@ function choosePreferredActivePick(existingPick, incomingPick) {
   const currentStatus = String(current.resultStatus || "pending").toLowerCase();
   const incomingStatus = String(incoming.resultStatus || "pending").toLowerCase();
 
-  // PERMANENT SETTLEMENT RULE: Settled always beats pending
+  // 🚨 THE PRISON RULE: Settled picks are locked in maximum security. 
+  // The server can NEVER revert a win/loss/push back to pending.
   const SETTLED = ["win", "loss", "push"];
   if (SETTLED.includes(currentStatus) && !SETTLED.includes(incomingStatus)) return current; 
   if (SETTLED.includes(incomingStatus) && !SETTLED.includes(currentStatus)) return incoming; 
@@ -6848,20 +6849,10 @@ function choosePreferredActivePick(existingPick, incomingPick) {
     if (isBetterLineForSide(current.side, current.line, incoming.line)) return current;
   }
 
-  const incomingStamp = getTrackerPickStamp(incoming);
-  const currentStamp = getTrackerPickStamp(current);
-  if (incomingStamp !== currentStamp) return incomingStamp > currentStamp ? incoming : current;
-
-  // 🚨 TIEBREAKER FIX: If stamps and status are identical, the newest UPDATE wins!
-  if (currentStatus === incomingStatus) {
-    const inUpdate = Date.parse(incoming.updatedAt || incoming.createdAt || "") || 0;
-    const curUpdate = Date.parse(current.updatedAt || current.createdAt || "") || 0;
-    if (inUpdate !== curUpdate) return inUpdate > curUpdate ? incoming : current;
-  }
-
-  const incomingEdge = Math.abs(Number(incoming.edgePct || 0));
-  const currentEdge = Math.abs(Number(current.edgePct || 0));
-  if (incomingEdge !== currentEdge) return incomingEdge > currentEdge ? incoming : current;
+  // If both are the same status, the absolute newest update wins the tiebreaker.
+  const inUpdate = Date.parse(incoming.updatedAt || incoming.createdAt || "") || 0;
+  const curUpdate = Date.parse(current.updatedAt || current.createdAt || "") || 0;
+  if (inUpdate !== curUpdate) return inUpdate > curUpdate ? incoming : current;
 
   return current;
 }
@@ -6901,7 +6892,10 @@ function mergeTrackerArchivedPicks(localArchived = [], serverArchived = []) {
     }
 
     const existing = merged.get(key);
-    if (getTrackerPickStamp(pick) > getTrackerPickStamp(existing)) {
+    // 🚨 PRISON RULE FOR ARCHIVE: Newest update always wins
+    const inUpdate = Date.parse(pick.updatedAt || pick.createdAt || "") || 0;
+    const curUpdate = Date.parse(existing.updatedAt || existing.createdAt || "") || 0;
+    if (inUpdate > curUpdate) {
       merged.set(key, pick);
     }
   });
@@ -6922,43 +6916,30 @@ function choosePreferredBucketPick(existingPick, incomingPick) {
 
   const currentSettled = isTrackedPickSettled(current);
   const incomingSettled = isTrackedPickSettled(incoming);
+  
+  // 🚨 PRISON RULE: Settled always beats pending, period.
   if (currentSettled !== incomingSettled) return incomingSettled ? incoming : current;
 
-  const currentStamp = getTrackerPickStamp(current);
-  const incomingStamp = getTrackerPickStamp(incoming);
-  if (incomingStamp !== currentStamp) return incomingStamp > currentStamp ? incoming : current;
-
-  // 🚨 TIEBREAKER FIX: Archive bucket strict update check
+  // 🚨 TIEBREAKER: Newest update wins
   const inUpdate = Date.parse(incoming.updatedAt || incoming.createdAt || "") || 0;
   const curUpdate = Date.parse(current.updatedAt || current.createdAt || "") || 0;
   if (inUpdate !== curUpdate) return inUpdate > curUpdate ? incoming : current;
 
-  const currentEdge = Math.abs(Number(current.edgePct || 0));
-  const incomingEdge = Math.abs(Number(incoming.edgePct || 0));
-  if (incomingEdge !== currentEdge) return incomingEdge > currentEdge ? incoming : current;
-
   return current;
 }
 
-
 function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
-  const active = Array.isArray(activePicks)
-    ? activePicks.map(p => ensureTrackedPickKeys(p))
-    : [];
-  const archived = Array.isArray(archivedPicks)
-    ? archivedPicks.map(p => ensureTrackedPickKeys(p))
-    : [];
+  const active = Array.isArray(activePicks) ? activePicks.map(p => ensureTrackedPickKeys(p)) : [];
+  const archived = Array.isArray(archivedPicks) ? archivedPicks.map(p => ensureTrackedPickKeys(p)) : [];
 
   const archivedBySlot = new Map();
   archived.forEach(pick => {
     const slotKey = makeTrackerActiveMergeKey(pick);
     if (!slotKey) return;
-
     if (!archivedBySlot.has(slotKey)) {
       archivedBySlot.set(slotKey, pick);
       return;
     }
-
     archivedBySlot.set(slotKey, choosePreferredBucketPick(archivedBySlot.get(slotKey), pick));
   });
 
@@ -6972,15 +6953,11 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
       const archivedSettled = isTrackedPickSettled(archivedPick);
       const activeSettled = isTrackedPickSettled(pick);
 
-      if (archivedSettled && !activeSettled) {
-        return;
-      }
+      if (archivedSettled && !activeSettled) return;
 
       if (archivedSettled && activeSettled) {
-        // FIX 4: If the archived copy has already passed the 10-hour cutoff,
-        // never let the active copy win — it would reset the archive clock.
         const _archiveTs = Date.parse(archivedPick.settledAt || archivedPick.createdAt || '') || 0;
-        const _cutoffMs  = TRACKER_ARCHIVE_AFTER_HOURS * 60 * 60 * 1000;
+        const _cutoffMs  = 10 * 60 * 60 * 1000; // 10 HOURS EXACTLY
         if (_archiveTs > 0 && (Date.now() - _archiveTs) >= _cutoffMs) return;
         const preferred = choosePreferredBucketPick(pick, archivedPick);
         if (preferred === archivedPick) return;
@@ -6991,14 +6968,10 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
       activeBySlot.set(slotKey, pick);
       return;
     }
-
     activeBySlot.set(slotKey, choosePreferredBucketPick(activeBySlot.get(slotKey), pick));
   });
 
-  const keepActive = [...activeBySlot.values()]
-    .sort((a, b) => getTrackerPickStamp(b) - getTrackerPickStamp(a))
-    .slice(0, TRACKED_PICKS_LIMIT);
-
+  const keepActive = [...activeBySlot.values()].sort((a, b) => getTrackerPickStamp(b) - getTrackerPickStamp(a)).slice(0, TRACKED_PICKS_LIMIT);
   const keepActiveBySlot = new Map();
   keepActive.forEach(pick => {
     const slotKey = makeTrackerActiveMergeKey(pick);
@@ -7009,241 +6982,23 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
   const keepArchived = archived.filter(pick => {
     const slotKey = makeTrackerActiveMergeKey(pick);
     if (!slotKey) return true;
-
-    // If this pick is already being kept in the active bucket,
-    // drop it from the archive unconditionally to prevent duplicates.
-    const activePick = keepActiveBySlot.get(slotKey);
-    if (activePick) return false;
-
+    if (keepActiveBySlot.get(slotKey)) return false;
     return true;
   });
 
-  const dedupedArchived = mergeTrackerArchivedPicks([], keepArchived);
-
   return {
     activePicks: keepActive,
-    archivedPicks: dedupedArchived
+    archivedPicks: mergeTrackerArchivedPicks([], keepArchived)
   };
 }
 
-
-function mergeTrackerStates(localState, serverState) {
-  const local = localState && typeof localState === "object" ? localState : {};
-  const server = serverState && typeof serverState === "object" ? serverState : {};
-
-  const mergedActive = mergeTrackerActivePicks(local.activePicks, server.activePicks);
-  const mergedArchived = mergeTrackerArchivedPicks(local.archivedPicks, server.archivedPicks);
-  const reconciled = reconcileTrackerBucketConflicts(mergedActive, mergedArchived);
-
-    // Safely find the newest actual modification time, without forcing Date.now()
-  const localTime = getTrackerStateUpdatedAtMs(local);
-  const serverTime = getTrackerStateUpdatedAtMs(server);
-  const maxTime = Math.max(localTime, serverTime);
-
-    return {
-    vId: Math.max(Number(local?.vId || 0), Number(server?.vId || 0)),
-    sId: window.__BETCEO_SESSION_ID,
-    activePicks: reconciled.activePicks,
-    archivedPicks: reconciled.archivedPicks,
-    stats: { total: 0, settled: 0, wins: 0, losses: 0, pushes: 0 },
-    updatedAt: maxTime > 0 ? new Date(maxTime).toISOString() : new Date().toISOString(),
-    lineMemory: {
-      ...(server.lineMemory && typeof server.lineMemory === "object" ? server.lineMemory : {}),
-      ...(local.lineMemory && typeof local.lineMemory === "object" ? local.lineMemory : {})
-    }
-  };
-}
-
-function isTrackerStateMeaningfullyEmpty(state) {
-  const active = Array.isArray(state?.activePicks) ? state.activePicks.length : 0;
-  const archived = Array.isArray(state?.archivedPicks) ? state.archivedPicks.length : 0;
-  const total = Number(state?.stats?.total || 0);
-  const settled = Number(state?.stats?.settled || 0);
-  return active === 0 && archived === 0 && total === 0 && settled === 0;
-}
-
-async function pushTrackerStateToServer(stateSnapshot, isEmergency = false) {
-  syncLineMemoryIntoTrackerState();
-
-  if (isTrackerStateMeaningfullyEmpty(stateSnapshot)) {
-    return { ok: true, state: g_trackerState };
-  }
-
-  // Increment internal version before every server push
-  stateSnapshot.vId = (Number(stateSnapshot.vId) || 0) + 1;
-  stateSnapshot.sId = window.__BETCEO_SESSION_ID;
-  stateSnapshot.updatedAt = new Date().toISOString();
-
-  const payload = JSON.stringify(stateSnapshot);
-
-  if (isEmergency && navigator.sendBeacon) {
-    const blob = new Blob([payload], { type: 'application/json' });
-    if (navigator.sendBeacon(TRACKER_API_URL, blob)) return { ok: true };
-  }
-
-  let payloadState = JSON.parse(payload);
-
-  try {
-    // 1. Get current server state
-    const { res: preRes, data: preData } = await fetchTrackerJson(TRACKER_API_URL, {
-      method: "GET",
-      headers: getTrackerHeaders(false)
-    });
-
-    if (preRes.ok && preData?.state) {
-      // 2. Conflict Check: If server has a newer version, merge server into local first
-      if ((Number(preData.state.vId) || 0) > payloadState.vId) {
-        trackerDebug("Sync Shield: Server version newer. Merging...", { server: preData.state.vId, local: payloadState.vId });
-        payloadState = mergeTrackerStates(payloadState, preData.state);
-        payloadState.vId = Number(preData.state.vId) + 1; // Increment on top of server version
-      }
-    }
-  } catch (err) {
-    console.error("[BB Engine] pre-sync version check failed", err);
-  }
-
-   try {
-    // 3. Push the resolved payload
-    // We wrapped the session ID in the payload instead of a header to avoid CORS "Preflight" blocks
-    payloadState.sessionId = window.__BETCEO_SESSION_ID;
-
-        const { res, data } = await fetchTrackerJson(TRACKER_API_URL, {
-      method: "POST",
-      mode: "cors",           // Forces CORS mode
-      credentials: "omit",    // Tells Safari we aren't sending tracking cookies
-      headers: getTrackerHeaders(true),
-      body: JSON.stringify(payloadState)
-    });
-
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-    if (data?.ok && data?.state) {
-      return data;
-    }
-  } catch (err) {
-    // Reworded so the Watch Dog treats it as a normal warning, not a critical crash
-    engineDebug(`Sync Shield: Server delayed (${err.message}). Local fallback active.`);
-  }
-
-  return { ok: true, state: payloadState };
-}
-
-
-
-
-
-function scheduleTrackerSave() {
-  syncLineMemoryIntoTrackerState();
-  g_trackerState.updatedAt = new Date().toISOString();
-  saveTrackerStateToLocal();
-  g_trackerSaveVersion++;
-
-  if (g_trackerSaveTimer) clearTimeout(g_trackerSaveTimer);
-  g_trackerSaveTimer = setTimeout(() => {
-    flushTrackerSave();
-  }, TRACKER_SAVE_DEBOUNCE_MS);
-}
-
-function scheduleTrackerRetry() {
-  if (g_trackerRetryTimer) return;
-
-  const delay = Math.min(
-    TRACKER_SAVE_RETRY_BASE_MS * Math.pow(2, Math.max(0, g_trackerSaveFailureCount - 1)),
-    TRACKER_SAVE_RETRY_MAX_MS
-  );
-
-  g_trackerRetryTimer = setTimeout(() => {
-    g_trackerRetryTimer = null;
-    flushTrackerSave();
-  }, delay);
-}
-
-async function flushTrackerSave() {
-  if (g_trackerSaveInFlight) return;
-  if (g_trackerPersistedVersion >= g_trackerSaveVersion) return;
-
-  g_trackerSaveInFlight = true;
-  g_trackerSaveTimer = null;
-
-  const saveVersion = g_trackerSaveVersion;
-  syncLineMemoryIntoTrackerState();
-  const stateSnapshot = JSON.parse(JSON.stringify(g_trackerState));
-
-  try {
-    trackerDebug("flush save start", { saveVersion, snapshot: getTrackerStateDebugScore(stateSnapshot) });
-    engineDebug("flush save start", { saveVersion, snapshot: getTrackerStateDebugScore(stateSnapshot) });
-    const data = await pushTrackerStateToServer(stateSnapshot);
-
-    if (saveVersion === g_trackerSaveVersion) {
-      engineDebug("flush save apply response", {
-        saveVersion,
-        applied: getTrackerStateDebugScore(data.state),
-        snapshot: getTrackerStateDebugScore(stateSnapshot)
-      });
-      normalizeTrackerState(data.state);
-      saveTrackerStateToLocal();
-    }
-
-    g_trackerPersistedVersion = Math.max(g_trackerPersistedVersion, saveVersion);
-    g_trackerSaveFailureCount = 0;
-
-    if (g_trackerRetryTimer) {
-      clearTimeout(g_trackerRetryTimer);
-      g_trackerRetryTimer = null;
-    }
-  } catch (err) {
-    g_trackerSaveFailureCount++;
-    console.error("[BB Engine] tracker save failed", err);
-    trackerDebug("flush save failed", { error: String(err?.message || err), snapshot: getTrackerStateDebugScore(stateSnapshot) });
-    engineDebug("flush save failed", { error: String(err?.message || err), snapshot: getTrackerStateDebugScore(stateSnapshot) });
-        console.warn("[BB Engine] tracker sync failed. Local copy kept on this device.");
-    scheduleTrackerRetry();
-  } finally {
-    g_trackerSaveInFlight = false;
-
-    if (g_trackerSaveFailureCount === 0 && saveVersion < g_trackerSaveVersion) {
-      flushTrackerSave();
-    }
-  }
-}
-
-function loadTrackedPicks() {
-  return Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
-}
-
-function saveTrackedPicks(picks) {
-  g_trackerState.activePicks = Array.isArray(picks)
-    ? picks
-        .map(p => ensureTrackedPickKeys({ ...p }))
-        .filter(p => isTrackerSupportedLeague(p?.league))
-        .slice(0, TRACKED_PICKS_LIMIT)
-    : [];
-
-  if (!Array.isArray(g_trackerState.archivedPicks)) {
-    g_trackerState.archivedPicks = [];
-  }
-
-  rebuildTrackerStats();
-  scheduleTrackerSave();
-  Promise.resolve().then(async () => {
-    try {
-      await forceTrackerSaveNow();
-      await hydrateTrackedPicks(true);
-    } catch (err) {
-      console.error("[BB Engine] saveTrackedPicks hard sync failed", err);
-    }
-  });
-}
-
-// --- NEW BLOCK (THE FIX) ---
 function archiveExpiredTrackedPicks() {
   const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
   const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
   const now = Date.now();
   
-  // Expire 14 hours after game tip-off (approx 3h game + 11h buffer)
-  const cutoffMs = 14 * 60 * 60 * 1000; 
+  // 🚨 THE PRISON SENTENCE: Exactly 10 hours. Not a second sooner.
+  const cutoffMs = 10 * 60 * 60 * 1000; 
 
   const stripHeavyData = (pick) => {
     const lean = { ...pick };
@@ -7256,13 +7011,8 @@ function archiveExpiredTrackedPicks() {
         bVol: lean.diagnostics.bVol
       };
     }
-    delete lean.diagnostics;
-    delete lean.massacre;
-    delete lean.trackerFeedback;
-    delete lean.shadowTrackerFeedback;
-    delete lean.teamMemory;
-    delete lean.intelligence;
-    delete lean.shadowIntelligence;
+    delete lean.diagnostics; delete lean.massacre; delete lean.trackerFeedback;
+    delete lean.shadowTrackerFeedback; delete lean.teamMemory; delete lean.intelligence; delete lean.shadowIntelligence;
     return lean;
   };
 
@@ -7274,10 +7024,10 @@ function archiveExpiredTrackedPicks() {
     const p = ensureTrackedPickKeys({ ...pick });
     const isSettled = ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase());
     
-    // Base the archive sweep strictly on the game time, so old games sweep immediately
     const gameTs = Date.parse(p.eventDate || p.createdAt || '') || 0;
     const isExpired = gameTs > 0 && (now - gameTs) >= cutoffMs;
 
+    // 🚨 PRISON GATE: Must be SETTLED AND EXPIRED (10 hours) to leave active picks.
     if (isSettled && isExpired) {
       moveToArchived.push(stripHeavyData(p));
       changed = true;
@@ -7290,10 +7040,7 @@ function archiveExpiredTrackedPicks() {
     const seen = new Set(archived.map(p => makeTrackedSignature(p)));
     moveToArchived.forEach(p => {
       const sig = makeTrackedSignature(p);
-      if (sig && !seen.has(sig)) {
-        seen.add(sig);
-        archived.unshift(p);
-      }
+      if (sig && !seen.has(sig)) { seen.add(sig); archived.unshift(p); }
     });
     g_trackerState.activePicks = keepActive;
     g_trackerState.archivedPicks = archived.slice(0, 2000);
@@ -7302,6 +7049,7 @@ function archiveExpiredTrackedPicks() {
   }
   return changed;
 }
+
 
 
 
