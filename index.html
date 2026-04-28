@@ -4220,7 +4220,7 @@ function getTrackerHeaders(includeJson = false) {
 }
 
 let g_trackerState = {
-  vId: Date.now(), // Version Sequence number
+  vId: 1, // Version Sequence number
   sId: window.__BETCEO_SESSION_ID, // Session that last modified it
   activePicks: [],
   archivedPicks: [],
@@ -6400,6 +6400,7 @@ async function forceTrackerSaveNow() {
     g_trackerSaveTimer = null;
   }
 
+  g_trackerState.updatedAt = new Date().toISOString();
   saveTrackerStateToLocal();
   g_trackerSaveVersion = Math.max(g_trackerSaveVersion + 1, g_trackerPersistedVersion + 1);
 
@@ -6413,6 +6414,7 @@ async function forceTrackerSaveNow() {
 function queueTrackerKeepaliveSave() {
   try {
     syncLineMemoryIntoTrackerState();
+    g_trackerState.updatedAt = new Date().toISOString();
     saveTrackerStateToLocal();
 
     if (isTrackerStateMeaningfullyEmpty(g_trackerState)) return;
@@ -6603,9 +6605,11 @@ if (!data?.state) {
 
       const serverState = data.state || {};
       
-      // STEP 1: Assert local authority — push local state first before any merge
-      await pushTrackerStateToServer(JSON.parse(JSON.stringify(localState)));
-
+            // [PRISON FIX 2] Timed cache shield removed.
+      // The shield fired on every load because saveTrackerStateToLocal bumps
+      // updatedAt each cycle, so localTime - serverTime always exceeded 15 000 ms
+      // after the first write. The settled > pending rule in choosePreferredActivePick
+      // and mergeTrackerArchivedPicks handles all authority conflicts correctly.
 
       engineDebug("hydrate state snapshot", {
         local: getTrackerStateDebugScore(localState || {}),
@@ -6693,6 +6697,7 @@ if (!data?.state) {
           merged: getTrackerStateDebugScore(mergedState || {})
         });
         try {
+          g_trackerState.updatedAt = new Date().toISOString();
           const pushed = await pushTrackerStateToServer(JSON.parse(JSON.stringify(g_trackerState)));
           if (pushed?.ok && pushed?.state) {
             normalizeTrackerState(pushed.state);
@@ -6764,7 +6769,7 @@ return g_trackerHydratePromise;
 // You also MUST add this missing function, or the engine will throw a ReferenceError and crash:
 function createEmptyTrackerState() {
   return {
-    vId: Date.now(),
+    vId: 1,
     sId: window.__BETCEO_SESSION_ID,
     activePicks: [],
     archivedPicks: [],
@@ -6820,17 +6825,27 @@ function makeTrackerActiveMergeKey(pick = {}) {
 function choosePreferredActivePick(existingPick, incomingPick) {
   const current = ensureTrackedPickKeys(existingPick || {});
   const incoming = ensureTrackedPickKeys(incomingPick || {});
+
   const currentStatus = String(current.resultStatus || "pending").toLowerCase();
   const incomingStatus = String(incoming.resultStatus || "pending").toLowerCase();
+
+  // 🚨 THE PRISON RULE: Settled picks are locked in maximum security. 
+  // The server can NEVER revert a win/loss/push back to pending.
   const SETTLED = ["win", "loss", "push"];
-  const currentSettled = SETTLED.includes(currentStatus);
-  const incomingSettled = SETTLED.includes(incomingStatus);
-  // RULE 1: Settlement is irreversible
-  if (currentSettled && !incomingSettled) return current;
-  if (!currentSettled && incomingSettled) return incoming;
-  // If both settled -> LOCAL ALWAYS WINS
-  if (currentSettled && incomingSettled) return current;
-  // If both pending -> LOCAL ALWAYS WINS
+  if (SETTLED.includes(currentStatus) && !SETTLED.includes(incomingStatus)) return current; 
+  if (SETTLED.includes(incomingStatus) && !SETTLED.includes(currentStatus)) return incoming; 
+
+  const sameSide = String(current.side || "") === String(incoming.side || "");
+  if (sameSide && ["over", "under"].includes(String(current.side || "").toLowerCase())) {
+    if (isBetterLineForSide(current.side, incoming.line, current.line)) return incoming;
+    if (isBetterLineForSide(current.side, current.line, incoming.line)) return current;
+  }
+
+  // If both are the same status, the absolute newest update wins the tiebreaker.
+  const inUpdate = Date.parse(incoming.updatedAt || incoming.createdAt || "") || 0;
+  const curUpdate = Date.parse(current.updatedAt || current.createdAt || "") || 0;
+  if (inUpdate !== curUpdate) return inUpdate > curUpdate ? incoming : current;
+
   return current;
 }
 
@@ -6858,23 +6873,30 @@ function mergeTrackerActivePicks(localActive = [], serverActive = []) {
 function mergeTrackerArchivedPicks(localArchived = [], serverArchived = []) {
   const merged = new Map();
 
-  [...(serverArchived || []), ...(localArchived || [])].forEach(pick => {
+  [...(serverArchived || []), ...(localArchived || [])].forEach(rawPick => {
+    const pick = ensureTrackedPickKeys(rawPick || {});
     const key = makeTrackedSignature(pick);
     if (!key) return;
+
     if (!merged.has(key)) {
       merged.set(key, pick);
       return;
     }
+
     const existing = merged.get(key);
-    const existingSettled = isTrackedPickSettled(existing);
-    const incomingSettled = isTrackedPickSettled(pick);
-    // Settled dominance
-    if (existingSettled && !incomingSettled) return;
-    if (!existingSettled && incomingSettled) {
+    // 🚨 PRISON RULE FOR ARCHIVE v2: Settled ALWAYS beats pending.
+    // Timestamps are only consulted within the same status tier.
+    const _ARCH_SETTLED = ["win", "loss", "push"];
+    const _existingSettled = _ARCH_SETTLED.includes(String(existing.resultStatus || "").toLowerCase());
+    const _incomingSettled = _ARCH_SETTLED.includes(String(pick.resultStatus || "").toLowerCase());
+    if (_existingSettled && !_incomingSettled) return; // local win/loss/push — server ghost-pending loses unconditionally
+    if (_incomingSettled && !_existingSettled) { merged.set(key, pick); return; } // accept incoming settlement
+    // Same tier — timestamp is safe to use as tiebreaker here
+    const inUpdate = Date.parse(pick.updatedAt || pick.createdAt || "") || 0;
+    const curUpdate = Date.parse(existing.updatedAt || existing.createdAt || "") || 0;
+    if (inUpdate > curUpdate) {
       merged.set(key, pick);
-      return;
     }
-    // Otherwise: keep existing (local bias)
   });
 
   return [...merged.values()]
@@ -6890,12 +6912,18 @@ function isTrackedPickSettled(pick) {
 function choosePreferredBucketPick(existingPick, incomingPick) {
   const current = ensureTrackedPickKeys(existingPick || {});
   const incoming = ensureTrackedPickKeys(incomingPick || {});
+
   const currentSettled = isTrackedPickSettled(current);
   const incomingSettled = isTrackedPickSettled(incoming);
-  // Settlement is irreversible
-  if (currentSettled && !incomingSettled) return current;
-  if (!currentSettled && incomingSettled) return incoming;
-  // LOCAL ALWAYS WINS
+  
+  // 🚨 PRISON RULE: Settled always beats pending, period.
+  if (currentSettled !== incomingSettled) return incomingSettled ? incoming : current;
+
+  // 🚨 TIEBREAKER: Newest update wins
+  const inUpdate = Date.parse(incoming.updatedAt || incoming.createdAt || "") || 0;
+  const curUpdate = Date.parse(current.updatedAt || current.createdAt || "") || 0;
+  if (inUpdate !== curUpdate) return inUpdate > curUpdate ? incoming : current;
+
   return current;
 }
 
@@ -6927,7 +6955,7 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
       if (archivedSettled && !activeSettled) return;
 
       if (archivedSettled && activeSettled) {
-        const _archiveTs = Date.parse(archivedPick.settledAt || archivedPick.createdAt || '') || 0;
+        const _archiveTs = Date.parse(archivedPick.eventDate || archivedPick.settledAt || archivedPick.createdAt || '') || 0; // [PRISON FIX 4b] eventDate is authoritative for the 10-hour lock
         const _cutoffMs  = 10 * 60 * 60 * 1000; // 10 HOURS EXACTLY
         if (_archiveTs > 0 && (Date.now() - _archiveTs) >= _cutoffMs) return;
         const preferred = choosePreferredBucketPick(pick, archivedPick);
@@ -9221,6 +9249,7 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
     const archivedChanged = archiveExpiredTrackedPicks();
     
     if (changed || archivedChanged) {
+      g_trackerState.updatedAt = new Date().toISOString();
       rebuildTrackerStats();
       
       // FIX: Await the database save so it safely finishes writing to your phone
