@@ -9862,13 +9862,27 @@ function getConfidenceGrade({
       return "D";
     }
 
-    // ── FIX #3: Market anchoring REMOVED ──
-// Projections are fully market-independent. The market line is used ONLY
-// for edge detection: edge = projection - marketLine.
-// Removed: projection = (projection + marketLine) / 2 style pulls.
+    // ── HYBRID FIX: Restored Market Anchoring (Vegas Safety Net) ──
 function anchorProjection(proj, line, league, marketType) {
-  return proj; // Anchoring disabled — model trusts its own math
+  const enabled = !!MODEL_TUNING.anchorEnabled?.[marketType];
+  if (!enabled || !isFinite(proj) || !isFinite(line) || line <= 0) return proj;
+
+  const rules = ANCHOR_RULES[marketType] || ANCHOR_RULES.ft;
+  const nbaStyle = league === "nba";
+  const diffGate = nbaStyle ? Number(rules.nbaDiff || 0) : Number(rules.otherDiff || 0);
+  const baseWeight = nbaStyle ? Number(rules.nbaWeight || 0) : Number(rules.otherWeight || 0);
+  if (!isFinite(diffGate) || diffGate <= 0 || !isFinite(baseWeight) || baseWeight <= 0) return proj;
+
+  const diff = Math.abs(proj - line);
+  if (diff <= diffGate) return proj;
+
+  const scale = Number(MODEL_TUNING.anchorScale?.[marketType] || 0.75);
+  const excess = clampNumber((diff - diffGate) / Math.max(1, diffGate * 1.5), 0, 1);
+  const weight = clampNumber(baseWeight * scale * excess, 0, 0.70);
+
+  return (proj * (1 - weight)) + (line * weight);
 }
+
 
 // Edge detection (use this to find value, never to correct projection)
 function calculateEdge(projection, marketLine) {
@@ -12189,15 +12203,17 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
 
 
-    // FIX 6: Apply Volatility Suppression before anchoring
+      // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
   const vl = getMarketVolLimit(league, "ft");
 
   if (isFinite(projAFT)) {
     projAFT = applyVolatility(projAFT, aVol, vl);
+    projAFT = applyContextAdjustments(projAFT, { injuryImpact: 1 - injMultA });
     projAFT = anchorProjection(projAFT, lines.aLine, league, "team");
   }
   if (isFinite(projBFT)) {
     projBFT = applyVolatility(projBFT, bVol, vl);
+    projBFT = applyContextAdjustments(projBFT, { injuryImpact: 1 - injMultB });
     projBFT = anchorProjection(projBFT, lines.bLine, league, "team");
   }
 
@@ -12206,6 +12222,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     ftProj = applyVolatility(ftProj, Math.max(aVol, bVol), vl);
     ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
   }
+
 
 
     // FIX 7 & 8: Calculate and return missing limits, flags, and scoring context
@@ -12315,17 +12332,24 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
 
-    // FIX 6: Apply Volatility Suppression before anchoring
+      // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
   const h1Vl = getMarketVolLimit(league, "h1");
   
-  if (isFinite(projA1H)) projA1H = applyVolatility(projA1H, aVol1, h1Vl);
-  if (isFinite(projB1H)) projB1H = applyVolatility(projB1H, bVol1, h1Vl);
+  if (isFinite(projA1H)) {
+    projA1H = applyVolatility(projA1H, aVol1, h1Vl);
+    projA1H = applyContextAdjustments(projA1H, { injuryImpact: 1 - injMultA });
+  }
+  if (isFinite(projB1H)) {
+    projB1H = applyVolatility(projB1H, bVol1, h1Vl);
+    projB1H = applyContextAdjustments(projB1H, { injuryImpact: 1 - injMultB });
+  }
 
   let h1Proj = projA1H + projB1H;
   if (isFinite(h1Proj)) {
     h1Proj = applyVolatility(h1Proj, Math.max(aVol1, bVol1), h1Vl);
     h1Proj = anchorProjection(h1Proj, lines.h1Line, league, "h1");
   }
+
 
 
         // FIX 8: Return missing 1H scoring context
@@ -12481,16 +12505,21 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     sampleTier
   });
 
+    // HYBRID FIX: Wire in Context Adjustments for 2H teams
+  if (isFinite(aTeam.proj)) aTeam.proj = applyContextAdjustments(aTeam.proj, { injuryImpact: 1 - injMultA });
+  if (isFinite(bTeam.proj)) bTeam.proj = applyContextAdjustments(bTeam.proj, { injuryImpact: 1 - injMultB });
+
   let h2Proj = isFinite(aTeam.proj) && isFinite(bTeam.proj) ? aTeam.proj + bTeam.proj : NaN;
-    const pace = computePaceSignal(league, aTeam.proj, bTeam.proj, "h2");
+  const pace = computePaceSignal(league, aTeam.proj, bTeam.proj, "h2");
   if (isFinite(pace)) h2Proj *= (1 + ((pace - 1) * 0.10));
   
-  // FIX 6: Apply Volatility Suppression before anchoring
+  // Apply Anchor (Volatility remains a passthrough)
   const h2Vl = getMarketVolLimit(league, "h2");
   if (isFinite(h2Proj)) {
     h2Proj = applyVolatility(h2Proj, Math.max(aTeam.vol, bTeam.vol), h2Vl);
     h2Proj = anchorProjection(h2Proj, lines.h2Line, league, "h2");
   }
+
 
 
   const h2Edge = lines.h2Line !== null && isFinite(h2Proj) ? h2Proj - lines.h2Line : NaN;
