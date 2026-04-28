@@ -6822,47 +6822,58 @@ function makeTrackerActiveMergeKey(pick = {}) {
   ].join("|");
 }
 
-function choosePreferredActivePick(existingPick, incomingPick) {
-  const current = ensureTrackedPickKeys(existingPick || {});
-  const incoming = ensureTrackedPickKeys(incomingPick || {});
+// 🚨 PRISON MODEL: State Hierarchy
+function getPickStateWeight(status) {
+  const s = String(status || "pending").toLowerCase();
+  return (s === "win" || s === "loss" || s === "push") ? 1 : 0;
+}
 
-  const currentStatus = String(current.resultStatus || "pending").toLowerCase();
-  const incomingStatus = String(incoming.resultStatus || "pending").toLowerCase();
+function resolveTrackedPick(localPick, serverPick) {
+  const local = ensureTrackedPickKeys(localPick || {});
+  const server = ensureTrackedPickKeys(serverPick || {});
 
-  // 🚨 THE PRISON RULE: Settled picks are locked in maximum security. 
-  // The server can NEVER revert a win/loss/push back to pending.
-  const SETTLED = ["win", "loss", "push"];
-  if (SETTLED.includes(currentStatus) && !SETTLED.includes(incomingStatus)) return current; 
-  if (SETTLED.includes(incomingStatus) && !SETTLED.includes(currentStatus)) return incoming; 
+  const localWeight = getPickStateWeight(local.resultStatus);
+  const serverWeight = getPickStateWeight(server.resultStatus);
 
-  const sameSide = String(current.side || "") === String(incoming.side || "");
-  if (sameSide && ["over", "under"].includes(String(current.side || "").toLowerCase())) {
-    if (isBetterLineForSide(current.side, incoming.line, current.line)) return incoming;
-    if (isBetterLineForSide(current.side, current.line, incoming.line)) return current;
+  // RULE 1: Server Patching. Server has settled data that local missed.
+  if (serverWeight > localWeight) {
+    return server;
   }
 
-  // If both are the same status, the absolute newest update wins the tiebreaker.
-  const inUpdate = Date.parse(incoming.updatedAt || incoming.createdAt || "") || 0;
-  const curUpdate = Date.parse(current.updatedAt || current.createdAt || "") || 0;
-  if (inUpdate !== curUpdate) return inUpdate > curUpdate ? incoming : current;
+  // RULE 2: Local Authority. Local ALWAYS wins ties. 
+  // (Prevents ghost pending from ever touching a local win/loss)
+  if (localWeight >= serverWeight) {
+    // Optional grace: Keep best line if both are still pending
+    if (localWeight === 0 && serverWeight === 0 && String(local.side) === String(server.side)) {
+      if (isBetterLineForSide(local.side, server.line, local.line)) return server;
+    }
+    return local;
+  }
 
-  return current;
+  return local;
 }
 
 function mergeTrackerActivePicks(localActive = [], serverActive = []) {
   const merged = new Map();
 
-  [...(serverActive || []), ...(localActive || [])].forEach(rawPick => {
-    const pick = ensureTrackedPickKeys(rawPick || {});
+  // Step 1: Local is the authoritative baseline
+  (localActive || []).forEach(raw => {
+    const pick = ensureTrackedPickKeys(raw || {});
+    const key = makeTrackerActiveMergeKey(pick) || makeTrackedSignature(pick);
+    if (key) merged.set(key, pick);
+  });
+
+  // Step 2: Server only acts as a patch source
+  (serverActive || []).forEach(raw => {
+    const pick = ensureTrackedPickKeys(raw || {});
     const key = makeTrackerActiveMergeKey(pick) || makeTrackedSignature(pick);
     if (!key) return;
 
     if (!merged.has(key)) {
-      merged.set(key, pick);
-      return;
+      merged.set(key, pick); // Add missing server picks
+    } else {
+      merged.set(key, resolveTrackedPick(merged.get(key), pick)); // Enforce hierarchy
     }
-
-    merged.set(key, choosePreferredActivePick(merged.get(key), pick));
   });
 
   return [...merged.values()]
@@ -6873,29 +6884,23 @@ function mergeTrackerActivePicks(localActive = [], serverActive = []) {
 function mergeTrackerArchivedPicks(localArchived = [], serverArchived = []) {
   const merged = new Map();
 
-  [...(serverArchived || []), ...(localArchived || [])].forEach(rawPick => {
-    const pick = ensureTrackedPickKeys(rawPick || {});
+  // Step 1: Local baseline
+  (localArchived || []).forEach(raw => {
+    const pick = ensureTrackedPickKeys(raw || {});
+    const key = makeTrackedSignature(pick);
+    if (key) merged.set(key, pick);
+  });
+
+  // Step 2: Server patch
+  (serverArchived || []).forEach(raw => {
+    const pick = ensureTrackedPickKeys(raw || {});
     const key = makeTrackedSignature(pick);
     if (!key) return;
 
     if (!merged.has(key)) {
       merged.set(key, pick);
-      return;
-    }
-
-    const existing = merged.get(key);
-    // 🚨 PRISON RULE FOR ARCHIVE v2: Settled ALWAYS beats pending.
-    // Timestamps are only consulted within the same status tier.
-    const _ARCH_SETTLED = ["win", "loss", "push"];
-    const _existingSettled = _ARCH_SETTLED.includes(String(existing.resultStatus || "").toLowerCase());
-    const _incomingSettled = _ARCH_SETTLED.includes(String(pick.resultStatus || "").toLowerCase());
-    if (_existingSettled && !_incomingSettled) return; // local win/loss/push — server ghost-pending loses unconditionally
-    if (_incomingSettled && !_existingSettled) { merged.set(key, pick); return; } // accept incoming settlement
-    // Same tier — timestamp is safe to use as tiebreaker here
-    const inUpdate = Date.parse(pick.updatedAt || pick.createdAt || "") || 0;
-    const curUpdate = Date.parse(existing.updatedAt || existing.createdAt || "") || 0;
-    if (inUpdate > curUpdate) {
-      merged.set(key, pick);
+    } else {
+      merged.set(key, resolveTrackedPick(merged.get(key), pick));
     }
   });
 
@@ -6903,6 +6908,7 @@ function mergeTrackerArchivedPicks(localArchived = [], serverArchived = []) {
     .sort((a, b) => getTrackerPickStamp(b) - getTrackerPickStamp(a))
     .slice(0, TRACKER_ARCHIVED_LIMIT);
 }
+
 
 function isTrackedPickSettled(pick) {
   const status = String(pick?.resultStatus || "pending").toLowerCase();
@@ -6913,19 +6919,16 @@ function choosePreferredBucketPick(existingPick, incomingPick) {
   const current = ensureTrackedPickKeys(existingPick || {});
   const incoming = ensureTrackedPickKeys(incomingPick || {});
 
-  const currentSettled = isTrackedPickSettled(current);
-  const incomingSettled = isTrackedPickSettled(incoming);
-  
-  // 🚨 PRISON RULE: Settled always beats pending, period.
-  if (currentSettled !== incomingSettled) return incomingSettled ? incoming : current;
+  const currentWeight = getPickStateWeight(current.resultStatus);
+  const incomingWeight = getPickStateWeight(incoming.resultStatus);
 
-  // 🚨 TIEBREAKER: Newest update wins
-  const inUpdate = Date.parse(incoming.updatedAt || incoming.createdAt || "") || 0;
-  const curUpdate = Date.parse(current.updatedAt || current.createdAt || "") || 0;
-  if (inUpdate !== curUpdate) return inUpdate > curUpdate ? incoming : current;
+  // Settled always beats pending. No timestamps allowed.
+  if (incomingWeight > currentWeight) return incoming;
+  if (currentWeight >= incomingWeight) return current;
 
   return current;
 }
+
 
 function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
   const active = Array.isArray(activePicks) ? activePicks.map(p => ensureTrackedPickKeys(p)) : [];
