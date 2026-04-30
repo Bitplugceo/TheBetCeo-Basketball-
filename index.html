@@ -2754,6 +2754,44 @@ body.dark-mode .tracker-analytics-section-head {
 </div>
 
 <script>
+
+// DEBUG PATCH — START
+function trackerDebugLog(msg, data = '') {
+  console.log(`[BB DEBUG] ${new Date().toLocaleTimeString()}: ${msg}`, data);
+  if (window.gtrackerDebugLog) {
+    window.gtrackerDebugLog.push({line: msg + (data ? ' ' + JSON.stringify(data) : ''), timestamp: Date.now()});
+    if (typeof renderTrackedPicks === 'function') renderTrackedPicks();
+  }
+}
+const originalHydrate = window.hydrateTrackedPicks;
+window.hydrateTrackedPicks = async function(force) {
+  trackerDebugLog("Hydrate starting...", {force});
+  const result = await originalHydrate(force);
+  trackerDebugLog("Hydrate finished", {activeCount: gtrackerState.activePicks?.length});
+  return result;
+};
+const originalSettle = window.refreshTrackedPickResults;
+window.refreshTrackedPickResults = async function() {
+  trackerDebugLog("Settlement cycle starting...");
+  const result = await originalSettle();
+  trackerDebugLog("Settlement cycle finished");
+  return result;
+};
+const originalPush = window.pushTrackerStateToServer;
+window.pushTrackerStateToServer = async function(state, isExit) {
+  trackerDebugLog("Attempting server push...", {pickCount: state.activePicks?.length});
+  try {
+    const res = await originalPush(state, isExit);
+    trackerDebugLog("Push success", {ok: res.ok});
+    return res;
+  } catch (e) {
+    trackerDebugLog("Push FAILED", {error: e.message});
+    throw e;
+  }
+};
+// DEBUG PATCH — END
+
+
 /**
  * 🛡️ BET-CEO UNKILLABLE GOD-MODE WATCHDOG
  * Detects: Syntax Errors, Typos (!!!), CORS Blocks, and Boot Failures.
@@ -9493,12 +9531,12 @@ function addTrackedPicks(newPicks) {
 function applyVolatility(proj, std, limit) {
   const isCEOMode = document.getElementById("ceoToggle")?.checked;
 
-  // ENGINE A Logic: Keep math pure (Standard)
+  // ENGINE A Logic: Standard passthrough (No shrinkage)
   if (!isCEOMode) return proj;
 
-  // ENGINE B Logic: Apply aggressive shrinkage (CEO Mode)
+  // ENGINE B Logic: Aggressive shrinkage for UNDERs
   if (!isFinite(proj) || !isFinite(std) || !isFinite(limit) || std <= limit) return proj;
-  const excess = clampNumber((std - limit) / Math.max(1, limit), 0, 0.50);
+  const excess = Math.max(0, Math.min((std - limit) / Math.max(1, limit), 0.50));
   const shrink = 1 - (excess * 0.12);
   return proj * shrink;
 }
@@ -13373,7 +13411,10 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta, league, diagnos
     awayId: fixtureMeta.awayId || "",
     fixtureLabel: `${fixtureMeta.homeTeam || "—"} vs ${fixtureMeta.awayTeam || "—"}`,
     marketKey,
-    marketName: pickRow.name,
+    marketName: (function(key) {
+      const names = { ft: "FT Total", h1: "1H Total", h2: "2H Total", team_a: "Team A Total", team_b: "Team B Total" };
+      return names[key] || "Other";
+    })(pickRow.marketKey),
     projection: isFinite(pickRow.proj) ? Number(pickRow.proj) : null,
     line: trackedLine,
     lineAtPick: trackedLine,
