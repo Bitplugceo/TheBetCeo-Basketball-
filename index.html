@@ -14778,7 +14778,8 @@ const AFDB = (function() {
     PICK:    { color:'#d4af37' }, H2H:     { color:'#c678dd' },
     SUCCESS: { color:'#49d45f' }, WARN:    { color:'#ffcf73' },
     ERROR:   { color:'#ff5c61' }, INFO:    { color:'#aaa'    },
-    ENGINE:  { color:'#d4af37' }, TRACKER: { color:'#4ea9ff' }
+    ENGINE:  { color:'#d4af37' }, TRACKER: { color:'#4ea9ff' },
+    VERDICT: { color:'#49d45f' }
   };
 
   const ICONS = {
@@ -14810,7 +14811,7 @@ const AFDB = (function() {
   }
 
   function copy(btnEl) {
-    const visibleLogs = _showOnlyErrors ? _log.filter(e => e.level === 'ERROR' || e.level === 'WARN') : _log;
+    const visibleLogs = _showOnlyErrors ? _log.filter(e => e.level === 'ERROR' || e.level === 'WARN' || e.level === 'VERDICT') : _log;
 
     const text = visibleLogs.slice().reverse().map(e => {
       let line = `[${e.ts}] [${e.level}] [${e.section}] ${e.msg}`;
@@ -14919,33 +14920,34 @@ const AFDB = (function() {
   }
 
   async function runTestFetch() {
+    try {
+        if (typeof forceTrackerSaveNow === 'function') await forceTrackerSaveNow();
+        if (typeof refreshTrackerInBackground === 'function') await refreshTrackerInBackground(true);
+    } catch(e) {}
+
     let totalSuspects = 0;
 
-    // SILENT CACHE FLUSH
     if (typeof _schedCache !== 'undefined') _schedCache.clear();
     if (typeof _summaryCache !== 'undefined') _summaryCache.clear();
     if (typeof _fixtureCache !== 'undefined') _fixtureCache.clear();
     if (typeof _teamCatalogCache !== 'undefined') _teamCatalogCache.clear();
 
-    // PHASE 1: UI & INPUT SANITY
     const inputsToCheck = ['aFTScored', 'bFTScored', 'ftMarket', 'teamAMarket', 'teamBMarket'];
     inputsToCheck.forEach(id => {
        const el = document.getElementById(id);
        const val = el ? el.value.trim() : "";
-       if (val && /[^0-9,\.\s-]/.test(val)) {
+       if (val && /[^0-9,.\s-]/.test(val)) {
            log('ERROR', 'UI INPUT', `Invalid characters detected in ${id}: "${val}". Math engine will crash.`);
            totalSuspects++;
        }
     });
 
-    // PHASE 2: MEMORY & STORAGE
     const active = Array.isArray(g_trackerState?.activePicks) ? g_trackerState.activePicks : [];
     const memCount = Object.keys(g_engineLineMemory || {}).length;
     if (memCount > 190) { log('ERROR','STORAGE', 'Line memory nearing maximum capacity (200). Pruning imminent.'); totalSuspects++; }
     if (active.length > 490) { log('ERROR','STORAGE', 'Active picks array is critically full (Limit: 500).'); totalSuspects++; }
     if (typeof MODEL_TUNING === 'undefined') { log('ERROR','CONFIG', 'MODEL_TUNING matrix is missing.'); totalSuspects++; }
 
-    // PHASE 3: LOGIC & BASKETBALL CONSISTENCY
     let paceAnomalies = 0, edgeAnomalies = 0;
     active.forEach(p => {
        const pace = p.diagnostics?.pace || p.godsEyeMemory?.pace;
@@ -14955,7 +14957,6 @@ const AFDB = (function() {
     if (paceAnomalies > 0) { log('ERROR','MATH ENGINE', `${paceAnomalies} picks show unrealistic pace projections (<65 or >130). Logic contradiction detected.`); totalSuspects++; }
     if (edgeAnomalies > 0) { log('ERROR','MATH ENGINE', `${edgeAnomalies} picks show extreme edge anomalies (>15%).`); totalSuspects++; }
 
-    // PHASE 4: HISTORICAL & PATTERN ANALYSIS
     const settled = g_trackerState?.stats?.settled || 0;
     const wins = g_trackerState?.stats?.wins || 0;
     if (settled >= 20) {
@@ -14963,7 +14964,6 @@ const AFDB = (function() {
         if (winRate < 45) { log('ERROR','MODEL BIAS', `System win rate dropping below safety threshold (${winRate.toFixed(1)}%). Recalibration required.`); totalSuspects++; }
     }
 
-    // PHASE 5: LIVE DATA SWEEP (Only runs if teams are filled out)
     const league = document.getElementById('leagueSelect')?.value;
     const tA = document.getElementById('teamAName')?.value;
     const tB = document.getElementById('teamBName')?.value;
@@ -14977,12 +14977,31 @@ const AFDB = (function() {
         }
     }
 
-    // FINAL VERDICT
-    if (totalSuspects === 0) {
-        log('SUCCESS','POLICE RAID','✅ RAID COMPLETE: Engine is mathematically and structurally flawless. 0 Suspects arrested.');
-    } else {
-        log('ERROR','POLICE RAID',`🚨 RAID COMPLETE: ${totalSuspects} critical anomalies arrested. Inspect culprits above.`);
-    }
+    const verdictMsg = totalSuspects === 0 
+        ? "Raid complete.
+Engine is 100% perfect." 
+        : `Raid complete.
+Caught ${totalSuspects} Thieves and locked them behind the bars ⛓️‍💥`;
+
+    const verdictEntry = {
+      ts: new Date().toLocaleTimeString([],{hour12:false}),
+      level: totalSuspects === 0 ? 'VERDICT' : 'ERROR', 
+      section: 'POLICE RAID',
+      msg: verdictMsg,
+      data: null
+    };
+
+    _log.unshift(verdictEntry);
+    if (_log.length > LOG_LIMIT) _log = _log.slice(0, LOG_LIMIT);
+    _render();
+
+    setTimeout(() => {
+        const idx = _log.indexOf(verdictEntry);
+        if (idx !== -1) {
+            _log.splice(idx, 1);
+            if (_isOpen) _render();
+        }
+    }, 7000);
   }
 
   return { log, clear, copy, toggleFilter, open, close, runTestFetch, get isOpen() { return _isOpen; } };
