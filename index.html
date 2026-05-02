@@ -2425,7 +2425,7 @@ body.dark-mode .tracker-analytics-section-head {
   <span class="brand-right">
     <button class="theme-toggle" type="button" id="themeToggleBtn" title="Toggle dark/light mode">🏀</button>
     <button class="theme-toggle" type="button" id="trackerToggleBtn" title="Open tracked picks">📊</button>
-    <button class="theme-toggle" type="button" id="afdbBtn" title="Auto-Fetch Debugger" onclick="AFDB.open()">🔬</button>
+    <button class="theme-toggle" type="button" id="reportBtn" title="Engine Report" onclick="AFDB.openReport()" style="font-size:16px;">📊</button><button class="theme-toggle" type="button" id="afdbBtn" title="Auto-Fetch Debugger" onclick="AFDB.open()">🔬</button>
     PREDICTIONS
   </span>
 </header>
@@ -14295,68 +14295,250 @@ const AFDB = (function() {
   const LOG_LIMIT = 600;
   let _log = [];
   let _isOpen = false;
+  let _showOnlyErrors = true; 
+
+  const LEVELS = {
+    BOOT:    { color:'#7aa6ff' }, NET:     { color:'#4ea9ff' },
+    FETCH:   { color:'#49d45f' }, FILL:    { color:'#2aff9e' },
+    PICK:    { color:'#d4af37' }, H2H:     { color:'#c678dd' },
+    SUCCESS: { color:'#49d45f' }, WARN:    { color:'#ffcf73' },
+    ERROR:   { color:'#ff5c61' }, INFO:    { color:'#aaa'    },
+    ENGINE:  { color:'#d4af37' }, TRACKER: { color:'#4ea9ff' },
+    VERDICT: { color:'#49d45f' } 
+  };
+
+  const ICONS = {
+    BOOT:'\u2699\ufe0f', NET:'\ud83c\udf10', FETCH:'\ud83d\udce1', FILL:'\u270f\ufe0f',
+    PICK:'\ud83d\udccc', H2H:'\ud83d\udd04', SUCCESS:'\u2705', WARN:'\u26a0\ufe0f', ERROR:'\u274c', INFO:'\u2139\ufe0f',
+    ENGINE:'\u2699\ufe0f', TRACKER:'\ud83d\udcca', VERDICT:'\ud83c\udf96\ufe0f'
+  };
+
+  function esc(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
 
   function log(level, section, msg, data) {
-    // Silence network noise
-    const raw = String(msg).toLowerCase();
-    if (raw.includes("load failed") || raw.includes("fetch") || raw.includes("network")) return;
-
-    _log.unshift({
+    const entry = {
       ts: new Date().toLocaleTimeString([],{hour12:false}),
       level, section: section||'CORE', msg,
       data: data !== undefined ? data : null
-    });
+    };
+    _log.unshift(entry);
     if (_log.length > LOG_LIMIT) _log = _log.slice(0, LOG_LIMIT);
     if (_isOpen) _render();
   }
 
-  // Logic to copy the report text
-  function copyFullReport() {
-    const stats = g_trackerState.stats || {};
-    let text = `=== ENGINE SYSTEM REPORT ===\n`;
-    text += `Wins: ${stats.wins} | Losses: ${stats.losses} | Pushes: ${stats.pushes}\n`;
-    text += `Win Rate: ${((stats.wins/(stats.settled||1))*100).toFixed(1)}%\n`;
-    navigator.clipboard.writeText(text);
-    alert("Full Report Copied!");
+  function clear() { _log = []; _render(); }
+
+  function toggleFilter() {
+    _showOnlyErrors = !_showOnlyErrors;
+    _render();
+  }
+
+  function copy(btnEl) {
+    const visibleLogs = _showOnlyErrors ? _log.filter(e => e.level === 'ERROR' || e.level === 'WARN' || e.level === 'VERDICT') : _log;
+    const textArr = visibleLogs.slice().reverse().map(e => {
+      let line = '[' + e.ts + '] [' + e.level + '] [' + e.section + '] ' + e.msg;
+      if (e.data !== null) {
+        try { line += ' | ' + JSON.stringify(e.data); }
+        catch(x) { line += ' | ' + String(e.data); }
+      }
+      return line;
+    });
+    const text = textArr.join(String.fromCharCode(10, 10));
+    try {
+      navigator.clipboard.writeText(text);
+      if (btnEl) {
+        const origText = btnEl.innerHTML;
+        btnEl.innerHTML = "\u2705 COPIED!";
+        setTimeout(() => { btnEl.innerHTML = origText; }, 1500);
+      }
+    } catch(e) {
+      log('WARN','AFDB','Clipboard blocked \u2014 printed to console');
+    }
+  }
+
+  function snapDOM() {
+    const ids = [
+      'leagueSelect','teamAName','teamBName',
+      'aFTScored','aFTAllowed','a1HScored','a1HAllowed',
+      'bFTScored','bFTAllowed','b1HScored','b1HAllowed',
+      'aFTH2H','bFTH2H','a1HH2H','b1HH2H',
+      'ftMarket','h1Market','h2Market','teamAMarket','teamBMarket'
+    ];
+    const snap = {};
+    ids.forEach(id => {
+      const el = document.getElementById(id);
+      snap[id] = el ? (el.value||'(empty)') : '\u26d4 NOT FOUND';
+    });
+    if (typeof selectedTeamIds !== 'undefined') snap['_teamIds'] = JSON.stringify(selectedTeamIds);
+    if (typeof uiState !== 'undefined') snap['_league'] = uiState.appliedLeagueSlug||'(none)';
+    return snap;
   }
 
   function _render() {
     const panel = document.getElementById('afdbPanel');
     if (!panel) return;
+    const visibleLogs = _showOnlyErrors ? _log.filter(e => e.level === 'ERROR' || e.level === 'WARN' || e.level === 'VERDICT') : _log;
+    const logRows = visibleLogs.map(e => {
+      const def = LEVELS[e.level]||LEVELS.INFO;
+      const icon = ICONS[e.level]||'\u2022';
+      let dataHtml = '';
+      if (e.data !== null) {
+        let ds;
+        try { ds = typeof e.data==='object' ? JSON.stringify(e.data,null,2) : String(e.data); }
+        catch(x) { ds = String(e.data); }
+        dataHtml = '<pre style="color:#888;font-size:9px;margin:4px 0 0 0;padding:6px;background:#070707;border-left:2px solid #222;white-space:pre-wrap;word-break:break-all;">' + esc(ds) + '</pre>';
+      }
+      return '<div style="padding:8px;border-bottom:1px solid #151515;"><div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;"><span style="color:#555;font-size:9px;min-width:65px;flex-shrink:0;">' + esc(e.ts) + '</span><span style="color:' + def.color + ';font-size:10px;font-weight:900;min-width:75px;flex-shrink:0;">' + icon + ' ' + esc(e.level) + '</span><span style="color:#777;font-size:9px;min-width:80px;flex-shrink:0;">[' + esc(e.section) + ']</span><span style="color:' + def.color + ';font-size:11px;font-weight:700;flex:1;white-space:pre-wrap;">' + esc(e.msg) + '</span></div>' + dataHtml + '</div>';
+    }).join('');
 
-    // Header with your original buttons + the new Report button
-    const header = `
-      <div style="background:#080808;border-bottom:1px solid #222;padding:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;flex-shrink:0;">
-        <div style="color:#d4af37;font-size:14px;font-weight:900;letter-spacing:1px;">🔬 AUTO-FETCH DEBUG BRAIN (BB)</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button onclick="AFDB.copyLogs()" style="background:#111;border:1px solid #333;color:#ccc;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;">📋 Copy Log</button>
-          <button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ccc;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;">🗑️ Clear</button>
-          <button onclick="AFDB.copyFullReport()" style="background:#49a443;border:1px solid #333;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;">📊 REPORT</button>
-          <button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;">🚨 MILITARY RAID</button>
-          <button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;">✕ Close</button>
-        </div>
-      </div>`;
+    const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">\ud83d\udccb Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">\ud83d\uddd1\ufe0f Clear</button><button onclick="AFDB.openReport()" style="background:#1a4a1a;border:1px solid #49a443;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">📊 REPORT</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">\ud83d\udea8 MILITARY RAID</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">\u2715 Close</button>';
 
-    // Reverting to your original terminal style list
-    const logsHtml = _log.map(e => `
-      <div style="padding:8px;border-bottom:1px solid #151515;display:flex;gap:10px;font-size:11px;">
-        <span style="color:#555;min-width:60px;">${e.ts}</span>
-        <b style="color:${e.level==='ERROR'?'#ff5c61':'#d4af37'};min-width:60px;">${e.level}</b>
-        <span style="color:#aaa;">${e.msg}</span>
-      </div>`).join('');
+    const emptyMsg = _showOnlyErrors ? 'No suspects arrested. The code is clean.' : 'No log entries yet. Run a fetch.';
+    const filterLabel = _showOnlyErrors ? '\ud83d\udc41\ufe0f SHOW ALL' : '\ud83c\udfaf ERRORS ONLY';
 
-    panel.innerHTML = header + `<div style="flex:1;overflow-y:auto;background:#0a0a0a;">${logsHtml || '<div style="color:#555;text-align:center;padding:40px;">No suspects arrested. The code is clean.</div>'}</div>`;
+    panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;padding:12px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;flex-shrink:0;"><div style="color:#d4af37;font-size:14px;font-weight:900;letter-spacing:1px;">\ud83d\udd2c AUTO-FETCH DEBUG BRAIN (BB)</div><div style="display:flex;gap:8px;flex-wrap:wrap;">' + headerBtns + '</div></div><div style="display:flex;flex-direction:column;flex:1;overflow-y:auto;background:#0a0a0a;"><div style="flex:1;"><div style="padding:10px 12px;background:#111;color:#d4af37;font-size:11px;font-weight:900;text-transform:uppercase;position:sticky;top:0;z-index:10;border-bottom:1px solid #222;display:flex;justify-content:space-between;align-items:center;"><span>\ud83d\udce1 FETCH & ENGINE LOGS</span><button onclick="AFDB.toggleFilter()" style="background:none;border:none;color:#4ea9ff;font-size:14px;font-weight:bold;cursor:pointer;">' + filterLabel + '</button></div><div style="padding-bottom:15px;">' + (logRows||'<div style="color:#555;font-size:12px;text-align:center;padding:30px;font-weight:bold;">' + emptyMsg + '</div>') + '</div></div></div>';
   }
 
-  return { 
-    log, 
-    copyFullReport,
-    copyLogs: () => { navigator.clipboard.writeText(JSON.stringify(_log, null, 2)); alert("Logs copied!"); },
-    clear: () => { _log = []; _render(); },
-    open: () => { _isOpen = true; document.getElementById('afdbOverlay').style.display='flex'; _render(); },
-    close: () => { _isOpen = false; document.getElementById('afdbOverlay').style.display='none'; },
-    runTestFetch: () => { /* calls your raid logic */ }
-  };
+  function open() {
+    _isOpen = true;
+    const ov = document.getElementById('afdbOverlay');
+    if (ov) { ov.style.display='flex'; _render(); }
+  }
+
+  function close() {
+    _isOpen = false;
+    const ov = document.getElementById('afdbOverlay');
+    if (ov) ov.style.display='none';
+  }
+
+  async function runTestFetch() {
+    try {
+      if (typeof forceTrackerSaveNow === 'function') await forceTrackerSaveNow();
+      if (typeof refreshTrackerInBackground === 'function') await refreshTrackerInBackground(true);
+    } catch(e) {}
+
+    let totalSuspects = 0;
+
+    if (typeof _schedCache !== 'undefined') _schedCache.clear();
+    if (typeof _summaryCache !== 'undefined') _summaryCache.clear();
+    if (typeof _fixtureCache !== 'undefined') _fixtureCache.clear();
+    if (typeof _teamCatalogCache !== 'undefined') _teamCatalogCache.clear();
+
+    const inputsToCheck = ['aFTScored', 'bFTScored', 'ftMarket', 'teamAMarket', 'teamBMarket'];
+    inputsToCheck.forEach(id => {
+      const el = document.getElementById(id);
+      const val = el ? el.value.trim() : '';
+      if (val && /[^0-9,.\s-]/.test(val)) {
+        log('ERROR', 'UI INPUT', 'Invalid characters detected in ' + id + ': "' + val + '". Math engine will crash.');
+        totalSuspects++;
+      }
+    });
+
+    const active = Array.isArray(g_trackerState && g_trackerState.activePicks) ? g_trackerState.activePicks : [];
+    const memCount = Object.keys(g_engineLineMemory || {}).length;
+    if (memCount > 190) { log('ERROR','STORAGE','Line memory nearing maximum capacity (200). Pruning imminent.'); totalSuspects++; }
+    if (active.length > 490) { log('ERROR','STORAGE','Active picks array is critically full (Limit: 500).'); totalSuspects++; }
+    if (typeof MODEL_TUNING === 'undefined') { log('ERROR','CONFIG','MODEL_TUNING matrix is missing.'); totalSuspects++; }
+
+    let paceAnomalies = 0, edgeAnomalies = 0;
+    active.forEach(p => {
+      const pace = (p.diagnostics && p.diagnostics.pace) || (p.godsEyeMemory && p.godsEyeMemory.pace);
+      if (pace && (pace > 135 || pace < 65)) paceAnomalies++;
+      if (p.edgePct && Math.abs(p.edgePct) > 15) edgeAnomalies++;
+    });
+    if (paceAnomalies > 0) { log('ERROR','MATH ENGINE', paceAnomalies + ' picks show unrealistic pace projections (<65 or >135). Logic contradiction detected.'); totalSuspects++; }
+    if (edgeAnomalies > 0) { log('ERROR','MATH ENGINE', edgeAnomalies + ' picks show extreme edge anomalies (>15%).'); totalSuspects++; }
+
+    const settled = (g_trackerState && g_trackerState.stats && g_trackerState.stats.settled) || 0;
+    const wins = (g_trackerState && g_trackerState.stats && g_trackerState.stats.wins) || 0;
+    if (settled >= 20) {
+      const winRate = (wins / settled) * 100;
+      if (winRate < 45) { log('ERROR','MODEL BIAS','System win rate dropping below safety threshold (' + winRate.toFixed(1) + '%). Recalibration required.'); totalSuspects++; }
+    }
+
+    const league = document.getElementById('leagueSelect') && document.getElementById('leagueSelect').value;
+    const tA = document.getElementById('teamAName') && document.getElementById('teamAName').value;
+    const tB = document.getElementById('teamBName') && document.getElementById('teamBName').value;
+    if (league && league !== 'unknown' && tA && tB) {
+      try { await fetchESPN(); }
+      catch(e) { log('ERROR','NETWORK','Live sweep failed: ' + e.message); totalSuspects++; }
+    }
+
+    const verdictMsg = totalSuspects === 0 ? 'Raid complete.\nEngine is 100% perfect.' : 'Raid complete.\nCaught ' + totalSuspects + ' Thieves and locked them behind the bars.';
+    const verdictEntry = {
+      ts: new Date().toLocaleTimeString([],{hour12:false}),
+      level: totalSuspects === 0 ? 'VERDICT' : 'ERROR',
+      section: 'POLICE RAID',
+      msg: verdictMsg,
+      data: null
+    };
+    _log.unshift(verdictEntry);
+    if (_log.length > LOG_LIMIT) _log = _log.slice(0, LOG_LIMIT);
+    if (_isOpen) _render();
+    setTimeout(() => {
+      const idx = _log.indexOf(verdictEntry);
+      if (idx !== -1) { _log.splice(idx, 1); if (_isOpen) _render(); }
+    }, 7000);
+  }
+
+
+  // ── REPORT MODAL ──────────────────────────────────────────────
+  function openReport() {
+    let overlay = document.getElementById('afdbReportOverlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'afdbReportOverlay';
+      overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.97);z-index:1000001;display:flex;flex-direction:column;font-family:ui-monospace,Consolas,monospace;';
+      document.body.appendChild(overlay);
+    }
+    const stats = (typeof g_trackerState !== 'undefined' && g_trackerState.stats) ? g_trackerState.stats : {};
+    const wins = Number(stats.wins) || 0;
+    const losses = Number(stats.losses) || 0;
+    const pushes = Number(stats.pushes) || 0;
+    const settled = Number(stats.settled) || 1;
+    const winRate = ((wins / settled) * 100).toFixed(1);
+    const reportText = `=== THE BET CEO — ENGINE REPORT ===
+Timestamp: ${new Date().toISOString()}
+
+[RECORD]
+Wins:    ${wins}
+Losses:  ${losses}
+Pushes:  ${pushes}
+Win Rate: ${winRate}%
+Settled:  ${settled}
+`;
+    overlay.innerHTML = `
+      <div style="background:#080808;border-bottom:1px solid #222;padding:12px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;">
+        <div style="color:#d4af37;font-size:14px;font-weight:900;letter-spacing:1px;">📊 ENGINE REPORT</div>
+        <div style="display:flex;gap:8px;">
+          <button id="afdbReportCopyBtn" onclick="AFDB.copyReport(this)" style="background:#49a443;border:none;color:#fff;padding:6px 14px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">📋 Copy Report</button>
+          <button onclick="AFDB.closeReport()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>
+        </div>
+      </div>
+      <div style="flex:1;overflow-y:auto;background:#0a0a0a;padding:20px;">
+        <pre id="afdbReportText" style="color:#49d45f;font-size:13px;line-height:1.7;white-space:pre-wrap;word-break:break-word;margin:0;">${reportText}</pre>
+      </div>`;
+    overlay.style.display = 'flex';
+  }
+
+  function closeReport() {
+    const overlay = document.getElementById('afdbReportOverlay');
+    if (overlay) overlay.style.display = 'none';
+  }
+
+  function copyReport(btn) {
+    const pre = document.getElementById('afdbReportText');
+    const text = pre ? pre.textContent : '';
+    navigator.clipboard.writeText(text).then(() => {
+      if (btn) { const old = btn.innerHTML; btn.innerHTML = '✅ Copied!'; setTimeout(() => btn.innerHTML = old, 2000); }
+    }).catch(() => {
+      if (btn) btn.innerHTML = '❌ Failed';
+    });
+  }
+
+  return { log, clear, copy, toggleFilter, open, close, runTestFetch, openReport, closeReport, copyReport, get isOpen() { return _isOpen; } };
 })();
 
 window.engineDebug = function(msg, extra) {
