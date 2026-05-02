@@ -2425,7 +2425,7 @@ body.dark-mode .tracker-analytics-section-head {
   <span class="brand-right">
     <button class="theme-toggle" type="button" id="themeToggleBtn" title="Toggle dark/light mode">🏀</button>
     <button class="theme-toggle" type="button" id="trackerToggleBtn" title="Open tracked picks">📊</button>
-    <button class="theme-toggle" type="button" id="reportBtn" title="Engine Report" onclick="AFDB.openReport()" style="font-size:16px;">📊</button><button class="theme-toggle" type="button" id="afdbBtn" title="Auto-Fetch Debugger" onclick="AFDB.open()">🔬</button>
+    <button class="theme-toggle" type="button" id="afdbBtn" title="Auto-Fetch Debugger" onclick="AFDB.open()">🔬</button>
     PREDICTIONS
   </span>
 </header>
@@ -2436,7 +2436,7 @@ body.dark-mode .tracker-analytics-section-head {
     <div class="section" id="leagueSection">
       <h3>League Tier</h3>
       <label>Select League</label>
-                        <select id="leagueSelect" class="league-box">
+            <select id="leagueSelect" class="league-box">
         <option value="">- Select League -</option>
         <optgroup label="── A ──────────────────">
           <option value="aba">ABA Liga</option>
@@ -2519,12 +2519,11 @@ body.dark-mode .tracker-analytics-section-head {
           <option value="swiss_sbl">Switzerland SB League</option>
           <option value="serbia_kls">Serbia KLS</option>
           <option value="serbia_2mls">Serbia 2. MLS</option>
-          <option value="acb">Spain - Liga ACB</option>
           <option value="spain_primera">Spain Primera FEB</option>
           <option value="spain_segunda">Spain Segunda FEB</option>
         </optgroup>
         <optgroup label="── T-U-W ──────────────">
-          <option value="turkey_tb2l">Turkiye TB2l</option>
+          <option value="turkey_tb2l">Turkiye TB2L</option>
           <option value="turkey_tbl">Turkiye TBL</option>
           <option value="turkey_tkbl_w">Turkiye TKBL Women</option>
           <option value="taipei_tpbl">TPBL (Taipei)</option>
@@ -2723,6 +2722,7 @@ body.dark-mode .tracker-analytics-section-head {
       <div class="tracker-head">
         <span id="trackerHeadTitle">Tracked Picks</span>
         <div class="tracker-head-actions">
+          <button type="button" id="trackerInsightsBtn" class="tracker-insights-btn state-idle" title="Open report" aria-label="Open report">📊 Report</button>
           <button type="button" id="trackerCloseBtn" class="tracker-close">✕</button>
         </div>
       </div>
@@ -2818,12 +2818,15 @@ body.dark-mode .tracker-analytics-section-head {
   // 3. NETWORK & PROMISE INTERCEPTOR
   window.addEventListener("unhandledrejection", function (e) {
     const reason = e.reason?.message || String(e.reason);
-    if (reason.toLowerCase().includes("load failed") || reason.toLowerCase().includes("fetch")) return; // Hard skip
+
+    // FIX: Ignore network noise completely
+    const isNoise = reason.toLowerCase().includes("fetch") || reason.toLowerCase().includes("load failed") || reason.toLowerCase().includes("networkerror");
+    if (isNoise) return;
 
     if (typeof window.engineDebug === "function") {
-        window.engineDebug("LOGIC ERROR", { detail: reason });
+        window.engineDebug("NETWORK/PROMISE ERROR", { detail: reason });
     }
-});
+  });
 
   // 4. GOD-MODE FETCH PROXY
   const originalFetch = window.fetch;
@@ -9175,6 +9178,7 @@ function applyContextAdjustments(baseProjection, ctx) {
     m && m.pick !== "NO PLAY" && m.pick !== "—" && !isNaN(m.edge) && m.line > 0
   );
 
+  // RULE: Only assign a lock if there is more than 1 valid pick to choose from
   if (valid.length <= 1) return -1;
 
   const best = [...valid].sort((a, b) => {
@@ -9199,14 +9203,21 @@ function applyContextAdjustments(baseProjection, ctx) {
     const aLockScore = aEdgePct + aFullModelBonus + aMassacreBonus;
     const bLockScore = bEdgePct + bFullModelBonus + bMassacreBonus;
 
-    return bLockScore - aLockScore;
+    if (Math.abs(bLockScore - aLockScore) > 0.0001) {
+      return bLockScore - aLockScore;
+    }
+
+    if (Math.abs(bEdgePct - aEdgePct) > 0.0001) {
+      return bEdgePct - aEdgePct;
+    }
+
+    return Math.abs(b.edge) - Math.abs(a.edge);
   })[0];
 
   return Number.isInteger(best?._idx)
     ? best._idx
     : markets.findIndex(m => m === best);
 }
-// END OF LOCK FUNCTION
 
 
 
@@ -13774,10 +13785,10 @@ if (trackedToSave.length) {
 
       document.getElementById("espnSection").style.display = isNbaOrNcaa ? "block" : "none";
 
-
-// THE FIX: Control brain selector visibility
-      const intel = document.getElementById("intelSection");
-      if (intel) intel.style.display = isNbaOrNcaa ? "block" : "none";
+      const intelSection = document.getElementById("intelSection");
+      if (intelSection) {
+        intelSection.style.display = isNbaOrNcaa ? "block" : "none";
+      }
 
       ["a1HSection", "b1HSection", "a2HSection", "b2HSection", "h2h1HSection", "h2h2HSection", "h1MarketSection", "h2MarketSection"].forEach(id => {
         const el = document.getElementById(id);
@@ -14296,7 +14307,6 @@ const AFDB = (function() {
   let _log = [];
   let _isOpen = false;
   let _showOnlyErrors = true; 
-  let _viewMode = 'logs'; // 'logs' or 'report'
 
   const LEVELS = {
     BOOT:    { color:'#7aa6ff' }, NET:     { color:'#4ea9ff' },
@@ -14319,10 +14329,6 @@ const AFDB = (function() {
   }
 
   function log(level, section, msg, data) {
-    // TOTAL SILENCE: Ignore network noise completely
-    const raw = String(msg).toLowerCase();
-    if (raw.includes("load failed") || raw.includes("fetch") || raw.includes("network")) return;
-
     const entry = {
       ts: new Date().toLocaleTimeString([],{hour12:false}),
       level, section: section||'CORE', msg,
@@ -14337,11 +14343,6 @@ const AFDB = (function() {
 
   function toggleFilter() {
     _showOnlyErrors = !_showOnlyErrors;
-    _render();
-  }
-
-  function toggleViewMode() {
-    _viewMode = _viewMode === 'logs' ? 'report' : 'logs';
     _render();
   }
 
@@ -14368,64 +14369,27 @@ const AFDB = (function() {
     }
   }
 
-  function getStructuredReport() {
-    const stats = (typeof g_trackerState !== 'undefined' && g_trackerState) ? (g_trackerState.stats || {}) : {};
-    const derived = (typeof g_trackerDerivedState !== 'undefined') ? (g_trackerDerivedState || {}) : {};
-    const activation = (typeof getPhase2ActivationState === "function") ? getPhase2ActivationState() : {};
-
-    let text = `=== ENGINE SYSTEM REPORT ===\n`;
-    text += `TIMESTAMP: ${new Date().toISOString()}\n`;
-    text += `MODEL: ${typeof ENGINE_MODEL_VERSION !== 'undefined' ? ENGINE_MODEL_VERSION : 'N/A'}\n\n`;
-    text += `[CORE STATS]\n`;
-    text += `Overall: ${stats.wins||0}W - ${stats.losses||0}L - ${stats.pushes||0}P (${stats.settled ? ((stats.wins/stats.settled)*100).toFixed(1) : 0}%)\n`;
-    text += `Settled Picks: ${stats.settled||0}\n\n`;
-    text += `[CHECKPOINT STATUS]\n`;
-    text += `Status: ${activation.trackerReady ? "READY" : "BUILDING"}\n`;
-    text += `Settled Progress: ${activation.settled||0}/${activation.reviewCheckpointSettled||20}\n\n`;
-    text += `[MARKET SIGNALS]\n`;
-    const markets = derived.marketSides || {};
-    Object.keys(markets).forEach(k => {
-        const m = markets[k];
-        if (m.settled > 0) text += `${m.label}: ${m.wins}W-${m.losses}L (${m.winRate}%)\n`;
+  function snapDOM() {
+    const ids = [
+      'leagueSelect','teamAName','teamBName',
+      'aFTScored','aFTAllowed','a1HScored','a1HAllowed',
+      'bFTScored','bFTAllowed','b1HScored','b1HAllowed',
+      'aFTH2H','bFTH2H','a1HH2H','b1HH2H',
+      'ftMarket','h1Market','h2Market','teamAMarket','teamBMarket'
+    ];
+    const snap = {};
+    ids.forEach(id => {
+      const el = document.getElementById(id);
+      snap[id] = el ? (el.value||'(empty)') : '\u26d4 NOT FOUND';
     });
-    return text;
-  }
-
-  function copyReportData(btnEl) {
-    try {
-      navigator.clipboard.writeText(getStructuredReport());
-      if (btnEl) {
-        const origText = btnEl.innerHTML;
-        btnEl.innerHTML = "\u2705 COPIED!";
-        setTimeout(() => { btnEl.innerHTML = origText; }, 1500);
-      }
-    } catch(e) {
-      log('WARN','AFDB','Clipboard blocked \u2014 printed to console');
-    }
+    if (typeof selectedTeamIds !== 'undefined') snap['_teamIds'] = JSON.stringify(selectedTeamIds);
+    if (typeof uiState !== 'undefined') snap['_league'] = uiState.appliedLeagueSlug||'(none)';
+    return snap;
   }
 
   function _render() {
     const panel = document.getElementById('afdbPanel');
     if (!panel) return;
-
-    // VIEW 1: THE TEXT REPORT PAGE
-    if (_viewMode === 'report') {
-      const reportText = getStructuredReport();
-      panel.innerHTML = `
-        <div style="background:#080808;border-bottom:1px solid #222;padding:12px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;flex-shrink:0;">
-          <div style="color:#d4af37;font-size:14px;font-weight:900;letter-spacing:1px;">\ud83d\udcca ENGINE REPORT DATA</div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;">
-            <button onclick="AFDB.copyReportData(this)" style="background:#3a9c35;border:1px solid #333;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">\ud83d\udccb COPY REPORT</button>
-            <button onclick="AFDB.toggleViewMode()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">\u2190 BACK TO LOGS</button>
-          </div>
-        </div>
-        <div style="flex:1;background:#0a0a0a;padding:15px;overflow-y:auto;display:flex;flex-direction:column;">
-          <textarea readonly style="flex:1;width:100%;min-height:200px;background:#111;color:#49d45f;border:1px solid #333;padding:15px;font-family:ui-monospace,Consolas,monospace;font-size:11px;line-height:1.6;resize:none;">${reportText}</textarea>
-        </div>`;
-      return;
-    }
-
-    // VIEW 2: THE ORIGINAL DEBUG LOGS
     const visibleLogs = _showOnlyErrors ? _log.filter(e => e.level === 'ERROR' || e.level === 'WARN' || e.level === 'VERDICT') : _log;
     const logRows = visibleLogs.map(e => {
       const def = LEVELS[e.level]||LEVELS.INFO;
@@ -14440,7 +14404,7 @@ const AFDB = (function() {
       return '<div style="padding:8px;border-bottom:1px solid #151515;"><div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;"><span style="color:#555;font-size:9px;min-width:65px;flex-shrink:0;">' + esc(e.ts) + '</span><span style="color:' + def.color + ';font-size:10px;font-weight:900;min-width:75px;flex-shrink:0;">' + icon + ' ' + esc(e.level) + '</span><span style="color:#777;font-size:9px;min-width:80px;flex-shrink:0;">[' + esc(e.section) + ']</span><span style="color:' + def.color + ';font-size:11px;font-weight:700;flex:1;white-space:pre-wrap;">' + esc(e.msg) + '</span></div>' + dataHtml + '</div>';
     }).join('');
 
-    const headerBtns = '<button onclick="AFDB.toggleViewMode()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;" title="Open Report">\ud83d\udcca</button><button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">\ud83d\udccb Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">\ud83d\uddd1\ufe0f Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">\ud83d\udea8 MILITARY RAID</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">\u2715 Close</button>';
+    const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">\ud83d\udccb Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">\ud83d\uddd1\ufe0f Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">\ud83d\udea8 MILITARY RAID</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">\u2715 Close</button>';
 
     const emptyMsg = _showOnlyErrors ? 'No suspects arrested. The code is clean.' : 'No log entries yet. Run a fetch.';
     const filterLabel = _showOnlyErrors ? '\ud83d\udc41\ufe0f SHOW ALL' : '\ud83c\udfaf ERRORS ONLY';
@@ -14450,14 +14414,12 @@ const AFDB = (function() {
 
   function open() {
     _isOpen = true;
-    _viewMode = 'logs';
     const ov = document.getElementById('afdbOverlay');
     if (ov) { ov.style.display='flex'; _render(); }
   }
 
   function close() {
     _isOpen = false;
-    _viewMode = 'logs';
     const ov = document.getElementById('afdbOverlay');
     if (ov) ov.style.display='none';
   }
@@ -14532,7 +14494,7 @@ const AFDB = (function() {
     }, 7000);
   }
 
-  return { log, clear, copy, copyReportData, toggleFilter, toggleViewMode, open, close, runTestFetch, get isOpen() { return _isOpen; } };
+  return { log, clear, copy, toggleFilter, open, close, runTestFetch, get isOpen() { return _isOpen; } };
 })();
 
 window.engineDebug = function(msg, extra) {
@@ -14547,7 +14509,7 @@ window.trackerDebug = function(msg, extra) {
   if (raw.includes("load failed") || raw.includes("fetch") || raw.includes("network")) return;
   const isErr = raw.includes('error') || raw.includes('fail');
   AFDB.log(isErr ? 'ERROR' : 'TRACKER', 'TRACKER', msg, extra);
-};
+};;
 
 document.addEventListener('DOMContentLoaded', function() {
   setTimeout(function() {
