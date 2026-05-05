@@ -3062,7 +3062,7 @@ const WORKER_BASE_URL = String(WORKER_URL || "").replace(/\/+$/, "");
 const DEBUG = false;
 const CACHE_MAX = 120;
 
-        // Fix 11: Dynamic Calibration System (Replaces Magic Numbers)
+            // Fix 11: Dynamic Calibration System (Replaces Magic Numbers)
     function getDynamicWeights(sampleTier, volatility, league) {
       const isFull = sampleTier === "full";
       const isHighVol = volatility > (LEAGUE_VOL_LIMITS[league] || 12);
@@ -3071,26 +3071,7 @@ const CACHE_MAX = 120;
       let teamWeight = isFull ? 0.65 : 0.50;
       if (isHighVol) teamWeight -= 0.10;
 
-      // Ensure weights always sum to 1.0
-      teamWeight = clampNumber(teamWeight, 0.40, 0.75);
-      const oppWeight = 1.0 - teamWeight;
-
-      // Regression to mean: High volatility forces a move toward the baseline
-      const baselineWeight = isHighVol ? 0.25 : 0.10;
-      const regressionWeight = 1.0 - baselineWeight;
-
-      return { teamWeight, oppWeight, regressionWeight, baselineWeight };
-    }
-    // Fix 11: Dynamic Calibration System (Replaces Magic Numbers)
-    function getDynamicWeights(sampleTier, volatility, league) {
-      const isFull = sampleTier === "full";
-      const isHighVol = volatility > (LEAGUE_VOL_LIMITS[league] || 12);
-      
-      // Base confidence starts at 0.60 for full samples, drops for thin/volatile
-      let teamWeight = isFull ? 0.65 : 0.50;
-      if (isHighVol) teamWeight -= 0.10;
-
-      // Ensure weights always sum to 1.0
+      // 🛡️ MATH FIX: Ensure weights always sum to 1.0 (Normalization)
       teamWeight = clampNumber(teamWeight, 0.40, 0.75);
       const oppWeight = 1.0 - teamWeight;
 
@@ -3102,7 +3083,7 @@ const CACHE_MAX = 120;
     }
 
     // Keep non-math constants here
-    const MODEL_CONFIG = {
+   const MODEL_CONFIG = {
       H2H_DIVERGE_THRESHOLD: 0.20,
       LINE_ANCHOR_NBA: 0.65,
       LINE_ANCHOR_OTHER: 0.50,
@@ -5078,17 +5059,10 @@ function maybeReadH2HEnabled(kind) {
   return !!(el && el.checked);
 }
 
-
-function maybeReadH2HEnabled(kind) {
-  const id = (kind === "ft") ? "useFTH2H" : (kind === "h1") ? "use1HH2H" : (kind === "h2") ? "use2HH2H" : null;
-  if (!id) return false;
-  const el = document.getElementById(id);
-  return !!(el && el.checked);
-}
-
 function getVisibleDebugLines(logs, scope, limit) {
   return prioritizeDebugLines(logs, limit);
 }
+
 
 function getDebugButtonState() {
   const engineLines = getVisibleDebugLines(g_engineDebugLog, "engine", 6);
@@ -5573,7 +5547,7 @@ function validateFetchSection() {
   return isValid;
 }
 
-    // --- LEVEL 2 MATH MODULE ---
+        // --- LEVEL 2 MATH MODULE ---
 function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 48) {
   const getStat = (key) => {
     const val = stats[key] || "0/0";
@@ -5586,8 +5560,11 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
   const orb = getStat("offensiveRebounds");
   const tov = getStat("turnovers");
 
-  // Hollinger Possession Formula: 0.96 * (FGA + (0.44 * FTA) - ORB + TOV)
-  let possessions = 0.96 * (fga + (0.44 * fta) - orb + tov);
+  // 🛡️ MATH FIX: True Hollinger requires opponent ORB to balance.
+  // Since we only have 1 team's box score here, we dampen the ORB subtraction 
+  // by 50% to simulate league-average opponent rebounding balancing it out.
+  let possessions = 0.96 * (fga + (0.44 * fta) - (orb * 0.5) + tov);
+
 
   // Guard: negative or zero possessions means the stat block is unusable.
   // Return null so the caller can exclude this game rather than storing fabricated ratings.
@@ -5779,14 +5756,15 @@ Any suggestion made here without proof is an audit error.
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), timeoutMs);
         try {
-          // ADDED THE PROXY TOKEN HERE to prevent ESPN fetch 403 errors
+                    // 🛡️ SECURITY FIX: Removed exposed client-side token.
+          // Cloudflare worker must enforce origin CORS instead.
           const res = await fetch(requestUrl, { 
             signal: ctrl.signal, 
-            headers: { "X-Engine-Proxy-Token": "v2_engine_strict_auth_9982" }, 
             cache: "no-store" 
           });
 
           if (!res.ok) throw new Error(label + " HTTP " + res.status);
+
           const text = await res.text();
           try { return JSON.parse(text); } catch (e) { throw new Error(label + " bad JSON: " + text.slice(0, 120)); }
         } finally { clearTimeout(timer); }
@@ -6658,14 +6636,14 @@ async function primeTrackerStateForRun() {
 
   renderTrackedPicks();
   
-  // 🔥 AUTOMATIC HARD SYNC ON LOAD/REFRESH
-  // This automatically fires the same logic as the "Force Hard Sync" button
-  // a split second after the page loads, guaranteeing the UI stays fixed.
-  setTimeout(() => {
-    g_trackerSaveFailureCount = 0; 
-    forceTrackerSaveNow();
-  }, 800);
+    // 🛡️ DATA LOSS FIX: Wait for hydration to completely resolve 
+  // BEFORE slamming the server with a save command.
+  await hydrateTrackedPicks(true);
+  
+  g_trackerSaveFailureCount = 0; 
+  await forceTrackerSaveNow();
 }
+
 
 
 
@@ -8942,7 +8920,7 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
         const statusName = competition?.status?.type?.name;
         const forceSettle = (clock === "0.0" || clock === "0:00") && period >= (pick.league === "nba" ? 4 : 2);
 
-        if (apiFinal || forceSettle) {
+                if (apiFinal || forceSettle) {
           const settled = settleTrackedPickFromCompetition(pick, competition, data?.boxscore);
           g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: settled && settled !== "pending" ? `✅ SETTLED: ${settled.toUpperCase()}` : `⚠️ GAME FINAL BUT SETTLED=${settled}`, apiFinal, clock, period, stateName, statusName, settled, actual: pick.actualScore, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
           if (settled && settled !== "pending" && pick.resultStatus !== settled) {
@@ -8956,6 +8934,13 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
         } else {
           g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: `⏳ NOT FINAL`, apiFinal, clock, period, stateName, statusName, settled: null, actual: null, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
         }
+
+        // 🛡️ MEMORY LEAK FIX: Force eviction if the log map grows too large
+        if (g_settlementDebugLog.size > 200) {
+          const firstKey = g_settlementDebugLog.keys().next().value;
+          g_settlementDebugLog.delete(firstKey);
+        }
+
       });
     }
 
@@ -9003,7 +8988,8 @@ function addTrackedPicks(newPicks) {
   let changed = false;
 
   newPicks.forEach(raw => {
-    const p = ensureTrackedPickKeys(raw);
+    // 🛡️ STATE FIX: Strict cloning to prevent in-place mutation of the original execution array
+    const p = { ...ensureTrackedPickKeys(raw) };
 
     // --- PRE-EMPTIVE DATA SLIMMING ---
     if (p.diagnostics) {
@@ -9025,6 +9011,7 @@ function addTrackedPicks(newPicks) {
     }
 
     if (!p.signature) p.signature = makeTrackedSignature(p);
+
 
     // 1. Check if pick already exists in active list
     const exactIdx = current.findIndex(x => makeTrackedSignature(x) === p.signature);
@@ -9164,19 +9151,30 @@ function getVolatilityRating(std, limit) {
 function applyContextAdjustments(baseProjection, ctx) {
   if (!isFinite(baseProjection)) return baseProjection;
   let adj = 0;
-  // Injury (replacement-adjusted — dampened to 50% of raw impact, max 3%)
-  if (ctx.injuryImpact) adj -= Math.min(ctx.injuryImpact * 0.5, 0.03);
-  // Rest/fatigue
+  
+  // 🛡️ DATA FIX: Strict NaN guards before mathematical operations
+  const injImpact = Number(ctx.injuryImpact);
+  if (isFinite(injImpact) && injImpact > 0) {
+    adj -= Math.min(injImpact * 0.5, 0.03);
+  }
+  
   if (ctx.backToBack) adj -= 0.01;
-  // Strength of Schedule
   if (ctx.sosHarder) adj += 0.01;
   if (ctx.sosEasier) adj -= 0.01;
-  // Recency (capped at ±2% to prevent recent hot/cold streaks from dominating)
-  if (ctx.recencyBias) adj += Math.max(Math.min(ctx.recencyBias, 0.02), -0.02);
+  
+  const recency = Number(ctx.recencyBias);
+  if (isFinite(recency)) {
+    adj += Math.max(Math.min(recency, 0.02), -0.02);
+  }
+
   // HARD CAP: total context adjustment cannot exceed ±6%
   adj = Math.max(-0.06, Math.min(0.06, adj));
-  return baseProjection * (1 + adj);
+  const finalProj = baseProjection * (1 + adj);
+  
+  // Fallback to base projection if final result is corrupted
+  return isFinite(finalProj) ? finalProj : baseProjection;
 }
+
 
     function getSampleTier(...arrays) {
       const lens = arrays.map(a => Array.isArray(a) ? a.length : 0);
@@ -11734,19 +11732,20 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
 
 
-      // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
+            // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
   const vl = getMarketVolLimit(league, "ft");
 
   if (isFinite(projAFT)) {
     projAFT = applyVolatility(projAFT, aVol, vl);
-    projAFT = applyContextAdjustments(projAFT, { injuryImpact: 1 - injMultA });
+    projAFT = applyContextAdjustments(projAFT, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
     projAFT = anchorProjection(projAFT, lines.aLine, league, "team");
   }
   if (isFinite(projBFT)) {
     projBFT = applyVolatility(projBFT, bVol, vl);
-    projBFT = applyContextAdjustments(projBFT, { injuryImpact: 1 - injMultB });
+    projBFT = applyContextAdjustments(projBFT, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
     projBFT = anchorProjection(projBFT, lines.bLine, league, "team");
   }
+
 
   let ftProj = projAFT + projBFT;
   if (isFinite(ftProj)) {
@@ -11864,17 +11863,18 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
 
-      // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
+            // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
   const h1Vl = getMarketVolLimit(league, "h1");
   
   if (isFinite(projA1H)) {
     projA1H = applyVolatility(projA1H, aVol1, h1Vl);
-    projA1H = applyContextAdjustments(projA1H, { injuryImpact: 1 - injMultA });
+    projA1H = applyContextAdjustments(projA1H, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
   }
   if (isFinite(projB1H)) {
     projB1H = applyVolatility(projB1H, bVol1, h1Vl);
-    projB1H = applyContextAdjustments(projB1H, { injuryImpact: 1 - injMultB });
+    projB1H = applyContextAdjustments(projB1H, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
   }
+
 
   let h1Proj = projA1H + projB1H;
   if (isFinite(h1Proj)) {
@@ -12037,11 +12037,12 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     sampleTier
   });
 
-    // HYBRID FIX: Wire in Context Adjustments for 2H teams
-  if (isFinite(aTeam.proj)) aTeam.proj = applyContextAdjustments(aTeam.proj, { injuryImpact: 1 - injMultA });
-  if (isFinite(bTeam.proj)) bTeam.proj = applyContextAdjustments(bTeam.proj, { injuryImpact: 1 - injMultB });
+      // HYBRID FIX: Wire in Context Adjustments for 2H teams
+  if (isFinite(aTeam.proj)) aTeam.proj = applyContextAdjustments(aTeam.proj, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
+  if (isFinite(bTeam.proj)) bTeam.proj = applyContextAdjustments(bTeam.proj, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
 
   let h2Proj = isFinite(aTeam.proj) && isFinite(bTeam.proj) ? aTeam.proj + bTeam.proj : NaN;
+
   const pace = computePaceSignal(league, aTeam.proj, bTeam.proj, "h2");
   if (isFinite(pace)) h2Proj *= (1 + ((pace - 1) * 0.10));
   
@@ -12331,19 +12332,21 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
     return { overPct: 50, underPct: 50 };
   }
 
-  // FIX 1: Box-Muller transform using actual stdDev (Normal Distribution)
+  // 🛡️ MATH FIX: Prevent Zero-Variance trap. 
+  // If a team scores exactly the same in a small sample, Box-Muller dies.
+  const safeStdDev = Math.max(stdDev, 3.5);
+
   const workerCode = `
     onmessage = function(e) {
-      const { mean, stdDev, line, runs } = e.data;
+      const { mean, safeStdDev, line, runs } = e.data;
       let overHits = 0;
       for (let i = 0; i < runs; i++) {
         let u1 = Math.random();
         let u2 = Math.random();
-        // Protect against Math.random() returning exactly 0
         while (u1 === 0) u1 = Math.random();
         
         let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-        let simulatedScore = mean + (stdDev * z0);
+        let simulatedScore = mean + (safeStdDev * z0);
         
         if (simulatedScore > line) overHits++;
       }
@@ -12356,26 +12359,25 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
   const workerUrl = URL.createObjectURL(blob); 
   const worker = new Worker(workerUrl);
 
-  // FIX 12: Assign the timeout to a variable so we can kill it
   let failsafeTimer;
 
   const workerPromise = new Promise((resolve, reject) => {
     worker.onmessage = (e) => {
-      clearTimeout(failsafeTimer); // Kill the ghost timer!
+      clearTimeout(failsafeTimer);
       worker.terminate();
       URL.revokeObjectURL(workerUrl); 
       resolve(e.data);
     };
     worker.onerror = (err) => {
-      clearTimeout(failsafeTimer); // Kill the ghost timer!
+      clearTimeout(failsafeTimer);
       worker.terminate();
       URL.revokeObjectURL(workerUrl);
       reject(err);
     };
     
-    // FIX 1: Actually pass stdDev into the worker payload
-    worker.postMessage({ mean, stdDev, line, runs }); 
+    worker.postMessage({ mean, safeStdDev, line, runs }); 
   });
+
 
   const timeoutPromise = new Promise((resolve) => {
     failsafeTimer = setTimeout(() => {
