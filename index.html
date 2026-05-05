@@ -6950,9 +6950,9 @@ function getTrackerPickStamp(pick) {
 
 function makeTrackerActiveMergeKey(pick = {}) {
   const safe = ensureTrackedPickKeys(pick);
-  const signature = makeTrackedSignature(safe);
-  if (signature) return signature;
-
+  
+  // 🛡️ DEDUPLICATION FIX: Do not use signature (which includes the shifting line).
+  // Force it to strictly group by the actual game event and market side.
   return [
     String(safe.eventId || ""),
     String(safe.marketKey || ""),
@@ -6961,6 +6961,7 @@ function makeTrackerActiveMergeKey(pick = {}) {
     String(safe.side || "").toLowerCase()
   ].join("|");
 }
+
 
 // 🚨 PRISON MODEL: State Hierarchy
 function getPickStateWeight(status) {
@@ -7112,8 +7113,9 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
 
       if (archivedSettled && !activeSettled) return;
 
-      if (archivedSettled && activeSettled) {
-        const _archiveTs = Date.parse(archivedPick.eventDate || archivedPick.settledAt || archivedPick.createdAt || '') || 0; // [PRISON FIX 4b] eventDate is authoritative for the 10-hour lock
+            if (archivedSettled && activeSettled) {
+        // 🛡️ TIMING FIX: Prioritize settledAt so the 10-hour lock starts when the game finishes
+        const _archiveTs = Date.parse(archivedPick.settledAt || archivedPick.eventDate || archivedPick.createdAt || '') || 0; 
         const _cutoffMs  = 10 * 60 * 60 * 1000; // 10 HOURS EXACTLY
         if (_archiveTs > 0 && (Date.now() - _archiveTs) >= _cutoffMs) return;
         const preferred = choosePreferredBucketPick(pick, archivedPick);
@@ -7181,11 +7183,13 @@ function archiveExpiredTrackedPicks() {
     const p = ensureTrackedPickKeys({ ...pick });
     const isSettled = ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase());
     
-    const gameTs = Date.parse(p.eventDate || p.createdAt || '') || 0;
-    const isExpired = gameTs > 0 && (now - gameTs) >= cutoffMs;
+    // 🛡️ TIMING FIX: Start the archive clock from settledAt, not eventDate
+    const refTs = Date.parse(p.settledAt || p.eventDate || p.createdAt || '') || 0;
+    const isExpired = refTs > 0 && (now - refTs) >= cutoffMs;
 
     // 🚨 PRISON GATE: Must be SETTLED AND EXPIRED (10 hours) to leave active picks.
     if (isSettled && isExpired) {
+
       moveToArchived.push(stripHeavyData(p));
       changed = true;
     } else {
@@ -7251,20 +7255,20 @@ function getTrackedPickTimeMs(pick) {
 function isTrackedPickVisibleOnPage(pick) {
   if (!pick) return false;
   const status = String(pick.resultStatus || "pending").toLowerCase();
-  
-  // Anchor everything to the game tip-off time (eventDate)
-  const gameTs = Date.parse(pick.eventDate || pick.createdAt || '') || 0;
 
   if (status === "pending") {
-    // Keep pending games visible for up to 48 hours just in case of API delays
+    const gameTs = Date.parse(pick.eventDate || pick.createdAt || '') || 0;
     if (!gameTs) return false;
+    // Keep pending games visible for up to 48 hours just in case of API delays
     return (Date.now() - gameTs) / (1000 * 60 * 60) < 48; 
   } else {
-    // Hide settled picks exactly 14 hours after game tip-off (3h game + 11h buffer)
-    if (!gameTs) return true;
-    return (Date.now() - gameTs) / (1000 * 60 * 60) < 14;
+    // 🛡️ TIMING FIX: Use settledAt so the clock starts when the game finishes. Keep 10 hours limit.
+    const finishTs = Date.parse(pick.settledAt || pick.eventDate || pick.createdAt || '') || 0;
+    if (!finishTs) return true;
+    return (Date.now() - finishTs) / (1000 * 60 * 60) < 10;
   }
 }
+
 
 
 function getCurrentFixtureMeta() {
