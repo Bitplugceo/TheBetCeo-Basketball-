@@ -4241,10 +4241,11 @@ async function saveTrackerStateToLocal() {
     g_trackerState.activePicks = reconciled.activePicks;
     g_trackerState.archivedPicks = reconciled.archivedPicks;
 
-    // 🛡️ SYNC FIX: Rebuild stats here so Header, Picks, and Report are always identical.
+    // 🛡️ STATS FIX: Recalculate stats so the Header matches the Report exactly.
     rebuildTrackerStats();
 
     const payload = JSON.stringify(g_trackerState);
+
 
 
     const activeKeys = [
@@ -5242,42 +5243,6 @@ function updateTrackerInsightsButton() {
     }
   }
 }
-
-function syncTrackerModalView() {
-  const panel = document.querySelector("#trackerModal .tracker-panel");
-  const headTitle = document.getElementById("trackerHeadTitle");
-  const wrapEl = document.getElementById("trackedPicksWrap");
-  const emptyEl = document.getElementById("trackerEmpty");
-  const analyticsEl = document.getElementById("trackerAnalyticsPanel");
-  const tableWrapEl = document.querySelector(".tracker-table-wrap");
-  const marketSummaryEl = document.getElementById("trackerMarketSummary");
-  const copyBtn = document.getElementById("trackerCopyDataBtn");
-
-  const isPicks = isTrackerPicksView();
-  const isReport = isTrackerReportView();
-
-  if (panel) panel.classList.toggle("analytics-view", !isPicks);
-  if (headTitle) {
-    headTitle.textContent = isPicks ? "Tracked Picks" : isReport ? "Engine Report" : "Engine Debug";
-    headTitle.style.cursor = isPicks ? "default" : "pointer";
-  }
-
-  if (analyticsEl) analyticsEl.style.display = isPicks ? "none" : "block";
-  if (tableWrapEl) tableWrapEl.style.display = isPicks ? "block" : "none";
-  if (wrapEl) wrapEl.style.display = "block";
-  if (emptyEl && !isPicks) emptyEl.style.display = "none";
-  
-  if (marketSummaryEl && !isPicks) {
-    marketSummaryEl.style.display = "none";
-    marketSummaryEl.innerHTML = "";
-  }
-
-  // 🛡️ UI FIX: Hide the Copy button on the "Tracked Picks" tab ONLY
-  if (copyBtn) {
-    copyBtn.style.display = isPicks ? "none" : "inline-block";
-  }
-}
-
 
 function setTrackerModalView(view) {
   const next = ["picks", "report", "debug"].includes(String(view || "")) ? String(view) : "picks";
@@ -6945,8 +6910,8 @@ function getTrackerPickStamp(pick) {
 
 function makeTrackerActiveMergeKey(pick = {}) {
   const safe = ensureTrackedPickKeys(pick);
-  // 🛡️ PRISON LOCK: We identify the game ONLY by Event ID + Market + Side.
-  // This prevents line movement or timestamps from creating "ghost" pending duplicates.
+  // 🛡️ PRISON LOCK: Identify picks ONLY by Match + Market + Side. 
+  // Line movement is no longer allowed to create ghost "Pending" clones.
   return [
     String(safe.eventId || ""),
     String(safe.marketKey || ""),
@@ -6956,7 +6921,6 @@ function makeTrackerActiveMergeKey(pick = {}) {
 
 function getPickStateWeight(status) {
   const s = String(status || "pending").toLowerCase();
-  // Settled (Win/Loss/Push) = 1, Pending = 0
   return (s === "win" || s === "loss" || s === "push") ? 1 : 0;
 }
 
@@ -6964,20 +6928,21 @@ function resolveTrackedPick(localPick, serverPick) {
   const local = ensureTrackedPickKeys(localPick || {});
   const server = ensureTrackedPickKeys(serverPick || {});
 
-  const localWeight = getPickStateWeight(local.resultStatus);
-  const serverWeight = getPickStateWeight(server.resultStatus);
+  const lW = getPickStateWeight(local.resultStatus);
+  const sW = getPickStateWeight(server.resultStatus);
 
-  // 🛡️ AUTHORITY RULE: If one side is Settled and the other is Pending, 
-  // the Settled one ALWAYS wins. No more reverting to pending.
-  if (localWeight > serverWeight) return local;
-  if (serverWeight > localWeight) return server;
+  // 🛡️ AUTHORITY RULE: Settled ALWAYS beats Pending. 
+  // Arrests the result so it can't flip back to pending during a sync.
+  if (lW > sW) return local;
+  if (sW > lW) return server;
 
-  // If both are the same weight, keep the one that actually has the score data saved
+  // If both same weight, prefer version with score context
   if (local.actualScore && !server.actualScore) return local;
   if (server.actualScore && !local.actualScore) return server;
 
   return local;
 }
+
 
 
 // 🚨 CORE MERGE WRAPPER (Restored)
@@ -7245,10 +7210,10 @@ function isTrackedPickVisibleOnPage(pick) {
   if (status === "pending") {
     const gameTs = Date.parse(pick.eventDate || pick.createdAt || '') || 0;
     if (!gameTs) return false;
-    // Keep pending games visible for up to 48 hours just in case of API delays
+    // Keep pending games visible for up to 48 hours waiting for grading
     return (Date.now() - gameTs) / (1000 * 60 * 60) < 48; 
   } else {
-    // 🛡️ TIMING FIX: Use settledAt so the clock starts when the game finishes. Keep 10 hours limit.
+    // 🛡️ PRISON TIMER: Use settledAt so the 10 hours starts when the game finishes.
     const finishTs = Date.parse(pick.settledAt || pick.eventDate || pick.createdAt || '') || 0;
     if (!finishTs) return true;
     return (Date.now() - finishTs) / (1000 * 60 * 60) < 10;
@@ -8978,35 +8943,17 @@ function addTrackedPicks(newPicks) {
   let changed = false;
 
   newPicks.forEach(raw => {
-    // 🛡️ STATE FIX: Strict cloning to prevent in-place mutation of the original execution array
     const p = { ...ensureTrackedPickKeys(raw) };
+    const prisonKey = makeTrackerActiveMergeKey(p);
 
-    // --- PRE-EMPTIVE DATA SLIMMING ---
-    if (p.diagnostics) {
-      p.godsEyeMemory = {
-        pace: p.diagnostics.pace,
-        netA: p.diagnostics.netA,
-        netB: p.diagnostics.netB,
-        aVol: p.diagnostics.aVol,
-        bVol: p.diagnostics.bVol,
-        simPct: p.diagnostics.massacre?.simPct,
-        edgePct: p.edgePct,
-        grade: p.confidenceGrade
-      };
-      delete p.diagnostics;
-      delete p.massacre;
-      delete p.trackerFeedback;
-      delete p.shadowTrackerFeedback;
-      delete p.teamMemory;
-    }
-
-    if (!p.signature) p.signature = makeTrackedSignature(p);
-
-
-    // 1. Check if pick already exists in active list
-    const exactIdx = current.findIndex(x => makeTrackedSignature(x) === p.signature);
+    // 1. 🛡️ ARREST GUARD: Check if pick exists using the Match+Market Key.
+    // If the game is already settled on your screen, the Run button is blocked from overwriting it.
+    const exactIdx = current.findIndex(x => makeTrackerActiveMergeKey(x) === prisonKey);
 
     if (exactIdx !== -1) {
+      const existing = current[exactIdx];
+      if (getPickStateWeight(existing.resultStatus) === 1) return;
+
       const existing = current[exactIdx];
       if (String(existing.resultStatus || "pending").toLowerCase() !== "pending") return;
 
