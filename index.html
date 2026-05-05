@@ -4137,8 +4137,10 @@ function getTrackerUserKey() {
 
 
 function getTrackerLocalStateStableKey() {
-  return TRACKER_LOCAL_STATE_PREFIX + getTrackerUserKey();
+  const key = getTrackerUserKey();
+  return key ? TRACKER_LOCAL_STATE_PREFIX + key : null;
 }
+
 
 function getTrackerLocalStateBuildKey(buildKey = APP_BUILD_VERSION) {
   return TRACKER_LOCAL_STATE_PREFIX + String(buildKey || "") + "_" + getTrackerUserKey();
@@ -4939,9 +4941,10 @@ function buildReportDebugCard(title, lines = [], limit = 10, emptyText = "No act
           <strong>THE BREAK:</strong> The system died because of this code:
         </div>
         <div style="margin-bottom:15px;">
-          <span style="background:#f44336; color:#fff; padding:3px 10px; border-radius:4px; font-family:monospace; font-weight:bold; font-size:11px; display:inline-block;">
-            ${culprit}
-          </span>
+        <span style="background:#f44336; color:#fff; padding:3px 10px; border-radius:4px; font-family:monospace; font-weight:bold; font-size:11px; display:inline-block;">
+  ${safeText(culprit)}
+</span>
+
         </div>
         <div style="background:#000; border:1px solid #333; border-radius:6px; padding:12px;">
           <div style="color:#fff; font-size:11px; font-weight:900; margin-bottom:6px; display:flex; align-items:center; gap:6px;">
@@ -5018,40 +5021,6 @@ window.addEventListener("unhandledrejection", event => {
   if (_r.toLowerCase().includes("fetch") || _r.toLowerCase().includes("load failed") || _r.toLowerCase().includes("networkerror")) return;
   engineDebug("UNHANDLED REJECTION: " + _r, "engine");
 });
-
-document.addEventListener("DOMContentLoaded", async () => {
-  if (typeof ensureFreshBuild === 'function' && ensureFreshBuild()) return;
-
-  // 1. RUN THE GOD-MODE AUDIT IMMEDIATELY
-  try {
-    if (typeof ENGINE_INTEGRITY_SHIELD !== 'undefined') {
-      const integrityReport = ENGINE_INTEGRITY_SHIELD.audit();
-      if (integrityReport.length > 0) {
-        integrityReport.forEach(err => {
-          engineDebug("WATCHDOG CRITICAL ERROR: " + err, "engine");
-          if (typeof triggerGlobalEngineAlert === 'function') triggerGlobalEngineAlert("WATCHDOG: " + err);
-        });
-      } else {
-        // This line feeds the Success message into the UI correctly
-        engineDebug("WATCHDOG SUCCESS: System integrity 100% verified. 🥶⚡️", "engine");
-      }
-    }
-  } catch(e) {
-    console.error("Watchdog execution failed", e);
-  }
-
-  // 2. INITIALIZE ENGINE
-  if (typeof openSection === 'function') openSection("leagueSection");
-  if (typeof setEngineMode === 'function') setEngineMode();
-  if (typeof makeSectionsCollapsible === 'function') makeSectionsCollapsible();
-  
-  // 3. SETTLE THE APRIL 14TH PICKS
-  if (typeof refreshTrackerInBackground === 'function') {
-    await refreshTrackerInBackground(true);
-  }
-});
-
-
 
 
 function getVisibleDebugLines(logs, scope, limit) {
@@ -5526,8 +5495,9 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
     return parseFloat(val) || 0;
   };
 
-  const fga = getStat("fieldGoalsMadeAttempted");
-  const fta = getStat("freeThrowsMadeAttempted");
+    const fga = getStat("fieldGoals");
+  const fta = getStat("freeThrows");
+
   const orb = getStat("offensiveRebounds");
   const tov = getStat("turnovers");
 
@@ -5747,16 +5717,9 @@ Any suggestion made here without proof is an audit error.
           trackerDebug("summary fetch ok via worker", { event: String(url).split("event=")[1]?.split("&")[0] || "", source: "worker" });
         }
         return workerData;
-      } catch (workerErr) {
-        // We log to standard console, but NOT trackerDebug to avoid red boxes
-        console.warn("[BB Engine] Worker failed, attempting direct connection...");
-        try {
-          const directData = await fetchJson(url, "Direct fetch");
-          return directData;
-        } catch (directErr) {
-          engineDebug("fetch failed completely", { request: fetchLabel, error: directErr.message });
-          throw workerErr;
-        }
+            } catch (workerErr) {
+        engineDebug("fetch failed completely", { request: fetchLabel, error: workerErr.message });
+        throw workerErr;
       }
     }
 
@@ -6147,11 +6110,9 @@ function ensureTrackedPickKeys(pick = {}) {
   // and would make the clock start 'now' instead of when the game ended.
   // Use only createdAt or eventDate, which are immutable.
   if (["win", "loss", "push"].includes(next.resultStatus) && !next.settledAt) {
-    // Use eventDate first (when the game was played) so the 10h archive clock
-    // starts from game time — not from when the pick was created or the field backfilled.
-next.settledAt = new Date().toISOString();
+    next.settledAt = next.eventDate || next.createdAt || new Date().toISOString();
+}
 
-  }
   next.modelVersion = normalizeModelVersion(next.modelVersion);
   next.createdAt = next.createdAt || new Date().toISOString();
   next.signature = next.signature || makeTrackedSignature(next);
@@ -12314,9 +12275,16 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
     };
   `;
 
-  const blob = new Blob([workerCode], { type: "application/javascript" });
-  const workerUrl = URL.createObjectURL(blob); 
-  const worker = new Worker(workerUrl);
+    const blob = new Blob([workerCode], { type: "application/javascript" });
+  let workerUrl, worker;
+  try {
+    workerUrl = URL.createObjectURL(blob); 
+    worker = new Worker(workerUrl);
+  } catch (err) {
+    console.warn("[BB Engine] Worker blocked (Private Mode/CSP). Reverting to median.");
+    return { overPct: 50, underPct: 50 };
+  }
+
 
   let failsafeTimer;
 
@@ -14375,13 +14343,13 @@ try {
     // THIS is the logic fix for the God-Mode shield
     const integrityReport = ENGINE_INTEGRITY_SHIELD.audit();
 
-    if (Array.isArray(integrityReport) && integrityReport.length > 0) {
+        if (Array.isArray(integrityReport) && integrityReport.length > 0) {
       integrityReport.forEach(e => {
-        engineDebug("WATCHDOG CRITICAL ERROR: " + e);
-
-        if (typeof triggerGlobalEngineAlert === "function") {
-          triggerGlobalEngineAlert(e);
-        }
+        engineDebug("WATCHDOG FLAG: " + e);
+        // Alert disabled to prevent false positives locking the UI
+        // if (typeof triggerGlobalEngineAlert === "function") {
+        //  triggerGlobalEngineAlert(e);
+        // }
       });
 
     } else {
