@@ -4480,9 +4480,10 @@ function collectDerivedSignals(bucketObject = {}, topN = 12) {
     .slice(0, topN);
 }
 function applyResultToDerivedBucket(bucket, pick) {
-  const status = String(pick?.resultStatus || "pending").toLowerCase();
+  const status = String(pick?.engineResultStatus || pick?.resultStatus || "pending").toLowerCase();
 
   bucket.picks++;
+
 
   if (status === "pending") {
     bucket.pending++;
@@ -6236,8 +6237,9 @@ function getTrackedPickLineMoveProxy(pick = {}) {
 function buildSettledPickRecord(items = []) {
   const base = { settled: 0, wins: 0, losses: 0, pushes: 0, winPct: NaN, netWins: 0 };
   (Array.isArray(items) ? items : []).forEach(pick => {
-    const status = String(pick?.resultStatus || "").toLowerCase();
+    const status = String(pick?.engineResultStatus || pick?.resultStatus || "").toLowerCase();
     if (!["win", "loss", "push"].includes(status)) return;
+
     base.settled++;
     if (status === "win") base.wins++;
     else if (status === "loss") base.losses++;
@@ -7368,8 +7370,13 @@ function renderTrackedPicks() {
     const statusClass = status === "win" ? "track-win" : status === "loss" ? "track-loss" : status === "push" ? "track-push" : "track-pending";
     const edgeText = (p.edgePct == null || isNaN(p.edgePct)) ? "—" : (p.edgePct > 0 ? "+" : "") + Number(p.edgePct).toFixed(2) + "%";
 
-    const grade = String(p.confidenceGrade || p.confidence || "—").toUpperCase();
+        const grade = String(p.confidenceGrade || p.confidence || "—").toUpperCase();
     const gradeClass = getConfidenceClass(grade);
+    
+    let dualGradeHtml = `<div>${status.toUpperCase()}</div>`;
+    if (p.engineResultStatus && p.engineResultStatus !== status && status !== "pending") {
+       dualGradeHtml += `<div style="font-size:8px; color:var(--tracker-subtext); margin-top:2px; font-weight:800; letter-spacing:0.5px;">MID: ${p.engineResultStatus.toUpperCase()}</div>`;
+    }
 
     return `
       <tr>
@@ -7380,7 +7387,7 @@ function renderTrackedPicks() {
         <td>${safeText(p.predictionText || "—")}${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
         <td class="${gradeClass}" style="font-weight:800;">${safeText(grade)}</td>
         <td>${safeText(edgeText)}</td>
-        <td class="${statusClass}"><div class="tracker-status-stack"><div>${status.toUpperCase()}</div>${getManualSettlementControlsMarkup(p)}</div></td>
+        <td class="${statusClass}"><div class="tracker-status-stack">${dualGradeHtml}${getManualSettlementControlsMarkup(p)}</div></td>
       </tr>
     `;
   }).join("");
@@ -7458,11 +7465,12 @@ function renderTrackerAnalytics() {
     return { label: "Advisory", note: "Lean only" };
   }
 
-  function buildRecord(items = []) {
+    function buildRecord(items = []) {
     const base = { settled: 0, wins: 0, losses: 0, pushes: 0, winPct: NaN };
     items.forEach(pick => {
-      const status = String(pick?.resultStatus || "").toLowerCase();
+      const status = String(pick?.engineResultStatus || pick?.resultStatus || "").toLowerCase();
       if (!["win", "loss", "push"].includes(status)) return;
+
       base.settled++;
       if (status === "win") base.wins++;
       else if (status === "loss") base.losses++;
@@ -8127,8 +8135,8 @@ function buildTrackerFeedbackProfile() {
     else if (status === "push") bucket.pushes++;
   }
 
-    all.forEach(pick => {
-    const status = String(pick.resultStatus || "").toLowerCase();
+        all.forEach(pick => {
+    const status = String(pick.engineResultStatus || pick.resultStatus || "").toLowerCase();
     const leagueKey = String(pick.league || "unknown");
     const marketKey = String(pick.marketKey || "other");
     const side = String(pick.side || "");
@@ -8318,7 +8326,7 @@ function applyTrackerFeedbackToPickRows(picks, phase2Activation = null) {
 function getAllSettledTrackedPicks() {
   return getLearningTrackedPicks()
     .filter(p => {
-      const status = String(p.resultStatus || "").toLowerCase();
+      const status = String(p.engineResultStatus || p.resultStatus || "").toLowerCase();
       return status === "win" || status === "loss";
     });
 }
@@ -8618,9 +8626,10 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
       touchedPick = pick;
       changed = true;
 
-      return ensureTrackedPickKeys({
+            return ensureTrackedPickKeys({
         ...pick,
         resultStatus: normalizedStatus,
+        engineResultStatus: normalizedStatus,
         settledAt: nowIso,
         updatedAt: nowIso,
         settlementSource: "manual",
@@ -8758,8 +8767,8 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
   }
 
   const market = pick.marketKey;
-  const line = parseFloat(pick.line);
-  if (isNaN(line)) return "pending";
+  const marketLine = parseFloat(pick.line); // Engine market mid
+  if (isNaN(marketLine)) return "pending";
 
   let actual = 0;
   const isTeamAHome = String(pick.homeId) === String(home.id) || pick.homeTeam === home.team?.displayName;
@@ -8781,15 +8790,27 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
      return "pending";
   }
 
-  // Save the exact score context for your God's Eye post-mortem UI
   pick.actualScore = actual;
-
   const pickSide = String(pick.side).toLowerCase();
-  if (actual > line) return pickSide === "over" ? "win" : "loss";
-  if (actual < line) return pickSide === "under" ? "win" : "loss";
-  return "push";
-}
 
+  // 1. Grade the Engine against the Market Mid
+  let engineGrade = "push";
+  if (actual > marketLine) engineGrade = pickSide === "over" ? "win" : "loss";
+  else if (actual < marketLine) engineGrade = pickSide === "under" ? "win" : "loss";
+  
+  pick.engineResultStatus = engineGrade;
+
+  // 2. Grade the Bankroll against the Actual Ticket Line
+  let actualPickLine = marketLine;
+  const pickMatch = String(pick.predictionText || "").match(/[0-9.]+/);
+  if (pickMatch) actualPickLine = parseFloat(pickMatch[0]);
+
+  let actualGrade = "push";
+  if (actual > actualPickLine) actualGrade = pickSide === "over" ? "win" : "loss";
+  else if (actual < actualPickLine) actualGrade = pickSide === "under" ? "win" : "loss";
+
+  return actualGrade; // This becomes resultStatus
+}
 
         async function refreshTrackedPickResults() {
   try {
