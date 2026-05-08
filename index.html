@@ -3638,13 +3638,15 @@ function defaultMassacreFetchContext() {
       overall: null, venue: null, lastGameDate: "", restDays: null,
       ortg10: [], drtg10: [], pace10: [],
       q1Scored: [], q2Scored: [], q3Scored: [], q4Scored: [],
-      q1Allowed: [], q2Allowed: [], q3Allowed: [], q4Allowed: []
+      q1Allowed: [], q2Allowed: [], q3Allowed: [], q4Allowed: [],
+      roster: []
     },
     B: { 
       overall: null, venue: null, lastGameDate: "", restDays: null,
       ortg10: [], drtg10: [], pace10: [],
       q1Scored: [], q2Scored: [], q3Scored: [], q4Scored: [],
-      q1Allowed: [], q2Allowed: [], q3Allowed: [], q4Allowed: []
+      q1Allowed: [], q2Allowed: [], q3Allowed: [], q4Allowed: [],
+      roster: []
     },
     h2hGames: []
   };
@@ -11260,10 +11262,27 @@ async function fetchESPN() {
     const leagueAvgFallback = Math.round((LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160) / 2);
     const aAvg = aStats?.scored?.length ? avg(aStats.scored) : leagueAvgFallback;
     const bAvg = bStats?.scored?.length ? avg(bStats.scored) : leagueAvgFallback;
-    [g_injA, g_injB] = await Promise.all([
+    async function fetchRoster(teamId) {
+      try {
+        const data = await proxyFetch(`${espnBase}/teams/${teamId}?enable=roster`);
+        const athletes = data?.team?.athlete || data?.team?.roster || [];
+        return athletes.map(a => ({
+          name: a.displayName,
+          ppg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "points")?.displayValue || 0),
+          rpg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "rebounds")?.displayValue || 0),
+          apg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "assists")?.displayValue || 0),
+          pos: a.position?.abbreviation || "G"
+        })).sort((a, b) => b.ppg - a.ppg).slice(0, 8);
+      } catch (e) { return []; }
+    }
+
+    const [injA, injB, rostA, rostB] = await Promise.all([
       fetchInjuryMeta(espnBase, teamAId, aAvg, league),
-      fetchInjuryMeta(espnBase, teamBId, bAvg, league)
+      fetchInjuryMeta(espnBase, teamBId, bAvg, league),
+      fetchRoster(teamAId),
+      fetchRoster(teamBId)
     ]);
+    g_injA = injA; g_injB = injB;
 
     // FIX: _fetchToken comparison removed
     g_massacreFetchContext = {
@@ -11273,6 +11292,7 @@ async function fetchESPN() {
         overall: aStats ? { ...aStats, ftScored10: aStats.scored10 || [], ftAllowed10: aStats.allowed10 || [] } : null,
         q1Scored: aStats?.q1Scored || [], q2Scored: aStats?.q2Scored || [], q3Scored: aStats?.q3Scored || [], q4Scored: aStats?.q4Scored || [],
         q1Allowed: aStats?.q1Allowed || [], q2Allowed: aStats?.q2Allowed || [], q3Allowed: aStats?.q3Allowed || [], q4Allowed: aStats?.q4Allowed || [],
+        roster: rostA || [],
         venue: aVenueStats ? { ...aVenueStats, ftScored10: aVenueStats.scored10 || [], ftAllowed10: aVenueStats.allowed10 || [] } : null,
         ortg10: aStats?.ortg10 || [], drtg10: aStats?.drtg10 || [], pace10: aStats?.pace10 || [],
         lastGameDate: aStats?.lastGameDate || "",
@@ -11286,6 +11306,7 @@ async function fetchESPN() {
         overall: bStats ? { ...bStats, ftScored10: bStats.scored10 || [], ftAllowed10: bStats.allowed10 || [] } : null,
         q1Scored: bStats?.q1Scored || [], q2Scored: bStats?.q2Scored || [], q3Scored: bStats?.q3Scored || [], q4Scored: bStats?.q4Scored || [],
         q1Allowed: bStats?.q1Allowed || [], q2Allowed: bStats?.q2Allowed || [], q3Allowed: bStats?.q3Allowed || [], q4Allowed: bStats?.q4Allowed || [],
+        roster: rostB || [],
         venue: bVenueStats ? { ...bVenueStats, ftScored10: bVenueStats.scored10 || [], ftAllowed10: bVenueStats.allowed10 || [] } : null,
         ortg10: bStats?.ortg10 || [], drtg10: bStats?.drtg10 || [], pace10: bStats?.pace10 || [],
         lastGameDate: bStats?.lastGameDate || "",
@@ -11683,6 +11704,9 @@ function getMarketKeyFromName(name) {
   if (n.startsWith("Q4 Total")) return "q4";
   if (n.startsWith("Team A Total")) return "team_a";
   if (n.startsWith("Team B Total")) return "team_b";
+  if (n.startsWith("HT/FT")) return "htft";
+  if (n.startsWith("Winning Margin")) return "margin";
+  if (n.startsWith("Highest Quarter")) return "high_q";
   return "other";
 }
 
@@ -13644,9 +13668,36 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const q3 = computeQ("q3", parseMarketLine(document.getElementById("q3Market")?.value));
     const q4 = computeQ("q4", parseMarketLine(document.getElementById("q4Market")?.value));
 
+    function getPlayerMilestones(side) {
+      const roster = g_massacreFetchContext[side].roster || [];
+      const oppDRtg = side === "A" ? avgOrNaN(g_massacreFetchContext.B.drtg10) : avgOrNaN(g_massacreFetchContext.A.drtg10);
+      const paceAdj = (ftCalc.pace || 100) / 100;
+      const results = [];
+      
+      roster.forEach(p => {
+        if (p.ppg < 5) return;
+        const adjP = p.ppg * paceAdj * (oppDRtg > 115 ? 1.05 : 0.95);
+        const adjR = p.rpg * paceAdj;
+        const adjA = p.apg * paceAdj;
+        
+        // Triple Double Check
+        if (p.ppg > 15 && p.rpg > 7 && p.apg > 7) {
+          results.push({ name: `${p.name} Triple Double`, pick: (adjP > 10 && adjR > 10 && adjA > 10) ? "YES" : "NO", grade: "B" });
+        }
+        // Double Double Check
+        if ((p.ppg > 10 && p.rpg > 8) || (p.ppg > 10 && p.apg > 8)) {
+           results.push({ name: `${p.name} Double Double`, pick: (adjP > 10 && (adjR > 10 || adjA > 10)) ? "YES" : "NO", grade: "A" });
+        }
+      });
+      return results;
+    }
+
+    const milA = getPlayerMilestones("A"); const milB = getPlayerMilestones("B");
+    const playerPicks = [...milA, ...milB].map((m, i) => ({
+      _idx: 100 + i, name: m.name, marketKey: "player", marketType: "other", league, context: {}, line: 0, proj: 0, edge: 0, pick: m.pick, confidence: m.grade, note: "Matchup vs DRtg Adjusted"
+    }));
+
     const picks = [
-  {
-    _idx: 0,
     name: "FT Total" + ftBadge,
     marketKey: "ft",
     marketType: "ft",
@@ -13723,6 +13774,60 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     confidence: bConfidence,
     note: ftNote,
     fullModel: ftCalc.teamFullModel
+  },
+  {
+    _idx: 20,
+    name: "HT/FT Double",
+    marketKey: "htft",
+    marketType: "other",
+    league,
+    proj: 0,
+    edge: 0,
+    pick: (function() {
+      const h1Winner = h1Calc.h1Proj > h1Line ? "A" : "B";
+      const ftWinner = ftCalc.projAFT > ftCalc.projBFT ? "A" : "B";
+      return (h1Winner === "A" ? "Home" : "Away") + "/" + (ftWinner === "A" ? "Home" : "Away");
+    })(),
+    confidence: "B",
+    note: "Calculated from Period Projections"
+  },
+  {
+    _idx: 21,
+    name: "Winning Margin",
+    marketKey: "margin",
+    marketType: "other",
+    league,
+    proj: Math.abs(ftCalc.projAFT - ftCalc.projBFT),
+    edge: 0,
+    pick: (function() {
+      const diff = ftCalc.projAFT - ftCalc.projBFT;
+      const winner = diff > 0 ? "Home" : "Away";
+      const abs = Math.abs(diff);
+      if (abs <= 5) return winner + " 1-5";
+      if (abs <= 10) return winner + " 6-10";
+      if (abs <= 15) return winner + " 11-15";
+      if (abs <= 20) return winner + " 16-20";
+      return winner + " 21+";
+    })(),
+    confidence: "C",
+    note: "Probable Margin Band"
+  },
+  {
+    _idx: 22,
+    name: "Highest Scoring Quarter",
+    marketKey: "high_q",
+    marketType: "other",
+    league,
+    proj: 0,
+    edge: 0,
+    pick: (function() {
+      const qs = [q1?.proj || 0, q2?.proj || 0, q3?.proj || 0, q4?.proj || 0];
+      const max = Math.max(...qs);
+      const qIdx = qs.indexOf(max) + 1;
+      return "Quarter " + qIdx;
+    })(),
+    confidence: "C",
+    note: "Projected Max Volume"
   }
 ];
 
