@@ -7069,10 +7069,9 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
       if (archivedSettled && !activeSettled) return;
 
             if (archivedSettled && activeSettled) {
-        // 🛡️ TIMING FIX: Prioritize settledAt so the 10-hour lock starts when the game finishes
-        const _archiveTs = Date.parse(archivedPick.settledAt || archivedPick.eventDate || archivedPick.createdAt || '') || 0; 
-        const _cutoffMs  = 10 * 60 * 60 * 1000; // 10 HOURS EXACTLY
-        if (_archiveTs > 0 && (Date.now() - _archiveTs) >= _cutoffMs) return;
+        const _archiveTs = safeParseDate(archivedPick.settledAt || archivedPick.eventDate || archivedPick.createdAt); 
+        const _cutoffMs  = 10 * 60 * 60 * 1000;
+        if (_archiveTs === 0 || (Date.now() - _archiveTs) >= _cutoffMs) return;
         const preferred = choosePreferredBucketPick(pick, archivedPick);
         if (preferred === archivedPick) return;
       }
@@ -7134,23 +7133,23 @@ function archiveExpiredTrackedPicks() {
   const moveToArchived = [];
   let changed = false;
 
-  active.forEach(pick => {
-    const p = ensureTrackedPickKeys({ ...pick });
-    const isSettled = ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase());
-    
-    // 🛡️ TIMING FIX: Start the archive clock from settledAt, not eventDate
-    const refTs = Date.parse(p.settledAt || p.eventDate || p.createdAt || '') || 0;
-    const isExpired = refTs > 0 && (now - refTs) >= cutoffMs;
+        active.forEach(pick => {
+        const p = ensureTrackedPickKeys({ ...pick });
+        const isSettled = ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase());
+        
+        const gameTs = safeParseDate(p.eventDate) || safeParseDate(p.createdAt) || 0;
+        const refTs = safeParseDate(p.settledAt) || gameTs;
+        
+        const isExpired = refTs === 0 || (now - refTs) >= cutoffMs;
+        const isGhost = gameTs > 0 && (now - gameTs) / (1000 * 60 * 60 * 24) > 7;
 
-    // 🚨 PRISON GATE: Must be SETTLED AND EXPIRED (10 hours) to leave active picks.
-    if (isSettled && isExpired) {
-
-      moveToArchived.push(stripHeavyData(p));
-      changed = true;
-    } else {
-      keepActive.push(p);
-    }
-  });
+        if ((isSettled && isExpired) || isGhost) {
+          moveToArchived.push(stripHeavyData(p));
+          changed = true;
+        } else {
+          keepActive.push(p);
+        }
+      });
 
   if (changed) {
     const seen = new Set(archived.map(p => makeTrackedSignature(p)));
@@ -7170,6 +7169,15 @@ function archiveExpiredTrackedPicks() {
 
 
 
+function safeParseDate(val) {
+  if (!val) return 0;
+  let ms = Date.parse(String(val));
+  if (Number.isFinite(ms) && ms > 0) return ms;
+  ms = Date.parse(String(val).replace(/-/g, '/').replace('T', ' '));
+  if (Number.isFinite(ms) && ms > 0) return ms;
+  return 0;
+}
+
 function makeTrackedSignature(pick) {
       return [
         pick.eventId || "",
@@ -7186,7 +7194,6 @@ function makeTrackedSignature(pick) {
 function getTrackedPickTimeMs(pick) {
   if (!pick) return 0;
 
-  // FIX: Only use fixed timestamps so the 10-hour clock doesn't reset on sync
   const candidates = [
     pick.settledAt,
     pick.eventDate,
@@ -7195,8 +7202,8 @@ function getTrackedPickTimeMs(pick) {
 
   for (const raw of candidates) {
     if (!raw) continue;
-    const ms = Date.parse(String(raw));
-    if (Number.isFinite(ms) && ms > 0) return ms;
+    const ms = safeParseDate(raw);
+    if (ms > 0) return ms;
   }
 
   return 0;
@@ -7209,15 +7216,18 @@ function getTrackedPickTimeMs(pick) {
 function isTrackedPickVisibleOnPage(pick) {
   if (!pick) return false;
   const status = String(pick.resultStatus || "pending").toLowerCase();
+  const now = Date.now();
+  
+  const gameTs = safeParseDate(pick.eventDate) || safeParseDate(pick.createdAt) || safeParseDate(pick.settledAt);
+  if (!gameTs) return false;
+  
+  if ((now - gameTs) / (1000 * 60 * 60 * 24) > 7) return false;
 
   if (status === "pending") {
-    const gameTs = Date.parse(pick.eventDate || pick.createdAt || '') || 0;
-    if (!gameTs) return false;
-    return (Date.now() - gameTs) / (1000 * 60 * 60) < 48; 
+    return (now - gameTs) / (1000 * 60 * 60) < 48; 
   } else {
-    const finishTs = Date.parse(pick.settledAt || pick.eventDate || pick.createdAt || '') || 0;
-    if (!finishTs) return true;
-    return (Date.now() - finishTs) / (1000 * 60 * 60) < 10;
+    const finishTs = safeParseDate(pick.settledAt) || gameTs;
+    return (now - finishTs) / (1000 * 60 * 60) < 10;
   }
 }
 
