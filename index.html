@@ -2652,6 +2652,15 @@ body.dark-mode .tracker-analytics-section-head {
   <div><label>1H Team B</label><input id="h1TeamBMarket" placeholder="53.5" /></div>
 </div>
 
+<div style="margin-top: 6px;">
+  <label>Highest Q Total Line</label>
+  <input id="highQTotalMarket" placeholder="62.5" />
+</div>
+<div style="margin-top: 6px;">
+  <label>Race to X Points (Range)</label>
+  <input id="racePointsMarket" placeholder="20 - 50" />
+</div>
+
 </div>
 <div class="section" id="teamASection">
   <h3>Team A - Last 5 Overall <span class="autofill-indicator" id="aAutoTag">✅ Auto-filled</span></h3>
@@ -11434,7 +11443,9 @@ function validateInputs(league) {
       h2Line: parseSoftLine("h2Market"), aLine: parseSoftLine("teamAMarket"),
       bLine: parseSoftLine("teamBMarket"),
       q1aLine: parseSoftLine("q1TeamAMarket"), q1bLine: parseSoftLine("q1TeamBMarket"),
-      h1aLine: parseSoftLine("h1TeamAMarket"), h1bLine: parseSoftLine("h1TeamBMarket")
+      h1aLine: parseSoftLine("h1TeamAMarket"), h1bLine: parseSoftLine("h1TeamBMarket"),
+      highQLine: parseSoftLine("highQTotalMarket"),
+      raceRange: (document.getElementById("racePointsMarket")?.value || "")
     }
   };
 }
@@ -11705,21 +11716,16 @@ function formatEdge(edge, line) {
   return (pct > 0 ? "+" : "") + pct.toFixed(2) + "%";
 }
 
-function getMarketKeyFromName(name) {
+function getMarketKeyFromName(name, marketKeyOverride) {
+  if (marketKeyOverride === "player") return "player";
   const n = String(name || "");
   if (n.startsWith("Winner & Total")) return "w_ou";
   if (n.startsWith("Race to")) return "race";
-  if (n.startsWith("Home to lead")) return "h_lead10";
-  if (n.startsWith("Away to lead")) return "a_lead10";
-  if (n.startsWith("Max Scoring Run")) return "runs";
-  if (n.startsWith("Team with Max Run")) return "max_run_team";
-  if (n.startsWith("Team to lead")) return "lead15";
   if (n.startsWith("1H Individual")) return "h1_teams";
   if (n.startsWith("Q1 Individual")) return "q1_teams";
-  if (n.startsWith("Q1 Winner")) return "q1w";
-  if (n.startsWith("1H Winner")) return "h1w";
   if (n.startsWith("Highest Scoring Quarter")) return "high_q";
   if (n.startsWith("Lowest Scoring Quarter")) return "low_q";
+  if (n.startsWith("Highest Q Total")) return "high_q_ou";
   if (n.startsWith("FT Total")) return "ft";
   if (n.startsWith("1H Total")) return "h1";
   if (n.startsWith("2H Total")) return "h2";
@@ -13287,7 +13293,9 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     }
     row.appendChild(tdPred);
 
-    const payload = buildTrackedPickPayload({ pickRow: p, isLock, fixtureMeta, league, diagnostics });
+    const marketKeyFromLogic = getMarketKeyFromName(p.name, p.marketKey);
+    const pickWithCorrectKey = { ...p, marketKey: marketKeyFromLogic };
+    const payload = buildTrackedPickPayload({ pickRow: pickWithCorrectKey, isLock, fixtureMeta, league, diagnostics });
     if (payload) tracked.push(payload);
   });
   return tracked;
@@ -13704,33 +13712,57 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     
     const projDiff = ftCalc.projAFT - ftCalc.projBFT;
 
-    function getPlayerMilestones(side) {
-      const roster = g_massacreFetchContext[side].roster || [];
-      const oppDRtg = side === "A" ? avgOrNaN(g_massacreFetchContext.B.drtg10) : avgOrNaN(g_massacreFetchContext.A.drtg10);
-      const teamNet = side === "A" ? netA : netB;
-      const paceAdj = (ftCalc.pace || 100) / 100;
-      const results = [];
-      roster.slice(0, 5).forEach(p => {
-        const adjP = p.ppg * paceAdj * (oppDRtg > 112 ? 1.06 : 0.96);
-        const adjR = p.rpg * paceAdj * (teamNet < 0 ? 1.04 : 1.0);
-        const adjA = p.apg * paceAdj * (teamNet > 0 ? 1.05 : 0.98);
-        const adj3 = (p.tpm || 0) * paceAdj;
-        if (p.ppg > 15 && p.rpg > 7 && p.apg > 7) results.push({ name: `${p.name} Triple Double`, pick: (adjP > 10 && adjR > 10 && adjA > 10) ? "YES" : "NO", proj: adjP, grade: "B", note: "Category Threat" });
-        if ((p.ppg > 10 && p.rpg > 8) || (p.ppg > 10 && p.apg > 8)) results.push({ name: `${p.name} Double Double`, pick: (adjP > 10 && (adjR > 10 || adjA > 10)) ? "YES" : "NO", proj: adjP, grade: "A", note: "High Volume" });
-        if (adjP > 12) results.push({ name: `${p.name} Points`, pick: "LEAN OVER", proj: adjP, grade: "B", note: "Proj: " + adjP.toFixed(1) });
-        if (adjR > 5) results.push({ name: `${p.name} Rebounds`, pick: "LEAN OVER", proj: adjR, grade: "C", note: "Proj: " + adjR.toFixed(1) });
-        if (adjA > 4) results.push({ name: `${p.name} Assists`, pick: "LEAN OVER", proj: adjA, grade: "C", note: "Proj: " + adjA.toFixed(1) });
-        if (adj3 > 1.5) results.push({ name: `${p.name} 3-Pointers`, pick: "LEAN OVER", proj: adj3, grade: "B", note: "Proj: " + adj3.toFixed(1) });
+    function getPlayerMilestones() {
+      const sides = ["A", "B"];
+      const allPotentials = [];
+
+      sides.forEach(side => {
+        const roster = g_massacreFetchContext[side].roster || [];
+        const oppDRtg = side === "A" ? avgOrNaN(g_massacreFetchContext.B.drtg10) : avgOrNaN(g_massacreFetchContext.A.drtg10);
+        const teamNet = side === "A" ? netA : netB;
+        const paceAdj = (ftCalc.pace || 100) / 100;
+
+        roster.slice(0, 5).forEach(p => {
+          const adjP = p.ppg * paceAdj * (oppDRtg > 112 ? 1.07 : 0.95);
+          const adjR = p.rpg * paceAdj * (teamNet < 0 ? 1.05 : 0.98);
+          const adjA = p.apg * paceAdj * (teamNet > 0 ? 1.06 : 0.97);
+          const adj3 = (p.tpm || 0) * paceAdj;
+
+          // Score by % increase over average to find the "Outlier"
+          if (p.ppg > 8) allPotentials.push({ name: p.name + " Pts", pick: adjP.toFixed(1), score: (adjP - p.ppg) / p.ppg, grade: "B" });
+          if (p.rpg > 3) allPotentials.push({ name: p.name + " Reb", pick: adjR.toFixed(1), score: (adjR - p.rpg) / p.rpg, grade: "C" });
+          if (p.apg > 2) allPotentials.push({ name: p.name + " Ast", pick: adjA.toFixed(1), score: (adjA - p.apg) / p.apg, grade: "C" });
+          if (p.tpm > 1) allPotentials.push({ name: p.name + " 3PM", pick: adj3.toFixed(1), score: (adj3 - p.tpm) / p.tpm, grade: "B" });
+          
+          // Milestone bonuses
+          if (adjP > 9.5 && adjR > 9.5 && adjA > 9.5) allPotentials.push({ name: p.name + " Triple Double", pick: "HIGH PROB", score: 2.0, grade: "A" });
+          else if (adjP > 9.5 && (adjR > 9.5 || adjA > 9.5)) allPotentials.push({ name: p.name + " Double Double", pick: "HIGH PROB", score: 1.5, grade: "A" });
+        });
       });
-      return results;
+
+      // Pick the single strongest outlier
+      const topPick = allPotentials.sort((a,b) => b.score - a.score)[0];
+      return topPick ? [topPick] : [];
     }
 
-    const milA = getPlayerMilestones("A"); const milB = getPlayerMilestones("B");
-    const playerPicks = [...milA, ...milB].map((m, i) => ({
-      _idx: 100 + i, name: m.name, marketKey: "player", marketType: "other", league, context: {}, line: 0, proj: m.proj || 0, edge: 0, pick: m.pick, confidence: m.grade, note: m.note || "Matchup vs DRtg Adjusted"
+    const bestProp = getPlayerMilestones();
+    const playerPicks = bestProp.map((m, i) => ({
+      _idx: 100 + i, 
+      name: "⭐ " + m.name, 
+      marketKey: "player", 
+      marketType: "other", 
+      league, 
+      context: {}, 
+      line: 0, 
+      proj: 0, 
+      edge: 0, 
+      pick: m.pick, 
+      confidence: m.grade, 
+      note: "Top Value Signal"
     }));
 
     const picks = [
+      ...playerPicks,
   {
     _idx: 0,
     name: "FT Total" + ftBadge,
@@ -13867,10 +13899,12 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     pick: (function() {
       const qs = [q1?.proj || 0, q2?.proj || 0, q3?.proj || 0, q4?.proj || 0];
       const max = Math.max(...qs);
-      return max > 0 ? "Quarter " + (qs.indexOf(max) + 1) : "—";
+      const sorted = [...qs].sort((a,b) => b - a);
+      if (sorted[0] - sorted[1] < 0.3) return "Equal";
+      return "Quarter " + (qs.indexOf(max) + 1);
     })(),
     confidence: "C",
-    note: "Max Volume"
+    note: "Max Quarter Winner"
   },
   {
     _idx: 23,
@@ -13881,10 +13915,28 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     pick: (function() {
       const qs = [q1?.proj || 999, q2?.proj || 999, q3?.proj || 999, q4?.proj || 999];
       const min = Math.min(...qs);
-      return min < 999 ? "Quarter " + (qs.indexOf(min) + 1) : "—";
+      const sorted = [...qs].sort((a,b) => a - b);
+      if (sorted[1] - sorted[0] < 0.3) return "Equal";
+      return "Quarter " + (qs.indexOf(min) + 1);
     })(),
     confidence: "C",
-    note: "Min Volume"
+    note: "Min Quarter Winner"
+  },
+  {
+    _idx: 25,
+    name: "Highest Q Total O/U",
+    marketKey: "high_q_ou",
+    marketType: "other",
+    league,
+    pick: (function() {
+      const qs = [q1?.proj || 0, q2?.proj || 0, q3?.proj || 0, q4?.proj || 0];
+      const max = Math.max(...qs);
+      const line = finalLines.highQLine;
+      if (!line) return "MAX: " + max.toFixed(1);
+      return max > line ? "OVER " + line : "UNDER " + line;
+    })(),
+    confidence: "C",
+    note: "Highest Quarter Total"
   },
   {
     _idx: 40,
@@ -13892,30 +13944,55 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     marketKey: "w_ou",
     marketType: "other",
     league,
-    pick: (function(){ const win = projDiff > 0 ? "Home" : "Away"; const ou = ftCalc.ftProj > ftLine ? "OVER" : "UNDER"; return win + " & " + ou; })(),
+    pick: (function(){ 
+      if (ftPick === "NO PLAY" || Math.abs(projDiff) < 1.0) return "NO PLAY";
+      const win = projDiff > 0 ? "Home" : "Away"; 
+      const ou = ftCalc.ftProj > ftLine ? "OVER" : "UNDER"; 
+      return win + " & " + ou; 
+    })(),
     confidence: "B",
-    note: "Combined Logic"
+    note: "Gated Combo Logic"
   },
   {
     _idx: 41,
-    name: "Race to 20 Points",
+    name: "Race to X Points",
     marketKey: "race",
     marketType: "other",
     league,
-    pick: (projDiff > 0 ? "Home" : "Away"),
+    pick: (function() {
+      const range = parseMarketRangeMeta(finalLines.raceRange) || { low: 20, high: 20 };
+      const targets = [20, 30, 40, 50].filter(t => t >= range.low && t <= range.high);
+      if (!targets.length) targets.push(20);
+
+      let bestLine = targets[0];
+      let bestWinner = "—";
+      let maxStrength = -1;
+
+      targets.forEach(line => {
+        let pA, pB;
+        if (line <= 25) {
+          if (!q1) return;
+          pA = q1.projA; pB = q1.projB;
+        } else {
+          if (!h1Calc || isNaN(h1Calc.projA1H)) return;
+          pA = h1Calc.projA1H; pB = h1Calc.projB1H;
+        }
+        
+        const lead = Math.abs(pA - pB);
+        const strength = lead / line;
+        if (strength > maxStrength) {
+          maxStrength = strength;
+          bestLine = line;
+          bestWinner = pA > pB ? "Home" : "Away";
+        }
+      });
+
+      return bestWinner + " " + bestLine;
+    })(),
     confidence: "A",
-    note: "Q1 Momentum"
+    note: "Best Range Choice"
   },
-  {
-    _idx: 43,
-    name: "Team to lead by 15+",
-    marketKey: "lead15",
-    marketType: "other",
-    league,
-    pick: (Math.abs(projDiff) > 8 || Math.max(netA, netB) > 10 ? "YES" : "NO"),
-    confidence: "B",
-    note: "Blowout Indicator"
-  },
+
     {
     _idx: 44,
     name: "Q1 Individual Totals",
@@ -13933,41 +14010,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     confidence: "C",
     note: "Team Q1 Performance"
   },
-  {
-    _idx: 45,
-    name: "Max Scoring Run",
-    marketKey: "runs",
-    marketType: "other",
-    league,
-    pick: (function() {
-       const highNet = Math.max(Math.abs(netA), Math.abs(netB));
-       if (highNet > 12) return "14-0 Run Likely";
-       if (highNet > 7) return "10-0 Run Likely";
-       return "8-0 Run Likely";
-    })(),
-    confidence: "B",
-    note: "Streak Probability"
-  },
-  {
-    _idx: 46,
-    name: "Home to lead by 10+",
-    marketKey: "h_lead10",
-    marketType: "other",
-    league,
-    pick: (netA > 6 || projDiff > 5) ? "YES" : "NO",
-    confidence: "B",
-    note: "Home Lead Prob"
-  },
-  {
-    _idx: 47,
-    name: "Away to lead by 10+",
-    marketKey: "a_lead10",
-    marketType: "other",
-    league,
-    pick: (netB > 6 || projDiff < -5) ? "YES" : "NO",
-    confidence: "B",
-    note: "Away Lead Prob"
-  },
+
+
   {
     _idx: 48,
     name: "1H Individual Totals",
@@ -13985,36 +14029,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     confidence: "B",
     note: "Team 1H Performance"
   },
-  {
-    _idx: 49,
-    name: "Q1 Winner (1X2)",
-    marketKey: "q1w",
-    marketType: "other",
-    league,
-    pick: (netA > netB + 1.5 ? "Home" : netB > netA + 1.5 ? "Away" : "Draw (X)"),
-    confidence: "B",
-    note: "Q1 Moneyline"
-  },
-  {
-    _idx: 50,
-    name: "1H Winner (1X2)",
-    marketKey: "h1w",
-    marketType: "other",
-    league,
-    pick: (netA > netB + 2 ? "Home" : netB > netA + 2 ? "Away" : "Draw (X)"),
-    confidence: "B",
-    note: "1H Moneyline"
-  },
-  {
-    _idx: 51,
-    name: "Team with Max Run",
-    marketKey: "max_run_team",
-    marketType: "other",
-    league,
-    pick: (netA > netB ? "Home Team" : "Away Team"),
-    confidence: "C",
-    note: "Based on Scoring Spikes"
-  }
+
+
 ];
 
     // FIX: Always show Halves for NBA/NCAA, even if lines are empty
