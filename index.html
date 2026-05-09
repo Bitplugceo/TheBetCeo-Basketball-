@@ -3810,7 +3810,7 @@ function syncLineMemoryIntoTrackerState() {
 function saveEngineLineMemory() {
   try {
     // FIX: Strict memory pruning to prevent QuotaExceeded errors
-    const MAX_ENTRIES = 200;
+    const MAX_ENTRIES = 100;
     const MAX_AGE_MS = 48 * 60 * 60 * 1000; // 48 hours
     const now = Date.now();
     let keys = Object.keys(g_engineLineMemory);
@@ -5566,8 +5566,8 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
 
   // 🛡️ MATH FIX: True Hollinger requires opponent ORB to balance.
   // Since we only have 1 team's box score here, we dampen the ORB subtraction 
-  // by 50% to simulate league-average opponent rebounding balancing it out.
-  let possessions = 0.96 * (fga + (0.44 * fta) - (orb * 0.5) + tov);
+  // by 75% to prevent pace warping in high-rebound variance games.
+  let possessions = 0.96 * (fga + (0.44 * fta) - (orb * 0.75) + tov);
 
 
   // Guard: negative or zero possessions means the stat block is unusable.
@@ -9173,10 +9173,8 @@ function applyContextAdjustments(baseProjection, ctx) {
   let adj = 0;
   
   // 🛡️ DATA FIX: Strict NaN guards before mathematical operations
-  const injImpact = Number(ctx.injuryImpact);
-  if (isFinite(injImpact) && injImpact > 0) {
-    adj -= Math.min(injImpact * 0.5, 0.03);
-  }
+  // Injury impact stripped here to prevent double-penalizing (handled via injMult earlier)
+  const injImpact = 0; 
   
   if (ctx.backToBack) adj -= 0.01;
   if (ctx.sosHarder) adj += 0.01;
@@ -9329,8 +9327,8 @@ function applyContextAdjustments(baseProjection, ctx) {
     m && m.pick !== "NO PLAY" && m.pick !== "—" && !isNaN(m.edge) && m.line > 0
   );
 
-  // RULE: Only assign a lock if there is more than 1 valid pick to choose from
-  if (valid.length <= 1) return -1;
+  // RULE: Assign a lock as long as there is at least 1 valid play
+  if (valid.length === 0) return -1;
 
   const getMarketTierBonus = (marketKey) => {
     // CORE: The most reliable, heavily tested markets. They get a massive priority boost.
@@ -10495,13 +10493,13 @@ updateIntelligencePack();
     function stripOTFromScores(scoreA, scoreB, linesA, linesB, regulationPeriods) {
       let sA = scoreA, sB = scoreB;
       if (linesA.length > regulationPeriods && linesB.length > regulationPeriods) {
-        const sumA = linesA.reduce((s, p) => s + readVal(p), 0);
-        const sumB = linesB.reduce((s, p) => s + readVal(p), 0);
-        if (Math.abs(sumA - sA) <= 3 && Math.abs(sumB - sB) <= 3) {
-          let otA = 0, otB = 0;
-          for (let i = regulationPeriods; i < linesA.length; i++) otA += readVal(linesA[i]);
-          for (let i = regulationPeriods; i < linesB.length; i++) otB += readVal(linesB[i]);
-          if (otA > 0 || otB > 0) { sA -= otA; sB -= otB; }
+        let regA = 0, regB = 0;
+        for (let i = 0; i < regulationPeriods; i++) {
+          regA += readVal(linesA[i]);
+          regB += readVal(linesB[i]);
+        }
+        if (regA > 0 && regB > 0) {
+          return [regA, regB];
         }
       }
       return [sA, sB];
@@ -11288,7 +11286,7 @@ async function fetchESPN() {
     async function fetchRoster(teamId) {
       try {
         const data = await proxyFetch(`${espnBase}/teams/${teamId}?enable=roster`);
-        const athletes = data?.team?.athlete || data?.team?.roster || [];
+        const athletes = data?.team?.athletes || data?.team?.roster || [];
         return athletes.map(a => ({
           name: a.displayName,
           ppg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "points")?.displayValue || 0),
@@ -12467,8 +12465,16 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
     workerUrl = URL.createObjectURL(blob); 
     worker = new Worker(workerUrl);
   } catch (err) {
-    console.warn("[BB Engine] Worker blocked (Private Mode/CSP). Reverting to median.");
-    return { overPct: 50, underPct: 50 };
+    console.warn("[BB Engine] Worker blocked (Private Mode/CSP). Running Monte Carlo synchronously.");
+    let overHits = 0;
+    for (let i = 0; i < runs; i++) {
+      let u1 = Math.random(), u2 = Math.random();
+      while (u1 === 0) u1 = Math.random();
+      let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+      if (mean + (safeStdDev * z0) > line) overHits++;
+    }
+    const overPct = (overHits / runs) * 100;
+    return { overPct, underPct: 100 - overPct };
   }
 
 
@@ -13769,8 +13775,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       league, 
       context: {}, 
       line: 0, 
-      proj: 0, 
-      edge: 0, 
+      proj: NaN, 
+      edge: NaN, 
       pick: m.pick, 
       confidence: m.grade, 
       note: "Top Value Signal"
@@ -13863,23 +13869,25 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     marketKey: "htft",
     marketType: "other",
     league,
-    proj: 0,
-    edge: 0,
+    proj: NaN,
+    edge: NaN,
     pick: (function() {
-      const h1Winner = h1Calc.h1Proj > h1Line ? "A" : "B";
-      const ftWinner = ftCalc.projAFT > ftCalc.projBFT ? "A" : "B";
-      return (h1Winner === "A" ? "Home" : "Away") + "/" + (ftWinner === "A" ? "Home" : "Away");
+      if (!isFinite(h1Calc.projA1H) || !isFinite(h1Calc.projB1H) || !isFinite(ftCalc.projAFT) || !isFinite(ftCalc.projBFT)) return "NaN";
+      const h1Win = h1Calc.projA1H > h1Calc.projB1H ? "Home" : "Away";
+      const ftWin = ftCalc.projAFT > ftCalc.projBFT ? "Home" : "Away";
+      return h1Win + "/" + ftWin;
     })(),
     confidence: "B",
     note: "Calculated from Period Projections"
   },
-    {
+  {
     _idx: 21,
     name: "Winning Margin (Team)",
     marketKey: "margin_team",
     marketType: "other",
     league,
     pick: (function(){ 
+      if (!isFinite(projDiff)) return "NaN";
       const w = projDiff > 0 ? "Home" : "Away"; const a = Math.abs(projDiff); 
       if (a <= 5) return w+" by 1-5"; if (a <= 10) return w+" by 6-10"; 
       if (a <= 15) return w+" by 11-15"; if (a <= 20) return w+" by 16-20"; 
@@ -13896,6 +13904,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     marketType: "other",
     league,
     pick: (function(){ 
+      if (!isFinite(projDiff)) return "NaN";
       const a = Math.abs(projDiff); 
       if (a <= 5) return "1-5"; if (a <= 10) return "6-10"; 
       if (a <= 15) return "11-15"; if (a <= 20) return "16-20"; 
@@ -13912,11 +13921,13 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     marketType: "other",
     league,
     pick: (function() {
-      const qs = [q1?.proj || 0, q2?.proj || 0, q3?.proj || 0, q4?.proj || 0];
-      const max = Math.max(...qs);
-      const sorted = [...qs].sort((a,b) => b - a);
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4) return "NaN";
+      const max = Math.max(...validQs);
+      const sorted = [...validQs].sort((a,b) => b - a);
       if (sorted[0] - sorted[1] < 0.3) return "Equal";
-      return "Quarter " + (qs.indexOf(max) + 1);
+      const orig = [q1.proj, q2.proj, q3.proj, q4.proj];
+      return "Quarter " + (orig.indexOf(max) + 1);
     })(),
     confidence: "C",
     note: "Max Quarter Winner"
@@ -13928,11 +13939,13 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     marketType: "other",
     league,
     pick: (function() {
-      const qs = [q1?.proj || 999, q2?.proj || 999, q3?.proj || 999, q4?.proj || 999];
-      const min = Math.min(...qs);
-      const sorted = [...qs].sort((a,b) => a - b);
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4) return "NaN";
+      const min = Math.min(...validQs);
+      const sorted = [...validQs].sort((a,b) => a - b);
       if (sorted[1] - sorted[0] < 0.3) return "Equal";
-      return "Quarter " + (qs.indexOf(min) + 1);
+      const orig = [q1.proj, q2.proj, q3.proj, q4.proj];
+      return "Quarter " + (orig.indexOf(min) + 1);
     })(),
     confidence: "C",
     note: "Min Quarter Winner"
@@ -13944,10 +13957,11 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     marketType: "other",
     league,
     pick: (function() {
-      const qs = [q1?.proj || 0, q2?.proj || 0, q3?.proj || 0, q4?.proj || 0];
-      const max = Math.max(...qs);
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4) return "NaN";
       const line = finalLines.highQLine;
-      if (!line) return "MAX: " + max.toFixed(1);
+      if (!isFinite(line)) return "NaN";
+      const max = Math.max(...validQs);
       return max > line ? "OVER " + line : "UNDER " + line;
     })(),
     confidence: "C",
@@ -13960,10 +13974,11 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     marketType: "other",
     league,
     pick: (function() {
-      const qs = [q1?.proj || 999, q2?.proj || 999, q3?.proj || 999, q4?.proj || 999];
-      const min = Math.min(...qs);
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4) return "NaN";
       const line = finalLines.lowQLine;
-      if (!line) return "MIN: " + min.toFixed(1);
+      if (!isFinite(line)) return "NaN";
+      const min = Math.min(...validQs);
       return min > line ? "OVER " + line : "UNDER " + line;
     })(),
     confidence: "C",
@@ -13976,10 +13991,11 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     marketType: "other",
     league,
     pick: (function(){ 
-      if (ftPick === "NO PLAY" || Math.abs(projDiff) < 1.0) return "NO PLAY";
+      if (ftPick === "NO PLAY" || !isFinite(projDiff) || !isFinite(ftLine)) return "NaN";
+      if (Math.abs(projDiff) < 1.0) return "NO PLAY";
       const win = projDiff > 0 ? "Home" : "Away"; 
       const ou = ftCalc.ftProj > ftLine ? "OVER" : "UNDER"; 
-      return win + " & " + ou; 
+      return win + " & " + ou + " " + ftLine; 
     })(),
     confidence: "B",
     note: "Gated Combo Logic"
@@ -13991,24 +14007,27 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     marketType: "other",
     league,
     pick: (function() {
+      if (!finalLines.raceRange) return "NaN";
       const range = parseMarketRangeMeta(finalLines.raceRange) || { low: 20, high: 20 };
       const targets = [20, 30, 40, 50].filter(t => t >= range.low && t <= range.high);
-      if (!targets.length) targets.push(20);
+      if (!targets.length) return "NaN";
 
       let bestLine = targets[0];
-      let bestWinner = "—";
+      let bestWinner = "NaN";
       let maxStrength = -1;
 
       targets.forEach(line => {
         let pA, pB;
         if (line <= 25) {
-          if (!q1) return;
+          if (!q1 || !isFinite(q1.projA) || !isFinite(q1.projB)) return;
           pA = q1.projA; pB = q1.projB;
         } else {
-          if (!h1Calc || isNaN(h1Calc.projA1H)) return;
+          if (!h1Calc || !isFinite(h1Calc.projA1H) || !isFinite(h1Calc.projB1H)) return;
           pA = h1Calc.projA1H; pB = h1Calc.projB1H;
         }
         
+        if (!isFinite(pA) || !isFinite(pB)) return;
+
         const lead = Math.abs(pA - pB);
         const strength = lead / line;
         if (strength > maxStrength) {
@@ -14018,50 +14037,72 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
         }
       });
 
+      if (bestWinner === "NaN") return "NaN";
       return bestWinner + " " + bestLine;
     })(),
     confidence: "A",
     note: "Best Range Choice"
   },
-
-    {
+  {
     _idx: 44,
-    name: "Q1 Individual Totals",
-    marketKey: "q1_teams",
-    marketType: "other",
+    name: "Team A Q1",
+    marketKey: "q1_team_a",
+    marketType: "team",
     league,
-    pick: (function() {
-      if (!q1) return "—";
-      const pA = q1.projA; const pB = q1.projB;
-      const lA = finalLines.q1aLine; const lB = finalLines.q1bLine;
-      const pickA = lA ? (pA > lA ? "H:OVER" : "H:UNDER") : "H:" + pA.toFixed(1);
-      const pickB = lB ? (pB > lB ? "A:OVER" : "A:UNDER") : "A:" + pB.toFixed(1);
-      return pickA + " | " + pickB;
-    })(),
-    confidence: "C",
-    note: "Team Q1 Performance"
+    context: {},
+    line: finalLines.q1aLine,
+    proj: q1?.projA,
+    edge: finalLines.q1aLine && isFinite(q1?.projA) ? q1.projA - finalLines.q1aLine : NaN,
+    pick: (!finalLines.q1aLine || !isFinite(q1?.projA)) ? "NaN" : getPick(q1.projA - finalLines.q1aLine, finalLines.q1aLine, league, "team", {}),
+    confidence: (!finalLines.q1aLine || !isFinite(q1?.projA)) ? "—" : (q1?.confidence || "—"),
+    note: null,
+    fullModel: false
   },
-
-
+  {
+    _idx: 45,
+    name: "Team B Q1",
+    marketKey: "q1_team_b",
+    marketType: "team",
+    league,
+    context: {},
+    line: finalLines.q1bLine,
+    proj: q1?.projB,
+    edge: finalLines.q1bLine && isFinite(q1?.projB) ? q1.projB - finalLines.q1bLine : NaN,
+    pick: (!finalLines.q1bLine || !isFinite(q1?.projB)) ? "NaN" : getPick(q1.projB - finalLines.q1bLine, finalLines.q1bLine, league, "team", {}),
+    confidence: (!finalLines.q1bLine || !isFinite(q1?.projB)) ? "—" : (q1?.confidence || "—"),
+    note: null,
+    fullModel: false
+  },
   {
     _idx: 48,
-    name: "1H Individual Totals",
-    marketKey: "h1_teams",
-    marketType: "other",
+    name: "Team A 1H",
+    marketKey: "h1_team_a",
+    marketType: "team",
     league,
-    pick: (function() {
-      if (!h1Calc || isNaN(h1Calc.projA1H)) return "—";
-      const pA = h1Calc.projA1H; const pB = h1Calc.projB1H;
-      const lA = finalLines.h1aLine; const lB = finalLines.h1bLine;
-      const pickA = lA ? (pA > lA ? "H:OVER" : "H:UNDER") : "H:" + pA.toFixed(1);
-      const pickB = lB ? (pB > lB ? "A:OVER" : "A:UNDER") : "A:" + pB.toFixed(1);
-      return pickA + " | " + pickB;
-    })(),
-    confidence: "B",
-    note: "Team 1H Performance"
+    context: { teamSc: h1Calc.aS1 },
+    line: finalLines.h1aLine,
+    proj: h1Calc.projA1H,
+    edge: finalLines.h1aLine && isFinite(h1Calc.projA1H) ? h1Calc.projA1H - finalLines.h1aLine : NaN,
+    pick: (!finalLines.h1aLine || !isFinite(h1Calc.projA1H)) ? "NaN" : getPick(h1Calc.projA1H - finalLines.h1aLine, finalLines.h1aLine, league, "team", { teamSc: h1Calc.aS1 }),
+    confidence: (!finalLines.h1aLine || !isFinite(h1Calc.projA1H)) ? "—" : h1Confidence,
+    note: h1Note,
+    fullModel: h1Calc.h1FullModel
   },
-
-
+  {
+    _idx: 49,
+    name: "Team B 1H",
+    marketKey: "h1_team_b",
+    marketType: "team",
+    league,
+    context: { teamSc: h1Calc.bS1 },
+    line: finalLines.h1bLine,
+    proj: h1Calc.projB1H,
+    edge: finalLines.h1bLine && isFinite(h1Calc.projB1H) ? h1Calc.projB1H - finalLines.h1bLine : NaN,
+    pick: (!finalLines.h1bLine || !isFinite(h1Calc.projB1H)) ? "NaN" : getPick(h1Calc.projB1H - finalLines.h1bLine, finalLines.h1bLine, league, "team", { teamSc: h1Calc.bS1 }),
+    confidence: (!finalLines.h1bLine || !isFinite(h1Calc.projB1H)) ? "—" : h1Confidence,
+    note: h1Note,
+    fullModel: h1Calc.h1FullModel
+  }
 ];
 
     if (ftCalc.ftSampleTier === "insufficient") {
@@ -14704,12 +14745,12 @@ function setEngineMode() {
       openSection("leagueSection");
       
       // 🔥 BRUTAL AUTO-SYNC (50ms)
-      // Slams local data to the cloud the millisecond the DOM is ready,
-      // completely locking out any stale cache from the server.
-      setTimeout(() => {
+      // Safely hydrates from the server FIRST, then pushes the merged state,
+      // preventing local race conditions from overwriting Cloudflare.
+      setTimeout(async () => {
         g_trackerSaveFailureCount = 0;
-        forceTrackerSaveNow();
-        refreshTrackerInBackground(true);
+        await refreshTrackerInBackground(true);
+        await forceTrackerSaveNow();
       }, 50);
 
       let _refreshDebounceTimer = null;
