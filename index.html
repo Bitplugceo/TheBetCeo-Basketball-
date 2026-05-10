@@ -9443,9 +9443,23 @@ function applyContextAdjustments(baseProjection, ctx) {
   // ---------------------------------
 
   if (edge < 0) {
-    // Soft under gate only.
-    // Keep the normal threshold/sample/trap flow, but do not hard-veto
-    // a real UNDER just because recent scoring profile is high.
+    const isBig3 = (league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa");
+    
+    // THE ROSTOCK SHIELD: Hard veto for Manual Leagues
+    if (!isBig3) {
+      const scoringSafetyBuffer = 1.02; // 2% buffer
+      
+      // Check Game Total Under
+      if (marketType === "ft" || marketType === "h1" || marketType === "h2") {
+        const teamAvgSum = (context.aSc || 0) + (context.bSc || 0);
+        if (teamAvgSum > (line * scoringSafetyBuffer)) return "NO PLAY";
+      }
+      
+      // Check Team Total Under
+      if (marketType === "team") {
+        if ((context.teamSc || 0) > (line * scoringSafetyBuffer)) return "NO PLAY";
+      }
+    }
   }
 
   return edge > 0 ? "OVER " + displayLine(line) : "UNDER " + displayLine(line);
@@ -12277,7 +12291,13 @@ function getExactFetchedSecondHalfH2HSeries(side, parsed) {
 
 
 function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
-  const supported = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
+  const isBig3 = (league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa");
+  const supported = isBig3;
+
+  // FIX: Force manual leagues to return NaN for 2H to prevent logic conflicts
+  if (!isBig3) {
+    return { h2Proj: NaN, h2Edge: NaN, h2SampleTier: "insufficient", h2Note: "Manual 2H disabled" };
+  }
 
   const a2HS = getManualSeries("A", "h2", parsed);
   const b2HS = getManualSeries("B", "h2", parsed);
@@ -12859,10 +12879,19 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
     : Math.max(0, 100 - (modelRange / getMassacreModelRangeLimit(marketKey)) * 100);
 
   const marketStdDev = (() => {
-    const base =
-      marketKey === "ft" ? (league === "ncaa" ? 14.5 : 13.8) :
-      marketKey === "h1" || marketKey === "h2" ? (league === "ncaa" ? 8.4 : 7.9) :
-      8.0;
+    const isBig3 = (league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa");
+    
+    // THE SURGICAL GATE: Existing math for Big 3, Scaled math for Manuals
+    let base;
+    if (isBig3) {
+      base = marketKey === "ft" ? (league === "ncaa" ? 14.5 : 13.8) :
+             marketKey === "h1" || marketKey === "h2" ? (league === "ncaa" ? 8.4 : 7.9) : 8.0;
+    } else {
+      // Manual Leagues: Scale variance based on the League's scoring baseline (eb)
+      // This prevents "NBA-sized" randomness from ruining manual confidence grades.
+      const eb = LEAGUE_BASES[league] || 160;
+      base = marketKey === "ft" ? (eb * 0.082) : 7.2; 
+    }
 
     const rangeAdj = isFinite(modelRange) ? modelRange * 0.18 : 0;
     const instabilityAdj = stabilityScore < 55 ? 1.2 : stabilityScore < 70 ? 0.6 : 0;
