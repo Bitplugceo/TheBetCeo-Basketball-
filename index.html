@@ -11669,7 +11669,8 @@ function getFixtureSideRole(side) {
   const teamName = normalizeTeamName(document.getElementById(side === "A" ? "teamAName" : "teamBName")?.value || "");
   if (teamName && normalizeTeamName(fixtureMeta?.homeTeam || "") === teamName) return "home";
   if (teamName && normalizeTeamName(fixtureMeta?.awayTeam || "") === teamName) return "away";
-  return "";
+  
+  return side === "A" ? "home" : "away";
 }
 
 function getFetchedSeries(side, scope, marketKey, metric) {
@@ -11992,7 +11993,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
     // FIX 5: Decouple base pace from the raw Vegas total.
     // Assign a true possession baseline based on league norms.
-    const basePace = league === "nba" ? 99.5 : league === "ncaa" ? 67.5 : 80.0;
+    const basePace = league === "nba" ? 99.5 : league === "ncaa" ? 67.5 : (eb / 2.24);
     
     const paceFactorA = (aS + aA) / eb;
     const paceFactorB = (bS + bA) / eb;
@@ -12121,25 +12122,31 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projA1H = (expEffA / 100) * estHalfPace * injMultA;
     projB1H = (expEffB / 100) * estHalfPace * injMultB;
      } else {
-    // FIX 3: 1H Fallback now blends Team's Offense (55%) with Opponent's Defense (45%)
+    // --- SYNTHETIC LEVEL 2 MATH FOR 1H (Aligned with FT Logic) ---
+    const cl = getEffectivePaceClamp(league);
     const avgA1HScored = avgOrNaN(a1HS);
     const avgB1HScored = avgOrNaN(b1HS);
+    const avgA1HAllowed = avgOrNaN(a1HA) || (eb / 4); 
+    const avgB1HAllowed = avgOrNaN(b1HA) || (eb / 4);
+
+    const basePace = league === "nba" ? 99.5 : league === "ncaa" ? 67.5 : (eb / 2.24);
+    const baseHalfPace = basePace / 2;
     
-    // a1HA and b1HA are already fetched securely above for the volatility check
-    const avgA1HAllowed = avgOrNaN(a1HA); 
-    const avgB1HAllowed = avgOrNaN(b1HA);
+    const paceFactorA = (avgA1HScored + avgA1HAllowed) / (eb / 2);
+    const paceFactorB = (avgB1HScored + avgB1HAllowed) / (eb / 2);
+    
+    const dampenedPaceA = 1 + ((paceFactorA - 1) * 0.4);
+    const dampenedPaceB = 1 + ((paceFactorB - 1) * 0.4);
 
-    const baseTeam1H = eb / 4; 
-
-    // Safe fallback if data is missing: use league baseline
-    const aOff = isFinite(avgA1HScored) ? avgA1HScored : baseTeam1H;
-    const bDef = isFinite(avgB1HAllowed) ? avgB1HAllowed : baseTeam1H;
-    const bOff = isFinite(avgB1HScored) ? avgB1HScored : baseTeam1H;
-    const aDef = isFinite(avgA1HAllowed) ? avgA1HAllowed : baseTeam1H;
-
-    // Apply the 55/45 Offense/Defense blend and the injury multiplier
-    projA1H = ((aOff * 0.55) + (bDef * 0.45)) * injMultA;
-    projB1H = ((bOff * 0.55) + (aDef * 0.45)) * injMultB;
+    estHalfPace = clampNumber(baseHalfPace * ((dampenedPaceA + dampenedPaceB) / 2), baseHalfPace * cl.min, baseHalfPace * cl.max);
+    
+    const synOrtgA = (avgA1HScored / (baseHalfPace * dampenedPaceA)) * 100;
+    const synDrtgA = (avgA1HAllowed / (baseHalfPace * dampenedPaceA)) * 100;
+    const synOrtgB = (avgB1HScored / (baseHalfPace * dampenedPaceB)) * 100;
+    const synDrtgB = (avgB1HAllowed / (baseHalfPace * dampenedPaceB)) * 100;
+    
+    projA1H = ((synOrtgA + synDrtgB) / 2 / 100) * estHalfPace * injMultA;
+    projB1H = ((synOrtgB + synDrtgA) / 2 / 100) * estHalfPace * injMultB;
   }
 
 
