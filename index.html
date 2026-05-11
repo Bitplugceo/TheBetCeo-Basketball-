@@ -7478,24 +7478,37 @@ function renderTrackedPicks() {
     const grade = String(p.confidenceGrade || p.confidence || "—").toUpperCase();
     const gradeClass = getConfidenceClass(grade);
     
-    let dualGradeHtml = status === 'pending'
-      ? `<div onclick="settleTrackedPickManual('${p.signature}')" style="cursor:pointer; text-decoration:underline dotted #ccc;" title="Click to settle manually">PENDING</div>`
-      : `<div>${status.toUpperCase()}</div>`;
-
-    if (p.engineResultStatus && p.engineResultStatus !== status && status !== "pending") {
-       dualGradeHtml += `<div style="font-size:8px; color:var(--tracker-subtext); margin-top:2px; font-weight:800; letter-spacing:0.5px;">MID: ${p.engineResultStatus.toUpperCase()}</div>`;
+    let statusHtml = "";
+    if (status === 'pending') {
+      const pId = p.signature.replace(/[^a-z0-9]/gi, '');
+      statusHtml = `
+        <div id="disp-${pId}" onclick="document.getElementById('disp-${pId}').style.display='none'; document.getElementById('act-${pId}').style.display='flex';" style="font-weight:900; cursor:pointer;">PENDING</div>
+        <div id="act-${pId}" style="display:none; flex-direction:column; gap:4px; align-items:center;">
+          <div style="font-size:8px; font-weight:900; opacity:0.5;">SETTLE</div>
+          <div style="display:flex; gap:2px;">
+            <button onclick="settleTrackedPick('${p.signature}', 'win')" class="tracker-manual-btn">W</button>
+            <button onclick="settleTrackedPick('${p.signature}', 'loss')" class="tracker-manual-btn">L</button>
+            <button onclick="settleTrackedPick('${p.signature}', 'push')" class="tracker-manual-btn">P</button>
+          </div>
+          <div style="font-size:8px; text-decoration:underline; cursor:pointer; margin-top:2px; opacity:0.7;" onclick="settleTrackedPickManualFull('${p.signature}')">CUSTOM</div>
+        </div>`;
+    } else {
+      statusHtml = `<div>${status.toUpperCase()}</div>`;
+      if (p.engineResultStatus && p.engineResultStatus !== status) {
+         statusHtml += `<div style="font-size:8px; color:var(--tracker-subtext); margin-top:2px; font-weight:800;">MID: ${p.engineResultStatus.toUpperCase()}</div>`;
+      }
     }
 
     return `
       <tr>
         <td>${safeText(formatTrackedDate(p.createdAt || p.eventDate))}</td>
-<td>${safeText((p.homeTeam || "NaN") + " vs " + (p.awayTeam || "NaN"))}</td>
-        <td>${safeText(String(p.marketName || "NaN").split('<')[0].trim())}</td>
+        <td style="font-weight:900; text-transform:uppercase;">${safeText((p.homeTeam || "—") + " vs " + (p.awayTeam || "—"))}</td>
+        <td style="font-weight:800;">${safeText(String(p.marketName || "—").split('<')[0].trim())}</td>
         <td>${isFinite(p.line) ? safeText(displayLine(p.line)) : "—"}</td>
-        <td style="white-space: nowrap; font-size: 11px;">${safeText(p.predictionText || "NaN")}${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
-        <td class="conf-none" style="font-weight:800;">${safeText(grade)}</td>
+        <td style="white-space: nowrap; font-size: 11px;">${safeText(p.predictionText || "—")}${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
+        <td class="conf-none">${safeText(grade)}</td>
         <td>${safeText(edgeText)}</td>
-        <td class="${statusClass}"><div class="tracker-status-stack">${dualGradeHtml}</div></td>
+        <td class="${statusClass}"><div class="tracker-status-stack">${statusHtml}</div></td>
       </tr>
     `;
   }).join("");
@@ -8704,17 +8717,20 @@ function canManuallySettleTrackedPick(pick) {
 
 
 
-async function settleTrackedPickManual(signature) {
+async function settleTrackedPick(signature, status) {
+  await applyManualSettlementToTrackedPick(signature, status);
+}
+
+async function settleTrackedPickManualFull(signature) {
   const pick = g_trackerState.activePicks.find(p => p.signature === signature);
   if (!pick) return;
-
-  const result = prompt(`Settle: ${pick.homeTeam} vs ${pick.awayTeam}\nType 'W' for Win, 'L' for Loss, or 'P' for Push:`);
-  if (!result) return;
-
-  const statusMap = { 'w': 'win', 'l': 'loss', 'p': 'push', 'win': 'win', 'loss': 'loss', 'push': 'push' };
-  const finalStatus = statusMap[result.toLowerCase()];
-
-  if (!finalStatus) return alert("Invalid entry. Use W, L, or P.");
+  const score = prompt(`Enter score for ${pick.homeTeam} vs ${pick.awayTeam} (e.g. 110-105):`);
+  if (!score) return;
+  const result = prompt("Type 'W' for Win, 'L' for Loss, or 'P' for Push:").toLowerCase();
+  const map = { 'w': 'win', 'l': 'loss', 'p': 'push', 'win': 'win', 'loss': 'loss', 'push': 'push' };
+  const finalStatus = map[result];
+  if (!finalStatus) return alert("Invalid status.");
+  pick.actualScore = score;
   await applyManualSettlementToTrackedPick(signature, finalStatus);
 }
 
@@ -14225,9 +14241,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       });
     }
 
-        // FIX: Strict Market Enforcement based on League Format
-    const includeH1 = isNbaOrNcaa;
-    const includeH2 = isNbaOrNcaa;
+            const includeH1 = isNbaOrNcaa;
     const includeQs = league === "nba" || league === "wnba" || league === "wnba_pre";
     
     const finalPicks = picks.filter(p => {
@@ -14240,6 +14254,16 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       
       return isNbaOrNcaa;
     });
+
+    // Reorder: Move Highest/Lowest Q Totals to be immediately below Team B 1H
+    const orderMap = { 
+      "ft":1, "h1":2, "h2":3, "team_a":4, "team_b":5, 
+      "q1":6, "q2":7, "q3":8, "q4":9, 
+      "q1_team_a":10, "q1_team_b":11, 
+      "h1_team_a":12, "h1_team_b":13, 
+      "high_q_ou":14, "low_q_ou":15 
+    };
+    finalPicks.sort((a, b) => (orderMap[a.marketKey] || 99) - (orderMap[b.marketKey] || 99));
 
     // Reorder: Move Highest/Lowest Q Totals to be immediately below Team B 1H
     const orderMap = { "ft":1, "h1":2, "h2":3, "team_a":4, "team_b":5, "q1":6, "q2":7, "q3":8, "q4":9, "q1_team_a":10, "q1_team_b":11, "h1_team_a":12, "h1_team_b":13, "high_q_ou":14, "low_q_ou":15 };
