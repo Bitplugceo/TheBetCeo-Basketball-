@@ -3359,7 +3359,7 @@ const PICK_RULES = {
 
 
 
-const LEAGUE_BASES = {
+let LEAGUE_BASES = {
   nba: 230, ncaa: 148, wnba: 168, wnba_pre: 164, cebl: 176,
   pba: 196, phil_mpbl: 156, cba: 202, china_nbl: 188, taipei_tpbl: 176,
   bleague: 162, korea_kbl: 164, indonesia_ibl: 154,
@@ -3403,7 +3403,7 @@ const LEAGUE_HOME_EDGE = {
   bal: 1.5, nigeria: 1.8, rwanda: 1.8, fiba_wc: 1.2, fiba_eb: 1.3, fiba_ac: 1.3, unknown: 1.5
 };
 
-const LEAGUE_VOL_LIMITS = {
+let LEAGUE_VOL_LIMITS = {
   nba: 14, ncaa: 11, wnba: 12, wnba_pre: 13, cebl: 12,
   pba: 13, phil_mpbl: 11, cba: 13, china_nbl: 12, taipei_tpbl: 12, bleague: 12, korea_kbl: 12, indonesia_ibl: 11,
   ausnbl: 12, aus_nbl1_central: 13, aus_nbl1_west: 13, aus_nbl1_central_w: 11, aus_big_v_w: 11, nznbl: 11,
@@ -12154,10 +12154,18 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 function deriveSecondHalfSeries(ftSeries, firstHalfSeries) {
   const ft = Array.isArray(ftSeries) ? ftSeries : [];
   const h1 = Array.isArray(firstHalfSeries) ? firstHalfSeries : [];
-  const len = Math.min(ft.length, h1.length);
-  const out = [];
+  
+  if (ft.length === 0 || h1.length === 0 || ft.length !== h1.length) {
+    const avgFT = avgOrNaN(ft);
+    const avgH1 = avgOrNaN(h1);
+    if (isFinite(avgFT) && isFinite(avgH1) && avgFT > avgH1) {
+      return [Math.round((avgFT - avgH1) * 10) / 10];
+    }
+    return [];
+  }
 
-  for (let i = 0; i < len; i++) {
+  const out = [];
+  for (let i = 0; i < ft.length; i++) {
     const v = Number(ft[i]) - Number(h1[i]);
     if (isFinite(v) && v > 0) out.push(Math.round(v * 10) / 10);
   }
@@ -12802,14 +12810,18 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
     : Math.max(0, 100 - (modelRange / getMassacreModelRangeLimit(marketKey)) * 100);
 
   const marketStdDev = (() => {
+    const actualTeamVol = Math.max(Number(pickRow.context?.aVol || 0), Number(pickRow.context?.bVol || 0));
+    
     const base =
       marketKey === "ft" ? (league === "ncaa" ? 14.5 : 13.8) :
       marketKey === "h1" || marketKey === "h2" ? (league === "ncaa" ? 8.4 : 7.9) :
       8.0;
 
+    const blendedBase = actualTeamVol > 0 ? (actualTeamVol * 0.6) + (base * 0.4) : base;
+
     const rangeAdj = isFinite(modelRange) ? modelRange * 0.18 : 0;
     const instabilityAdj = stabilityScore < 55 ? 1.2 : stabilityScore < 70 ? 0.6 : 0;
-    return base + rangeAdj + instabilityAdj;
+    return blendedBase + rangeAdj + instabilityAdj;
   })();
 
   const sim = await runMassacreMonteCarlo(
@@ -13862,6 +13874,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const bBadge = getMicroStreakBadge(ctxB.ftScored10, null, null, null, bLine, true);
 
     function computeQ(qKey, lineVal) {
+      const supported = league === "nba" || league === "wnba" || league === "wnba_pre";
+      if (!supported) return null;
+
       const aS = getManualSeries("A", qKey, parsed); const bS = getManualSeries("B", qKey, parsed);
       const pKeyA = "a" + qKey.toUpperCase() + "Allowed"; const pKeyB = "b" + qKey.toUpperCase() + "Allowed";
       const aA = parsed[pKeyA]?.length ? parsed[pKeyA] : (g_massacreFetchContext.A[qKey + "Allowed"] || []);
@@ -15045,6 +15060,23 @@ try {
 } catch (e) {
   engineDebug("WATCHDOG CRITICAL: Audit engine crash");
 }
+
+async function fetchRemoteConfig() {
+  try {
+    const configUrl = WORKER_BASE_URL + "/config.json"; 
+    const res = await fetch(configUrl, { cache: "no-store" });
+    if (res.ok) {
+      const cloudConfig = await res.json();
+      if (cloudConfig.LEAGUE_BASES) LEAGUE_BASES = { ...LEAGUE_BASES, ...cloudConfig.LEAGUE_BASES };
+      if (cloudConfig.LEAGUE_VOL_LIMITS) LEAGUE_VOL_LIMITS = { ...LEAGUE_VOL_LIMITS, ...cloudConfig.LEAGUE_VOL_LIMITS };
+      engineDebug("WATCHDOG: Remote config loaded from Cloudflare.");
+    }
+  } catch (err) {
+    engineDebug("WATCHDOG: Remote config fetch failed, using local baselines.");
+  }
+}
+
+fetchRemoteConfig();
 
 }); // <-- EXACTLY ONE CLOSING BRACKET HERE.
 </script>
