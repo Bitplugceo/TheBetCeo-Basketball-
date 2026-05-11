@@ -8718,6 +8718,7 @@ function canManuallySettleTrackedPick(pick) {
 
 
 async function settleTrackedPick(signature, status) {
+  if (!confirm(`Confirm: Mark this pick as ${status.toUpperCase()}?`)) return;
   await applyManualSettlementToTrackedPick(signature, status);
 }
 
@@ -8727,15 +8728,15 @@ async function settleTrackedPickManualFull(signature) {
   if (!pick) return;
   
   const score = prompt(`Enter score for ${pick.homeTeam} vs ${pick.awayTeam} (e.g. 110-105):`, pick.actualScore || "");
-  if (score === null) return; 
+  if (score === null) return;
   
   const result = prompt("Type 'W' for Win, 'L' for Loss, 'P' for Push, or 'PENDING' to revert a mistake:", pick.resultStatus || "").toLowerCase();
   if (!result) return;
   
   const map = { 'w': 'win', 'l': 'loss', 'p': 'push', 'win': 'win', 'loss': 'loss', 'push': 'push', 'pending': 'pending' };
   const finalStatus = map[result];
-  
   if (!finalStatus) return alert("Invalid status.");
+  
   pick.actualScore = score;
   await applyManualSettlementToTrackedPick(signature, finalStatus);
 }
@@ -8745,42 +8746,41 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
   if (!signature || !["win", "loss", "push", "pending"].includes(normalizedStatus)) return false;
 
   const nowIso = new Date().toISOString();
-  let changed = false;
   let touchedPick = null;
 
-  ["activePicks", "archivedPicks"].forEach(bucketName => {
-    const bucket = Array.isArray(g_trackerState?.[bucketName]) ? g_trackerState[bucketName] : [];
-    g_trackerState[bucketName] = bucket.map(raw => {
-      const pick = ensureTrackedPickKeys({ ...raw });
-      const pickSignature = makeTrackedSignature(pick);
-
-      if (pickSignature !== signature) return pick;
-
-      touchedPick = pick;
-      changed = true;
-
-            return ensureTrackedPickKeys({
-        ...pick,
-        resultStatus: normalizedStatus,
-        engineResultStatus: normalizedStatus,
-        settledAt: nowIso,
-        updatedAt: nowIso,
-        settlementSource: "manual",
-        manualSettlement: true,
-        manualSettledAt: nowIso
-      });
-    });
+  // 1. Filter out the target pick from both buckets to prevent duplicates
+  const active = g_trackerState.activePicks.filter(p => {
+    if (makeTrackedSignature(p) === signature) { touchedPick = p; return false; }
+    return true;
+  });
+  const archived = g_trackerState.archivedPicks.filter(p => {
+    if (makeTrackedSignature(p) === signature) { touchedPick = p; return false; }
+    return true;
   });
 
-  if (!changed || !touchedPick) return false;
+  if (!touchedPick) return false;
 
-  const reconciled = reconcileTrackerBucketConflicts(
-    Array.isArray(g_trackerState?.activePicks) ? g_trackerState.activePicks : [],
-    Array.isArray(g_trackerState?.archivedPicks) ? g_trackerState.archivedPicks : []
-  );
+  // 2. Apply status updates
+  const updatedPick = ensureTrackedPickKeys({
+    ...touchedPick,
+    resultStatus: normalizedStatus,
+    engineResultStatus: normalizedStatus,
+    settledAt: normalizedStatus === 'pending' ? null : nowIso,
+    updatedAt: nowIso,
+    settlementSource: "manual",
+    manualSettlement: true,
+    manualSettledAt: nowIso
+  });
 
-  g_trackerState.activePicks = reconciled.activePicks.slice(0, TRACKED_PICKS_LIMIT);
-  g_trackerState.archivedPicks = reconciled.archivedPicks.slice(0, TRACKER_ARCHIVED_LIMIT);
+  // 3. Reinsert into the correct bucket (Pending = Active, Settled = Archive)
+  if (normalizedStatus === 'pending') {
+    active.unshift(updatedPick);
+  } else {
+    archived.unshift(updatedPick);
+  }
+
+  g_trackerState.activePicks = active.slice(0, TRACKED_PICKS_LIMIT);
+  g_trackerState.archivedPicks = archived.slice(0, TRACKER_ARCHIVED_LIMIT);
   g_trackerState.updatedAt = nowIso;
 
   rebuildTrackerStats();
