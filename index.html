@@ -6195,7 +6195,7 @@ function trimmedAvg(arr) {
     }
 
     function displayLine(val) {
-      if (val === null || val === undefined || isNaN(val)) return "NaN";
+      if (val === null || val === undefined || isNaN(val) || !isFinite(val)) return "—";
       return (Math.round(val * 2) / 2).toFixed(1);
     }
 
@@ -7018,9 +7018,15 @@ function createEmptyTrackerState() {
 }
 
 function getPendingActivePickCount(state) {
-
   const active = Array.isArray(state?.activePicks) ? state.activePicks : [];
-  return active.filter(p => String(p?.resultStatus || "pending").toLowerCase() === "pending").length;
+  const now = Date.now();
+  // Filter out "Zombie" games older than 48 hours to prevent API deadlock
+  return active.filter(p => {
+    const status = String(p?.resultStatus || "pending").toLowerCase();
+    const gameTs = safeParseDate(p.eventDate || p.createdAt);
+    const isTooOld = gameTs > 0 && (now - gameTs) > (48 * 60 * 60 * 1000);
+    return status === "pending" && !isTooOld;
+  }).length;
 }
 
 function getTrackerActivePickCount(state) {
@@ -7093,8 +7099,21 @@ function resolveTrackedPick(localPick, serverPick) {
 function mergeTrackerStates(localState, serverState) {
   const local = localState || {};
   const server = serverState || {};
+  // Conflict Resolution: Use higher version ID or most recent update timestamp
+  const localTs = safeParseDate(local.updatedAt);
+  const serverTs = safeParseDate(server.updatedAt);
+  const useServerStats = serverTs > localTs;
+
   return {
-    vId: Math.max(local.vId || 1, server.vId || 1),
+    vId: Math.max(local.vId || 1, server.vId || 1) + 1,
+    sId: server.sId || local.sId,
+    activePicks: mergeTrackerActivePicks(local.activePicks, server.activePicks),
+    archivedPicks: mergeTrackerArchivedPicks(local.archivedPicks, server.archivedPicks),
+    stats: useServerStats ? (server.stats || local.stats) : (local.stats || server.stats),
+    updatedAt: new Date().toISOString(),
+    lineMemory: { ...(local.lineMemory || {}), ...(server.lineMemory || {}) }
+  };
+}
     sId: server.sId || local.sId,
     activePicks: mergeTrackerActivePicks(local.activePicks, server.activePicks),
     archivedPicks: mergeTrackerArchivedPicks(local.archivedPicks, server.archivedPicks),
@@ -7593,8 +7612,10 @@ function renderTrackedPicks() {
                 let statusHtml = "";
     if (status === 'pending') {
       const pId = (p.eventId || '') + p.signature.replace(/[^a-z0-9]/gi, '');
+      const gameTs = safeParseDate(p.eventDate || p.createdAt);
+      const isZombie = gameTs > 0 && (Date.now() - gameTs) > (36 * 60 * 60 * 1000);
       statusHtml = `
-        <div id="disp-${pId}" onclick="document.getElementById('disp-${pId}').style.display='none'; document.getElementById('act-${pId}').style.display='flex';" style="font-weight:900; font-size:10px; cursor:pointer; text-decoration:underline dotted #ccc;" title="Click to settle">PENDING</div>
+        <div id="disp-${pId}" onclick="document.getElementById('disp-${pId}').style.display='none'; document.getElementById('act-${pId}').style.display='flex';" style="font-weight:900; font-size:10px; cursor:pointer; text-decoration:underline dotted #ccc; ${isZombie ? 'color:#ff9800;' : ''}" title="${isZombie ? 'Game stale - manual check needed' : 'Click to settle'}">${isZombie ? 'STALE' : 'PENDING'}</div>
         <div id="act-${pId}" style="display:none; flex-direction:column; align-items:center; gap:2px; margin-top:-2px;">
           <div style="font-size:8px; font-weight:900; opacity:0.6; margin-bottom:1px; color:var(--text);">SETTLE</div>
           <button onclick="settleTrackedPick('${p.signature}', 'win')" class="tracker-manual-btn" style="padding:0 !important; width:28px !important; min-width:28px !important; height:16px !important; min-height:16px !important; font-size:9px !important; line-height:16px !important;">W</button>
@@ -13951,9 +13972,9 @@ const { ftLine, h1Line, h2Line, aLine, bLine } = finalLines;
     if (h2Calc.h2SampleTier === "insufficient") h2Pick = "NO PLAY";
     if (h2Calc.h2SampleTier === "thin" && !h2Calc.h2HasH2H) h2Pick = "NO PLAY";
 
-    const ftTrap = ftPick !== "NO PLAY" && detectTrap(ftCalc.ftEdge, ftLine, ftPick, league, "ft", (ftCalc.aVol || 0) + (ftCalc.bVol || 0));
-    const h1Trap = h1Pick !== "NO PLAY" && detectTrap(h1Calc.h1Edge, h1Line, h1Pick, league, "h1", (h1Calc.aVol1 || 0) + (h1Calc.bVol1 || 0));
-    const h2Trap = h2Pick !== "NO PLAY" && detectTrap(h2Calc.h2Edge, h2Line, h2Pick, league, "h2", (h2Calc.aVol2 || 0) + (h2Calc.bVol2 || 0));
+    const ftTrap = ftPick !== "NO PLAY" && isFinite(ftCalc.ftEdge) && detectTrap(ftCalc.ftEdge, ftLine, ftPick, league, "ft", (ftCalc.aVol || 0) + (ftCalc.bVol || 0));
+    const h1Trap = h1Pick !== "NO PLAY" && isFinite(h1Calc.h1Edge) && detectTrap(h1Calc.h1Edge, h1Line, h1Pick, league, "h1", (h1Calc.aVol1 || 0) + (h1Calc.bVol1 || 0));
+    const h2Trap = h2Pick !== "NO PLAY" && isFinite(h2Calc.h2Edge) && detectTrap(h2Calc.h2Edge, h2Line, h2Pick, league, "h2", (h2Calc.aVol2 || 0) + (h2Calc.bVol2 || 0));
     const aTrap = aPick !== "NO PLAY" && detectTrap(ftCalc.aEdge, aLine, aPick, league, "team", ftCalc.aVol || 0);
     const bTrap = bPick !== "NO PLAY" && detectTrap(ftCalc.bEdge, bLine, bPick, league, "team", ftCalc.bVol || 0);
 
