@@ -3885,7 +3885,7 @@ function syncLineMemoryIntoTrackerState() {
 function saveEngineLineMemory() {
   try {
     // FIX: Strict memory pruning to prevent QuotaExceeded errors
-    const MAX_ENTRIES = 100;
+    const MAX_ENTRIES = 400;
     const MAX_AGE_MS = 48 * 60 * 60 * 1000; // 48 hours
     const now = Date.now();
     let keys = Object.keys(g_engineLineMemory);
@@ -6558,7 +6558,17 @@ async function pushTrackerStateToServer(state, isExit = false) {
   renderTrackerAnalytics();
   
   try {
-    const payload = JSON.stringify(state);
+    let stateToPush = state;
+    // Safari 64KB Keepalive Protection: Strip heavy metadata if exiting or too large
+    if (isExit || JSON.stringify(state).length > 60000) {
+      const leanActive = (state.activePicks || []).map(p => {
+        const { diagnostics, ...rest } = p;
+        return rest;
+      });
+      stateToPush = { ...state, activePicks: leanActive, archivedPicks: [], lineMemory: {} };
+    }
+
+    const payload = JSON.stringify(stateToPush);
     const { res, data } = await fetchTrackerJson(TRACKER_API_URL, {
       method: "POST",
       body: payload,
@@ -6767,10 +6777,8 @@ async function refreshTrackerInBackground(forceHydrate = false) {
   } catch (err) {
     engineDebug("WATCHDOG ERROR: Sync cycle interrupted: " + err.message);
   } finally {
-    // Release the lock after a tiny delay to let the network breathe
-    setTimeout(() => {
-      g_refreshTrackedPicksInFlight = false;
-    }, 500);
+    // Release the lock strictly after work is 100% complete
+    g_refreshTrackedPicksInFlight = false;
   }
 }
 
@@ -7584,7 +7592,7 @@ function renderTrackedPicks() {
     
                 let statusHtml = "";
     if (status === 'pending') {
-      const pId = p.signature.replace(/[^a-z0-9]/gi, '');
+      const pId = (p.eventId || '') + p.signature.replace(/[^a-z0-9]/gi, '');
       statusHtml = `
         <div id="disp-${pId}" onclick="document.getElementById('disp-${pId}').style.display='none'; document.getElementById('act-${pId}').style.display='flex';" style="font-weight:900; font-size:10px; cursor:pointer; text-decoration:underline dotted #ccc;" title="Click to settle">PENDING</div>
         <div id="act-${pId}" style="display:none; flex-direction:column; align-items:center; gap:2px; margin-top:-2px;">
@@ -12833,7 +12841,7 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
         while (u1 === 0) u1 = Math.random();
         
         let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-        let simulatedScore = mean + (safeStdDev * z0);
+        let simulatedScore = Math.max(0, mean + (safeStdDev * z0));
         
         if (simulatedScore > line) overHits++;
       }
@@ -15233,7 +15241,7 @@ function setEngineMode() {
       const clearBtn = document.getElementById("clearBtn");
       if (clearBtn) clearBtn.addEventListener("click", clearAll);
 
-      setEngineMode();
+      // setEngineMode is omitted here; initialization handled by manual selection to prevent layout thrashing
 
       makeSectionsCollapsible();
       document.querySelectorAll(".section").forEach(s => {
