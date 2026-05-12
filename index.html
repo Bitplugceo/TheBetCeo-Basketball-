@@ -2771,22 +2771,28 @@ body.dark-mode .tracker-analytics-section-head {
 </div>
 
 <div class="section" id="h2hSection">
-<h3>H2H TEST <span class="autofill-indicator" id="h2hAutoTag">✅ Auto-filled (2024+, OT stripped, expanded matchup history)</span></h3>
+  <h3>H2H TEST <span class="autofill-indicator" id="h2hAutoTag">✅ Auto-filled (2024+, OT stripped, expanded matchup history)</span></h3>
 
-<label id="useFTH2HLabel"><input type="checkbox" id="useFTH2H" /> Use FT H2H (min 2 games)</label>
-<input id="aFTH2H" placeholder="82,78,84,76,82" />
-<input id="bFTH2H" placeholder="79,81,77,80,78" />
-
-  <div id="h2h1HSection" style="display:none;">
-    <label id="use1HH2HLabel"><input type="checkbox" id="use1HH2H" /> Use 1H H2H (min 2 games)</label>
-    <input id="a1HH2H" placeholder="41,39,43,38,41" />
-    <input id="b1HH2H" placeholder="39,41,38,42,39" />
+  <label id="useFTH2HLabel"><input type="checkbox" id="useFTH2H" /> Use FT H2H (min 2 games)</label>
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;">
+    <input id="aFTH2H" placeholder="82,78,84,76,82" />
+    <input id="bFTH2H" placeholder="79,81,77,80,78" />
   </div>
 
-  <div id="h2h2HSection" style="display:none;">
+  <div id="h2h1HSection" style="display:none; margin-top: 6px;">
+    <label id="use1HH2HLabel"><input type="checkbox" id="use1HH2H" /> Use 1H H2H (min 2 games)</label>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;">
+      <input id="a1HH2H" placeholder="41,39,43,38,41" />
+      <input id="b1HH2H" placeholder="39,41,38,42,39" />
+    </div>
+  </div>
+
+  <div id="h2h2HSection" style="display:none; margin-top: 6px;">
     <label><input type="checkbox" id="use2HH2H" /> Use 2H H2H (min 2 games)</label>
-    <input id="a2HH2H" placeholder="43,39,41,38,40" />
-    <input id="b2HH2H" placeholder="38,42,36,40,39" />
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;">
+      <input id="a2HH2H" placeholder="43,39,41,38,40" />
+      <input id="b2HH2H" placeholder="38,42,36,40,39" />
+    </div>
   </div>
 
 </div>
@@ -9447,15 +9453,21 @@ function applyContextAdjustments(baseProjection, ctx) {
   const rules = PICK_RULES[marketType] || PICK_RULES.default;
   const underBlockRatio = rules.underBlockRatio ?? PICK_RULES.default.underBlockRatio;
 
-  const overMin =
+  let overMin =
     marketType === "h2" ? (periodThresholds.h1 + 0.008) :
     (marketType === "h1") ? periodThresholds.h1 :
     Number(rules.over ?? PICK_RULES.default.over);
 
-  const underMin =
+  let underMin =
     marketType === "h2" ? (periodThresholds.h1 + Number(rules.underExtra || 0) + 0.010) :
     (marketType === "h1") ? (periodThresholds.h1 + Number(rules.underExtra || 0)) :
     Number(rules.under ?? PICK_RULES.default.under);
+
+  // --- MICRO-MARKET EDGE BUMP ---
+  if (marketType === "h1" || marketType === "h2") {
+    overMin = Math.max(overMin, 0.08);
+    underMin = Math.max(underMin, 0.08);
+  }
 
   const pct = Math.abs(edge / line);
   if (edge === 0) return "NO PLAY";
@@ -10836,11 +10848,35 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
             }
 
             // LEVEL 2 HIJACK: Advanced Box Score Extraction
-            if (boxscore && boxscore.teams) {
-              const myBox = boxscore.teams.find(t => matchesTeam(t, tId));
-              if (myBox && myBox.statistics) {
-                const sMap = {};
+            if (boxscore) {
+              let sMap = {};
+              const myBox = (boxscore.teams || []).find(t => matchesTeam(t, tId));
+              
+              if (myBox && myBox.statistics && myBox.statistics.length > 0) {
                 myBox.statistics.forEach(s => { sMap[s.name] = s.displayValue; });
+              } else if (boxscore.players) {
+                // Rescue: Hunt down player stats if team stats are missing/corrupted
+                const myPlayers = boxscore.players.find(p => matchesTeam(p, tId));
+                if (myPlayers && myPlayers.statistics && myPlayers.statistics[0] && myPlayers.statistics[0].athletes) {
+                  let fga = 0, fta = 0, orb = 0, tov = 0;
+                  const keys = myPlayers.statistics[0].names || [];
+                  const iFga = keys.indexOf("FGA");
+                  const iFta = keys.indexOf("FTA");
+                  const iOrb = keys.indexOf("OREB");
+                  const iTov = keys.indexOf("TO");
+                  
+                  myPlayers.statistics[0].athletes.forEach(ath => {
+                    const st = ath.stats || [];
+                    if (iFga >= 0) fga += parseFloat(st[iFga]) || 0;
+                    if (iFta >= 0) fta += parseFloat(st[iFta]) || 0;
+                    if (iOrb >= 0) orb += parseFloat(st[iOrb]) || 0;
+                    if (iTov >= 0) tov += parseFloat(st[iTov]) || 0;
+                  });
+                  sMap = { fieldGoals: fga, freeThrows: fta, offensiveRebounds: orb, turnovers: tov };
+                }
+              }
+              
+              if (Object.keys(sMap).length > 0) {
                 const gameMinutes = leagueKey === "nba" ? 48 : 40;
                 const advResult = calculateAdvancedMetrics(sMap, ms, os, gameMinutes);
                 // Only store if valid — null means unusable stat block (negative possessions)
@@ -13787,20 +13823,22 @@ const { ftLine, h1Line, h2Line, aLine, bLine } = finalLines;
       h2: summarizeCalcForDebug(h2Calc)
     });
 
-        let ftPick = getPick(ftCalc.ftEdge, ftLine, league, "ft", { aSc: ftCalc.aS, bSc: ftCalc.bS, blowoutGap: ftCalc.blowoutGap });
-    let h1Pick = getPick(h1Calc.h1Edge, h1Line, league, "h1", { aSc: h1Calc.aS1, bSc: h1Calc.bS1 });
-    // Block NBA 1H when Level 2 advanced data is absent
-const hasLevel2 = (g_massacreFetchContext.A.ortg10?.length >= 2) && 
-                  (g_massacreFetchContext.B.ortg10?.length >= 2);
+                let ftPick = getPick(ftCalc.ftEdge, ftLine, league, "ft", { aSc: ftCalc.aS, bSc: ftCalc.bS, blowoutGap: ftCalc.blowoutGap });
+        let h1Pick = getPick(h1Calc.h1Edge, h1Line, league, "h1", { aSc: h1Calc.aS1, bSc: h1Calc.bS1 });
+        let h2Pick = getPick(h2Calc.h2Edge, h2Line, league, "h2", { aSc: h2Calc.aS2, bSc: h2Calc.bS2 });
+        let aPick = getPick(ftCalc.aEdge, aLine, league, "team", { teamSc: ftCalc.aS, blowoutGap: ftCalc.blowoutGap });
+        let bPick = getPick(ftCalc.bEdge, bLine, league, "team", { teamSc: ftCalc.bS, blowoutGap: ftCalc.blowoutGap });
 
-if (league === "nba" && !hasLevel2) {
-  h1Pick = "NO PLAY";
-}
+        // --- NEW LEVEL 2 SHIELD ---
+        const hasLevel2 = (g_massacreFetchContext.A.ortg10?.length >= 2) && 
+                          (g_massacreFetchContext.B.ortg10?.length >= 2);
 
-    let h2Pick = getPick(h2Calc.h2Edge, h2Line, league, "h2", { aSc: h2Calc.aS2, bSc: h2Calc.bS2 });
-    let aPick = getPick(ftCalc.aEdge, aLine, league, "team", { teamSc: ftCalc.aS, blowoutGap: ftCalc.blowoutGap });
-    let bPick = getPick(ftCalc.bEdge, bLine, league, "team", { teamSc: ftCalc.bS, blowoutGap: ftCalc.blowoutGap });
-
+        if (league === "nba" && !hasLevel2) {
+          h1Pick = "NO PLAY";
+          h2Pick = "NO PLAY";
+          h1Calc.projA1H = NaN;
+          h1Calc.projB1H = NaN;
+        }
 
         if (ftCalc.ftSampleTier === "insufficient") {
       ftPick = "NO PLAY";
@@ -14245,54 +14283,58 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     })(),
     note: "Calculated from Period Projections"
   },
-  {
-    _idx: 21,
-    name: "Winning Margin (Team)",
-    marketKey: "margin_team",
-    marketType: "other",
-    league,
-    pick: (function(){ 
-      if (!isFinite(projDiff)) return "NO PLAY";
-      const w = projDiff > 0 ? "Home" : "Away"; const a = Math.abs(projDiff); 
-      if (a <= 5) return w+" by 1-5"; if (a <= 10) return w+" by 6-10"; 
-      if (a <= 15) return w+" by 11-15"; if (a <= 20) return w+" by 16-20"; 
-      if (a <= 25) return w+" by 21-25"; if (a <= 30) return w+" by 26-30"; 
-      return w+" by 31+"; 
-    })(),
-    confidence: (() => {
-      if (!isFinite(projDiff)) return "—";
-      const a = Math.abs(projDiff);
-      if (a >= 15) return "B";
-      if (a >= 8) return "C";
-      if (a >= 3) return "D";
-      return "—";
-    })(),
-    note: "Specific Team Margin"
-  },
-  {
-    _idx: 24,
-    name: "Winning Margin (Any)",
-    marketKey: "margin_any",
-    marketType: "other",
-    league,
-    pick: (function(){ 
-      if (!isFinite(projDiff)) return "NO PLAY";
-      const a = Math.abs(projDiff); 
-      if (a <= 5) return "1-5"; if (a <= 10) return "6-10"; 
-      if (a <= 15) return "11-15"; if (a <= 20) return "16-20"; 
-      if (a <= 25) return "21-25"; if (a <= 30) return "26-30"; 
-      return "31+"; 
-    })(),
-    confidence: (() => {
-      if (!isFinite(projDiff)) return "—";
-      const a = Math.abs(projDiff);
-      if (a >= 15) return "B";
-      if (a >= 8) return "C";
-      if (a >= 3) return "D";
-      return "—";
-    })(),
-    note: "Any Team Gap"
-  },
+        {
+        _idx: 21,
+        name: "Winning Margin (Team)",
+        marketKey: "margin_team",
+        marketType: "other",
+        league,
+        pick: (function(){ 
+          if (!isFinite(projDiff)) return "NO PLAY";
+          if ((ftCalc.aVol || 0) + (ftCalc.bVol || 0) > 22) return "NO PLAY";
+          const w = projDiff > 0 ? "Home" : "Away"; const a = Math.abs(projDiff); 
+          if (a <= 5) return w+" by 1-5"; if (a <= 10) return w+" by 6-10"; 
+          if (a <= 15) return w+" by 11-15"; if (a <= 20) return w+" by 16-20"; 
+          if (a <= 25) return w+" by 21-25"; if (a <= 30) return w+" by 26-30"; 
+          return w+" by 31+"; 
+        })(),
+        confidence: (() => {
+          if (!isFinite(projDiff)) return "—";
+          if ((ftCalc.aVol || 0) + (ftCalc.bVol || 0) > 22) return "—";
+          const a = Math.abs(projDiff);
+          if (a >= 15) return "B";
+          if (a >= 8) return "C";
+          if (a >= 3) return "D";
+          return "—";
+        })(),
+        note: "Specific Team Margin"
+      },
+      {
+        _idx: 24,
+        name: "Winning Margin (Any)",
+        marketKey: "margin_any",
+        marketType: "other",
+        league,
+        pick: (function(){ 
+          if (!isFinite(projDiff)) return "NO PLAY";
+          if ((ftCalc.aVol || 0) + (ftCalc.bVol || 0) > 22) return "NO PLAY";
+          const a = Math.abs(projDiff); 
+          if (a <= 5) return "1-5"; if (a <= 10) return "6-10"; 
+          if (a <= 15) return "11-15"; if (a <= 20) return "16-20"; 
+          if (a <= 25) return "21-25"; if (a <= 30) return "26-30"; 
+          return "31+"; 
+        })(),
+        confidence: (() => {
+          if (!isFinite(projDiff)) return "—";
+          if ((ftCalc.aVol || 0) + (ftCalc.bVol || 0) > 22) return "—";
+          const a = Math.abs(projDiff);
+          if (a >= 15) return "B";
+          if (a >= 8) return "C";
+          if (a >= 3) return "D";
+          return "—";
+        })(),
+        note: "Any Team Gap"
+      },
   {
     _idx: 22,
     name: "Highest Scoring Quarter",
@@ -14468,6 +14510,19 @@ const finalPicksForDisplay = finalPicks
 
 applySoftTrackerInfluenceToPicks(finalPicksForDisplay, fixtureMeta, phase2Activation);
 applyLeagueTrustToPicks(finalPicksForDisplay, league);
+
+// --- STRICT A/B CONFIDENCE GATE ---
+finalPicksForDisplay.forEach(p => {
+  if (p.pick !== "NO PLAY") {
+    const grade = String(p.confidence || "").replace(/[^ABCD]/g, '').charAt(0);
+    if (grade !== "A" && grade !== "B") {
+      p.pick = "NO PLAY";
+      p.confidence = "—";
+      p.note = "Confidence gate: Lower grades blocked (A & B only)";
+      p.lockRestricted = true;
+    }
+  }
+});
 
 persistLineMemoryFromFinalPicks(finalPicksForDisplay, fixtureMeta, league);
 
@@ -14716,37 +14771,43 @@ if (trackedToSave.length) {
 
       const teamMarketSection = document.getElementById("teamMarketSection");
       if (teamMarketSection) {
-        teamMarketSection.style.gridTemplateColumns = isNbaOrNcaa ? "1fr 1fr" : "1fr";
+        teamMarketSection.style.gridTemplateColumns = "1fr 1fr";
       }
 
       document.getElementById("espnSection").style.display = isNbaOrNcaa ? "block" : "none";
-const qMarketsEl = document.getElementById("qMarketsSection");
-if (qMarketsEl) qMarketsEl.style.display = isQs ? "grid" : "none";
-      document.getElementById("aQSection").style.display = isQs ? "block" : "none";
-      document.getElementById("bQSection").style.display = isQs ? "block" : "none";
+      
+      // Keep Quarters inputs globally accessible
+      const qMarketsEl = document.getElementById("qMarketsSection");
+      if (qMarketsEl) qMarketsEl.style.display = "grid";
+      document.getElementById("aQSection").style.display = "block";
+      document.getElementById("bQSection").style.display = "block";
 
-
-      // 1H/2H stat inputs — NBA/NCAA only (manual leagues derive from FT)
-      ["a1HSection", "b1HSection", "a2HSection", "b2HSection", "h2h1HSection", "h2h2HSection"].forEach(id => {
+      // Keep 1H, H2H inputs globally accessible, but hide 2H Stats for manual leagues
+      ["a1HSection", "b1HSection", "h2h1HSection", "h2h2HSection"].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = "block";
+      });
+      ["a2HSection", "b2HSection"].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.style.display = isNbaOrNcaa ? "block" : "none";
       });
-      // 1H market line — show for ALL leagues
+      
+      // Handle Market Lines (Hide 2H Market for manual)
       const h1h2MarketEl = document.getElementById("h1h2MarketSection");
-      if (h1h2MarketEl) h1h2MarketEl.style.display = league ? "grid" : "none";
-      // Other market sections — NBA/NCAA only
-      ["h1TeamMarketSection", "exoticMarketSection"].forEach(id => {
+      if (h1h2MarketEl) {
+        h1h2MarketEl.style.display = league ? "grid" : "none";
+        h1h2MarketEl.style.gridTemplateColumns = isNbaOrNcaa ? "1fr 1fr" : "1fr";
+        if (h1h2MarketEl.children[1]) h1h2MarketEl.children[1].style.display = isNbaOrNcaa ? "block" : "none";
+      }
+
+      // Other market sections — globally accessible
+      ["h1TeamMarketSection", "exoticMarketSection", "q1q2MarketSection", "q3q4MarketSection", "q1TeamMarketSection"].forEach(id => {
         const el = document.getElementById(id);
-        if (el) el.style.display = isNbaOrNcaa ? "grid" : "none";
+        if (el) el.style.display = "grid";
       });
       
       const highQ = document.getElementById("highQTotalWrapper");
-      if (highQ) highQ.style.display = isNbaOrNcaa ? "block" : "none";
-
-      ["q1q2MarketSection", "q3q4MarketSection", "q1TeamMarketSection"].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) el.style.display = isQs ? "grid" : "none";
-      });
+      if (highQ) highQ.style.display = "block";
 
       if (!isNbaOrNcaa) {
         setFieldValues(FIELD_GROUPS.periodInputs);
