@@ -3420,6 +3420,28 @@ let LEAGUE_VOL_LIMITS = {
   bal: 11, nigeria: 10, rwanda: 10, fiba_wc: 11, fiba_eb: 11, fiba_ac: 11, unknown: 12
 };
 
+const LEAGUE_H1_RATIO = {
+  nba: 0.490, ncaa: 0.490, wnba: 0.490, wnba_pre: 0.490,
+  euroleague: 0.488, eurocup: 0.488, champions_league: 0.488,
+  acb: 0.488, lba: 0.488, bbl: 0.488, turkey_bsl: 0.488,
+  proa: 0.487, bcl: 0.487, isl: 0.487, aba: 0.487, plk: 0.487,
+  lkl: 0.487, prob: 0.487, united_league: 0.488,
+  cba: 0.488, bleague: 0.487, korea_kbl: 0.487, pba: 0.488,
+  ausnbl: 0.488, brazil_nbb: 0.487, argentina_lnb: 0.487,
+  cebl: 0.488, nznbl: 0.488, serbia_kls: 0.487, croatia_premier: 0.487,
+  default: 0.487
+};
+
+function getLeagueH1Ratio(league) {
+  return LEAGUE_H1_RATIO[String(league || "").toLowerCase()] || LEAGUE_H1_RATIO.default;
+}
+
+function deriveH1SeriesFromFT(ftSeries, ratio) {
+  return (ftSeries || [])
+    .map(v => Math.round(Number(v) * ratio * 2) / 2)
+    .filter(v => isFinite(v) && v > 0);
+}
+
 const LEAGUE_TRUST_PROFILES = {
   trusted: [
     "nba", "ncaa", "wnba", "euroleague", "eurocup", "champions_league", 
@@ -12091,21 +12113,48 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
 
 function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
-  const supported = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
-  
-    const a1HS = getManualSeries("A", "h1", parsed);
-  const b1HS = getManualSeries("B", "h1", parsed);
+
+  // Try actual 1H inputs first
+  let a1HS = getManualSeries("A", "h1", parsed);
+  let b1HS = getManualSeries("B", "h1", parsed);
+  let h1Derived = false;
+
+  // No 1H data → derive from FT series using league ratio
+  if (!a1HS.length || !b1HS.length) {
+    const aFTS = getManualSeries("A", "ft", parsed);
+    const bFTS = getManualSeries("B", "ft", parsed);
+    if (aFTS.length >= 2 && bFTS.length >= 2) {
+      const ratio = getLeagueH1Ratio(league);
+      a1HS = deriveH1SeriesFromFT(aFTS, ratio);
+      b1HS = deriveH1SeriesFromFT(bFTS, ratio);
+      h1Derived = true;
+    }
+  }
+
   const sampleTier = getSampleTier(a1HS, b1HS);
 
+  // Fetch or derive allowed series
+  let a1HA = getAllowedSeries("A", "overall", "h1", parsed);
+  let b1HA = getAllowedSeries("B", "overall", "h1", parsed);
+
+  if (h1Derived) {
+    const ratio = getLeagueH1Ratio(league);
+    if (!a1HA.length) {
+      const aFTA = getAllowedSeries("A", "overall", "ft", parsed);
+      if (aFTA.length) a1HA = deriveH1SeriesFromFT(aFTA, ratio);
+    }
+    if (!b1HA.length) {
+      const bFTA = getAllowedSeries("B", "overall", "ft", parsed);
+      if (bFTA.length) b1HA = deriveH1SeriesFromFT(bFTA, ratio);
+    }
+  }
+
   // 1H VOLATILITY CALCULATION
-  const a1HA = getAllowedSeries("A", "overall", "h1", parsed);
-  const b1HA = getAllowedSeries("B", "overall", "h1", parsed);
   const aVol1Series = [...a1HS, ...b1HA].map(Number).filter(v => isFinite(v) && v > 0);
   const aVol1 = aVol1Series.length >= 2 ? stdDev(aVol1Series) : 0;
   const bVol1Series = [...b1HS, ...a1HA].map(Number).filter(v => isFinite(v) && v > 0);
   const bVol1 = bVol1Series.length >= 2 ? stdDev(bVol1Series) : 0;
-
 
   const aORTG = g_massacreFetchContext.A.ortg10 || [];
   const aDRTG = g_massacreFetchContext.A.drtg10 || [];
@@ -12114,10 +12163,12 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const aPace = g_massacreFetchContext.A.pace10 || [];
   const bPace = g_massacreFetchContext.B.pace10 || [];
 
-    // SYNC FIX: Kills the Phantom 115.0 by catching empty data immediately
-  if (!supported || sampleTier === "insufficient") {
-    return { h1Proj: NaN, h1Edge: NaN, h1SampleTier: sampleTier, h1Note: "Insufficient 1H sample" };
+  if (sampleTier === "insufficient") {
+    return { h1Proj: NaN, h1Edge: NaN, h1SampleTier: sampleTier, h1Note: "Insufficient sample — need 2+ FT games", h1Derived: false };
   }
+
+  // Note only for non-derived thin samples (derived thin is normal operation)
+  const note = (sampleTier === "thin" && !h1Derived) ? "Thin 1H sample — projection downgraded" : null;
 
   let projA1H, projB1H, estHalfPace;
 
@@ -12125,37 +12176,41 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const expEffA = (avgOrNaN(aORTG) + avgOrNaN(bDRTG)) / 2;
     const expEffB = (avgOrNaN(bORTG) + avgOrNaN(aDRTG)) / 2;
     const rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
-    estHalfPace = (rawPace / 2); 
+    estHalfPace = rawPace / 2;
     projA1H = (expEffA / 100) * estHalfPace * injMultA;
     projB1H = (expEffB / 100) * estHalfPace * injMultB;
-     } else {
-    // FIX 3: 1H Fallback now blends Team's Offense (55%) with Opponent's Defense (45%)
+  } else {
     const avgA1HScored = avgOrNaN(a1HS);
     const avgB1HScored = avgOrNaN(b1HS);
-    
-    // a1HA and b1HA are already fetched securely above for the volatility check
-    const avgA1HAllowed = avgOrNaN(a1HA); 
+    const avgA1HAllowed = avgOrNaN(a1HA);
     const avgB1HAllowed = avgOrNaN(b1HA);
-
-    const baseTeam1H = eb / 4; 
-
-    // Safe fallback if data is missing: use league baseline
+    const baseTeam1H = eb / 4;
     const aOff = isFinite(avgA1HScored) ? avgA1HScored : baseTeam1H;
     const bDef = isFinite(avgB1HAllowed) ? avgB1HAllowed : baseTeam1H;
     const bOff = isFinite(avgB1HScored) ? avgB1HScored : baseTeam1H;
     const aDef = isFinite(avgA1HAllowed) ? avgA1HAllowed : baseTeam1H;
-
-    // Apply the 55/45 Offense/Defense blend and the injury multiplier
     projA1H = ((aOff * 0.55) + (bDef * 0.45)) * injMultA;
     projB1H = ((bOff * 0.55) + (aDef * 0.45)) * injMultB;
   }
 
+  // H2H injection — also derive 1H H2H from FT H2H when in derived mode
+  let aH2H1 = getH2HSeries("A", "h1", parsed);
+  let bH2H1 = getH2HSeries("B", "h1", parsed);
 
+  if (h1Derived && (!aH2H1.length || !bH2H1.length)) {
+    const aFTH2H = getH2HSeries("A", "ft", parsed);
+    const bFTH2H = getH2HSeries("B", "ft", parsed);
+    if (aFTH2H.length >= 2 && bFTH2H.length >= 2) {
+      const ratio = getLeagueH1Ratio(league);
+      aH2H1 = deriveH1SeriesFromFT(aFTH2H, ratio);
+      bH2H1 = deriveH1SeriesFromFT(bFTH2H, ratio);
+    }
+  }
 
-  // --- H2H INJECTION FOR 1H ---
-  const aH2H1 = getH2HSeries("A", "h1", parsed);
-  const bH2H1 = getH2HSeries("B", "h1", parsed);
-  const h1HasH2H = maybeReadH2HEnabled("h1") && aH2H1.length >= 2 && bH2H1.length >= 2;
+  // For derived mode, use FT H2H checkbox since 1H checkbox is hidden
+  const h1HasH2H = h1Derived
+    ? (maybeReadH2HEnabled("ft") && aH2H1.length >= 2 && bH2H1.length >= 2)
+    : (maybeReadH2HEnabled("h1") && aH2H1.length >= 2 && bH2H1.length >= 2);
 
   if (h1HasH2H) {
     const hw1 = getH2HWeight(aH2H1.length, bH2H1.length, "h1", sampleTier);
@@ -12165,27 +12220,21 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const roleA = getFixtureSideRole("A");
   const homeEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5) / 2;
-  
   const hasVenueData = g_massacreFetchContext.A.venue?.h1Scored10?.length >= 5;
-  
   if (!hasVenueData) {
     if (roleA === "home") { projA1H += (homeEdge / 2); projB1H -= (homeEdge / 2); }
     else if (roleA === "away") { projA1H -= (homeEdge / 2); projB1H += (homeEdge / 2); }
   }
 
-
-            // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
   const h1Vl = getMarketVolLimit(league, "h1");
-  
   if (isFinite(projA1H)) {
     projA1H = applyVolatility(projA1H, aVol1, h1Vl);
-    projA1H = applyContextAdjustments(projA1H, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
+    projA1H = applyContextAdjustments(projA1H, { injuryImpact: 0 });
   }
   if (isFinite(projB1H)) {
     projB1H = applyVolatility(projB1H, bVol1, h1Vl);
-    projB1H = applyContextAdjustments(projB1H, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
+    projB1H = applyContextAdjustments(projB1H, { injuryImpact: 0 });
   }
-
 
   let h1Proj = projA1H + projB1H;
   if (isFinite(h1Proj)) {
@@ -12193,20 +12242,20 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     h1Proj = anchorProjection(h1Proj, lines.h1Line, league, "h1");
   }
 
-
-
-        // FIX 8: Return missing 1H scoring context
-    return {
+  return {
     h1Proj,
     h1Edge: lines.h1Line ? h1Proj - lines.h1Line : NaN,
     h1SampleTier: sampleTier,
     h1HasH2H,
+    h1Note: note,
+    h1ProjectionNote: null,
     aVol1, bVol1,
     h1FullModel: sampleTier === "full" && aORTG.length >= 5,
     paceGapRisk: false,
     aS1: avgOrNaN(a1HS),
     bS1: avgOrNaN(b1HS),
-    projA1H, projB1H
+    projA1H, projB1H,
+    h1Derived
   };
 }
 
@@ -13833,6 +13882,11 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       marketKey: "h1"
     });
 
+    // Derived 1H projections get -1 confidence grade (estimated, not measured)
+    const h1ConfidenceFinal = (h1Calc.h1Derived && h1Confidence !== "NaN")
+      ? bumpConfidenceGrade(h1Confidence, -1)
+      : h1Confidence;
+
     const h2VolLimit = Math.round((LEAGUE_VOL_LIMITS[league] || (league === "nba" ? 14 : 11)) / 2);
 
     const h2Confidence = getConfidenceGrade({
@@ -14044,7 +14098,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     proj: h1Calc.h1Proj,
     edge: h1Calc.h1Edge,
     pick: h1Pick,
-    confidence: h1Confidence,
+    confidence: h1ConfidenceFinal,
     note: h1Note,
     fullModel: h1Calc.h1FullModel
   },
@@ -14369,13 +14423,14 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       });
     }
 
-            const includeH1 = isNbaOrNcaa;
+            const includeH1 = isFinite(h1Line) && h1Line > 0;
     const includeQs = league === "nba" || league === "wnba" || league === "wnba_pre";
     
     const finalPicks = picks.filter(p => {
       if (p.marketKey === "player") return true;
       if (p.marketKey === "ft" || p.marketKey === "team_a" || p.marketKey === "team_b") return true;
-      if (p.marketKey === "h1" || p.marketKey === "h2" || p.marketKey === "h1_team_a" || p.marketKey === "h1_team_b" || p.marketKey === "htft") return includeH1;
+      if (p.marketKey === "h1") return includeH1;
+      if (p.marketKey === "h2" || p.marketKey === "h1_team_a" || p.marketKey === "h1_team_b" || p.marketKey === "htft") return isNbaOrNcaa;
       
       const isQuarterMarket = p.marketKey.startsWith("q") || p.marketKey.includes("_q") || p.marketKey.includes("q_ou");
       if (isQuarterMarket) return includeQs;
@@ -14663,9 +14718,18 @@ if (qMarketsEl) qMarketsEl.style.display = isQs ? "grid" : "none";
       document.getElementById("bQSection").style.display = isQs ? "block" : "none";
 
 
-      ["a1HSection", "b1HSection", "a2HSection", "b2HSection", "h2h1HSection", "h2h2HSection", "h1h2MarketSection", "h1TeamMarketSection", "exoticMarketSection"].forEach(id => {
+      // 1H/2H stat inputs — NBA/NCAA only (manual leagues derive from FT)
+      ["a1HSection", "b1HSection", "a2HSection", "b2HSection", "h2h1HSection", "h2h2HSection"].forEach(id => {
         const el = document.getElementById(id);
-        if (el) el.style.display = isNbaOrNcaa ? (el.tagName === 'DIV' && el.id.includes('MarketSection') ? "grid" : "block") : "none";
+        if (el) el.style.display = isNbaOrNcaa ? "block" : "none";
+      });
+      // 1H market line — show for ALL leagues
+      const h1h2MarketEl = document.getElementById("h1h2MarketSection");
+      if (h1h2MarketEl) h1h2MarketEl.style.display = league ? "grid" : "none";
+      // Other market sections — NBA/NCAA only
+      ["h1TeamMarketSection", "exoticMarketSection"].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = isNbaOrNcaa ? "grid" : "none";
       });
       
       const highQ = document.getElementById("highQTotalWrapper");
