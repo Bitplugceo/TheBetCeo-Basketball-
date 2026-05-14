@@ -3763,7 +3763,7 @@ If proof is absent, this section must be skipped completely.
 Any suggestion made here without proof is an audit error.
 */
     const TRACKED_PICKS_LIMIT = 500;
-const TRACKER_ARCHIVED_LIMIT = 2000;
+const TRACKER_ARCHIVED_LIMIT = 400;
 const TRACKER_ARCHIVE_AFTER_HOURS = 10;
 const TRACKER_API_URL = WORKER_BASE_URL + "/cloud-sync";
 
@@ -7288,7 +7288,7 @@ function archiveExpiredTrackedPicks() {
       if (sig && !seen.has(sig)) { seen.add(sig); archived.unshift(p); }
     });
     g_trackerState.activePicks = keepActive;
-    g_trackerState.archivedPicks = archived.slice(0, 2000);
+    g_trackerState.archivedPicks = archived.slice(0, TRACKER_ARCHIVED_LIMIT);
     rebuildTrackerStats();
     saveTrackerStateToLocal();
   }
@@ -7554,6 +7554,7 @@ function renderTrackedPicks() {
   emptyEl.style.display = "none";
   wrapEl.style.display = "block";
 
+  requestAnimationFrame(() => {
       bodyEl.innerHTML = displayPicks.map(p => {
     const status = String(p.resultStatus || "pending").toLowerCase();
     const statusClass = status === "win" ? "track-win" : status === "loss" ? "track-loss" : status === "push" ? "track-push" : "track-pending";
@@ -7596,6 +7597,7 @@ function renderTrackedPicks() {
       </tr>
     `;
   }).join("");
+  });
 }
 
 
@@ -8745,6 +8747,13 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
         lockRestricted = true;
         reasons.push("team no-play caution");
       }
+    }
+
+    // FIX: Double-Penalty Shield (Don't downgrade if League Trust is already going to penalize)
+    const trustMeta = getLeagueTrustMeta(p.league);
+    if (trustMeta.mode !== "full" && confidenceShift < 0) {
+      confidenceShift = 0; // Cancel the tracker penalty, trust gate will handle it
+      reasons.push("tracker penalty skipped (advisory league)");
     }
 
     if (advisoryOnly) {
@@ -10908,16 +10917,18 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
             }
 
             // LEVEL 2 HIJACK: Advanced Box Score Extraction
-            if (boxscore) {
+            if (boxscore && typeof boxscore === 'object') {
               let sMap = {};
-              const myBox = (boxscore.teams || []).find(t => matchesTeam(t, tId));
+              const safeTeams = Array.isArray(boxscore.teams) ? boxscore.teams : [];
+              const myBox = safeTeams.find(t => matchesTeam(t, tId));
               
-              if (myBox && myBox.statistics && myBox.statistics.length > 0) {
+              if (myBox && Array.isArray(myBox.statistics) && myBox.statistics.length > 0) {
                 myBox.statistics.forEach(s => { sMap[s.name] = s.displayValue; });
-              } else if (boxscore.players) {
+              } else if (Array.isArray(boxscore.players)) {
                 // Rescue: Hunt down player stats if team stats are missing/corrupted
-                const myPlayers = boxscore.players.find(p => matchesTeam(p, tId));
-                if (myPlayers && myPlayers.statistics && myPlayers.statistics[0] && myPlayers.statistics[0].athletes) {
+                const safePlayers = boxscore.players || [];
+                const myPlayers = safePlayers.find(p => matchesTeam(p, tId));
+                if (myPlayers && Array.isArray(myPlayers.statistics) && myPlayers.statistics[0] && Array.isArray(myPlayers.statistics[0].athletes)) {
                   let fga = 0, fta = 0, orb = 0, tov = 0;
                   const keys = myPlayers.statistics[0].names || [];
                   const iFga = keys.indexOf("FGA");
