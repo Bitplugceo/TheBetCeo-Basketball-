@@ -3157,7 +3157,81 @@ const CACHE_MAX = 120;
 // FIX 12 & 3 & 8: Global Namespace, Timeouts & Archiving Limits
 const BB_CONFIG = {
   limits: { activePicks: 500, archivePruneDays: 90 },
-  timeouts: { fetch: 15000 }
+  timeouts: { fetch: 15000 },
+  version: "Path-A-FINAL-v2"
+};
+
+/**
+ * FIX 1: ROBUST ESPN ADAPTER (FINAL)
+ * Central shield protecting all math calculations from ESPN API changes.
+ */
+const MatchupAdapter = {
+  standardizeEvent: (ev, targetTeamId) => {
+    try {
+      const comp = ev?.competitions?.[0] || ev;
+      if (!comp) return null;
+
+      const status = comp?.status?.type;
+      const competitors = comp?.competitors || [];
+
+      const mine = competitors.find(x => matchesTeam(x, targetTeamId)) || competitors[0];
+      const opp = competitors.find(x => !matchesTeam(x, targetTeamId)) || competitors[1];
+
+      const parseScore = (s) => {
+        if (s == null) return 0;
+        return typeof s === "object" ? parseFloat(s.value ?? s.displayValue ?? 0) : parseFloat(s || 0);
+      };
+
+      return {
+        id: String(ev.id || ""),
+        date: ev.date || "",
+        isFinal: !!(status?.completed || status?.name === "STATUS_FINAL" || status?.state === "post"),
+        venue: mine?.homeAway || "",
+        scores: {
+          mine: parseScore(mine?.score),
+          opp: parseScore(opp?.score),
+          mineLines: (mine?.linescores || []).map(l => parseScore(l)),
+          oppLines: (opp?.linescores || []).map(l => parseScore(l))
+        }
+      };
+    } catch (e) {
+      engineDebug("Adapter Error", e.message);
+      return null;
+    }
+  },
+
+  standardizeBoxscore: (data, targetTeamId, leagueKey) => {
+    try {
+      const box = data?.boxscore;
+      const teams = Array.isArray(box?.teams) ? box.teams : [];
+      const myBox = teams.find(t => matchesTeam(t, targetTeamId));
+      if (!myBox || !myBox.statistics) return null;
+
+      const sMap = {};
+      myBox.statistics.forEach(s => { sMap[s.name] = s.displayValue; });
+
+      const gameMinutes = leagueKey === "nba" ? 48 : 40;
+      return typeof calculateAdvancedMetrics === "function" 
+        ? calculateAdvancedMetrics(sMap, 0, 0, gameMinutes) 
+        : null;
+    } catch (e) {
+      return null;
+    }
+  }
+};
+
+/**
+ * FIX 4: MATH UNIT TEST SUITE
+ */
+const ENGINE_TEST_SUITE = {
+  run: () => {
+    console.log("--- PATH A UNIT TESTS ---");
+    const w = getDynamicWeights("full", 5, "nba");
+    console.log(Math.abs((w.teamWeight + w.oppWeight) - 1.0) < 0.001 ? "✅ Weights OK" : "❌ Weights Broken");
+
+    const a = anchorProjection(220, 210, "nba", "ft");
+    console.log(a < 220 ? "✅ Anchor OK" : "❌ Anchor Broken");
+  }
 };
 
             // Fix 11: Dynamic Calibration System (Replaces Magic Numbers)
@@ -10825,30 +10899,16 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
 
         const events = r?.events || r?.team?.schedule?.events || [];
         for (const ev of events) {
-          if (!ev?.id) continue;
-
-          const comp = ev?.competitions?.[0];
-          if (!comp) continue;
-
-          const done =
-            comp?.status?.type?.completed ||
-            comp?.status?.type?.name === "STATUS_FINAL" ||
-            comp?.status?.type?.state === "post";
-
-          if (!done || (comp?.competitors || []).length < 2) continue;
-
-          const competitors = comp.competitors;
-          const mine = competitors.find(x => matchesTeam(x, tId)) || competitors[0];
-          const opp = competitors.find(x => !matchesTeam(x, tId)) || competitors[1];
-          const ps = s => typeof s === "object" ? parseFloat(s.value ?? s.displayValue ?? 0) : parseFloat(s);
-
-          gameRefs.push({
-            id: String(ev.id),
-            date: ev.date || "",
-            rawS: ps(mine?.score),
-            rawA: ps(opp?.score),
-            venue: mine?.homeAway || ""
-          });
+          const standard = MatchupAdapter.standardizeEvent(ev, tId);
+          if (standard && standard.isFinal) {
+            gameRefs.push({
+              id: standard.id,
+              date: standard.date,
+              rawS: standard.scores.mine,
+              rawA: standard.scores.opp,
+              venue: standard.venue
+            });
+          }
         }
       } catch (e) {
         logDebug("fetchScheduleCore failed", e);
@@ -11428,14 +11488,15 @@ return isPreGame;
 }
 
 async function fetchESPN() {
-  const league = document.getElementById("leagueSelect").value;
-  const teamAName = document.getElementById("teamAName").value.trim();
-  const teamBName = document.getElementById("teamBName").value.trim();
+  try {
+    const league = document.getElementById("leagueSelect").value;
+    const teamAName = document.getElementById("teamAName").value.trim();
+    const teamBName = document.getElementById("teamBName").value.trim();
 
-  if (!teamAName || !teamBName) {
-    setStatusText("❌ Enter both team names first.", "err");
-    return;
-  }
+    if (!teamAName || !teamBName) {
+      setStatusText("❌ Enter both team names first.", "err");
+      return;
+    }
   if (league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa") {
     setStatusText("❌ ESPN auto-fetch is NBA, WNBA & NCAA only.", "err");
     return;
@@ -11725,9 +11786,10 @@ async function fetchESPN() {
     setStatusHTML(compactFetchStatus ? `<div>${compactFetchStatus}</div>` : "", allGood && !fetchAuditIssues.length ? "ok" : "err");
 
   } catch (e) {
+    engineDebug("Fetch Error Boundary", e.message);
     if (e.name !== 'AbortError') {
       setFetchAuditIssues([e.message]);
-      setStatusText("❌ " + e.message, "err");
+      setStatusText("❌ Fetch failed. Check AFDB for details.", "err");
     }
   } finally {
     unlockFetchBtn();
@@ -13826,7 +13888,8 @@ async function runEngine() {
   const runBtn = document.getElementById("runBtn");
   const table = document.getElementById("results");
 
-  g_engineDebugLog = [];
+  try {
+    g_engineDebugLog = [];
     acknowledgeGlobalEngineAlert();
   renderEngineDebugPanel();
   if (runBtn) runBtn.disabled = true;
@@ -14912,6 +14975,7 @@ if (trackedToSave.length) {
 
     setTimeout(() => {
       const rect = table.getBoundingClientRect();
+      if (!rect) return;
       const isInView = (rect.top >= 0 && rect.bottom <= window.innerHeight);
       if (!isInView) {
         table.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -14919,12 +14983,11 @@ if (trackedToSave.length) {
     }, 300);
 
   } catch (err) {
-    console.error("[BB Engine] runEngine failed", err);
-    engineDebug("run failed", { error: String(err?.message || err) });
+    engineDebug("ENGINE BOUNDARY", { msg: err.message });
     if (table) {
       table.style.display = "table";
-      table.innerHTML = "<tr><th>Pick</th><th>Projection</th><th>Edge</th><th>Model Grade</th><th>Prediction</th></tr>";
-      showRunError(table, "⚠ Unexpected engine error. Check the latest edit.");
+      table.innerHTML = "<tr><th colspan='5' style='background:#333;color:#ffcf73;'>⚠️ CALCULATION INTERRUPTED</th></tr>";
+      showRunError(table, "Data anomaly detected. Review inputs and try again.");
     }
   } finally {
     engineDebug("run finally", { trackerState: getTrackerStateDebugScore(g_trackerState) });
