@@ -3154,24 +3154,26 @@ const WORKER_BASE_URL = String(WORKER_URL || "").replace(/\/+$/, "");
 const DEBUG = false;
 const CACHE_MAX = 120;
 
+// FIX 12 & 3 & 8: Global Namespace, Timeouts & Archiving Limits
+const BB_CONFIG = {
+  limits: { activePicks: 500, archivePruneDays: 90 },
+  timeouts: { fetch: 15000 }
+};
+
             // Fix 11: Dynamic Calibration System (Replaces Magic Numbers)
     function getDynamicWeights(sampleTier, volatility, league) {
       const isFull = sampleTier === "full";
       const isHighVol = volatility > (LEAGUE_VOL_LIMITS[league] || 12);
       
       // Base confidence starts at 0.60 for full samples, drops for thin/volatile
-      let teamWeight = isFull ? 0.65 : 0.50;
-      if (isHighVol) teamWeight -= 0.10;
+      let teamWeight = clampNumber(isFull ? 0.65 : 0.50 - (isHighVol ? 0.10 : 0), 0.40, 0.75);
 
-      // 🛡️ MATH FIX: Ensure weights always sum to 1.0 (Normalization)
-      teamWeight = clampNumber(teamWeight, 0.40, 0.75);
-      const oppWeight = 1.0 - teamWeight;
-
-      // Regression to mean: High volatility forces a move toward the baseline
-      const baselineWeight = isHighVol ? 0.25 : 0.10;
-      const regressionWeight = 1.0 - baselineWeight;
-
-      return { teamWeight, oppWeight, regressionWeight, baselineWeight };
+      return { 
+        teamWeight, 
+        oppWeight: 1.0 - teamWeight, 
+        regressionWeight: isHighVol ? 0.75 : 0.90, 
+        baselineWeight: isHighVol ? 0.25 : 0.10 
+      };
     }
 
     // Keep non-math constants here
@@ -3762,7 +3764,7 @@ proven in this exact build.
 If proof is absent, this section must be skipped completely.
 Any suggestion made here without proof is an audit error.
 */
-    const TRACKED_PICKS_LIMIT = 500;
+    const TRACKED_PICKS_LIMIT = BB_CONFIG.limits.activePicks;
 const TRACKER_ARCHIVED_LIMIT = 400;
 const TRACKER_ARCHIVE_AFTER_HOURS = 10;
 const TRACKER_API_URL = WORKER_BASE_URL + "/cloud-sync";
@@ -3863,7 +3865,7 @@ const TRACKER_LOCAL_STATE_PREFIX = "bb_engine_tracker_state_";
 const TRACKER_SAVE_DEBOUNCE_MS = 400;
 const TRACKER_SAVE_RETRY_BASE_MS = 1500;
 const TRACKER_SAVE_RETRY_MAX_MS = 15000;
-const TRACKER_NETWORK_TIMEOUT_MS = 12000;
+const TRACKER_NETWORK_TIMEOUT_MS = BB_CONFIG.timeouts.fetch;
 const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_V3";
 const ENGINE_MODEL_VERSION = "engine_v2_final";
 const TRACKER_LEARNING_ENABLED = true;
@@ -5812,10 +5814,13 @@ Any suggestion made here without proof is an audit error.
             cache: "no-store" 
           });
 
-          if (!res.ok) throw new Error(label + " HTTP " + res.status);
+          if (!res.ok) throw new Error(`${label} HTTP ${res.status}: ${res.statusText}`);
 
           const text = await res.text();
-          try { return JSON.parse(text); } catch (e) { throw new Error(label + " bad JSON: " + text.slice(0, 120)); }
+          try { return JSON.parse(text); } catch (e) { throw new Error(`${label} bad JSON (Length: ${text.length})`); }
+        } catch (e) {
+          if (e.name === 'AbortError') throw new Error(`${label} Timeout after ${timeoutMs/1000}s`);
+          throw e;
         } finally { clearTimeout(timer); }
       }
 
@@ -7260,6 +7265,7 @@ function archiveExpiredTrackedPicks() {
   const keepActive = [];
   const moveToArchived = [];
   let changed = false;
+  const pruneCutoffMs = BB_CONFIG.limits.archivePruneDays * 24 * 60 * 60 * 1000;
 
         active.forEach(pick => {
         const p = ensureTrackedPickKeys({ ...pick });
@@ -7289,7 +7295,12 @@ function archiveExpiredTrackedPicks() {
       if (sig && !seen.has(sig)) { seen.add(sig); archived.unshift(p); }
     });
     g_trackerState.activePicks = keepActive;
-    g_trackerState.archivedPicks = archived.slice(0, TRACKER_ARCHIVED_LIMIT);
+    
+    const now = Date.now();
+    g_trackerState.archivedPicks = archived
+      .filter(p => (now - (safeParseDate(p.eventDate || p.createdAt) || now)) < pruneCutoffMs)
+      .slice(0, TRACKER_ARCHIVED_LIMIT);
+      
     rebuildTrackerStats();
     saveTrackerStateToLocal();
   }
@@ -7523,8 +7534,10 @@ function renderTrackedPicks() {
         "low_q": 19, "high_q": 20 
       };
       return (mktOrderMap[a.marketKey] || 99) - (mktOrderMap[b.marketKey] || 99);
-    })
-    .slice(0, 150); // Cap rendering to keep Safari fast
+    });
+
+  window.__trackerRenderLimit = window.__trackerRenderLimit || 50;
+  const displayPicks = visiblePicks.slice(0, window.__trackerRenderLimit);
 
   rebuildTrackerStats();
   renderTrackerAnalytics();
@@ -7598,6 +7611,16 @@ function renderTrackedPicks() {
       </tr>
     `;
   }).join("");
+
+  if (visiblePicks.length > window.__trackerRenderLimit) {
+    bodyEl.innerHTML += `
+      <tr>
+        <td colspan="8" style="padding:10px; text-align:center;">
+          <button onclick="window.__trackerRenderLimit += 50; renderTrackedPicks();" style="background:#3a404c; color:#fff; border:none; padding:8px 16px; font-weight:bold; cursor:pointer;">Load More</button>
+        </td>
+      </tr>
+    `;
+  }
   });
 }
 
@@ -9402,6 +9425,7 @@ function addTrackedPicks(newPicks) {
     marketType === "h1" ? 0.28 :
     MODEL_TUNING.h2hMaxWeight;
 
+  if (!isFinite(base)) return 0;
   return clampNumber(base, 0, maxCap);
 }
 
@@ -14094,7 +14118,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     });
 
     // Derived 1H projections get -1 confidence grade (estimated, not measured)
-    const h1ConfidenceFinal = (h1Calc.h1Derived && h1Confidence !== "NaN")
+    const h1ConfidenceFinal = (h1Calc.h1Derived && h1Confidence !== "NaN" && h1Confidence !== "—")
       ? bumpConfidenceGrade(h1Confidence, -1)
       : h1Confidence;
 
@@ -14714,7 +14738,7 @@ finalPicksForDisplay.forEach(p => {
       p.pick = "NO PLAY";
       p.displayPick = "NO PLAY";
       p.confidence = "—";
-      p.note = "Confidence gate: Lower grades blocked (A, B & C only)";
+      p.note = "Confidence gate: Lower grades blocked post-massacre";
       p.lockRestricted = true;
     }
   }
@@ -15639,6 +15663,12 @@ ${JSON.stringify({
 ${fullHTML}
 `;
 
+      if (godfatherData.length > 5000000) {
+        alert("⚠️ WARNING: The Godfather Dump exceeds 5MB. This may cause your clipboard to fail. Falling back to direct .txt download.");
+        downloadGodfatherFile(godfatherData, godModeCopyBtn);
+        return;
+      }
+
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(godfatherData).then(() => {
           const originalText = godModeCopyBtn.innerHTML;
@@ -15689,6 +15719,7 @@ const AFDB = (function() {
   let _log = [];
   let _isOpen = false;
   let _showOnlyErrors = true; 
+  let _currentLogLevel = 'ALL';
 
   const LEVELS = {
     BOOT:    { color:'#7aa6ff' }, NET:     { color:'#4ea9ff' },
@@ -15724,7 +15755,9 @@ const AFDB = (function() {
   function clear() { _log = []; _render(); }
 
   function toggleFilter() {
-    _showOnlyErrors = !_showOnlyErrors;
+    const levels = ['ALL', 'ERROR', 'WARN'];
+    _currentLogLevel = levels[(levels.indexOf(_currentLogLevel) + 1) % levels.length];
+    _showOnlyErrors = _currentLogLevel !== 'ALL';
     _render();
   }
 
@@ -15772,7 +15805,7 @@ const AFDB = (function() {
   function _render() {
     const panel = document.getElementById('afdbPanel');
     if (!panel) return;
-    const visibleLogs = _showOnlyErrors ? _log.filter(e => e.level === 'ERROR' || e.level === 'WARN' || e.level === 'VERDICT') : _log;
+    const visibleLogs = _log.filter(e => _currentLogLevel === 'ALL' || e.level === _currentLogLevel || (_currentLogLevel === 'ERROR' && e.level === 'VERDICT') || (_currentLogLevel === 'WARN' && (e.level === 'ERROR' || e.level === 'VERDICT')));
     const logRows = visibleLogs.map(e => {
       const def = LEVELS[e.level]||LEVELS.INFO;
       const icon = ICONS[e.level]||'\u2022';
@@ -15790,7 +15823,7 @@ const AFDB = (function() {
 const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
 
 const emptyMsg = _showOnlyErrors ? 'No suspects arrested. The code is clean.' : 'No log entries yet. Run a fetch.';
-const filterLabel = _showOnlyErrors ? '\ud83d\udc41\ufe0f SHOW ALL' : '\ud83c\udfaf ERRORS ONLY';
+const filterLabel = `\ud83c\udfaf LEVEL: ${_currentLogLevel}`;
 
 panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;padding:12px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;flex-shrink:0;"><div style="color:#d4af37;font-size:14px;font-weight:900;letter-spacing:1px;">\ud83d\udd2c AUTO-FETCH DEBUG BRAIN (BB)</div><div style="display:flex;gap:8px;flex-wrap:wrap;">' + headerBtns + '</div></div><div style="display:flex;flex-direction:column;flex:1;overflow-y:auto;background:#0a0a0a;"><div style="flex:1;"><div style="padding:10px 12px;background:#111;color:#d4af37;font-size:11px;font-weight:900;text-transform:uppercase;position:sticky;top:0;z-index:10;border-bottom:1px solid #222;display:flex;justify-content:space-between;align-items:center;"><span>\ud83d\udce1 FETCH & ENGINE LOGS</span><button onclick="AFDB.toggleFilter()" style="background:none;border:none;color:#4ea9ff;font-size:14px;font-weight:bold;cursor:pointer;">' + filterLabel + '</button></div><div style="padding-bottom:15px;">' + (logRows||'<div style="color:#555;font-size:12px;text-align:center;padding:30px;font-weight:bold;">' + emptyMsg + '</div>') + '</div></div></div>';
 
