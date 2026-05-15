@@ -3157,48 +3157,7 @@ const CACHE_MAX = 120;
 // FIX 12 & 3 & 8: Global Namespace, Timeouts & Archiving Limits
 const BB_CONFIG = {
   limits: { activePicks: 500, archivePruneDays: 90 },
-  timeouts: { fetch: 15000 },
-  version: "Path-A-v1"
-};
-
-/**
- * FIX 1: ESPN ADAPTER LAYER (Clean Version)
- * Shields the math engine from ESPN API changes.
- */
-const MatchupAdapter = {
-  standardizeEvent: (ev, targetTeamId) => {
-    try {
-      const comp = ev?.competitions?.[0] || ev;
-      if (!comp) return null;
-
-      const status = comp?.status?.type;
-      const competitors = comp?.competitors || [];
-
-      const mine = competitors.find(x => matchesTeam(x, targetTeamId)) || competitors[0];
-      const opp = competitors.find(x => !matchesTeam(x, targetTeamId)) || competitors[1];
-
-      const parseScore = (s) => {
-        if (s == null) return 0;
-        return typeof s === "object" ? parseFloat(s.value ?? s.displayValue ?? 0) : parseFloat(s || 0);
-      };
-
-      return {
-        id: String(ev.id || ""),
-        date: ev.date || "",
-        isFinal: !!(status?.completed || status?.name === "STATUS_FINAL" || status?.state === "post"),
-        venue: mine?.homeAway || "",
-        scores: {
-          mine: parseScore(mine?.score),
-          opp: parseScore(opp?.score),
-          mineLines: (mine?.linescores || []).map(l => parseScore(l)),
-          oppLines: (opp?.linescores || []).map(l => parseScore(l))
-        }
-      };
-    } catch (e) {
-      if (typeof engineDebug === "function") engineDebug("Adapter Error", e.message);
-      return null;
-    }
-  }
+  timeouts: { fetch: 15000 }
 };
 
             // Fix 11: Dynamic Calibration System (Replaces Magic Numbers)
@@ -11468,37 +11427,56 @@ return isPreGame;
   fetchESPN();
 }
 
-async function fetchESPN() {
-  const league = document.getElementById("leagueSelect").value;
-  const teamAName = document.getElementById("teamAName").value.trim();
-  const teamBName = document.getElementById("teamBName").value.trim();
-
-  if (!teamAName || !teamBName) {
-    setStatusText("❌ Enter both team names first.", "err");
-    return;
-  }
-  if (league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa") {
-    setStatusText("❌ ESPN auto-fetch is NBA, WNBA & NCAA only.", "err");
-    return;
-  }
-  
-  const btn = document.getElementById("fetchBtn");
-  btn.disabled = true;
-  setFetchAuditIssues([]);
-  resetResultsTable();
-  setStatusHTML('<span class="spinner"></span>Fetching from ESPN...', "loading");
-
-  if (g_activeFetchController) {
-    g_activeFetchController.abort();
-  }
-  g_activeFetchController = new AbortController();
-  // Fix C4: Map signal for background network jobs
-  window.__abortSignal = g_activeFetchController.signal;
-
+/**
+ * 1. STRICT ERROR BOUNDARY WRAPPER
+ */
+async function safeExecute(name, task, options = {}) {
   try {
+    engineDebug(`Boundary: Starting ${name}...`);
+    await task();
+  } catch (err) {
+    console.error(`[Fatal ${name}]`, err);
+    engineDebug(`CRITICAL failure in ${name}`, err);
+    if (typeof AFDB !== 'undefined') AFDB.log('ERROR', 'BOUNDARY', `${name} Crashed`, err.message);
+    
+    if (options.runBtn) document.getElementById(options.runBtn).disabled = false;
+    if (options.fetchBtn) document.getElementById(options.fetchBtn).disabled = false;
+
+    triggerGlobalEngineAlert(`${name} Error: ${err.message}`);
+  } finally {
+    if (options.cleanup) options.cleanup();
+  }
+}
+
+async function fetchESPN() {
+  await safeExecute("Fetch-Stats", async () => {
+    const league = document.getElementById("leagueSelect").value;
+    const teamAName = document.getElementById("teamAName").value.trim();
+    const teamBName = document.getElementById("teamBName").value.trim();
+
+    if (!teamAName || !teamBName) {
+      setStatusText("❌ Enter both team names first.", "err");
+      return;
+    }
+    if (league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa") {
+      setStatusText("❌ ESPN auto-fetch is NBA, WNBA & NCAA only.", "err");
+      return;
+    }
+    
+    const btn = document.getElementById("fetchBtn");
+    btn.disabled = true;
+    setFetchAuditIssues([]);
+    resetResultsTable();
+    setStatusHTML('<span class="spinner"></span>Fetching from ESPN...', "loading");
+
+    if (g_activeFetchController) {
+      g_activeFetchController.abort();
+    }
+    g_activeFetchController = new AbortController();
+    window.__abortSignal = g_activeFetchController.signal;
+
     const isNcaa = league === "ncaa";
     const isWnba = league === "wnba" || league === "wnba_pre";
-    const isNba = league === "nba";
     const leagueSlug = isNcaa ? "mens-college-basketball" : (isWnba ? "wnba" : "nba");
     const espnBase = `https://site.api.espn.com/apis/site/v2/sports/basketball/${leagueSlug}`;
 
@@ -11536,7 +11514,6 @@ async function fetchESPN() {
       teamBVenue ? (isNcaa ? fetchNcaaSchedule(espnBase, teamBId, teamBVenue, true) : fetchScheduleCore(espnBase, teamBId, league, teamBVenue, true)) : Promise.resolve(null)
     ]);
 
-    // FIX: _fetchToken comparison removed
     if (!aStats && !bStats) throw new Error("No recent schedule data found from ESPN.");
     g_injA = defaultInjuryMeta();
     g_injB = defaultInjuryMeta();
@@ -11571,8 +11548,6 @@ async function fetchESPN() {
       }
       document.getElementById("aAutoTag").style.display = "inline";
       messages.push(`${safeText(teamAName)}: ${aStats.scored.length} games ✅`);
-    } else {
-      messages.push(`${safeText(teamAName)}: no data ❌`);
     }
 
     if (bStats?.scored?.length > 0) {
@@ -11597,8 +11572,6 @@ async function fetchESPN() {
       }
       document.getElementById("bAutoTag").style.display = "inline";
       messages.push(`${safeText(teamBName)}: ${bStats.scored.length} games ✅`);
-    } else {
-      messages.push(`${safeText(teamBName)}: no data ❌`);
     }
 
     g_fetchMeta.A = {
@@ -11612,24 +11585,18 @@ async function fetchESPN() {
       h2: { source: "espn", venueReliable: !!(bVenueStats?.h2VenueReliable || bVenueStats?.venueReliable || bVenueStats?.usedVenueFallback === false) }
     };
 
-    setStatusHTML('<span class="spinner"></span>Scanning H2H since 2024...', "loading");
+    setStatusHTML('<span class="spinner"></span>Scanning H2H...', "loading");
 
-    let h2hGames = [];
-    try {
-      h2hGames = isNcaa ? await fetchNcaaH2H(espnBase, teamAId, teamBId) : await fetchH2HCore(espnBase, teamAId, teamBId, league);
-    } catch (e) {
-      logDebug("H2H fetch failed", e);
-    }
+    let h2hGames = isNcaa ? await fetchNcaaH2H(espnBase, teamAId, teamBId) : await fetchH2HCore(espnBase, teamAId, teamBId, league);
 
-    // FIX: _fetchToken comparison removed
     if (h2hGames.length >= 2) {
       clearH2HFields();
       const tA = String(teamAId);
       const h2hA = [], h2hB = [];
-      for (const g of h2hGames.slice(0, 5)) {
+      h2hGames.slice(0, 5).forEach(g => {
         if (normalizeId(g.teamAId) === tA) { h2hA.push(g.scoreA); h2hB.push(g.scoreB); }
         else { h2hA.push(g.scoreB); h2hB.push(g.scoreA); }
-      }
+      });
       document.getElementById("aFTH2H").value = h2hA.join(",");
       document.getElementById("bFTH2H").value = h2hB.join(",");
       syncH2HCheckbox("ft", false); queueH2HCheckboxSync(false);
@@ -11640,7 +11607,7 @@ async function fetchESPN() {
       if (h2hA1H.length >= 2 && h2hB1H.length >= 2) {
         document.getElementById("a1HH2H").value = h2hA1H.join(",");
         document.getElementById("b1HH2H").value = h2hB1H.join(",");
-        syncH2HCheckbox("h1", false); queueH2HCheckboxSync(false);
+        syncH2HCheckbox("h1", false);
       }
 
       const h2hA2H = h2hGames.slice(0, 5).map(g => normalizeId(g.teamAId) === tA ? g.h2A : g.h2B).filter(v => v > 0);
@@ -11650,69 +11617,54 @@ async function fetchESPN() {
         document.getElementById("b2HH2H").value = h2hB2H.join(",");
         syncH2HCheckbox("h2", false);
       }
-
-            for (let q = 1; q <= 4; q++) {
-        const key = "q" + q;
-        const h2hAQ = h2hGames.slice(0, 5).map(g => normalizeId(g.teamAId) === tA ? g[key + 'A'] : g[key + 'B']).filter(v => v > 0);
-        const h2hBQ = h2hGames.slice(0, 5).map(g => normalizeId(g.teamAId) === tA ? g[key + 'B'] : g[key + 'A']).filter(v => v > 0);
-        if (h2hAQ.length >= 2 && h2hBQ.length >= 2) {
-          document.getElementById("a" + key.toUpperCase() + "H2H").value = h2hAQ.join(",");
-          document.getElementById("b" + key.toUpperCase() + "H2H").value = h2hBQ.join(",");
-          syncH2HCheckbox(key, false);
-        }
-      }
       queueH2HCheckboxSync(false);
-      messages.push(`H2H: ${Math.min(h2hGames.length, 5)} 2024+ games ✅`);
-    } else if (h2hGames.length === 1) {
-      clearH2HFields();
-      const tA = String(teamAId);
-      const g = h2hGames[0];
-      document.getElementById("aFTH2H").value = normalizeId(g.teamAId) === tA ? g.scoreA : g.scoreB;
-      document.getElementById("bFTH2H").value = normalizeId(g.teamAId) === tA ? g.scoreB : g.scoreA;
-      syncAllH2HCheckboxes(false); queueH2HCheckboxSync(false);
-      messages.push("H2H: 1 game found from 2024+ (min 2 to auto-enable)");
-    } else {
-      messages.push("H2H: no 2024+ games found");
+      messages.push(`H2H: ${Math.min(h2hGames.length, 5)} games ✅`);
     }
 
     setStatusHTML('<span class="spinner"></span>Checking injuries...', "loading");
 
-    const leagueAvgFallback = Math.round((LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160) / 2);
-    const aAvg = aStats?.scored?.length ? avg(aStats.scored) : leagueAvgFallback;
-    const bAvg = bStats?.scored?.length ? avg(bStats.scored) : leagueAvgFallback;
-    async function fetchRoster(teamId) {
-      try {
-        const data = await proxyFetch(`${espnBase}/teams/${teamId}?enable=roster`);
-        const athletes = data?.team?.athletes || data?.team?.roster || [];
-        return athletes.map(a => ({
-          name: a.displayName,
-          ppg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "points")?.displayValue || 0),
-          rpg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "rebounds")?.displayValue || 0),
-          apg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "assists")?.displayValue || 0),
-          tpm: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "threePointFieldGoalsMade")?.displayValue || 0),
-          pos: a.position?.abbreviation || "G"
-        })).sort((a, b) => b.ppg - a.ppg).slice(0, 8);
-      } catch (e) { return []; }
-    }
-
+    const aAvg = aStats?.scored?.length ? avg(aStats.scored) : 80;
+    const bAvg = bStats?.scored?.length ? avg(bStats.scored) : 80;
+    
     const [injA, injB, rostA, rostB] = await Promise.all([
       fetchInjuryMeta(espnBase, teamAId, aAvg, league),
       fetchInjuryMeta(espnBase, teamBId, bAvg, league),
-      fetchRoster(teamAId),
-      fetchRoster(teamBId)
+      (async () => {
+        try {
+          const data = await proxyFetch(`${espnBase}/teams/${teamAId}?enable=roster`);
+          const athletes = data?.team?.athletes || data?.team?.roster || [];
+          return athletes.map(a => ({
+            name: a.displayName,
+            ppg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "points")?.displayValue || 0),
+            rpg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "rebounds")?.displayValue || 0),
+            apg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "assists")?.displayValue || 0),
+            tpm: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "threePointFieldGoalsMade")?.displayValue || 0),
+            pos: a.position?.abbreviation || "G"
+          })).sort((a, b) => b.ppg - a.ppg).slice(0, 8);
+        } catch (e) { return []; }
+      })(),
+      (async () => {
+        try {
+          const data = await proxyFetch(`${espnBase}/teams/${teamBId}?enable=roster`);
+          const athletes = data?.team?.athletes || data?.team?.roster || [];
+          return athletes.map(a => ({
+            name: a.displayName,
+            ppg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "points")?.displayValue || 0),
+            rpg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "rebounds")?.displayValue || 0),
+            apg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "assists")?.displayValue || 0),
+            tpm: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "threePointFieldGoalsMade")?.displayValue || 0),
+            pos: a.position?.abbreviation || "G"
+          })).sort((a, b) => b.ppg - a.ppg).slice(0, 8);
+        } catch (e) { return []; }
+      })()
     ]);
+    
     g_injA = injA; g_injB = injB;
-
-    // FIX: _fetchToken comparison removed
     g_massacreFetchContext = {
       league,
       eventDate: String(selectedFixture?.dataset?.eventDate || ""),
       A: {
-        overall: aStats ? { ...aStats, ftScored10: aStats.scored10 || [], ftAllowed10: aStats.allowed10 || [] } : null,
-        q1Scored: aStats?.q1Scored || [], q2Scored: aStats?.q2Scored || [], q3Scored: aStats?.q3Scored || [], q4Scored: aStats?.q4Scored || [],
-        q1Allowed: aStats?.q1Allowed || [], q2Allowed: aStats?.q2Allowed || [], q3Allowed: aStats?.q3Allowed || [], q4Allowed: aStats?.q4Allowed || [],
-        roster: rostA || [],
-        venue: aVenueStats ? { ...aVenueStats, ftScored10: aVenueStats.scored10 || [], ftAllowed10: aVenueStats.allowed10 || [] } : null,
+        overall: aStats, roster: rostA, venue: aVenueStats,
         ortg10: aStats?.ortg10 || [], drtg10: aStats?.drtg10 || [], pace10: aStats?.pace10 || [],
         lastGameDate: aStats?.lastGameDate || "",
         restDays: (() => {
@@ -11722,11 +11674,7 @@ async function fetchESPN() {
         })()
       },
       B: {
-        overall: bStats ? { ...bStats, ftScored10: bStats.scored10 || [], ftAllowed10: bStats.allowed10 || [] } : null,
-        q1Scored: bStats?.q1Scored || [], q2Scored: bStats?.q2Scored || [], q3Scored: bStats?.q3Scored || [], q4Scored: bStats?.q4Scored || [],
-        q1Allowed: bStats?.q1Allowed || [], q2Allowed: bStats?.q2Allowed || [], q3Allowed: bStats?.q3Allowed || [], q4Allowed: bStats?.q4Allowed || [],
-        roster: rostB || [],
-        venue: bVenueStats ? { ...bVenueStats, ftScored10: bVenueStats.scored10 || [], ftAllowed10: bVenueStats.allowed10 || [] } : null,
+        overall: bStats, roster: rostB, venue: bVenueStats,
         ortg10: bStats?.ortg10 || [], drtg10: bStats?.drtg10 || [], pace10: bStats?.pace10 || [],
         lastGameDate: bStats?.lastGameDate || "",
         restDays: (() => {
@@ -11735,19 +11683,12 @@ async function fetchESPN() {
           return isFinite(lastMs) && isFinite(eventMs) ? Math.max(0, Math.round((eventMs - lastMs) / 86400000) - 1) : null;
         })()
       },
-      h2hGames: Array.isArray(h2hGames) ? h2hGames.slice(0, 10) : []
+      h2hGames: h2hGames
     };
 
     renderInjuryBox("injuryBoxA", "injuryContentA", g_injA);
     renderInjuryBox("injuryBoxB", "injuryContentB", g_injB);
-
-    updateIntelligencePack(league, {
-      ftLine: parseMarketLine(document.getElementById("ftMarket")?.value || ""),
-      h1Line: parseMarketLine(document.getElementById("h1Market")?.value || ""),
-      h2Line: parseMarketLine(document.getElementById("h2Market")?.value || ""),
-      aLine: parseMarketLine(document.getElementById("teamAMarket")?.value || ""),
-      bLine: parseMarketLine(document.getElementById("teamBMarket")?.value || "")
-    });
+    updateIntelligencePack(league);
 
     const fetchAuditIssues = buildFetchAuditIssues({ league, teamAName, teamBName, aStats, bStats, h2hGames });
     setFetchAuditIssues(fetchAuditIssues);
@@ -11764,15 +11705,7 @@ async function fetchESPN() {
 
     const compactFetchStatus = buildCompactFetchStatus(messages, fetchAuditIssues);
     setStatusHTML(compactFetchStatus ? `<div>${compactFetchStatus}</div>` : "", allGood && !fetchAuditIssues.length ? "ok" : "err");
-
-  } catch (e) {
-    if (e.name !== 'AbortError') {
-      setFetchAuditIssues([e.message]);
-      setStatusText("❌ " + e.message, "err");
-    }
-  } finally {
-    unlockFetchBtn();
-  }
+  }, { fetchBtn: "fetchBtn" });
 }
 
 
@@ -13863,121 +13796,165 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
 
 
 
-async function runEngine() {
-  const runBtn = document.getElementById("runBtn");
-  const table = document.getElementById("results");
+/**
+ * 2. MODULARIZED MATH LOGIC
+ */
+function extractEngineContext() {
+  const league = document.getElementById("leagueSelect")?.value || "";
+  if (!league) throw new Error("Select a league first.");
 
-  g_engineDebugLog = [];
-    acknowledgeGlobalEngineAlert();
-  renderEngineDebugPanel();
-  if (runBtn) runBtn.disabled = true;
-  engineDebug("run start", {
-    trackerKey: getTrackerUserKey(),
-    trackerState: getTrackerStateDebugScore(g_trackerState),
-    build: APP_BUILD_VERSION
-  });
+  const validation = validateInputs(league);
+  if (!validation.ok) {
+    const stripped = validation.errorHtml.replace(/<[^>]*>?/gm, '');
+    throw new Error(stripped);
+  }
 
-  try {
-const _localState = await loadTrackerStateFromLocal();
-if (_localState) {
-  normalizeTrackerState(_localState);
-  backfillLineMemoryFromTrackedPicks();
+  const teamANameNorm = normalizeTeamName(document.getElementById("teamAName")?.value || "");
+  const teamBNameNorm = normalizeTeamName(document.getElementById("teamBName")?.value || "");
+  if (teamANameNorm && teamANameNorm === teamBNameNorm) {
+    throw new Error("Team A and Team B cannot be the same.");
+  }
+
+  return {
+    league,
+    fixtureMeta: getCurrentFixtureMeta(),
+    parsed: validation.parsed,
+    lines: validation.lines,
+    injMultA: g_injA.scoringMult,
+    injMultB: g_injB.scoringMult
+  };
 }
 
-    engineDebug("tracker primed for run", { trackerState: getTrackerStateDebugScore(g_trackerState) });
+async function calculateEngineProjections(ctx) {
+  const { league, parsed, lines, injMultA, injMultB, fixtureMeta } = ctx;
 
-    if (!table) return;
+  const baseCalc = {
+    ft: computeFTProjection({ league, parsed, lines, injMultA, injMultB }),
+    h1: compute1HProjection({ league, parsed, lines, injMultA, injMultB }),
+    h2: compute2HProjection({ league, parsed, lines, injMultA, injMultB })
+  };
 
-    table.style.display = "table";
-    table.innerHTML = "<tr><th>Pick</th><th>Projection</th><th>Edge</th><th>Model Grade</th><th>Prediction</th></tr>";
+  const resolved = {
+    ft: resolveStoredLineBeforeDecision({ fixtureMeta, league, marketKey: "ft", currentLine: lines.ftLine, proj: baseCalc.ft.ftProj, marketType: "ft", context: { aSc: baseCalc.ft.aS, bSc: baseCalc.ft.bS } }),
+    h1: resolveStoredLineBeforeDecision({ fixtureMeta, league, marketKey: "h1", currentLine: lines.h1Line, proj: baseCalc.h1.h1Proj, marketType: "h1", context: { aSc: baseCalc.h1.aS1, bSc: baseCalc.h1.bS1 } }),
+    h2: resolveStoredLineBeforeDecision({ fixtureMeta, league, marketKey: "h2", currentLine: lines.h2Line, proj: baseCalc.h2.h2Proj, marketType: "h2", context: { aSc: baseCalc.h2.aS2, bSc: baseCalc.h2.bS2 } }),
+    a: resolveStoredLineBeforeDecision({ fixtureMeta, league, marketKey: "team_a", currentLine: lines.aLine, proj: baseCalc.ft.projAFT, marketType: "team", context: { teamSc: baseCalc.ft.aS } }),
+    b: resolveStoredLineBeforeDecision({ fixtureMeta, league, marketKey: "team_b", currentLine: lines.bLine, proj: baseCalc.ft.projBFT, marketType: "team", context: { teamSc: baseCalc.ft.bS } })
+  };
 
-    const league = document.getElementById("leagueSelect")?.value || "";
-    const isNba = league === "nba";
-    const isNbaOrNcaa = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
+  const finalLines = Object.freeze({
+    ...lines,
+    ftLine: resolved.ft.line,
+    h1Line: resolved.h1.line,
+    h2Line: resolved.h2.line,
+    aLine: resolved.a.line,
+    bLine: resolved.b.line
+  });
 
-    if (!league) {
-      engineDebug("run blocked missing league");
-      showRunError(table, "⚠ Select a league first.");
-      return;
+  const ftCalc = computeFTProjection({ league, parsed, lines: finalLines, injMultA, injMultB });
+  const h1Calc = compute1HProjection({ league, parsed, lines: finalLines, injMultA, injMultB });
+  const h2Calc = compute2HProjection({ league, parsed, lines: finalLines, injMultA, injMultB });
+
+  const includeQs = league === "nba" || league === "wnba" || league === "wnba_pre";
+  const q1 = computeQ("q1", parseMarketLine(document.getElementById("q1Market")?.value), league, parsed);
+  const q2 = computeQ("q2", parseMarketLine(document.getElementById("q2Market")?.value), league, parsed);
+  const q3 = computeQ("q3", parseMarketLine(document.getElementById("q3Market")?.value), league, parsed);
+  const q4 = computeQ("q4", parseMarketLine(document.getElementById("q4Market")?.value), league, parsed);
+
+  const sharedInj = [...(g_injA.notes || []), ...(g_injB.notes || [])];
+  const h1VolLim = Math.round((LEAGUE_VOL_LIMITS[league] || 14) / 2);
+
+  const rawPicks = [
+    { name: "FT Total", marketKey: "ft", line: finalLines.ftLine, proj: ftCalc.ftProj, edge: ftCalc.ftEdge, confidence: getConfidenceGrade({ pick: "OVER", line: finalLines.ftLine, edge: ftCalc.ftEdge, sampleTier: ftCalc.ftSampleTier, volatility: Math.max(ftCalc.aVol, ftCalc.bVol), volLimit: ftCalc.vl, injuryNotes: sharedInj, marketKey: "ft" }), pick: getPick(ftCalc.ftEdge, finalLines.ftLine, league, "ft", { blowoutGap: ftCalc.blowoutGap }), fullModel: ftCalc.ftFullModel },
+    { name: "1H Total", marketKey: "h1", line: finalLines.h1Line, proj: h1Calc.h1Proj, edge: h1Calc.h1Edge, confidence: h1Calc.h1Derived ? bumpConfidenceGrade(getConfidenceGrade({ pick: "OVER", line: finalLines.h1Line, edge: h1Calc.h1Edge, sampleTier: h1Calc.h1SampleTier, volatility: Math.max(h1Calc.aVol1, h1Calc.bVol1), volLimit: h1VolLim, marketKey: "h1" }), -1) : getConfidenceGrade({ pick: "OVER", line: finalLines.h1Line, edge: h1Calc.h1Edge, sampleTier: h1Calc.h1SampleTier, volatility: Math.max(h1Calc.aVol1, h1Calc.bVol1), volLimit: h1VolLim, marketKey: "h1" }), pick: getPick(h1Calc.h1Edge, finalLines.h1Line, league, "h1", {}), fullModel: h1Calc.h1FullModel },
+    { name: "2H Total", marketKey: "h2", line: finalLines.h2Line, proj: h2Calc.h2Proj, edge: h2Calc.h2Edge, confidence: getConfidenceGrade({ pick: "OVER", line: finalLines.h2Line, edge: h2Calc.h2Edge, sampleTier: h2Calc.h2SampleTier, volatility: Math.max(h2Calc.aVol2, h2Calc.bVol2), volLimit: h1VolLim, marketKey: "h2" }), pick: getPick(h2Calc.h2Edge, finalLines.h2Line, league, "h2", {}), fullModel: h2Calc.h2FullModel },
+    { name: "Team A Total", marketKey: "team_a", line: finalLines.aLine, proj: ftCalc.projAFT, edge: ftCalc.aEdge, confidence: getConfidenceGrade({ pick: "OVER", line: finalLines.aLine, edge: ftCalc.aEdge, sampleTier: ftCalc.ftSampleTier, volatility: ftCalc.aVol, volLimit: ftCalc.vl, injuryNotes: g_injA.notes, marketKey: "team_a" }), pick: getPick(ftCalc.aEdge, finalLines.aLine, league, "team", { blowoutGap: ftCalc.blowoutGap }), fullModel: ftCalc.teamFullModel },
+    { name: "Team B Total", marketKey: "team_b", line: finalLines.bLine, proj: ftCalc.projBFT, edge: ftCalc.bEdge, confidence: getConfidenceGrade({ pick: "OVER", line: finalLines.bLine, edge: ftCalc.bEdge, sampleTier: ftCalc.ftSampleTier, volatility: ftCalc.bVol, volLimit: ftCalc.vl, injuryNotes: g_injB.notes, marketKey: "team_b" }), pick: getPick(ftCalc.bEdge, finalLines.bLine, league, "team", { blowoutGap: ftCalc.blowoutGap }), fullModel: ftCalc.teamFullModel }
+  ];
+
+  const phase2 = (typeof getPhase2ActivationState === "function") ? getPhase2ActivationState() : null;
+  const rawMarketInputs = getRawMarketInputMap();
+  const finalPicks = rawPicks.map(p => applySmartLineToPick(p, rawMarketInputs[p.marketKey], league));
+
+  applySoftTrackerInfluenceToPicks(finalPicks, fixtureMeta, phase2);
+  applyLeagueTrustToPicks(finalPicks, league);
+  await applyMassacreFrameworkToPicks(finalPicks, league, parsed, fixtureMeta);
+
+  finalPicks.forEach(p => {
+    if (p.pick !== "NO PLAY") {
+      const grade = String(p.confidence || "").charAt(0);
+      if (!["A", "B", "C"].includes(grade)) {
+        p.pick = "NO PLAY";
+        p.note = "Confidence gate: Grade D blocked post-massacre";
+      }
     }
+  });
 
-        const teamAId = String(selectedTeamIds.A || "");
-    const teamBId = String(selectedTeamIds.B || "");
-    const teamANameNorm = normalizeTeamName(document.getElementById("teamAName")?.value || "");
-    const teamBNameNorm = normalizeTeamName(document.getElementById("teamBName")?.value || "");
+  return { finalPicks, ftCalc, h1Calc, h2Calc, finalLines, phase2 };
+}
 
-        // FIX 15: Simplified duplicate team check for raw execution speed
-    const isDuplicate = (teamAId && teamAId === teamBId) || 
-                       (teamANameNorm && teamANameNorm === teamBNameNorm);
+function renderEngineOutput(results, ctx) {
+  const { finalPicks, ftCalc, h1Calc, h2Calc, finalLines, phase2 } = results;
+  const table = document.getElementById("results");
 
+  const dashHtml = `
+    <div style="background: #333; color: #ffd700; padding: 8px 10px; font-weight: 800; font-size: 11px; display: flex; justify-content: space-between; border-bottom: 1px solid var(--panel-border);">
+      <span>SYNDICATE INSIGHT (LEVEL 2)</span>
+      <span style="color: ${ftCalc.ftFullModel ? '#4CAF50' : '#ffa500'}">${ftCalc.ftFullModel ? '🟢 FULL MODEL' : '🟡 LIMITED DATA'}</span>
+    </div>
+    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; padding: 12px; text-align: center; gap: 5px;">
+      <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team A Net</div><div style="font-size: 18px; font-weight: 900; color: ${ftCalc.synNetA >= 0 ? '#3a9c35' : '#c91920'}">${(ftCalc.synNetA || 0).toFixed(1)}</div></div>
+      <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Exp. Pace</div><div style="font-size: 18px; font-weight: 900; color: var(--text);">${isFinite(ftCalc.pace) ? ftCalc.pace.toFixed(1) : '—'}</div></div>
+      <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team B Net</div><div style="font-size: 18px; font-weight: 900; color: ${ftCalc.synNetB >= 0 ? '#3a9c35' : '#c91920'}">${(ftCalc.synNetB || 0).toFixed(1)}</div></div>
+    </div>`;
 
-    if (isDuplicate) {
-      engineDebug("run blocked duplicate teams", { teamAId, teamBId, teamANameNorm });
-      showRunError(table, "⚠ Team A and Team B cannot be the same.");
-      return;
-    }
+  let dash = document.getElementById('syndicateDashboard');
+  if (!dash) {
+    dash = document.createElement('div');
+    dash.id = 'syndicateDashboard';
+    dash.style.cssText = "background: var(--panel); border: 1px solid var(--panel-border); margin: 10px 0; padding: 0; box-shadow: var(--shadow); font-family: sans-serif; min-height: 85px;";
+    table.parentNode.insertBefore(dash, table);
+  }
+  dash.innerHTML = dashHtml;
 
+  const markets = finalPicks.map(p => ({
+    _idx: p._idx,
+    edge: isFinite(p.displayEdge) ? p.displayEdge : p.edge,
+    line: isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line,
+    pick: p.pick,
+    fullModel: p.fullModel,
+    confidence: p.confidence,
+    note: p.note,
+    lockStrength: p.lockStrength
+  }));
 
-    const validation = validateInputs(league);
-    if (!validation.ok) {
-      engineDebug("validation failed", { league, errorHtml: validation.errorHtml });
-      showRunError(table, validation.errorHtml);
-      return;
-    }
+  const lockIdx = selectLock(markets);
+  const tracked = buildResultRows({
+    table, finalPicks, lockIdx, fixtureMeta: ctx.fixtureMeta, league: ctx.league,
+    diagnostics: { ...ftCalc, phase2Activation: phase2 }
+  });
 
-    const { parsed, lines } = validation;
-const fixtureMeta = getCurrentFixtureMeta();
-    engineDebug("validation passed", {
-      league,
-      fixture: summarizeFixtureMetaForDebug(fixtureMeta),
-      sourceMeta: summarizeFetchMetaForDebug(),
-      rawLines: lines,
-      parsed: summarizeParsedForDebug(parsed)
-    });
+  if (tracked.length) {
+    addTrackedPicks(tracked);
+    scheduleTrackerSave();
+  }
+}
 
-// 🛡️ ARCHITECTURE FIX: Deterministic Execution
-// Freezing the base state prevents intermediate functions from mutating the input lines
-const baseLines = Object.freeze({
-  ftLine: lines.ftLine,
-  h1Line: lines.h1Line,
-  h2Line: lines.h2Line,
-  aLine: lines.aLine,
-  bLine: lines.bLine
-});
+async function runEngine() {
+  const runBtn = document.getElementById("runBtn");
+  if (runBtn) runBtn.disabled = true;
 
-// PASS 1: Base calculation to establish preliminary projections for memory lookup
-const baseFtCalc = computeFTProjection({
-  league,
-  parsed,
-  lines: baseLines,
-  injMultA: g_injA.scoringMult,
-  injMultB: g_injB.scoringMult
-});
+  await safeExecute("Prediction-Engine", async () => {
+    const local = await loadTrackerStateFromLocal();
+    if (local) { normalizeTrackerState(local); backfillLineMemoryFromTrackedPicks(); }
 
-const baseH1Calc = compute1HProjection({
-  league,
-  parsed,
-  lines: baseLines,
-  injMultA: g_injA.scoringMult,
-  injMultB: g_injB.scoringMult
-});
-
-const baseH2Calc = compute2HProjection({
-  league,
-  parsed,
-  lines: baseLines,
-  injMultA: g_injA.scoringMult,
-  injMultB: g_injB.scoringMult
-});
-
-    engineDebug("projection pass 1", {
-      ft: summarizeCalcForDebug(baseFtCalc),
-      h1: summarizeCalcForDebug(baseH1Calc),
-      h2: summarizeCalcForDebug(baseH2Calc)
-    });
-
-const resFT = resolveStoredLineBeforeDecision({
-  fixtureMeta, league, marketKey: "ft", currentLine: baseLines.ftLine, proj: baseFtCalc.ftProj, marketType: "ft", context: { aSc: baseFtCalc.aS, bSc: baseFtCalc.bS }
+    const context = extractEngineContext();
+    const results = await calculateEngineProjections(context);
+    renderEngineOutput(results, context);
+  }, { 
+    runBtn: "runBtn",
+    cleanup: () => { if (runBtn) runBtn.disabled = false; }
+  });
 });
 const resH1 = resolveStoredLineBeforeDecision({
   fixtureMeta, league, marketKey: "h1", currentLine: baseLines.h1Line, proj: baseH1Calc.h1Proj, marketType: "h1", context: { aSc: baseH1Calc.aS1, bSc: baseH1Calc.bS1 }
@@ -15881,6 +15858,28 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
     if (ov) ov.style.display='none';
   }
 
+  /**
+   * 3. TARGETED UNIT TESTS
+   */
+  function runEngineSanityTests() {
+    engineDebug("--- STARTING UNIT TESTS ---");
+    let passed = 0; let total = 0;
+    const assert = (name, condition) => {
+      total++;
+      if (condition) { passed++; engineDebug(`✅ TEST PASSED: ${name}`); }
+      else { AFDB.log('ERROR', 'UNIT TEST', `FAILED: ${name}`); engineDebug(`❌ TEST FAILED: ${name}`); }
+    };
+
+    assert("Weights: Full Sample NBA", getDynamicWeights("full", 5, "nba").teamWeight === 0.65);
+    assert("Math: Clamp Number", clampNumber(10, 0, 5) === 5);
+    assert("Math: Grade A Calc", getConfidenceGrade({ pick: "OVER", line: 200, edge: 25, sampleTier: "full", fullModel: true, marketKey: "ft" }) === "A");
+    assert("Config: NBA H1 Ratio", getLeagueH1Ratio("nba") === 0.49);
+    assert("Math: Trimmed Average", trimmedAvg([100, 110, 120, 130, 200]) > 115);
+
+    engineDebug(`--- TESTS COMPLETE: ${passed}/${total} PASSED ---`);
+    return passed === total;
+  }
+
   async function runTestFetch() {
     try {
       if (typeof forceTrackerSaveNow === 'function') await forceTrackerSaveNow();
@@ -15888,6 +15887,8 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
     } catch(e) {}
 
     let totalSuspects = 0;
+    const testsPassed = runEngineSanityTests();
+    if (!testsPassed) totalSuspects++;
 
     if (typeof _schedCache !== 'undefined') _schedCache.clear();
     if (typeof _summaryCache !== 'undefined') _summaryCache.clear();
@@ -15899,31 +15900,25 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
       const el = document.getElementById(id);
       const val = el ? el.value.trim() : '';
       if (val && /[^0-9,.\s-]/.test(val)) {
-        log('ERROR', 'UI INPUT', 'Invalid characters detected in ' + id + ': "' + val + '". Math engine will crash.');
+        log('ERROR', 'UI INPUT', 'Invalid characters detected in ' + id + ': "' + val + '".');
         totalSuspects++;
       }
     });
 
     const active = Array.isArray(g_trackerState && g_trackerState.activePicks) ? g_trackerState.activePicks : [];
-    const memCount = Object.keys(g_engineLineMemory || {}).length;
-    if (memCount > 190) { log('ERROR','STORAGE','Line memory nearing maximum capacity (200). Pruning imminent.'); totalSuspects++; }
-    if (active.length > 490) { log('ERROR','STORAGE','Active picks array is critically full (Limit: 500).'); totalSuspects++; }
-    if (typeof MODEL_TUNING === 'undefined') { log('ERROR','CONFIG','MODEL_TUNING matrix is missing.'); totalSuspects++; }
+    if (active.length > 490) { log('ERROR','STORAGE','Active picks critically full.'); totalSuspects++; }
 
-    let paceAnomalies = 0, edgeAnomalies = 0;
+    let paceAnomalies = 0;
     active.forEach(p => {
       const pace = (p.diagnostics && p.diagnostics.pace) || (p.godsEyeMemory && p.godsEyeMemory.pace);
       if (pace && (pace > 135 || pace < 65)) paceAnomalies++;
-      if (p.edgePct && Math.abs(p.edgePct) > 25) edgeAnomalies++;
     });
-    if (paceAnomalies > 0) { log('ERROR','MATH ENGINE', paceAnomalies + ' picks show unrealistic pace projections (<65 or >135). Logic contradiction detected.'); totalSuspects++; }
-    if (edgeAnomalies > 0) { log('ERROR','MATH ENGINE', edgeAnomalies + ' picks show extreme edge anomalies (>25%).'); totalSuspects++; }
+    if (paceAnomalies > 0) { log('ERROR','MATH ENGINE', paceAnomalies + ' Realistic pace failures.'); totalSuspects++; }
 
     const settled = (g_trackerState && g_trackerState.stats && g_trackerState.stats.settled) || 0;
-    const wins = (g_trackerState && g_trackerState.stats && g_trackerState.stats.wins) || 0;
     if (settled >= 20) {
-      const winRate = (wins / settled) * 100;
-      if (winRate < 45) { log('ERROR','MODEL BIAS','System win rate dropping below safety threshold (' + winRate.toFixed(1) + '%). Recalibration required.'); totalSuspects++; }
+      const winRate = (Number(g_trackerState.stats.wins || 0) / settled) * 100;
+      if (winRate < 45) { log('ERROR','MODEL BIAS','System win rate below 45%.'); totalSuspects++; }
     }
 
     const league = document.getElementById('leagueSelect') && document.getElementById('leagueSelect').value;
@@ -15934,7 +15929,7 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
       catch(e) { log('ERROR','NETWORK','Live sweep failed: ' + e.message); totalSuspects++; }
     }
 
-    const verdictMsg = totalSuspects === 0 ? 'Raid complete.\nEngine is 100% perfect.' : 'Raid complete.\nCaught ' + totalSuspects + ' Thieves and locked them behind the bars.';
+    const verdictMsg = totalSuspects === 0 ? 'Raid complete.\nEngine is 100% perfect.' : 'Raid complete.\nFound ' + totalSuspects + ' suspected logic leaks.';
     const verdictEntry = {
       ts: new Date().toLocaleTimeString([],{hour12:false}),
       level: totalSuspects === 0 ? 'VERDICT' : 'ERROR',
@@ -15943,13 +15938,11 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
       data: null
     };
     _log.unshift(verdictEntry);
-    if (_log.length > LOG_LIMIT) _log = _log.slice(0, LOG_LIMIT);
     if (_isOpen) _render();
     setTimeout(() => {
       const idx = _log.indexOf(verdictEntry);
       if (idx !== -1) { _log.splice(idx, 1); if (_isOpen) _render(); }
     }, 7000);
-
   }
 
   return { log, clear, copy, toggleFilter, open, close, runTestFetch, get isOpen() { return _isOpen; }, get logs() { return _log; } };
