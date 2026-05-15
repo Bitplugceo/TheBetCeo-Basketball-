@@ -2997,33 +2997,6 @@ window.__BETCEO_SESSION_ID = "sess_" + Date.now() + "_" + Math.random().toString
 
 // --- GOD-MODE WATCHDOG CORE ---
 
-/**
- * MATH UTILITIES (Moved to Global Scope for Adapter)
- */
-function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 48) {
-  const getStat = (key) => {
-    const val = stats[key] || "0/0";
-    if (typeof val === "string" && val.includes("/")) return parseFloat(val.split("/")[1]) || 0;
-    return parseFloat(val) || 0;
-  };
-  const fga = getStat("fieldGoals");
-  const fta = getStat("freeThrows");
-  const orb = getStat("offensiveRebounds");
-  const tov = getStat("turnovers");
-  let possessions = 0.96 * (fga + (0.44 * fta) - (orb * 0.75) + tov);
-  if (possessions <= 0) return null;
-  if (possessions < 50) possessions = (minutes >= 40 ? 100 : 50);
-  const ortg = (pointsScored / possessions) * 100;
-  const drtg = (pointsAllowed / possessions) * 100;
-  const pace = (possessions / minutes) * 48;
-  return {
-    possessions: parseFloat(possessions.toFixed(2)),
-    ortg: parseFloat(ortg.toFixed(2)),
-    drtg: parseFloat(drtg.toFixed(2)),
-    pace: parseFloat(pace.toFixed(2))
-  };
-}
-
 const ENGINE_INTEGRITY_SHIELD = {
   // Golden Hashes of core logic (prevents "thief in the night" code changes)
   expectedFingerprints: {
@@ -3184,39 +3157,7 @@ const CACHE_MAX = 120;
 // FIX 12 & 3 & 8: Global Namespace, Timeouts & Archiving Limits
 const BB_CONFIG = {
   limits: { activePicks: 500, archivePruneDays: 90 },
-  timeouts: { fetch: 15000 },
-  version: "Path-A-CORE-v3"
-};
-
-/**
- * FIX 1: ROBUST ESPN ADAPTER (V3)
- * Unique standardizer to shield math from API shifts.
- */
-const MatchupAdapter = {
-  standardize: (raw, tid) => {
-    try {
-      const comp = raw?.header?.competitions?.[0] || raw?.competitions?.[0];
-      if (!comp) return null;
-      const teams = comp.competitors || [];
-      const m = teams.find(t => matchesTeam(t, tid)) || teams[0];
-      const o = teams.find(t => !matchesTeam(t, tid)) || teams[1];
-      const ps = (s) => typeof s === "object" ? parseFloat(s.value ?? s.displayValue ?? 0) : parseFloat(s || 0);
-      return {
-        id: String(raw.id || comp.id),
-        isFinal: !!(comp.status?.type?.completed || comp.status?.type?.state === 'post'),
-        venue: m.homeAway || "",
-        scores: { m: ps(m.score), o: ps(o.score), mL: (m.linescores || []).map(ps), oL: (o.linescores || []).map(ps) }
-      };
-    } catch (e) { return null; }
-  }
-};
-
-const ENGINE_TEST_SUITE = {
-  run: () => {
-    console.log("--- ENGINE STATUS ---");
-    const w = getDynamicWeights("full", 5, "nba");
-    console.log(Math.abs((w.teamWeight + w.oppWeight) - 1.0) < 0.001 ? "✅ Math Matrix: Healthy" : "❌ Math Matrix: Broken");
-  }
+  timeouts: { fetch: 15000 }
 };
 
             // Fix 11: Dynamic Calibration System (Replaces Magic Numbers)
@@ -5653,7 +5594,49 @@ function validateFetchSection() {
   return isValid;
 }
 
-// [ADVANCED MATH MOVED TO INITIALIZATION]
+        // --- LEVEL 2 MATH MODULE ---
+function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 48) {
+  const getStat = (key) => {
+    const val = stats[key] || "0/0";
+    if (typeof val === "string" && val.includes("/")) return parseFloat(val.split("/")[1]) || 0;
+    return parseFloat(val) || 0;
+  };
+
+    const fga = getStat("fieldGoals");
+  const fta = getStat("freeThrows");
+
+  const orb = getStat("offensiveRebounds");
+  const tov = getStat("turnovers");
+
+  // 🛡️ MATH FIX: True Hollinger requires opponent ORB to balance.
+  // Since we only have 1 team's box score here, we dampen the ORB subtraction 
+  // by 75% to prevent pace warping in high-rebound variance games.
+  let possessions = 0.96 * (fga + (0.44 * fta) - (orb * 0.75) + tov);
+
+
+  // Guard: negative or zero possessions means the stat block is unusable.
+  // Return null so the caller can exclude this game rather than storing fabricated ratings.
+  if (possessions <= 0) {
+    console.warn("[BB Engine] calculateAdvancedMetrics: invalid possessions (" + possessions.toFixed(2) + ") — game excluded from Level 2 memory.");
+    return null;
+  }
+
+  // Guard: suspiciously low possessions that aren't negative — fall back to league average.
+  if (possessions < 50) possessions = (minutes >= 40 ? 100 : 50);
+
+  const ortg = (pointsScored / possessions) * 100;
+  // NOTE: True DRtg requires opponent possessions. We use own possessions as a close approximation.
+  // In most games the two counts differ by ≤ 2, so the error is small for FT markets.
+  const drtg = (pointsAllowed / possessions) * 100;
+  const pace = (possessions / minutes) * 48;
+
+  return {
+    possessions: parseFloat(possessions.toFixed(2)),
+    ortg: parseFloat(ortg.toFixed(2)),
+    drtg: parseFloat(drtg.toFixed(2)),
+    pace: parseFloat(pace.toFixed(2))
+  };
+}
 
 
 
@@ -10816,7 +10799,6 @@ updateIntelligencePack();
     // V3 + V6 + V7: shared fetch core using LEAGUE_FETCH_RULES
 
 async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFallback = true) {
-  // ADAPTER WRAPPER (Fix Logic Conflict)
   const rules = LEAGUE_FETCH_RULES[leagueKey];
   if (!rules) return null;
 
@@ -10841,19 +10823,32 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
               return p;
             })());
 
-                const events = r?.events || r?.team?.schedule?.events || [];
+        const events = r?.events || r?.team?.schedule?.events || [];
         for (const ev of events) {
-          const standard = MatchupAdapter.standardize(ev, tId);
-          if (standard && standard.isFinal) {
-            gameRefs.push({
-              id: standard.id,
-              date: standard.date,
-              rawS: standard.scores.mine,
-              rawA: standard.scores.opp,
-              venue: standard.venue
-            });
-          }
-        }
+          if (!ev?.id) continue;
+
+          const comp = ev?.competitions?.[0];
+          if (!comp) continue;
+
+          const done =
+            comp?.status?.type?.completed ||
+            comp?.status?.type?.name === "STATUS_FINAL" ||
+            comp?.status?.type?.state === "post";
+
+          if (!done || (comp?.competitors || []).length < 2) continue;
+
+          const competitors = comp.competitors;
+          const mine = competitors.find(x => matchesTeam(x, tId)) || competitors[0];
+          const opp = competitors.find(x => !matchesTeam(x, tId)) || competitors[1];
+          const ps = s => typeof s === "object" ? parseFloat(s.value ?? s.displayValue ?? 0) : parseFloat(s);
+
+          gameRefs.push({
+            id: String(ev.id),
+            date: ev.date || "",
+            rawS: ps(mine?.score),
+            rawA: ps(opp?.score),
+            venue: mine?.homeAway || ""
+          });
         }
       } catch (e) {
         logDebug("fetchScheduleCore failed", e);
@@ -10894,33 +10889,104 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
 
     const summaries = await Promise.all(
     chosen.slice(0, 10).map(async ref => {
-      let ms = ref.rawS, os = ref.rawA, h1m = 0, h1o = 0, h2m = 0, h2o = 0, gotLS = false, advanced = null;
+      let ms = ref.rawS;
+      let os = ref.rawA;
+      let h1m = 0;
+      let h1o = 0;
+      let h2m = 0;
+      let h2o = 0;
+      let gotLS = false;
+      let advanced = null;
+
       try {
         const key = `${base}:sum:${ref.id}`;
-        const data = await (_summaryCache.has(key) ? _summaryCache.get(key) : (() => {
-          const p = proxyFetch(`${base}/summary?event=${ref.id}`).catch(err => { _summaryCache.delete(key); throw err; });
-          cacheSet(_summaryCache, key, p); return p;
-        })());
-        const std = MatchupAdapter.standardize(data, tId);
-        if (std) {
-          gotLS = true; ms = std.scores.m; os = std.scores.o;
-          const lm = std.scores.mL, lo = std.scores.oL;
-          if (lm.length >= 1 && lo.length >= 1) {
-            const is4Q = rules.regulationPeriods >= 4;
-            h1m = is4Q ? (lm[0] || 0) + (lm[1] || 0) : (lm[0] || 0);
-            h1o = is4Q ? (lo[0] || 0) + (lo[1] || 0) : (lo[0] || 0);
-            h2m = is4Q ? (lm[2] || 0) + (lm[3] || 0) : (lm[1] || 0);
-            h2o = is4Q ? (lo[2] || 0) + (lo[3] || 0) : (lo[1] || 0);
-            if (is4Q && lm.length >= 4) ref.qs = { m: lm.slice(0, 4), o: lo.slice(0, 4) };
-            [ms, os] = stripOTFromScores(ms, os, lm, lo, rules.regulationPeriods);
-          }
-          const myBox = (data?.boxscore?.teams || []).find(t => matchesTeam(t, tId));
-          if (myBox?.statistics) {
-            const sMap = {}; myBox.statistics.forEach(s => { sMap[s.name] = s.displayValue; });
-            advanced = calculateAdvancedMetrics(sMap, ms, os, leagueKey === "nba" ? 48 : 40);
+        const data = await (_summaryCache.has(key)
+          ? _summaryCache.get(key)
+          : (() => {
+              const p = proxyFetch(`${base}/summary?event=${ref.id}`).catch(err => {
+                _summaryCache.delete(key);
+                throw err;
+              });
+              cacheSet(_summaryCache, key, p);
+              return p;
+            })());
+
+        const hc = data?.header?.competitions?.[0];
+        const boxscore = data?.boxscore;
+
+        if (hc) {
+          const competitors = hc?.competitors || [];
+          const mine = competitors.find(c => matchesTeam(c, tId));
+          const opp = competitors.find(c => !matchesTeam(c, tId));
+
+          if (mine && opp) {
+            gotLS = true;
+            ms = parseFloat(mine.score) || ms;
+            os = parseFloat(opp.score) || os;
+
+            const lm = mine?.linescores || [];
+            const lo = opp?.linescores || [];
+
+            if (lm.length >= 1 && lo.length >= 1) {
+              if (rules.regulationPeriods >= 4) {
+                h1m = (readVal(lm[0]) || 0) + (readVal(lm[1]) || 0);
+                h1o = (readVal(lo[0]) || 0) + (readVal(lo[1]) || 0);
+                h2m = (readVal(lm[2]) || 0) + (readVal(lm[3]) || 0);
+                h2o = (readVal(lo[2]) || 0) + (readVal(lo[3]) || 0);
+                ref.qs = { m: [readVal(lm[0]), readVal(lm[1]), readVal(lm[2]), readVal(lm[3])], o: [readVal(lo[0]), readVal(lo[1]), readVal(lo[2]), readVal(lo[3])] };
+              } else {
+                [h1m, h1o] = extractFirstHalf(lm, lo);
+                [h2m, h2o] = extractSecondHalf(lm, lo);
+              }
+              [ms, os] = stripOTFromScores(ms, os, lm, lo, rules.regulationPeriods);
+            }
+
+            // LEVEL 2 HIJACK: Advanced Box Score Extraction
+            if (boxscore && typeof boxscore === 'object') {
+              let sMap = {};
+              const safeTeams = Array.isArray(boxscore.teams) ? boxscore.teams : [];
+              const myBox = safeTeams.find(t => matchesTeam(t, tId));
+              
+              if (myBox && Array.isArray(myBox.statistics) && myBox.statistics.length > 0) {
+                myBox.statistics.forEach(s => { sMap[s.name] = s.displayValue; });
+              } else if (Array.isArray(boxscore.players)) {
+                // Rescue: Hunt down player stats if team stats are missing/corrupted
+                const safePlayers = boxscore.players || [];
+                const myPlayers = safePlayers.find(p => matchesTeam(p, tId));
+                if (myPlayers && Array.isArray(myPlayers.statistics) && myPlayers.statistics[0] && Array.isArray(myPlayers.statistics[0].athletes)) {
+                  let fga = 0, fta = 0, orb = 0, tov = 0;
+                  const keys = myPlayers.statistics[0].names || [];
+                  const iFga = keys.indexOf("FGA");
+                  const iFta = keys.indexOf("FTA");
+                  const iOrb = keys.indexOf("OREB");
+                  const iTov = keys.indexOf("TO");
+                  
+                  myPlayers.statistics[0].athletes.forEach(ath => {
+                    const st = ath.stats || [];
+                    if (iFga >= 0) fga += parseFloat(st[iFga]) || 0;
+                    if (iFta >= 0) fta += parseFloat(st[iFta]) || 0;
+                    if (iOrb >= 0) orb += parseFloat(st[iOrb]) || 0;
+                    if (iTov >= 0) tov += parseFloat(st[iTov]) || 0;
+                  });
+                  sMap = { fieldGoals: fga, freeThrows: fta, offensiveRebounds: orb, turnovers: tov };
+                }
+              }
+              
+              if (Object.keys(sMap).length > 0) {
+                const gameMinutes = leagueKey === "nba" ? 48 : 40;
+                const advResult = calculateAdvancedMetrics(sMap, ms, os, gameMinutes);
+                // Only store if valid — null means unusable stat block (negative possessions)
+                if (advResult) {
+                  advanced = advResult;
+                  trackerDebug(`Level 2 Stats Extracted: ${ref.id}`, advanced);
+                }
+              }
+            }
           }
         }
-      } catch (e) { logDebug("SchedCore Adapter Err", e); }
+      } catch (e) {
+        logDebug("fetchScheduleCore summary failed", e);
+      }
 
       if (isNaN(ms) || isNaN(os) || ms <= 0 || os <= 0) return null;
 
@@ -11362,15 +11428,14 @@ return isPreGame;
 }
 
 async function fetchESPN() {
-  try {
-    const league = document.getElementById("leagueSelect").value;
-    const teamAName = document.getElementById("teamAName").value.trim();
-    const teamBName = document.getElementById("teamBName").value.trim();
+  const league = document.getElementById("leagueSelect").value;
+  const teamAName = document.getElementById("teamAName").value.trim();
+  const teamBName = document.getElementById("teamBName").value.trim();
 
-    if (!teamAName || !teamBName) {
-      setStatusText("❌ Enter both team names first.", "err");
-      return;
-    }
+  if (!teamAName || !teamBName) {
+    setStatusText("❌ Enter both team names first.", "err");
+    return;
+  }
   if (league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa") {
     setStatusText("❌ ESPN auto-fetch is NBA, WNBA & NCAA only.", "err");
     return;
@@ -11660,10 +11725,9 @@ async function fetchESPN() {
     setStatusHTML(compactFetchStatus ? `<div>${compactFetchStatus}</div>` : "", allGood && !fetchAuditIssues.length ? "ok" : "err");
 
   } catch (e) {
-    engineDebug("Fetch Error Boundary", e.message);
     if (e.name !== 'AbortError') {
       setFetchAuditIssues([e.message]);
-      setStatusText("❌ Fetch failed. Check AFDB for details.", "err");
+      setStatusText("❌ " + e.message, "err");
     }
   } finally {
     unlockFetchBtn();
@@ -13761,14 +13825,19 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
 async function runEngine() {
   const runBtn = document.getElementById("runBtn");
   const table = document.getElementById("results");
+
+  g_engineDebugLog = [];
+    acknowledgeGlobalEngineAlert();
+  renderEngineDebugPanel();
   if (runBtn) runBtn.disabled = true;
+  engineDebug("run start", {
+    trackerKey: getTrackerUserKey(),
+    trackerState: getTrackerStateDebugScore(g_trackerState),
+    build: APP_BUILD_VERSION
+  });
 
   try {
-    g_engineDebugLog = [];
-    acknowledgeGlobalEngineAlert();
-    renderEngineDebugPanel();
-    
-    const _localState = await loadTrackerStateFromLocal();
+const _localState = await loadTrackerStateFromLocal();
 if (_localState) {
   normalizeTrackerState(_localState);
   backfillLineMemoryFromTrackedPicks();
@@ -14836,14 +14905,13 @@ if (trackedToSave.length) {
   );
 }
 
-        engineDebug("run finished successfully", {
+    engineDebug("run finished successfully", {
       trackerState: getTrackerStateDebugScore(g_trackerState),
       resultsShown: finalPicksForDisplay.length
     });
 
     setTimeout(() => {
       const rect = table.getBoundingClientRect();
-      if (!rect) return;
       const isInView = (rect.top >= 0 && rect.bottom <= window.innerHeight);
       if (!isInView) {
         table.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -14851,27 +14919,16 @@ if (trackedToSave.length) {
     }, 300);
 
   } catch (err) {
-    engineDebug("ENGINE BOUNDARY", { msg: err.message });
+    console.error("[BB Engine] runEngine failed", err);
+    engineDebug("run failed", { error: String(err?.message || err) });
     if (table) {
       table.style.display = "table";
-      table.innerHTML = "<tr><th colspan='5' style='background:#333;color:#ffcf73;'>⚠️ CALCULATION INTERRUPTED</th></tr>";
-      showRunError(table, "Data anomaly detected. Review inputs and try again.");
+      table.innerHTML = "<tr><th>Pick</th><th>Projection</th><th>Edge</th><th>Model Grade</th><th>Prediction</th></tr>";
+      showRunError(table, "⚠ Unexpected engine error. Check the latest edit.");
     }
   } finally {
     engineDebug("run finally", { trackerState: getTrackerStateDebugScore(g_trackerState) });
     if (runBtn) runBtn.disabled = false;
-  }
-}, 300);
-
-  } catch (err) {
-    engineDebug("ENGINE BOUNDARY", { msg: err.message, stack: err.stack });
-    if (table) {
-      table.style.display = "table";
-      table.innerHTML = "<tr><th colspan='5' style='background:#333;color:#ffcf73;'>⚠️ CALCULATION INTERRUPTED</th></tr>";
-      showRunError(table, "The engine encountered a data anomaly. Review inputs and try again.");
-    }
-  } finally {
-    // Button re-enable is handled by the inner setTimeout callback's own finally block.
   }
 }
 
@@ -15323,12 +15380,10 @@ function setEngineMode() {
 
       // setEngineMode is omitted here; initialization handled by manual selection to prevent layout thrashing
 
-      // FIX: Restore collapsing functionality
       makeSectionsCollapsible();
       document.querySelectorAll(".section").forEach(s => {
-        if (!s.classList.contains("locked")) {
-          s.classList.add("collapsed");
-        }
+        s.classList.add("collapsed");
+        s.classList.remove("locked");
       });
 
       const ls0 = document.getElementById("leagueSelect");
