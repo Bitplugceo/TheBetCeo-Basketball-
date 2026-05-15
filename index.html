@@ -3153,6 +3153,7 @@ const WORKER_URL = "https://thebetceo-engine.ridwantunde636.workers.dev/";
 const WORKER_BASE_URL = String(WORKER_URL || "").replace(/\/+$/, "");
 const DEBUG = false;
 const CACHE_MAX = 120;
+const CACHE_TTL_MS = 10 * 60 * 1000; // Path B #4: 10-min ESPN cache eviction window
 
 // FIX 12 & 3 & 8: Global Namespace, Timeouts & Archiving Limits
 const BB_CONFIG = {
@@ -3204,16 +3205,21 @@ const MatchupAdapter = {
             // Fix 11: Dynamic Calibration System (Replaces Magic Numbers)
     function getDynamicWeights(sampleTier, volatility, league) {
       const isFull = sampleTier === "full";
-      const isHighVol = volatility > (LEAGUE_VOL_LIMITS[league] || 12);
-      
+      const lp = (typeof getLeagueProfile === "function") ? getLeagueProfile(league) : { teamWeightBonus: 0, volBias: 0, label: "?" };
+      const volLimit = (LEAGUE_VOL_LIMITS[league] || 12) + (lp.volBias || 0);
+      const isHighVol = volatility > volLimit;
+
       // Base confidence starts at 0.60 for full samples, drops for thin/volatile
+      // Path B #3: per-league-family teamWeightBonus applied on top
       let teamWeight = clampNumber(isFull ? 0.65 : 0.50 - (isHighVol ? 0.10 : 0), 0.40, 0.75);
+      teamWeight = clampNumber(teamWeight + (lp.teamWeightBonus || 0), 0.38, 0.76);
 
       return { 
         teamWeight, 
         oppWeight: 1.0 - teamWeight, 
         regressionWeight: isHighVol ? 0.75 : 0.90, 
-        baselineWeight: isHighVol ? 0.25 : 0.10 
+        baselineWeight: isHighVol ? 0.25 : 0.10,
+        leagueProfileLabel: lp.label
       };
     }
 
@@ -3511,6 +3517,26 @@ const LEAGUE_H1_RATIO = {
   cebl: 0.488, nznbl: 0.488, serbia_kls: 0.487, croatia_premier: 0.487,
   default: 0.487
 };
+
+/* ── PATH B #3: MULTI-LEAGUE PROFILES ── */
+const LEAGUE_PROFILES = {
+  nba:     { teamWeightBonus:  0.05, volBias:  0.00, label: "NBA/WNBA"     },
+  ncaa:    { teamWeightBonus:  0.03, volBias:  0.00, label: "NCAA"         },
+  euro:    { teamWeightBonus:  0.00, volBias:  0.00, label: "EuroLeague"   },
+  asia:    { teamWeightBonus: -0.02, volBias:  0.02, label: "Asia/Pacific" },
+  latam:   { teamWeightBonus: -0.03, volBias:  0.03, label: "LatAm"        },
+  default: { teamWeightBonus: -0.02, volBias:  0.02, label: "Other"        }
+};
+function getLeagueProfile(league) {
+  const l = String(league || "").toLowerCase();
+  if (["nba","wnba","wnba_pre"].includes(l)) return LEAGUE_PROFILES.nba;
+  if (l === "ncaa") return LEAGUE_PROFILES.ncaa;
+  if (["euroleague","eurocup","champions_league","acb","lba","bbl","bcl","proa","isl","aba","lkl","plk","prob","turkey_bsl","united_league","bnxt"].includes(l)) return LEAGUE_PROFILES.euro;
+  if (["cba","bleague","korea_kbl","pba","ausnbl","nznbl","aus_nbl1_central","aus_nbl1_west","cebl"].includes(l)) return LEAGUE_PROFILES.asia;
+  if (["argentina_lnb","brazil_nbb","chile_lnb","mexico_lnbp","mexico_cibacopa","puerto_rico_bsn","uruguay_lub"].includes(l)) return LEAGUE_PROFILES.latam;
+  return LEAGUE_PROFILES.default;
+}
+/* ── END PATH B #3 ── */
 
 function getLeagueH1Ratio(league) {
   return LEAGUE_H1_RATIO[String(league || "").toLowerCase()] || LEAGUE_H1_RATIO.default;
@@ -8873,6 +8899,46 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
     };
   });
 }
+/* ── PATH B #1: ADVANCED TRACKER INTELLIGENCE ── */
+function applyTrackerLearningToPicks(picks) {
+  if (!Array.isArray(picks) || !picks.length) return;
+  const archived = Array.isArray(g_trackerState?.archivedPicks) ? g_trackerState.archivedPicks : [];
+  const active   = Array.isArray(g_trackerState?.activePicks)   ? g_trackerState.activePicks   : [];
+  const allSettled = [...archived, ...active].filter(p =>
+    p.resultStatus === "win" || p.resultStatus === "loss" || p.resultStatus === "push"
+  );
+  if (allSettled.length < 15) return;
+
+  const mkt = {};
+  for (const p of allSettled) {
+    const k = p.marketKey || "ft";
+    if (!mkt[k]) mkt[k] = { wins: 0, total: 0 };
+    if (p.resultStatus === "win") mkt[k].wins++;
+    mkt[k].total++;
+  }
+
+  picks.forEach(p => {
+    if (!p || p.pick === "NO PLAY") return;
+    const ms = mkt[p.marketKey];
+    if (!ms || ms.total < 8) return;
+    const wr = ms.wins / ms.total;
+    let shift = 0;
+    if (wr < 0.40 && ms.total >= 10) shift = -1;
+    else if (wr > 0.62 && ms.total >= 10) shift = 1;
+    if (shift !== 0 && p.confidence && p.confidence !== "NaN" && p.confidence !== "—") {
+      const prev = p.confidence;
+      p.confidence = bumpConfidenceGrade(p.confidence, shift);
+      p.trackerLearning = { marketKey: p.marketKey, winRate: wr, total: ms.total, shift, from: prev, to: p.confidence };
+    }
+  });
+
+  const summary = Object.entries(mkt).map(([k,v]) =>
+    `${k}:${v.wins}W/${v.total}T(${((v.wins/v.total)*100).toFixed(0)}%)`
+  ).join(" | ");
+  engineDebug("TRACKER LEARNING", summary);
+}
+/* ── END PATH B #1 ── */
+
 function getTrackedLeagueBase(league) {
   const l = String(league || "").toLowerCase();
   if (l === "nba") return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
@@ -14871,6 +14937,9 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
 // Fix C1: Plug in the Massacre MC machine
 await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtureMeta);
 
+// Path B #1: Apply tracker learning adjustments post-massacre
+applyTrackerLearningToPicks(finalPicksForDisplay);
+
 // Fix H1: Attach the memory icons (🧠)
 finalPicksForDisplay.forEach(p => {
   if (memoryFlags[p.marketKey]) p.usedMemory = true;
@@ -15057,6 +15126,9 @@ if (trackedToSave.length) {
       resultsShown: finalPicksForDisplay.length
     });
 
+// Path B #6: Run automated model health check
+runModelHealthCheck(finalPicksForDisplay);
+
     setTimeout(() => {
       const rect = table.getBoundingClientRect();
       const isInView = (rect.top >= 0 && rect.bottom <= window.innerHeight);
@@ -15078,6 +15150,169 @@ if (trackedToSave.length) {
     if (runBtn) runBtn.disabled = false;
   }
 }
+
+/* ── PATH B #6: AUTOMATED MODEL HEALTH MONITOR ── */
+function runModelHealthCheck(currentPicks) {
+  try {
+    const stats   = g_trackerState?.stats || {};
+    const settled = stats.settled || 0;
+    const wins    = stats.wins    || 0;
+
+    const allPicks = [
+      ...(Array.isArray(g_trackerState?.archivedPicks) ? g_trackerState.archivedPicks : []),
+      ...(Array.isArray(g_trackerState?.activePicks)   ? g_trackerState.activePicks   : [])
+    ]
+      .filter(p => p.resultStatus === "loss" || p.resultStatus === "win" || p.resultStatus === "push")
+      .sort((a, b) => new Date(b.settledAt || b.addedAt || 0) - new Date(a.settledAt || a.addedAt || 0));
+
+    let lossStreak = 0;
+    for (const p of allPicks) { if (p.resultStatus === "loss") lossStreak++; else break; }
+
+    const totalNow  = Array.isArray(currentPicks) ? currentPicks.length : 0;
+    const noPlayNow = Array.isArray(currentPicks) ? currentPicks.filter(p => p.pick === "NO PLAY").length : 0;
+    const allNoPlay = totalNow > 0 && noPlayNow === totalNow;
+
+    const alerts = [];
+    if (settled >= 10) {
+      const wr = wins / settled;
+      if (wr < 0.43)      alerts.push({ level: "danger", msg: `⛔ Win rate ${(wr*100).toFixed(1)}% — critically low. Pause bets and review your data inputs.` });
+      else if (wr < 0.50) alerts.push({ level: "warn",   msg: `⚠️ Win rate ${(wr*100).toFixed(1)}% — below breakeven on ${settled} settled picks. Monitor closely.` });
+      else                alerts.push({ level: "ok",     msg: `✅ Win rate ${(wr*100).toFixed(1)}% across ${settled} settled picks — engine healthy.` });
+    }
+    if (lossStreak >= 5)      alerts.push({ level: "danger", msg: `⛔ ${lossStreak} consecutive losses. Avoid high-stake plays until streak breaks.` });
+    else if (lossStreak >= 3) alerts.push({ level: "warn",   msg: `⚠️ ${lossStreak} consecutive losses. Stay disciplined on unit sizing.` });
+    if (allNoPlay) alerts.push({ level: "warn", msg: `⚠️ Every pick this run returned NO PLAY — data may be insufficient or thresholds are very tight.` });
+    if (alerts.length === 0 && settled < 10)
+      alerts.push({ level: "info", msg: `ℹ️ Health monitor active — needs ${10 - settled} more settled pick(s) for a full report.` });
+
+    const colorMap = { danger:"#c91920", warn:"#d98a00", ok:"#2f8f4a", info:"#3a7fc1" };
+    const bgMap    = { danger:"#fff0f0", warn:"#fffbe6", ok:"#f0fff4", info:"#f0f6ff" };
+    const bannerHtml = alerts.map(a =>
+      `<div style="padding:6px 10px;font-size:11px;font-weight:700;color:${colorMap[a.level]};background:${bgMap[a.level]};border-left:3px solid ${colorMap[a.level]};margin-bottom:2px;">${a.msg}</div>`
+    ).join("");
+
+    let banner = document.getElementById("modelHealthBanner");
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.id = "modelHealthBanner";
+      banner.style.cssText = "margin:6px 0;font-family:sans-serif;";
+      const dash = document.getElementById("syndicateDashboard");
+      if (dash && dash.parentNode) dash.parentNode.insertBefore(banner, dash.nextSibling);
+    }
+    banner.innerHTML = bannerHtml;
+    engineDebug("MODEL HEALTH CHECK", alerts.map(a => `[${a.level.toUpperCase()}] ${a.msg}`));
+  } catch (err) { engineDebug("MODEL HEALTH CHECK ERROR", err.message); }
+}
+/* ── END PATH B #6 ── */
+
+/* ── PATH B #4: CACHE EVICTION SCHEDULER ── */
+function scheduleCacheEviction() {
+  setInterval(() => {
+    try {
+      const before = (typeof _schedCache   !== "undefined" ? _schedCache.size   : 0)
+                   + (typeof _summaryCache !== "undefined" ? _summaryCache.size : 0);
+      if (typeof _schedCache   !== "undefined") _schedCache.clear();
+      if (typeof _summaryCache !== "undefined") _summaryCache.clear();
+      if (before > 0) engineDebug(`CACHE EVICTION: Cleared ${before} stale ESPN entries`);
+    } catch(e) { /* silent */ }
+  }, CACHE_TTL_MS);
+}
+/* ── END PATH B #4 ── */
+
+/* ── PATH B #2: PLAYER PROPS ENGINE ── */
+function calculatePlayerProp(name, scoresArr, line, league) {
+  if (!Array.isArray(scoresArr) || scoresArr.length < 3) return null;
+  const nums = scoresArr.map(Number).filter(n => isFinite(n) && n >= 0);
+  if (nums.length < 3 || !isFinite(line) || line <= 0) return null;
+  const recencyW = [1.5, 1.3, 1.1, 0.9, 0.7, 0.5, 0.4, 0.3, 0.25];
+  let wSum = 0, wTotal = 0;
+  nums.forEach((v, i) => { const w = recencyW[i] || 0.25; wSum += v * w; wTotal += w; });
+  const rawProj = wTotal > 0 ? wSum / wTotal : avg(nums);
+  const anchor  = 0.50;
+  const proj    = rawProj * (1 - anchor) + line * anchor;
+  const edge    = proj - line;
+  const edgePct = Math.abs(edge / line);
+  const vol     = (typeof stdDev === "function") ? stdDev(nums) : 0;
+  let pick = "NO PLAY";
+  if (edgePct >= 0.065)
+    pick = edge > 0 ? `OVER ${(line + 0.5).toFixed(1)}` : `UNDER ${(line - 0.5).toFixed(1)}`;
+  let confidence = "—";
+  if (pick !== "NO PLAY") {
+    if (edgePct >= 0.12 && vol < line * 0.25) confidence = "B";
+    else if (edgePct >= 0.09) confidence = "C";
+    else confidence = "D";
+  }
+  return { name, proj: Math.round(proj * 10) / 10, line, edge: Math.round(edge * 10) / 10, edgePct, pick, confidence, vol: Math.round(vol * 10) / 10, sampleSize: nums.length };
+}
+
+function injectPlayerPropsUI() {
+  if (document.getElementById("playerPropsSection")) return;
+  const tableWrap = document.querySelector(".table-wrap");
+  if (!tableWrap) return;
+  const section = document.createElement("div");
+  section.id = "playerPropsSection";
+  section.className = "section collapsed";
+  section.style.marginTop = "8px";
+  section.innerHTML = `
+    <button class="section-toggle" type="button" onclick="this.closest('.section').classList.toggle('collapsed')">
+      <span class="toggle-title">🏀 PLAYER PROPS ENGINE <span style="font-size:10px;font-weight:400;color:var(--muted);">Path B #2</span></span>
+      <span class="toggle-icon">▼</span>
+    </button>
+    <div class="section-body">
+      <label>Player Name</label>
+      <input id="propPlayerName" placeholder="e.g. LeBron James" style="max-width:260px;" />
+      <label>Last Scores (comma-separated, newest first)</label>
+      <input id="propScores" placeholder="27,31,19,24,22" style="max-width:260px;" />
+      <label>Prop Line</label>
+      <input id="propLine" placeholder="24.5" style="max-width:120px;" />
+      <label>Market</label>
+      <select id="propMarket" class="league-box" style="max-width:160px;">
+        <option value="points">Points</option>
+        <option value="rebounds">Rebounds</option>
+        <option value="assists">Assists</option>
+        <option value="3pm">3-Pointers Made</option>
+        <option value="pra">PRA (Pts+Reb+Ast)</option>
+      </select>
+      <br/>
+      <button type="button" id="calcPropBtn" style="background:#3a9c35;color:#fff;border:none;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;margin-top:8px;">Calculate Prop</button>
+      <div id="propResult" style="margin-top:8px;font-size:12px;"></div>
+    </div>
+  `;
+  tableWrap.parentNode.insertBefore(section, tableWrap.nextSibling);
+  document.getElementById("calcPropBtn").addEventListener("click", function() {
+    const name   = (document.getElementById("propPlayerName")?.value || "").trim() || "Player";
+    const rawSc  = (document.getElementById("propScores")?.value || "").trim();
+    const line   = parseFloat(document.getElementById("propLine")?.value || "");
+    const market = document.getElementById("propMarket")?.value || "points";
+    const league = document.getElementById("leagueSelect")?.value || "nba";
+    const scores = rawSc.split(",").map(s => parseFloat(s.trim())).filter(n => isFinite(n));
+    const result = calculatePlayerProp(name, scores, line, league);
+    const out    = document.getElementById("propResult");
+    if (!result) { out.innerHTML = '<span style="color:#d92d2a;">⚠ Need at least 3 valid scores and a line.</span>'; return; }
+    const pickColor  = result.pick === "NO PLAY" ? "#7b8088" : result.pick.startsWith("OVER") ? "#2f8f4a" : "#c91920";
+    const gradeColor = { A:"#3a9c35", B:"#2f8f4a", C:"#d98a00", D:"#c91920", "—":"#7b8088" }[result.confidence] || "#7b8088";
+    out.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:4px;background:var(--panel);">
+      <tr style="background:var(--table-head);color:#fff;">
+        <th style="padding:6px 8px;border:1px solid var(--table-border);">Player</th>
+        <th style="padding:6px 8px;border:1px solid var(--table-border);">Market</th>
+        <th style="padding:6px 8px;border:1px solid var(--table-border);">Proj</th>
+        <th style="padding:6px 8px;border:1px solid var(--table-border);">Edge</th>
+        <th style="padding:6px 8px;border:1px solid var(--table-border);">Grade</th>
+        <th style="padding:6px 8px;border:1px solid var(--table-border);">Pick</th>
+      </tr>
+      <tr>
+        <td style="padding:6px 8px;border:1px solid var(--table-border);">${result.name}</td>
+        <td style="padding:6px 8px;border:1px solid var(--table-border);">${market.toUpperCase()} ${result.line}</td>
+        <td style="padding:6px 8px;border:1px solid var(--table-border);">${result.proj}</td>
+        <td style="padding:6px 8px;border:1px solid var(--table-border);">${result.edge > 0 ? "+" : ""}${result.edge}</td>
+        <td style="padding:6px 8px;border:1px solid var(--table-border);color:${gradeColor};font-weight:900;">${result.confidence}</td>
+        <td style="padding:6px 8px;border:1px solid var(--table-border);color:${pickColor};font-weight:900;">${result.pick}</td>
+      </tr>
+    </table>
+    <div style="font-size:10px;color:var(--muted);margin-top:4px;">Vol: ${result.vol} pts | Edge: ${(result.edgePct*100).toFixed(1)}% | ${result.sampleSize} games sampled</div>`;
+  });
+}
+/* ── END PATH B #2 ── */
 
             function clearAll() {
       acknowledgeGlobalEngineAlert();
@@ -15852,6 +16087,8 @@ ${fullHTML}
     });
   }
 
+  scheduleCacheEviction();
+  injectPlayerPropsUI();
 }); // <-- EXACTLY ONE CLOSING BRACKET HERE.
 </script>
 
@@ -15966,7 +16203,7 @@ const AFDB = (function() {
   return '<div style="padding:8px;border-bottom:1px solid #151515;"><div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;"><span style="color:#555;font-size:9px;min-width:65px;flex-shrink:0;">' + esc(e.ts) + '</span><span style="color:' + def.color + ';font-size:10px;font-weight:900;min-width:75px;flex-shrink:0;">' + icon + ' ' + esc(e.level) + '</span><span style="color:#777;font-size:9px;min-width:80px;flex-shrink:0;">[' + esc(e.section) + ']</span><span style="color:' + def.color + ';font-size:11px;font-weight:700;flex:1;white-space:pre-wrap;">' + esc(e.msg) + '</span></div>' + dataHtml + '</div>';
 }).join('');
 
-const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
+const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊</button><button onclick="AFDB.quickHealthSummary()" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🏥 HEALTH</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
 
 const emptyMsg = _showOnlyErrors ? 'No suspects arrested. The code is clean.' : 'No log entries yet. Run a fetch.';
 const filterLabel = `\ud83c\udfaf LEVEL: ${_currentLogLevel}`;
@@ -16058,7 +16295,32 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
 
   }
 
-  return { log, clear, copy, toggleFilter, open, close, runTestFetch, get isOpen() { return _isOpen; }, get logs() { return _log; } };
+  function quickHealthSummary() {
+    try {
+      const stats   = (typeof g_trackerState !== "undefined" && g_trackerState?.stats) ? g_trackerState.stats : {};
+      const settled = stats.settled || 0;
+      const wins    = stats.wins    || 0;
+      const losses  = stats.losses  || 0;
+      const wr      = settled > 0 ? ((wins / settled) * 100).toFixed(1) : "—";
+      const league  = document.getElementById("leagueSelect")?.value || "(none)";
+      const teamA   = document.getElementById("teamAName")?.value?.trim() || "(empty)";
+      const teamB   = document.getElementById("teamBName")?.value?.trim() || "(empty)";
+      const active  = (typeof g_trackerState !== "undefined" && Array.isArray(g_trackerState?.activePicks)) ? g_trackerState.activePicks.length : 0;
+      log("ENGINE", "HEALTH", "SESSION HEALTH REPORT", {
+        league, teamA, teamB,
+        settled, wins, losses,
+        winRate: wr + "%",
+        activePicks: active,
+        cacheEntries: {
+          sched:   typeof _schedCache   !== "undefined" ? _schedCache.size   : "N/A",
+          summary: typeof _summaryCache !== "undefined" ? _summaryCache.size : "N/A"
+        }
+      });
+      if (!_isOpen) open();
+    } catch(e) { log("ERROR", "HEALTH", "Health check failed: " + e.message); }
+  }
+
+  return { log, clear, copy, toggleFilter, open, close, runTestFetch, quickHealthSummary, get isOpen() { return _isOpen; }, get logs() { return _log; } };
 })();
 
 window.openVisualReportFromDebug = function() {
