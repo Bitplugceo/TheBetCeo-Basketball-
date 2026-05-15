@@ -3153,27 +3153,13 @@ const WORKER_URL = "https://thebetceo-engine.ridwantunde636.workers.dev/";
 const WORKER_BASE_URL = String(WORKER_URL || "").replace(/\/+$/, "");
 const DEBUG = false;
 const CACHE_MAX = 120;
-const CACHE_TTL_MS = 10 * 60 * 1000; // Path B #4: 10-min ESPN cache eviction window
 
 // FIX 12 & 3 & 8: Global Namespace, Timeouts & Archiving Limits
-    const BB_CONFIG = {
+const BB_CONFIG = {
   limits: { activePicks: 500, archivePruneDays: 90 },
   timeouts: { fetch: 15000 },
-  version: "Path-A-v1",
-  patchRegistry: new Set()
+  version: "Path-A-v1"
 };
-
-// Issue 7: Patch-once registry — prevents duplicate side-effects when a patch
-// block is applied more than once (e.g. after a hot reload or re-patch session).
-function registerPatch(id) {
-  if (BB_CONFIG.patchRegistry.has(id)) return false;
-  BB_CONFIG.patchRegistry.add(id);
-  return true;
-}
-
-function hasPatch(id) {
-  return BB_CONFIG.patchRegistry.has(id);
-}
 
 /**
  * FIX 1: ESPN ADAPTER LAYER (Clean Version)
@@ -3218,21 +3204,16 @@ const MatchupAdapter = {
             // Fix 11: Dynamic Calibration System (Replaces Magic Numbers)
     function getDynamicWeights(sampleTier, volatility, league) {
       const isFull = sampleTier === "full";
-      const lp = (typeof getLeagueProfile === "function") ? getLeagueProfile(league) : { teamWeightBonus: 0, volBias: 0, label: "?" };
-      const volLimit = (LEAGUE_VOL_LIMITS[league] || 12) + (lp.volBias || 0);
-      const isHighVol = volatility > volLimit;
-
+      const isHighVol = volatility > (LEAGUE_VOL_LIMITS[league] || 12);
+      
       // Base confidence starts at 0.60 for full samples, drops for thin/volatile
-      // Path B #3: per-league-family teamWeightBonus applied on top
       let teamWeight = clampNumber(isFull ? 0.65 : 0.50 - (isHighVol ? 0.10 : 0), 0.40, 0.75);
-      teamWeight = clampNumber(teamWeight + (lp.teamWeightBonus || 0), 0.38, 0.76);
 
       return { 
         teamWeight, 
         oppWeight: 1.0 - teamWeight, 
         regressionWeight: isHighVol ? 0.75 : 0.90, 
-        baselineWeight: isHighVol ? 0.25 : 0.10,
-        leagueProfileLabel: lp.label
+        baselineWeight: isHighVol ? 0.25 : 0.10 
       };
     }
 
@@ -3530,26 +3511,6 @@ const LEAGUE_H1_RATIO = {
   cebl: 0.488, nznbl: 0.488, serbia_kls: 0.487, croatia_premier: 0.487,
   default: 0.487
 };
-
-/* ── PATH B #3: MULTI-LEAGUE PROFILES ── */
-const LEAGUE_PROFILES = {
-  nba:     { teamWeightBonus:  0.05, volBias:  0.00, label: "NBA/WNBA"     },
-  ncaa:    { teamWeightBonus:  0.03, volBias:  0.00, label: "NCAA"         },
-  euro:    { teamWeightBonus:  0.00, volBias:  0.00, label: "EuroLeague"   },
-  asia:    { teamWeightBonus: -0.02, volBias:  0.02, label: "Asia/Pacific" },
-  latam:   { teamWeightBonus: -0.03, volBias:  0.03, label: "LatAm"        },
-  default: { teamWeightBonus: -0.02, volBias:  0.02, label: "Other"        }
-};
-function getLeagueProfile(league) {
-  const l = String(league || "").toLowerCase();
-  if (["nba","wnba","wnba_pre"].includes(l)) return LEAGUE_PROFILES.nba;
-  if (l === "ncaa") return LEAGUE_PROFILES.ncaa;
-  if (["euroleague","eurocup","champions_league","acb","lba","bbl","bcl","proa","isl","aba","lkl","plk","prob","turkey_bsl","united_league","bnxt"].includes(l)) return LEAGUE_PROFILES.euro;
-  if (["cba","bleague","korea_kbl","pba","ausnbl","nznbl","aus_nbl1_central","aus_nbl1_west","cebl"].includes(l)) return LEAGUE_PROFILES.asia;
-  if (["argentina_lnb","brazil_nbb","chile_lnb","mexico_lnbp","mexico_cibacopa","puerto_rico_bsn","uruguay_lub"].includes(l)) return LEAGUE_PROFILES.latam;
-  return LEAGUE_PROFILES.default;
-}
-/* ── END PATH B #3 ── */
 
 function getLeagueH1Ratio(league) {
   return LEAGUE_H1_RATIO[String(league || "").toLowerCase()] || LEAGUE_H1_RATIO.default;
@@ -4927,10 +4888,10 @@ function trackerDebug(message, extra = null) {
   }
 }
 
-// Issue 7: renderTrackerDebugPanel and renderEngineDebugPanel were byte-for-byte
-// identical. Collapsed to a single implementation via alias to eliminate the duplicate.
 function renderTrackerDebugPanel() {
-  renderEngineDebugPanel();
+  if (!isTrackerPicksView()) {
+    renderTrackerAnalytics();
+  }
 }
 
 const ENGINE_DEBUG_LIMIT = 180;
@@ -8912,46 +8873,6 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
     };
   });
 }
-/* ── PATH B #1: ADVANCED TRACKER INTELLIGENCE ── */
-function applyTrackerLearningToPicks(picks) {
-  if (!Array.isArray(picks) || !picks.length) return;
-  const archived = Array.isArray(g_trackerState?.archivedPicks) ? g_trackerState.archivedPicks : [];
-  const active   = Array.isArray(g_trackerState?.activePicks)   ? g_trackerState.activePicks   : [];
-  const allSettled = [...archived, ...active].filter(p =>
-    p.resultStatus === "win" || p.resultStatus === "loss" || p.resultStatus === "push"
-  );
-  if (allSettled.length < 15) return;
-
-  const mkt = {};
-  for (const p of allSettled) {
-    const k = p.marketKey || "ft";
-    if (!mkt[k]) mkt[k] = { wins: 0, total: 0 };
-    if (p.resultStatus === "win") mkt[k].wins++;
-    mkt[k].total++;
-  }
-
-  picks.forEach(p => {
-    if (!p || p.pick === "NO PLAY") return;
-    const ms = mkt[p.marketKey];
-    if (!ms || ms.total < 8) return;
-    const wr = ms.wins / ms.total;
-    let shift = 0;
-    if (wr < 0.40 && ms.total >= 10) shift = -1;
-    else if (wr > 0.62 && ms.total >= 10) shift = 1;
-    if (shift !== 0 && p.confidence && p.confidence !== "NaN" && p.confidence !== "—") {
-      const prev = p.confidence;
-      p.confidence = bumpConfidenceGrade(p.confidence, shift);
-      p.trackerLearning = { marketKey: p.marketKey, winRate: wr, total: ms.total, shift, from: prev, to: p.confidence };
-    }
-  });
-
-  const summary = Object.entries(mkt).map(([k,v]) =>
-    `${k}:${v.wins}W/${v.total}T(${((v.wins/v.total)*100).toFixed(0)}%)`
-  ).join(" | ");
-  engineDebug("TRACKER LEARNING", summary);
-}
-/* ── END PATH B #1 ── */
-
 function getTrackedLeagueBase(league) {
   const l = String(league || "").toLowerCase();
   if (l === "nba") return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
@@ -9517,9 +9438,7 @@ function addTrackedPicks(newPicks) {
 
   If output looks different, prove the exact broken path first before changing any constant.
 */
-    function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0, league = "") {
-  // Issue 3: optional league param enables profile-based cap adjustment.
-  // Backward-compatible: callers that omit league get capAdj = 0 (no change).
+    function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0) {
   const minLen = Math.min(Number(lenA) || 0, Number(lenB) || 0);
   if (minLen < 2) return 0;
 
@@ -9541,21 +9460,13 @@ function addTrackedPicks(newPicks) {
     else if (diff >= 8) base *= 0.80;
   }
 
-  // Profile-aware cap: EuroLeague round-robin H2H is more reliable (raise cap);
-  // LatAm/Asia data is noisier so we tighten the cap to limit its pull.
-  const lp = (typeof getLeagueProfile === "function") ? getLeagueProfile(league) : null;
-  const capAdj =
-    lp?.label === "EuroLeague"   ?  0.04 :
-    lp?.label === "LatAm"        ? -0.04 :
-    lp?.label === "Asia/Pacific" ? -0.02 : 0;
-
   const maxCap =
     marketType === "h2" ? 0.32 :
     marketType === "h1" ? 0.28 :
     MODEL_TUNING.h2hMaxWeight;
 
   if (!isFinite(base)) return 0;
-  return clampNumber(base, 0, clampNumber(maxCap + capAdj, 0.08, 0.38));
+  return clampNumber(base, 0, maxCap);
 }
 
     // ── FIX #1: Volatility no longer shrinks the projection value.
@@ -9718,13 +9629,8 @@ function applyContextAdjustments(baseProjection, ctx) {
 
 
     function getTrapVolThreshold(marketType, league) {
-      // Issue 3: extend binary NBA/other to a profile-scaled threshold.
-      // LatAm/Asia leagues have higher volBias so they tolerate a slightly wider vol
-      // before the trap fires, reflecting their noisier scoring distributions.
       const bucket = TRAP_RULES.volThresholds[marketType] || TRAP_RULES.volThresholds.ft;
-      if (league === "nba" || league === "wnba" || league === "wnba_pre") return bucket.nba;
-      const lp = (typeof getLeagueProfile === "function") ? getLeagueProfile(league) : { volBias: 0 };
-      return bucket.other + Number(lp.volBias || 0);
+      return league === "nba" ? bucket.nba : bucket.other;
     }
 
     function detectTrap(edge, line, pick, league, marketType, vol) {
@@ -9739,16 +9645,6 @@ function applyContextAdjustments(baseProjection, ctx) {
       if (marketType === "ft" && pick.includes("UNDER")) {
         if (league === "nba" && line < TRAP_RULES.lowLineUnder.nba) bad++;
         else if (league === "ncaa" && line < TRAP_RULES.lowLineUnder.ncaa) bad++;
-        else {
-          // Issue 3: profile-aware under trap for international leagues.
-          // Each floor reflects the realistic minimum scoring total for that family.
-          const lp = (typeof getLeagueProfile === "function") ? getLeagueProfile(league) : null;
-          const intlFloor =
-            lp?.label === "EuroLeague"   ? 142 :
-            lp?.label === "Asia/Pacific" ? 152 :
-            lp?.label === "LatAm"        ? 138 : 0;
-          if (intlFloor > 0 && line < intlFloor) bad++;
-        }
       }
       return bad >= 2;
     }
@@ -12770,13 +12666,9 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 }
 
 function getMarketVolLimit(league, marketKey) {
-  // Issue 3: apply league-profile volBias so international leagues (LatAm, Asia)
-  // get a wider vol limit and the engine grades them more conservatively.
-  const lp = (typeof getLeagueProfile === "function") ? getLeagueProfile(league) : { volBias: 0 };
-  const bias = Number(lp.volBias || 0);
-  if (marketKey === "h1" || marketKey === "h2") return (league === "nba" ? 7 : 6) + bias;
-  if (marketKey.startsWith("q")) return (league === "nba" ? 5.5 : 4.8) + bias;
-  return (LEAGUE_VOL_LIMITS[league] || 12) + bias;
+  if (marketKey === "h1" || marketKey === "h2") return league === "nba" ? 7 : 6;
+  if (marketKey.startsWith("q")) return league === "nba" ? 5.5 : 4.8;
+  return LEAGUE_VOL_LIMITS[league] || LEAGUE_VOL_LIMITS.unknown;
 }
 
 function getMassacreThresholdBucket(league, marketKey) {
@@ -14979,9 +14871,6 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
 // Fix C1: Plug in the Massacre MC machine
 await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtureMeta);
 
-// Path B #1: Apply tracker learning adjustments post-massacre
-applyTrackerLearningToPicks(finalPicksForDisplay);
-
 // Fix H1: Attach the memory icons (🧠)
 finalPicksForDisplay.forEach(p => {
   if (memoryFlags[p.marketKey]) p.usedMemory = true;
@@ -15168,9 +15057,6 @@ if (trackedToSave.length) {
       resultsShown: finalPicksForDisplay.length
     });
 
-// Path B #6: Run automated model health check
-runModelHealthCheck(finalPicksForDisplay);
-
     setTimeout(() => {
       const rect = table.getBoundingClientRect();
       const isInView = (rect.top >= 0 && rect.bottom <= window.innerHeight);
@@ -15192,79 +15078,6 @@ runModelHealthCheck(finalPicksForDisplay);
     if (runBtn) runBtn.disabled = false;
   }
 }
-
-/* ── PATH B #6: AUTOMATED MODEL HEALTH MONITOR ── */
-function runModelHealthCheck(currentPicks) {
-  try {
-    const stats   = g_trackerState?.stats || {};
-    const settled = stats.settled || 0;
-    const wins    = stats.wins    || 0;
-
-    const allPicks = [
-      ...(Array.isArray(g_trackerState?.archivedPicks) ? g_trackerState.archivedPicks : []),
-      ...(Array.isArray(g_trackerState?.activePicks)   ? g_trackerState.activePicks   : [])
-    ]
-      .filter(p => p.resultStatus === "loss" || p.resultStatus === "win" || p.resultStatus === "push")
-      .sort((a, b) => new Date(b.settledAt || b.addedAt || 0) - new Date(a.settledAt || a.addedAt || 0));
-
-    let lossStreak = 0;
-    for (const p of allPicks) { if (p.resultStatus === "loss") lossStreak++; else break; }
-
-    const totalNow  = Array.isArray(currentPicks) ? currentPicks.length : 0;
-    const noPlayNow = Array.isArray(currentPicks) ? currentPicks.filter(p => p.pick === "NO PLAY").length : 0;
-    const allNoPlay = totalNow > 0 && noPlayNow === totalNow;
-
-    const alerts = [];
-    if (settled >= 10) {
-      const wr = wins / settled;
-      if (wr < 0.43)      alerts.push({ level: "danger", msg: `⛔ Win rate ${(wr*100).toFixed(1)}% — critically low. Pause bets and review your data inputs.` });
-      else if (wr < 0.50) alerts.push({ level: "warn",   msg: `⚠️ Win rate ${(wr*100).toFixed(1)}% — below breakeven on ${settled} settled picks. Monitor closely.` });
-      else                alerts.push({ level: "ok",     msg: `✅ Win rate ${(wr*100).toFixed(1)}% across ${settled} settled picks — engine healthy.` });
-    }
-    if (lossStreak >= 5)      alerts.push({ level: "danger", msg: `⛔ ${lossStreak} consecutive losses. Avoid high-stake plays until streak breaks.` });
-    else if (lossStreak >= 3) alerts.push({ level: "warn",   msg: `⚠️ ${lossStreak} consecutive losses. Stay disciplined on unit sizing.` });
-    if (allNoPlay) alerts.push({ level: "warn", msg: `⚠️ Every pick this run returned NO PLAY — data may be insufficient or thresholds are very tight.` });
-    if (alerts.length === 0 && settled < 10)
-      alerts.push({ level: "info", msg: `ℹ️ Health monitor active — needs ${10 - settled} more settled pick(s) for a full report.` });
-
-    const colorMap = { danger:"#c91920", warn:"#d98a00", ok:"#2f8f4a", info:"#3a7fc1" };
-    const bgMap    = { danger:"#fff0f0", warn:"#fffbe6", ok:"#f0fff4", info:"#f0f6ff" };
-    const bannerHtml = alerts.map(a =>
-      `<div style="padding:6px 10px;font-size:11px;font-weight:700;color:${colorMap[a.level]};background:${bgMap[a.level]};border-left:3px solid ${colorMap[a.level]};margin-bottom:2px;">${a.msg}</div>`
-    ).join("");
-
-    let banner = document.getElementById("modelHealthBanner");
-    if (!banner) {
-      banner = document.createElement("div");
-      banner.id = "modelHealthBanner";
-      banner.style.cssText = "margin:6px 0;font-family:sans-serif;";
-      const dash = document.getElementById("syndicateDashboard");
-      if (dash && dash.parentNode) dash.parentNode.insertBefore(banner, dash.nextSibling);
-    }
-    banner.innerHTML = bannerHtml;
-    engineDebug("MODEL HEALTH CHECK", alerts.map(a => `[${a.level.toUpperCase()}] ${a.msg}`));
-  } catch (err) { engineDebug("MODEL HEALTH CHECK ERROR", err.message); }
-}
-/* ── END PATH B #6 ── */
-
-/* ── PATH B #4: CACHE EVICTION SCHEDULER ── */
-function scheduleCacheEviction() {
-  // Issue 7: guard with registerPatch so repeat calls (hot-reload, re-patch)
-  // cannot stack duplicate setInterval timers.
-  if (!registerPatch("cache_eviction_scheduler_v1")) return;
-  setInterval(() => {
-    try {
-      const before = (typeof _schedCache   !== "undefined" ? _schedCache.size   : 0)
-                   + (typeof _summaryCache !== "undefined" ? _summaryCache.size : 0);
-      if (typeof _schedCache   !== "undefined") _schedCache.clear();
-      if (typeof _summaryCache !== "undefined") _summaryCache.clear();
-      if (before > 0) engineDebug(`CACHE EVICTION: Cleared ${before} stale ESPN entries`);
-    } catch(e) { /* silent */ }
-  }, CACHE_TTL_MS);
-}
-/* ── END PATH B #4 ── */
-
-
 
             function clearAll() {
       acknowledgeGlobalEngineAlert();
@@ -15324,13 +15137,10 @@ function scheduleCacheEviction() {
 
       const dash = document.getElementById("syndicateDashboard");
       if (dash) dash.remove();
-      const healthBanner = document.getElementById("modelHealthBanner");
-      if (healthBanner) healthBanner.remove();
 
       g_engineDebugLog = [];
 
       renderEngineDebugPanel();
----REPLACE---
       const fixtureSelect = document.getElementById("fixtureSelect");
       if (fixtureSelect) { fixtureSelect.innerHTML = '<option value="">— Select match —</option>'; fixtureSelect.value = ""; }
 
@@ -16042,8 +15852,6 @@ ${fullHTML}
     });
   }
 
-        scheduleCacheEviction();
----REPLACE---
 }); // <-- EXACTLY ONE CLOSING BRACKET HERE.
 </script>
 
@@ -16158,7 +15966,7 @@ const AFDB = (function() {
   return '<div style="padding:8px;border-bottom:1px solid #151515;"><div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;"><span style="color:#555;font-size:9px;min-width:65px;flex-shrink:0;">' + esc(e.ts) + '</span><span style="color:' + def.color + ';font-size:10px;font-weight:900;min-width:75px;flex-shrink:0;">' + icon + ' ' + esc(e.level) + '</span><span style="color:#777;font-size:9px;min-width:80px;flex-shrink:0;">[' + esc(e.section) + ']</span><span style="color:' + def.color + ';font-size:11px;font-weight:700;flex:1;white-space:pre-wrap;">' + esc(e.msg) + '</span></div>' + dataHtml + '</div>';
 }).join('');
 
-const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊</button><button onclick="AFDB.quickHealthSummary()" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🏥 HEALTH</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
+const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
 
 const emptyMsg = _showOnlyErrors ? 'No suspects arrested. The code is clean.' : 'No log entries yet. Run a fetch.';
 const filterLabel = `\ud83c\udfaf LEVEL: ${_currentLogLevel}`;
@@ -16250,171 +16058,13 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
 
   }
 
-  function quickHealthSummary() {
-    // Issue 6: comprehensive health dump including league profile, Phase 2 activation,
-    // derived signal boards, patch registry, and all cache sizes.
-    try {
-      const stats    = (typeof g_trackerState !== "undefined" && g_trackerState?.stats) ? g_trackerState.stats : {};
-      const settled  = stats.settled || 0;
-      const wins     = stats.wins    || 0;
-      const losses   = stats.losses  || 0;
-      const pushes   = stats.pushes  || 0;
-      const wr       = settled > 0 ? ((wins / settled) * 100).toFixed(1) + "%" : "—";
-      const league   = document.getElementById("leagueSelect")?.value || "(none)";
-      const teamA    = document.getElementById("teamAName")?.value?.trim() || "(empty)";
-      const teamB    = document.getElementById("teamBName")?.value?.trim() || "(empty)";
-      const active   = (typeof g_trackerState !== "undefined" && Array.isArray(g_trackerState?.activePicks))   ? g_trackerState.activePicks.length   : 0;
-      const archived = (typeof g_trackerState !== "undefined" && Array.isArray(g_trackerState?.archivedPicks)) ? g_trackerState.archivedPicks.length : 0;
-
-      const lp     = (typeof getLeagueProfile     === "function" && league !== "(none)") ? getLeagueProfile(league)     : null;
-      const trust  = (typeof getLeagueTrustMeta   === "function" && league !== "(none)") ? getLeagueTrustMeta(league)   : null;
-      const phase2 = (typeof getPhase2ActivationState === "function") ? getPhase2ActivationState() : null;
-      const derived = (typeof g_trackerDerivedState !== "undefined") ? g_trackerDerivedState : null;
-      const patches = (typeof BB_CONFIG !== "undefined" && BB_CONFIG.patchRegistry) ? [...BB_CONFIG.patchRegistry] : [];
-
-      log("ENGINE", "HEALTH", "SESSION HEALTH REPORT", {
-        "MATCH": { league, teamA, teamB },
-        "RECORD": {
-          settled, wins, losses, pushes, winRate: wr,
-          activePicks: active, archivedPicks: archived
-        },
-        "LEAGUE PROFILE": {
-          profileLabel:    lp?.label    || "—",
-          teamWeightBonus: lp           ? (lp.teamWeightBonus >= 0 ? "+" : "") + lp.teamWeightBonus : "—",
-          volBias:         lp           ? lp.volBias   : "—",
-          trustLevel:      trust?.level || "—",
-          trustMode:       trust?.mode  || "—",
-          trustGuidance:   trust?.guidance || "—"
-        },
-        "PHASE 2 / PATH B": {
-          phase2Mode:          phase2?.phase2Mode          || "—",
-          trackerFeedbackLive: phase2?.trackerFeedbackLive ?? "—",
-          teamMemoryLive:      phase2?.teamMemoryLive      ?? "—",
-          advisoryOnly:        phase2?.advisoryOnly        ?? "—",
-          checkpoint:          phase2 ? `${phase2.settled}/${phase2.reviewCheckpointSettled} settled` : "—",
-          trackerReady:        phase2?.trackerReady        ?? "—",
-          teamReady:           phase2?.teamReady           ?? "—"
-        },
-        "DERIVED SIGNALS": derived?.signalBoards ? {
-          marketSideSignals: derived.signalBoards.marketSides?.length || 0,
-          teamSignals:       derived.signalBoards.teams?.length       || 0,
-          matchupSignals:    derived.signalBoards.matchups?.length    || 0,
-          profileSignals:    derived.signalBoards.profiles?.length    || 0,
-          computedAt:        derived.computedAt || "—"
-        } : "not built yet",
-        "SYSTEM": {
-          modelVersion:  (typeof ENGINE_MODEL_VERSION !== "undefined") ? ENGINE_MODEL_VERSION : "—",
-          buildVersion:  (typeof APP_BUILD_VERSION    !== "undefined") ? APP_BUILD_VERSION    : "—",
-          patchesApplied: patches.length ? patches.join(", ") : "(none)",
-          lineMemory:    (typeof g_engineLineMemory !== "undefined") ? Object.keys(g_engineLineMemory).length + " entries" : "—",
-          caches: {
-            sched:   typeof _schedCache   !== "undefined" ? _schedCache.size   + " entries" : "N/A",
-            summary: typeof _summaryCache !== "undefined" ? _summaryCache.size + " entries" : "N/A",
-            fixture: typeof _fixtureCache !== "undefined" ? _fixtureCache.size + " entries" : "N/A"
-          }
-        }
-      });
-      if (!_isOpen) open();
-    } catch(e) { log("ERROR", "HEALTH", "Health check failed: " + e.message); }
-  }
-
-  return { log, clear, copy, toggleFilter, open, close, runTestFetch, quickHealthSummary, get isOpen() { return _isOpen; }, get logs() { return _log; } };
+  return { log, clear, copy, toggleFilter, open, close, runTestFetch, get isOpen() { return _isOpen; }, get logs() { return _log; } };
 })();
 
-// Issue 6: inline system-status overlay rendered inside the AFDB panel.
-// Shows league profile, Phase 2 state, tracker record, patch registry, and caches
-// without leaving the debug view.
-window.showAfdbSystemStatus = function() {
-  try {
-    const league  = document.getElementById("leagueSelect")?.value || "(none)";
-    const lp      = (typeof getLeagueProfile       === "function" && league !== "(none)") ? getLeagueProfile(league)       : null;
-    const trust   = (typeof getLeagueTrustMeta     === "function" && league !== "(none)") ? getLeagueTrustMeta(league)     : null;
-    const phase2  = (typeof getPhase2ActivationState === "function") ? getPhase2ActivationState() : null;
-    const derived = (typeof g_trackerDerivedState !== "undefined") ? g_trackerDerivedState : null;
-    const stats   = (typeof g_trackerState !== "undefined" && g_trackerState?.stats) ? g_trackerState.stats : {};
-    const patches = (typeof BB_CONFIG !== "undefined" && BB_CONFIG.patchRegistry) ? [...BB_CONFIG.patchRegistry] : [];
-
-    const wr = stats.settled
-      ? ((Number(stats.wins || 0) / stats.settled) * 100).toFixed(1) + "%"
-      : "—";
-
-    const panel = document.getElementById("afdbPanel");
-    if (!panel) return;
-
-    // Build rows: [label, value] where value=null renders a section header
-    const rows = [
-      ["MATCH",            null],
-      ["League",           league],
-      ["Team A",           document.getElementById("teamAName")?.value?.trim() || "(empty)"],
-      ["Team B",           document.getElementById("teamBName")?.value?.trim() || "(empty)"],
-      ["RECORD",           null],
-      ["Overall",          `${stats.wins||0}W / ${stats.losses||0}L / ${stats.pushes||0}P  (${wr})`],
-      ["Settled",          String(stats.settled || 0)],
-      ["Active",           String(Array.isArray(g_trackerState?.activePicks) ? g_trackerState.activePicks.length : 0)],
-      ["Archived",         String(Array.isArray(g_trackerState?.archivedPicks) ? g_trackerState.archivedPicks.length : 0)],
-      ["LEAGUE PROFILE",   null],
-      ["Profile",          lp?.label || "—"],
-      ["Weight Bonus",     lp ? (lp.teamWeightBonus >= 0 ? "+" : "") + lp.teamWeightBonus : "—"],
-      ["Vol Bias",         lp ? String(lp.volBias) : "—"],
-      ["Trust Level",      trust ? `${trust.label} (${trust.mode})` : "—"],
-      ["PHASE 2 / PATH B", null],
-      ["Mode",             phase2?.phase2Mode || "—"],
-      ["Tracker Feedback", phase2?.trackerFeedbackLive ? "LIVE" : "advisory / shadow"],
-      ["Team Memory",      phase2?.teamMemoryLive      ? "LIVE" : "advisory / shadow"],
-      ["Checkpoint",       phase2 ? `${phase2.settled} / ${phase2.reviewCheckpointSettled} settled` : "—"],
-      ["Mkt Signals",      String(derived?.signalBoards?.marketSides?.length || 0)],
-      ["Team Signals",     String(derived?.signalBoards?.teams?.length || 0)],
-      ["SYSTEM",           null],
-      ["Model",            (typeof ENGINE_MODEL_VERSION !== "undefined") ? ENGINE_MODEL_VERSION : "—"],
-      ["Build",            (typeof APP_BUILD_VERSION    !== "undefined") ? APP_BUILD_VERSION    : "—"],
-      ["Patches",          patches.length ? patches.join(", ") : "(none)"],
-      ["Line Memory",      (typeof g_engineLineMemory !== "undefined") ? Object.keys(g_engineLineMemory).length + " entries" : "—"],
-      ["Sched Cache",      (typeof _schedCache   !== "undefined") ? _schedCache.size   + " entries" : "—"],
-      ["Summary Cache",    (typeof _summaryCache !== "undefined") ? _summaryCache.size + " entries" : "—"],
-      ["Fixture Cache",    (typeof _fixtureCache !== "undefined") ? _fixtureCache.size + " entries" : "—"]
-    ];
-
-    const rowHtml = rows.map(([k, v]) => {
-      if (v === null) {
-        return `<tr><td colspan="2" style="background:#1a1a1a;color:#d4af37;font-size:10px;font-weight:900;padding:5px 8px;text-transform:uppercase;letter-spacing:0.5px;">${k}</td></tr>`;
-      }
-      return `<tr>
-        <td style="padding:5px 8px;color:#777;font-size:10px;font-weight:700;border-bottom:1px solid #111;white-space:nowrap;">${k}</td>
-        <td style="padding:5px 8px;color:#fff;font-size:10px;font-weight:800;border-bottom:1px solid #111;word-break:break-all;">${v}</td>
-      </tr>`;
-    }).join("");
-
-    const existing = document.getElementById("afdbStatusOverlay");
-    if (existing) { existing.remove(); return; } // toggle off if already open
-
-    const overlay = document.createElement("div");
-    overlay.id = "afdbStatusOverlay";
-    overlay.style.cssText = "position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(8,8,8,0.97);z-index:10;overflow-y:auto;";
-    overlay.innerHTML = `
-      <div style="padding:12px 14px 8px;color:#d4af37;font-size:13px;font-weight:900;letter-spacing:1px;border-bottom:1px solid #222;display:flex;justify-content:space-between;align-items:center;">
-        <span>📊 SYSTEM STATUS</span>
-        <button onclick="document.getElementById('afdbStatusOverlay').remove()" style="background:none;border:none;color:#aaa;font-size:18px;font-weight:900;cursor:pointer;line-height:1;">✕</button>
-      </div>
-      <table style="width:100%;border-collapse:collapse;margin-top:4px;">${rowHtml}</table>
-    `;
-
-    panel.style.position = "relative";
-    panel.appendChild(overlay);
-  } catch(e) {
-    console.error("[BB Engine] showAfdbSystemStatus failed", e);
-  }
-};
-
-// Issue 6: 📊 button now shows the inline status panel when AFDB is open;
-// falls back to opening the tracker report when AFDB is closed.
 window.openVisualReportFromDebug = function() {
-  if (typeof AFDB !== "undefined" && AFDB.isOpen) {
-    window.showAfdbSystemStatus();
-  } else {
-    if (typeof AFDB !== "undefined") AFDB.close();
-    if (typeof openTrackerModal    === "function") openTrackerModal();
-    if (typeof setTrackerModalView === "function") setTrackerModalView("report");
-  }
+  AFDB.close();
+  if (typeof openTrackerModal === 'function') openTrackerModal();
+  if (typeof setTrackerModalView === 'function') setTrackerModalView('report');
 };
 
 window.engineDebug = function(msg, extra) {
