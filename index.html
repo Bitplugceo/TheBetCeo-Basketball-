@@ -13863,6 +13863,111 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
 
 
 
+/* ── FIX 2: Error Boundary ─────────────────────────────────── */
+function withErrorBoundary(fn, context) {
+  return async function (...args) {
+    try {
+      return await fn.apply(this, args);
+    } catch (err) {
+      const msg = err?.message || String(err);
+      if (typeof engineDebug === "function")
+        engineDebug("ERROR BOUNDARY [" + context + "]: " + msg, { stack: err?.stack });
+      if (typeof triggerGlobalEngineAlert === "function")
+        triggerGlobalEngineAlert(context + " crashed: " + msg);
+      const t = document.getElementById("results");
+      if (t) {
+        t.style.display = "table";
+        const row = t.insertRow();
+        row.innerHTML = `<td colspan="5" style="color:#ff6b6b;text-align:left;padding:8px;">⚠ <b>${escapeHtml(context)}</b> hit an error: ${escapeHtml(msg)}</td>`;
+      }
+      const rb = document.getElementById("runBtn");
+      if (rb) rb.disabled = false;
+      return null;
+    }
+  };
+}
+
+/* ── FIX 3: Clean Input Layer ───────────────────────────────── */
+function extractInputs(league) {
+  const isNbaOrNcaa = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
+  function readLine(id) {
+    const v = parseMarketLine((document.getElementById(id)?.value || "").trim());
+    return isFinite(v) ? v : null;
+  }
+  function readSeries(id) {
+    return ((document.getElementById(id)?.value || "").trim()) ? parseGames(id) : null;
+  }
+  let h1Line = readLine("h1Market");
+  const ftLine = readLine("ftMarket");
+  if (!h1Line && ftLine && typeof getLeagueH1Ratio === "function")
+    h1Line = Math.round(ftLine * getLeagueH1Ratio(league) * 2) / 2;
+  const parsed = {
+    aFTScored:  readSeries("aFTScored"),  aFTAllowed: readSeries("aFTAllowed"),
+    bFTScored:  readSeries("bFTScored"),  bFTAllowed: readSeries("bFTAllowed"),
+    a1HScored:  readSeries("a1HScored"),  a1HAllowed: readSeries("a1HAllowed"),
+    b1HScored:  readSeries("b1HScored"),  b1HAllowed: readSeries("b1HAllowed"),
+    a2HScored:  readSeries("a2HScored"),  a2HAllowed: readSeries("a2HAllowed"),
+    b2HScored:  readSeries("b2HScored"),  b2HAllowed: readSeries("b2HAllowed"),
+    aQ1Scored:  readSeries("aQ1Scored"),  aQ1Allowed: readSeries("aQ1Allowed"),
+    aQ2Scored:  readSeries("aQ2Scored"),  aQ2Allowed: readSeries("aQ2Allowed"),
+    aQ3Scored:  readSeries("aQ3Scored"),  aQ3Allowed: readSeries("aQ3Allowed"),
+    aQ4Scored:  readSeries("aQ4Scored"),  aQ4Allowed: readSeries("aQ4Allowed"),
+    bQ1Scored:  readSeries("bQ1Scored"),  bQ1Allowed: readSeries("bQ1Allowed"),
+    bQ2Scored:  readSeries("bQ2Scored"),  bQ2Allowed: readSeries("bQ2Allowed"),
+    bQ3Scored:  readSeries("bQ3Scored"),  bQ3Allowed: readSeries("bQ3Allowed"),
+    bQ4Scored:  readSeries("bQ4Scored"),  bQ4Allowed: readSeries("bQ4Allowed"),
+    aFTH2H: readSeries("aFTH2H"),  bFTH2H: readSeries("bFTH2H"),
+    a1HH2H: readSeries("a1HH2H"),  b1HH2H: readSeries("b1HH2H"),
+    a2HH2H: readSeries("a2HH2H"),  b2HH2H: readSeries("b2HH2H"),
+    aQ1H2H: readSeries("aQ1H2H"),  bQ1H2H: readSeries("bQ1H2H"),
+    aQ2H2H: readSeries("aQ2H2H"),  bQ2H2H: readSeries("bQ2H2H"),
+    aQ3H2H: readSeries("aQ3H2H"),  bQ3H2H: readSeries("bQ3H2H"),
+    aQ4H2H: readSeries("aQ4H2H"),  bQ4H2H: readSeries("bQ4H2H"),
+  };
+  const lines = {
+    ftLine, h1Line,
+    h2Line:    isNbaOrNcaa ? readLine("h2Market") : null,
+    aLine:     readLine("teamAMarket"),
+    bLine:     readLine("teamBMarket"),
+    q1aLine:   readLine("q1TeamAMarket"),
+    q1bLine:   readLine("q1TeamBMarket"),
+    h1aLine:   readLine("h1TeamAMarket"),
+    h1bLine:   readLine("h1TeamBMarket"),
+    highQLine: readLine("highQTotalMarket"),
+    lowQLine:  readLine("lowQTotalMarket"),
+    raceRange: (document.getElementById("racePointsMarket")?.value || ""),
+  };
+  return { parsed, lines };
+}
+
+function validateExtractedInputs(extracted, league) {
+  const errors = [];
+  if (!league) return { ok: false, errorHtml: "⚠ Select a league first." };
+  const { parsed } = extracted;
+  const normA = normalizeTeamName(document.getElementById("teamAName")?.value || "");
+  const normB = normalizeTeamName(document.getElementById("teamBName")?.value || "");
+  const tAId = String(selectedTeamIds?.A || "");
+  const tBId = String(selectedTeamIds?.B || "");
+  if ((tAId && tAId === tBId) || (normA && normA === normB))
+    errors.push("Team A and Team B cannot be the same team.");
+  function chk(s, lbl) { if (s?.err) errors.push(`<b>${lbl}:</b> ${s.err}`); }
+  chk(parsed.aFTScored, "Team A FT Scored"); chk(parsed.aFTAllowed, "Team A FT Allowed");
+  chk(parsed.bFTScored, "Team B FT Scored"); chk(parsed.bFTAllowed, "Team B FT Allowed");
+  chk(parsed.a1HScored, "Team A 1H Scored"); chk(parsed.a1HAllowed, "Team A 1H Allowed");
+  chk(parsed.b1HScored, "Team B 1H Scored"); chk(parsed.b1HAllowed, "Team B 1H Allowed");
+  chk(parsed.a2HScored, "Team A 2H Scored"); chk(parsed.b2HScored,  "Team B 2H Scored");
+  chk(parsed.aFTH2H, "FT H2H (A)");  chk(parsed.bFTH2H, "FT H2H (B)");
+  chk(parsed.a1HH2H, "1H H2H (A)");  chk(parsed.b1HH2H, "1H H2H (B)");
+  ["Q1","Q2","Q3","Q4"].forEach(q => {
+    chk(parsed[`aQ${q}H2H`], q + " H2H (A)");
+    chk(parsed[`bQ${q}H2H`], q + " H2H (B)");
+  });
+  if (errors.length)
+    return { ok: false, errorHtml: "⚠ <b>Input Errors:</b><br>" + errors.join("<br>") };
+  return { ok: true };
+}
+/* ─────────────────────────────────────────────────────────────── */
+
 async function runEngine() {
   const runBtn = document.getElementById("runBtn");
   const table = document.getElementById("results");
@@ -13918,14 +14023,15 @@ if (_localState) {
     }
 
 
-    const validation = validateInputs(league);
+    const _extracted = extractInputs(league);
+    const validation = validateExtractedInputs(_extracted, league);
     if (!validation.ok) {
       engineDebug("validation failed", { league, errorHtml: validation.errorHtml });
       showRunError(table, validation.errorHtml);
       return;
     }
 
-    const { parsed, lines } = validation;
+    const { parsed, lines } = _extracted;
 const fixtureMeta = getCurrentFixtureMeta();
     engineDebug("validation passed", {
       league,
@@ -15268,7 +15374,7 @@ if (trackerCopyDataBtn) trackerCopyDataBtn.addEventListener("click", copyTracker
       }
 
       const fetchBtn = document.getElementById("fetchBtn");
-if (fetchBtn) fetchBtn.addEventListener("click", fetchESPN);
+if (fetchBtn) fetchBtn.addEventListener("click", withErrorBoundary(fetchESPN, "fetchESPN"));
 
 const SPORT_MODE_BASKETBALL = "basketball";
 
@@ -15414,7 +15520,7 @@ function setEngineMode() {
 }
 
       const runBtn = document.getElementById("runBtn");
-      if (runBtn) runBtn.addEventListener("click", runEngine);
+      if (runBtn) runBtn.addEventListener("click", withErrorBoundary(runEngine, "runEngine"));
 
       const clearBtn = document.getElementById("clearBtn");
       if (clearBtn) clearBtn.addEventListener("click", clearAll);
@@ -16145,5 +16251,181 @@ function copyTrackerData() {
     } catch (_) { finish(false); }
   }
 }
+
+/* ── FIX 4: ENGINE TEST SUITE — run: ENGINE_TEST_SUITE.run() ── */
+window.ENGINE_TEST_SUITE = (() => {
+  let _p = 0, _f = 0;
+  const _fails = [];
+  const _tests = [];
+
+  function expect(label, actual, expected) {
+    const ok = JSON.stringify(actual) === JSON.stringify(expected);
+    if (ok) { _p++; } else { _f++; _fails.push(`FAIL: ${label}\n  Expected: ${JSON.stringify(expected)}\n  Got:      ${JSON.stringify(actual)}`); }
+  }
+  function expectApprox(label, actual, expected, tol = 0.05) {
+    const ok = typeof actual === "number" && isFinite(actual) && Math.abs(actual - expected) <= tol;
+    if (ok) { _p++; } else { _f++; _fails.push(`FAIL: ${label}\n  Expected ~${expected} ±${tol}, got ${actual}`); }
+  }
+  function expectTrue(label, cond) {
+    if (cond) { _p++; } else { _f++; _fails.push(`FAIL: ${label}`); }
+  }
+  function suite(name, fn) { _tests.push({ name, fn }); }
+
+  suite("clampNumber", () => {
+    expect("below min", clampNumber(5,  10, 20), 10);
+    expect("above max", clampNumber(25, 10, 20), 20);
+    expect("in range",  clampNumber(15, 10, 20), 15);
+  });
+
+  suite("getDynamicWeights", () => {
+    const w = getDynamicWeights("full", 5, "nba");
+    expect("teamWeight NBA full", w.teamWeight, 0.65);
+    expectTrue("weights sum to 1", Math.abs(w.teamWeight + w.oppWeight - 1) < 0.001);
+    expectTrue("thin <= full teamWeight", getDynamicWeights("thin", 5, "nba").teamWeight <= w.teamWeight);
+    expectTrue("high-vol regression < low-vol", getDynamicWeights("full", 20, "nba").regressionWeight < w.regressionWeight);
+  });
+
+  suite("avg / trimmedAvg / stdDev / weightedRecentAverage", () => {
+    expectApprox("avg [80,90,100]", avg([80,90,100]), 90, 0.001);
+    expectTrue("avg empty = NaN", isNaN(avg([])));
+    const t = trimmedAvg([60,80,90,95,120]);
+    expectTrue("trimmedAvg drops outliers (75–100)", isFinite(t) && t > 75 && t < 100);
+    expectApprox("stdDev uniform = 0", stdDev([10,10,10,10]), 0, 0.001);
+    expectTrue("stdDev spread > 0", stdDev([80,90,100,110,120]) > 0);
+    const w = weightedRecentAverage([100,90,80,70,60]);
+    expectTrue("recency-weighted avg > simple avg (80)", w > 80);
+  });
+
+  suite("getPick — NBA FT gates", () => {
+    expect("tiny edge NO PLAY",     getPick(1,   220, "nba", "ft", {}), "NO PLAY");
+    expect("zero edge NO PLAY",     getPick(0,   220, "nba", "ft", {}), "NO PLAY");
+    expect("null line NO PLAY",     getPick(10, null, "nba", "ft", {}), "NO PLAY");
+    expectTrue("5.5% over = OVER",  String(getPick(12,  220, "nba", "ft", {})).startsWith("OVER"));
+    expectTrue("6.4% under = UNDER",String(getPick(-14, 220, "nba", "ft", {})).startsWith("UNDER"));
+  });
+
+  suite("detectTrap", () => {
+    expect("0.45% edge is trap",      detectTrap(1,  220, "OVER 220.5", "nba", "ft", 0), true);
+    expect("5.5% low vol not trap",   detectTrap(12, 220, "OVER 220.5", "nba", "ft", 5), false);
+  });
+
+  suite("anchorProjection", () => {
+    const a = anchorProjection(250, 220, "nba", "ft");
+    expectTrue("outlier pulled toward line", a < 250 && a > 220);
+    expectApprox("within gate no change", anchorProjection(232, 220, "nba", "ft"), 232, 0.5);
+  });
+
+  suite("parseMarketRangeMeta", () => {
+    const r = parseMarketRangeMeta("218.5-224.5");
+    expect("range mid",   r?.mid,     221.5);
+    expect("isRange",     r?.isRange, true);
+    const s = parseMarketRangeMeta("220.5");
+    expect("single mid",  s?.mid,     220.5);
+    expect("not range",   s?.isRange, false);
+    expect("invalid",     parseMarketRangeMeta("abc"), null);
+    expect("empty",       parseMarketRangeMeta(""),    null);
+  });
+
+  suite("getMarketKeyFromName", () => {
+    expect("FT Total",        getMarketKeyFromName("FT Total"),          "ft");
+    expect("1H Total",        getMarketKeyFromName("1H Total"),          "h1");
+    expect("2H Total",        getMarketKeyFromName("2H Total"),          "h2");
+    expect("Q1 Total",        getMarketKeyFromName("Q1 Total"),          "q1");
+    expect("Q2 Total",        getMarketKeyFromName("Q2 Total"),          "q2");
+    expect("Q3 Total",        getMarketKeyFromName("Q3 Total"),          "q3");
+    expect("Q4 Total",        getMarketKeyFromName("Q4 Total"),          "q4");
+    expect("Team A Total",    getMarketKeyFromName("Team A Total"),      "team_a");
+    expect("Team B Total",    getMarketKeyFromName("Team B Total"),      "team_b");
+    expect("Team A Q1",       getMarketKeyFromName("Team A Q1"),         "q1_team_a");
+    expect("Team B Q1",       getMarketKeyFromName("Team B Q1"),         "q1_team_b");
+    expect("Team A 1H",       getMarketKeyFromName("Team A 1H"),         "h1_team_a");
+    expect("Team B 1H",       getMarketKeyFromName("Team B 1H"),         "h1_team_b");
+    expect("HT/FT Double",    getMarketKeyFromName("HT/FT Double"),      "htft");
+    expect("Highest Q Total", getMarketKeyFromName("Highest Q Total"),   "high_q_ou");
+    expect("Lowest Q Total",  getMarketKeyFromName("Lowest Q Total"),    "low_q_ou");
+  });
+
+  suite("getLeagueTrustMeta", () => {
+    expect("NBA trusted",           getLeagueTrustMeta("nba").level,        "trusted");
+    expect("NBA mode full",         getLeagueTrustMeta("nba").mode,         "full");
+    expect("NCAA trusted",          getLeagueTrustMeta("ncaa").level,       "trusted");
+    expect("EuroCup trusted",       getLeagueTrustMeta("eurocup").level,    "trusted");
+    expect("unknown advisory",      getLeagueTrustMeta("unknown").level,    "advisory");
+    expect("unknown mode advisory", getLeagueTrustMeta("unknown").mode,     "advisory");
+    expect("rwanda blocked",        getLeagueTrustMeta("rwanda").level,     "blocked");
+    expect("rwanda mode block",     getLeagueTrustMeta("rwanda").mode,      "block");
+  });
+
+  suite("normalizeTeamName", () => {
+    expect("lowercases + trims", normalizeTeamName("  Lakers  "),   "lakers");
+    expect("saint → st",         normalizeTeamName("Saint Mary's"), "st marys");
+    expect("& → and",            normalizeTeamName("Texas A&M"),    "texas a and m");
+  });
+
+  suite("displayLine", () => {
+    expect("rounds to .5",  displayLine(220.3), "220.5");
+    expect("NaN → —",       displayLine(NaN),   "—");
+    expect("null → —",      displayLine(null),  "—");
+    expect("220 → 220.0",   displayLine(220),   "220.0");
+  });
+
+  suite("getConfidenceGrade", () => {
+    const base = { note: null, sampleTier: "full", projectionOnly: false, fullModel: true,
+                   trap: false, hasH2H: true, volatility: 8, volLimit: 14, marketKey: "ft" };
+    expect("NO PLAY → NaN", getConfidenceGrade({ ...base, pick: "NO PLAY", line: 220, edge: 12 }), "NaN");
+    const gFull = getConfidenceGrade({ ...base, pick: "OVER 220.5", line: 220, edge: 22 });
+    expectTrue("strong conditions → A or B", gFull === "A" || gFull === "B");
+    const gThin = getConfidenceGrade({ ...base, pick: "OVER 220.5", line: 220, edge: 22, sampleTier: "thin" });
+    const rank = { A:4, B:3, C:2, D:1, NaN:0 };
+    expectTrue("thin grade <= full grade", (rank[gThin]??0) <= (rank[gFull]??0));
+  });
+
+  suite("bumpConfidenceGrade", () => {
+    expect("A+1 stays A",  bumpConfidenceGrade("A",  1),  "A");
+    expect("B+1 → A",      bumpConfidenceGrade("B",  1),  "A");
+    expect("C-1 → D",      bumpConfidenceGrade("C", -1),  "D");
+    expect("D-1 stays D",  bumpConfidenceGrade("D", -1),  "D");
+    expect("no shift",     bumpConfidenceGrade("B",  0),  "B");
+  });
+
+  suite("getPickSideFromText", () => {
+    expect("OVER",       getPickSideFromText("OVER 220.5"),      "over");
+    expect("UNDER",      getPickSideFromText("UNDER 210.5"),     "under");
+    expect("LEAN OVER",  getPickSideFromText("LEAN OVER 218.5"), "over");
+    expect("NO PLAY",    getPickSideFromText("NO PLAY"),         "");
+    expect("empty",      getPickSideFromText(""),                "");
+  });
+
+  suite("getSampleTier", () => {
+    expect("5 games = full",        getSampleTier([1,2,3,4,5],[1,2,3,4,5]), "full");
+    expect("3 games = thin",        getSampleTier([1,2,3],[1,2,3]),         "thin");
+    expect("1 game = insufficient", getSampleTier([1],[1]),                 "insufficient");
+    expect("empty = insufficient",  getSampleTier([],[]),                   "insufficient");
+  });
+
+  function run() {
+    _p = 0; _f = 0; _fails.length = 0;
+    if (typeof engineDebug === "function")
+      engineDebug("ENGINE_TEST_SUITE: running " + _tests.length + " suites...");
+    for (const t of _tests) {
+      try { t.fn(); }
+      catch(e) { _f++; _fails.push("CRASH [" + t.name + "]: " + e.message); }
+    }
+    const total = _p + _f;
+    const label = _f === 0 ? "✅ ALL PASSED" : "❌ " + _f + " FAILED";
+    const summary = label + " | " + _p + "/" + total + " passed";
+    if (typeof engineDebug === "function")
+      engineDebug("ENGINE_TEST_SUITE: " + summary, _f ? { failures: _fails } : null);
+    console[_f ? "error" : "log"](
+      "%c" + summary,
+      "color:" + (_f ? "#ff5c61" : "#3a9c35") + ";font-weight:900;font-size:14px;"
+    );
+    if (_f) _fails.forEach(f => console.error(f));
+    return { passed: _p, failed: _f, total, failures: [..._fails] };
+  }
+
+  return { run };
+})();
+/* ──────────────────────────────────────────────────────────────── */
 
 </script>
