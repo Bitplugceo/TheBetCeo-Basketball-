@@ -15224,25 +15224,65 @@ function calculatePlayerProp(name, scoresArr, line, league) {
   if (!Array.isArray(scoresArr) || scoresArr.length < 3) return null;
   const nums = scoresArr.map(Number).filter(n => isFinite(n) && n >= 0);
   if (nums.length < 3 || !isFinite(line) || line <= 0) return null;
-  const recencyW = [1.5, 1.3, 1.1, 0.9, 0.7, 0.5, 0.4, 0.3, 0.25];
+
+  // Trimmed weighted recent average — mirrors main engine chronological trim logic
+  const trimmed = nums.length >= 5
+    ? (function() {
+        const maxV = Math.max(...nums), minV = Math.min(...nums);
+        let rMax = false, rMin = false;
+        return nums.filter(v => {
+          if (!rMax && v === maxV) { rMax = true; return false; }
+          if (!rMin && v === minV) { rMin = true; return false; }
+          return true;
+        });
+      })()
+    : nums;
+
+  const recencyW = [1.35, 1.20, 1.00, 0.85, 0.70];
   let wSum = 0, wTotal = 0;
-  nums.forEach((v, i) => { const w = recencyW[i] || 0.25; wSum += v * w; wTotal += w; });
+  trimmed.forEach((v, i) => { const w = recencyW[i] || 0.60; wSum += v * w; wTotal += w; });
   const rawProj = wTotal > 0 ? wSum / wTotal : avg(nums);
-  const anchor  = 0.50;
-  const proj    = rawProj * (1 - anchor) + line * anchor;
+
+  // Dynamic anchor: tighter for large samples, looser for thin data
+  const anchorW = nums.length >= 5 ? 0.40 : 0.55;
+  const proj = clampNumber(rawProj * (1 - anchorW) + line * anchorW, line * 0.50, line * 1.80);
+
   const edge    = proj - line;
   const edgePct = Math.abs(edge / line);
   const vol     = (typeof stdDev === "function") ? stdDev(nums) : 0;
+  const volRatio = vol > 0 ? vol / line : 0;
+
+  // Volatility-gated edge threshold — mirrors league gate philosophy
+  const minEdgePct = volRatio > 0.30 ? 0.090 : volRatio > 0.20 ? 0.075 : 0.065;
+
   let pick = "NO PLAY";
-  if (edgePct >= 0.065)
-    pick = edge > 0 ? `OVER ${(line + 0.5).toFixed(1)}` : `UNDER ${(line - 0.5).toFixed(1)}`;
+  if (edgePct >= minEdgePct) {
+    const bufferedLine = Math.round((edge > 0 ? line + 0.5 : line - 0.5) * 2) / 2;
+    pick = edge > 0 ? `OVER ${bufferedLine.toFixed(1)}` : `UNDER ${bufferedLine.toFixed(1)}`;
+  }
+
+  // ABCD grading mirrors main engine confidence system
   let confidence = "—";
   if (pick !== "NO PLAY") {
-    if (edgePct >= 0.12 && vol < line * 0.25) confidence = "B";
-    else if (edgePct >= 0.09) confidence = "C";
+    let score = 0;
+    if (nums.length >= 5) score += 2;
+    if (edgePct >= 0.10) score += 2; else if (edgePct >= 0.085) score += 1;
+    if (volRatio <= 0.20) score += 1; else if (volRatio > 0.30) score -= 1;
+    if (nums.length >= 7) score += 1;
+    if (score >= 5) confidence = "A";
+    else if (score >= 3) confidence = "B";
+    else if (score >= 1) confidence = "C";
     else confidence = "D";
   }
-  return { name, proj: Math.round(proj * 10) / 10, line, edge: Math.round(edge * 10) / 10, edgePct, pick, confidence, vol: Math.round(vol * 10) / 10, sampleSize: nums.length };
+
+  const side = pick === "NO PLAY" ? "" : pick.startsWith("OVER") ? "over" : "under";
+
+  return {
+    name, proj: Math.round(proj * 10) / 10, line,
+    edge: Math.round(edge * 10) / 10, edgePct, pick, confidence,
+    vol: Math.round(vol * 10) / 10, volRatio: Math.round(volRatio * 100) / 100,
+    sampleSize: nums.length, side
+  };
 }
 
 function injectPlayerPropsUI() {
@@ -15279,37 +15319,118 @@ function injectPlayerPropsUI() {
     </div>
   `;
   tableWrap.parentNode.insertBefore(section, tableWrap.nextSibling);
+
   document.getElementById("calcPropBtn").addEventListener("click", function() {
+    const btn  = this;
+    const out  = document.getElementById("propResult");
     const name   = (document.getElementById("propPlayerName")?.value || "").trim() || "Player";
     const rawSc  = (document.getElementById("propScores")?.value || "").trim();
     const line   = parseFloat(document.getElementById("propLine")?.value || "");
     const market = document.getElementById("propMarket")?.value || "points";
     const league = document.getElementById("leagueSelect")?.value || "nba";
-    const scores = rawSc.split(",").map(s => parseFloat(s.trim())).filter(n => isFinite(n));
-    const result = calculatePlayerProp(name, scores, line, league);
-    const out    = document.getElementById("propResult");
-    if (!result) { out.innerHTML = '<span style="color:#d92d2a;">⚠ Need at least 3 valid scores and a line.</span>'; return; }
-    const pickColor  = result.pick === "NO PLAY" ? "#7b8088" : result.pick.startsWith("OVER") ? "#2f8f4a" : "#c91920";
-    const gradeColor = { A:"#3a9c35", B:"#2f8f4a", C:"#d98a00", D:"#c91920", "—":"#7b8088" }[result.confidence] || "#7b8088";
-    out.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:4px;background:var(--panel);">
-      <tr style="background:var(--table-head);color:#fff;">
-        <th style="padding:6px 8px;border:1px solid var(--table-border);">Player</th>
-        <th style="padding:6px 8px;border:1px solid var(--table-border);">Market</th>
-        <th style="padding:6px 8px;border:1px solid var(--table-border);">Proj</th>
-        <th style="padding:6px 8px;border:1px solid var(--table-border);">Edge</th>
-        <th style="padding:6px 8px;border:1px solid var(--table-border);">Grade</th>
-        <th style="padding:6px 8px;border:1px solid var(--table-border);">Pick</th>
-      </tr>
-      <tr>
-        <td style="padding:6px 8px;border:1px solid var(--table-border);">${result.name}</td>
-        <td style="padding:6px 8px;border:1px solid var(--table-border);">${market.toUpperCase()} ${result.line}</td>
-        <td style="padding:6px 8px;border:1px solid var(--table-border);">${result.proj}</td>
-        <td style="padding:6px 8px;border:1px solid var(--table-border);">${result.edge > 0 ? "+" : ""}${result.edge}</td>
-        <td style="padding:6px 8px;border:1px solid var(--table-border);color:${gradeColor};font-weight:900;">${result.confidence}</td>
-        <td style="padding:6px 8px;border:1px solid var(--table-border);color:${pickColor};font-weight:900;">${result.pick}</td>
-      </tr>
-    </table>
-    <div style="font-size:10px;color:var(--muted);margin-top:4px;">Vol: ${result.vol} pts | Edge: ${(result.edgePct*100).toFixed(1)}% | ${result.sampleSize} games sampled</div>`;
+
+    btn.disabled = true;
+    btn.textContent = "Calculating…";
+    out.innerHTML = '<small class="muted-note">Running model…</small>';
+
+    setTimeout(() => {
+      try {
+        const scores = rawSc.split(",").map(s => parseFloat(s.trim())).filter(n => isFinite(n));
+        const result = calculatePlayerProp(name, scores, line, league);
+
+        if (!result) {
+          out.innerHTML = '<small class="error-note">⚠ Need at least 3 valid scores and a line.</small>';
+          return;
+        }
+
+        const gradeClass = result.confidence === "A" ? "conf-a"
+          : result.confidence === "B" ? "conf-b"
+          : result.confidence === "C" ? "conf-c"
+          : result.confidence === "D" ? "conf-d" : "conf-none";
+        const predClass = result.pick === "NO PLAY" ? "pred-noplay"
+          : result.side === "over" ? "pred-over" : "pred-under";
+
+        const trackerBtnHtml = (result.pick !== "NO PLAY" && result.confidence !== "—")
+          ? `<button type="button" id="propAddTrackerBtn" style="background:#313744;color:#fff;border:none;padding:4px 10px;font-size:11px;font-weight:700;cursor:pointer;margin-top:6px;">+ Add to Tracker</button>`
+          : "";
+
+        out.innerHTML = `
+          <table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:4px;background:var(--panel);">
+            <tr>
+              <th style="padding:6px 8px;border:1px solid var(--table-border);background:var(--table-head);color:#fff;">Player</th>
+              <th style="padding:6px 8px;border:1px solid var(--table-border);background:var(--table-head);color:#fff;">Market</th>
+              <th style="padding:6px 8px;border:1px solid var(--table-border);background:var(--table-head);color:#fff;">Proj</th>
+              <th style="padding:6px 8px;border:1px solid var(--table-border);background:var(--table-head);color:#fff;">Edge</th>
+              <th style="padding:6px 8px;border:1px solid var(--table-border);background:var(--table-head);color:#fff;">Grade</th>
+              <th style="padding:6px 8px;border:1px solid var(--table-border);background:var(--table-head);color:#fff;">Pick</th>
+            </tr>
+            <tr>
+              <td style="padding:6px 8px;border:1px solid var(--table-border);color:var(--text);">${safeText(result.name)}</td>
+              <td style="padding:6px 8px;border:1px solid var(--table-border);color:var(--text);">${safeText(market.toUpperCase())} ${result.line}</td>
+              <td style="padding:6px 8px;border:1px solid var(--table-border);color:var(--text);">${result.proj}</td>
+              <td style="padding:6px 8px;border:1px solid var(--table-border);color:var(--text);">${result.edge > 0 ? "+" : ""}${result.edge}</td>
+              <td class="${gradeClass}" style="padding:6px 8px;border:1px solid var(--table-border);">${safeText(result.confidence)}</td>
+              <td class="${predClass}" style="padding:6px 8px;border:1px solid var(--table-border);">${safeText(result.pick)}</td>
+            </tr>
+          </table>
+          <small class="muted-note">Vol: ${result.vol} | Edge: ${(result.edgePct*100).toFixed(1)}% | ${result.sampleSize} games sampled</small>
+          ${trackerBtnHtml}
+        `;
+
+        // Wire up "Add to Tracker" after DOM is written
+        const addBtn = document.getElementById("propAddTrackerBtn");
+        if (addBtn) {
+          addBtn.addEventListener("click", function() {
+            const fixtureMeta = getCurrentFixtureMeta();
+            if (!fixtureMeta?.eventId) {
+              alert("⚠ Select a fixture first so the pick can be linked to a game.");
+              return;
+            }
+            const nowIso = new Date().toISOString();
+            const payload = {
+              pickId: (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
+                ? crypto.randomUUID() : `prop_${Date.now()}`,
+              eventId: fixtureMeta.eventId,
+              eventDate: fixtureMeta.eventDate || "",
+              league,
+              homeTeam: fixtureMeta.homeTeam || "—",
+              awayTeam: fixtureMeta.awayTeam || "—",
+              homeId: fixtureMeta.homeId || "",
+              awayId: fixtureMeta.awayId || "",
+              fixtureLabel: `${fixtureMeta.homeTeam || "—"} vs ${fixtureMeta.awayTeam || "—"}`,
+              marketKey: "player",
+              marketName: `${result.name} — ${market.toUpperCase()} ${result.line}`,
+              projection: result.proj,
+              line: result.line,
+              lineAtPick: result.line,
+              side: result.side,
+              predictionText: result.pick,
+              edge: result.edge,
+              edgePct: result.edgePct * 100,
+              confidenceGrade: result.confidence,
+              modelVersion: getCurrentModelVersion(),
+              isLock: false,
+              sampleTier: result.sampleSize >= 5 ? "full" : "thin",
+              inputSource: "manual",
+              marketType: "other",
+              resultStatus: "pending",
+              createdAt: nowIso
+            };
+            payload.signature = makeTrackedSignature(payload);
+            addTrackedPicks([payload]);
+            scheduleTrackerSave();
+            addBtn.textContent = "✅ Added";
+            addBtn.disabled = true;
+          });
+        }
+
+      } catch(e) {
+        out.innerHTML = `<small class="error-note">⚠ Calculation error: ${safeText(e.message)}</small>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Calculate Prop";
+      }
+    }, 0);
   });
 }
 /* ── END PATH B #2 ── */
@@ -15372,6 +15493,8 @@ function injectPlayerPropsUI() {
 
       const dash = document.getElementById("syndicateDashboard");
       if (dash) dash.remove();
+      const healthBanner = document.getElementById("modelHealthBanner");
+      if (healthBanner) healthBanner.remove();
 
       g_engineDebugLog = [];
 
