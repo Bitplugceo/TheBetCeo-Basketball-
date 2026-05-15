@@ -15264,177 +15264,7 @@ function scheduleCacheEviction() {
 }
 /* ── END PATH B #4 ── */
 
-/* ── PATH B #2: PLAYER PROPS ENGINE ── */
-function getLeagueProfile(league) {
-  const LEAGUE_PROFILES = {
-    nba:      { pace: 100, volLimit: 14, h2hWeight: 0.25, injuryImpact: 1.0 },
-    ncaa:     { pace:  95, volLimit: 16, h2hWeight: 0.30, injuryImpact: 0.85 },
-    euroleague:{ pace: 88, volLimit: 12, h2hWeight: 0.35, injuryImpact: 0.90 },
-    eurocup:  { pace:  88, volLimit: 12, h2hWeight: 0.35, injuryImpact: 0.90 },
-    acb:      { pace:  90, volLimit: 13, h2hWeight: 0.32, injuryImpact: 0.88 },
-    nbl:      { pace:  92, volLimit: 15, h2hWeight: 0.28, injuryImpact: 0.95 },
-    pba:      { pace:  98, volLimit: 17, h2hWeight: 0.22, injuryImpact: 1.05 },
-    default:  { pace:  95, volLimit: 14, h2hWeight: 0.25, injuryImpact: 1.0 }
-  };
-  return LEAGUE_PROFILES[league] || LEAGUE_PROFILES.default;
-}
 
-async function fetchPlayerLastGames(playerName, league = "nba") {
-  try {
-    const espnLeague = league === "ncaa" ? "basketball/ncaab" : (league === "euroleague" || league === "eurocup") ? "basketball/euroleague" : `basketball/${league}`;
-    const searchUrl = `https://site.api.espn.com/apis/site/v2/sports/${espnLeague}/athletes?limit=8&query=${encodeURIComponent(playerName)}`;
-    const searchRes = await fetch(searchUrl);
-    const searchData = await searchRes.json();
-    const athlete = searchData?.athletes?.[0];
-    if (!athlete) return null;
-
-    const athleteId = athlete.id;
-    const currentSeason = new Date().getFullYear();
-    const statsUrl = `https://site.api.espn.com/apis/site/v2/sports/${espnLeague}/athletes/${athleteId}/gamelog?season=${currentSeason}`;
-    const statsRes = await fetch(statsUrl);
-    const statsData = await statsRes.json();
-
-    const games = statsData?.events?.slice(0, 10) || [];
-    const scores = games.map(g => {
-      const stats = g?.stats?.[0]?.stats || {};
-      return parseFloat(stats.PTS || stats.points || stats.PRA || 0);
-    }).filter(n => isFinite(n) && n > 0);
-
-    return scores.length >= 3 ? scores : null;
-  } catch (e) {
-    console.warn("Player auto-fetch failed:", e);
-    if (typeof AFDB !== "undefined") AFDB.log("ERROR", "PLAYER-PROPS", "Auto-fetch failed for " + playerName, { error: e.message });
-    return null;
-  }
-}
-
-function calculatePlayerProp(name, scoresArr, line, league) {
-  if (!Array.isArray(scoresArr) || scoresArr.length < 3) return null;
-  const nums = scoresArr.map(Number).filter(n => isFinite(n) && n >= 0);
-  if (nums.length < 3 || !isFinite(line) || line <= 0) return null;
-
-  const profile = getLeagueProfile(league);
-  const trimmed = nums.length >= 5 ? nums.slice(1, -1) : nums;
-  const recencyW = [1.35, 1.20, 1.00, 0.85, 0.70];
-  let wSum = 0, wTotal = 0;
-  trimmed.forEach((v, i) => { const w = recencyW[i] || 0.60; wSum += v * w; wTotal += w; });
-  let rawProj = wTotal > 0 ? wSum / wTotal : avg(nums);
-
-  const weights = getDynamicWeights("full", stdDev(nums) || 8, league);
-  const proj = clampNumber(rawProj * (1 - 0.45) + line * 0.45, line * 0.50, line * 1.80);
-
-  const edge = proj - line;
-  const edgePct = Math.abs(edge / line);
-  const vol = stdDev(nums) || 0;
-  const volRatio = vol > 0 ? vol / line : 0;
-
-  const minEdgePct = volRatio > profile.volLimit * 0.02 ? 0.09 : 0.065;
-  let pick = "NO PLAY";
-  if (edgePct >= minEdgePct) {
-    const bufferedLine = Math.round((edge > 0 ? line + 0.5 : line - 0.5) * 2) / 2;
-    pick = edge > 0 ? `OVER ${bufferedLine.toFixed(1)}` : `UNDER ${bufferedLine.toFixed(1)}`;
-  }
-
-  let confidence = "—";
-  if (pick !== "NO PLAY") {
-    let score = nums.length >= 5 ? 2 : 0;
-    if (edgePct >= 0.10) score += 2; else if (edgePct >= 0.085) score += 1;
-    if (volRatio <= 0.20) score += 1;
-    if (score >= 5) confidence = "A";
-    else if (score >= 3) confidence = "B";
-    else if (score >= 1) confidence = "C";
-    else confidence = "D";
-  }
-
-  const side = pick === "NO PLAY" ? "" : pick.startsWith("OVER") ? "over" : "under";
-  return { name, proj: Math.round(proj * 10) / 10, line, edge: Math.round(edge * 10) / 10, edgePct, pick, confidence, vol: Math.round(vol * 10) / 10, sampleSize: nums.length, side };
-}
-
-async function calculatePlayerPropAuto() {
-  const name   = (document.getElementById("propPlayerName")?.value || "").trim();
-  const line   = parseFloat(document.getElementById("propLine")?.value || "");
-  const market = document.getElementById("propMarket")?.value || "points";
-  const league = document.getElementById("leagueSelect")?.value || "nba";
-  const out    = document.getElementById("propResult");
-  const btn    = document.getElementById("calcPropBtn");
-
-  if (!name || !isFinite(line) || line <= 0) {
-    out.innerHTML = '<span style="color:#d92d2a;">⚠ Enter player name and valid line.</span>';
-    return;
-  }
-
-  btn.disabled = true;
-  btn.textContent = "Fetching from ESPN…";
-  out.innerHTML = '<span style="color:#d98a00;">⏳ Fetching player stats from ESPN...</span>';
-
-  const scores = await fetchPlayerLastGames(name, league);
-  btn.disabled = false;
-  btn.textContent = "Calculate (Auto-Fetch from ESPN)";
-
-  if (!scores || scores.length < 3) {
-    out.innerHTML = '<span style="color:#d92d2a;">❌ Could not fetch enough recent games. Try manual scores below.</span>';
-    return;
-  }
-
-  const result = calculatePlayerProp(name, scores, line, league);
-  if (!result) {
-    out.innerHTML = '<span style="color:#d92d2a;">❌ Calculation failed.</span>';
-    return;
-  }
-
-  const pickColor  = result.pick === "NO PLAY" ? "#7b8088" : result.pick.startsWith("OVER") ? "#2f8f4a" : "#c91920";
-  const gradeColor = { A:"#3a9c35", B:"#2f8f4a", C:"#d98a00", D:"#c91920", "—":"#7b8088" }[result.confidence] || "#7b8088";
-
-  out.innerHTML = `
-    <div style="background:#f8f9fa;border:1px solid #ddd;padding:10px;margin-top:8px;font-size:12px;">
-      <strong>${result.name} — ${market.toUpperCase()} ${result.line}</strong><br>
-      <span style="color:#2f8f4a;">Projection: ${result.proj}</span> | 
-      <span style="color:${pickColor};font-weight:900;">${result.pick}</span> | 
-      <span style="color:${gradeColor};font-weight:900;">Grade ${result.confidence}</span><br>
-      <small>Edge: ${result.edge > 0 ? "+" : ""}${result.edge} (${(result.edgePct*100).toFixed(1)}%) | Vol: ${result.vol} | ${result.sampleSize} games fetched</small>
-    </div>
-  `;
-}
-
-function injectPlayerPropsUI() {
-  if (document.getElementById("playerPropsSection")) return;
-  const tableWrap = document.querySelector(".table-wrap");
-  if (!tableWrap) return;
-  const section = document.createElement("div");
-  section.id = "playerPropsSection";
-  section.className = "section collapsed";
-  section.style.marginTop = "8px";
-  section.innerHTML = `
-    <button class="section-toggle" type="button" onclick="this.closest('.section').classList.toggle('collapsed')">
-      <span class="toggle-title">🏀 PLAYER PROPS ENGINE <span style="font-size:10px;font-weight:400;color:var(--muted);">Path B #2</span></span>
-      <span class="toggle-icon">▼</span>
-    </button>
-    <div class="section-body">
-      <label>Player Name</label>
-      <input id="propPlayerName" placeholder="e.g. LeBron James" style="max-width:260px;" />
-      <label>Last Scores (comma-separated, newest first) — auto-filled if possible</label>
-      <input id="propScores" placeholder="27,31,19,24,22" style="max-width:260px;" />
-      <label>Prop Line</label>
-      <input id="propLine" placeholder="24.5" style="max-width:120px;" />
-      <label>Market</label>
-      <select id="propMarket" class="league-box" style="max-width:160px;">
-        <option value="points">Points</option>
-        <option value="rebounds">Rebounds</option>
-        <option value="assists">Assists</option>
-        <option value="3pm">3-Pointers Made</option>
-        <option value="pra">PRA (Pts+Reb+Ast)</option>
-      </select>
-      <br/>
-      <button type="button" id="calcPropBtn" style="background:#3a9c35;color:#fff;border:none;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;margin-top:8px;">Calculate (Auto-Fetch from ESPN)</button>
-      <div id="propResult" style="margin-top:8px;font-size:12px;"></div>
-    </div>
-  `;
-  tableWrap.parentNode.insertBefore(section, tableWrap.nextSibling);
-
-  const btn = document.getElementById("calcPropBtn");
-  if (btn) btn.addEventListener("click", calculatePlayerPropAuto);
-}
-/* ── END PATH B #2 ── */
 
             function clearAll() {
       acknowledgeGlobalEngineAlert();
@@ -15497,12 +15327,10 @@ function injectPlayerPropsUI() {
       const healthBanner = document.getElementById("modelHealthBanner");
       if (healthBanner) healthBanner.remove();
 
-      const propSection = document.getElementById("playerPropsSection");
-      if (propSection) propSection.classList.add("collapsed");
-
       g_engineDebugLog = [];
 
       renderEngineDebugPanel();
+---REPLACE---
       const fixtureSelect = document.getElementById("fixtureSelect");
       if (fixtureSelect) { fixtureSelect.innerHTML = '<option value="">— Select match —</option>'; fixtureSelect.value = ""; }
 
@@ -16214,14 +16042,8 @@ ${fullHTML}
     });
   }
 
-  scheduleCacheEviction();
-  injectPlayerPropsUI();
-
-  // Path B safety guard — prevents duplicate patch application
-  if (!window.__PATH_B_FULLY_APPLIED) {
-    window.__PATH_B_FULLY_APPLIED = true;
-    console.log("%c✅ ALL REMAINING PATH B FIXES APPLIED — Player Props auto-fetch, multi-league profiles, UI polish, and tracker integration complete", "color:#3a9c35;font-weight:700");
-  }
+        scheduleCacheEviction();
+---REPLACE---
 }); // <-- EXACTLY ONE CLOSING BRACKET HERE.
 </script>
 
