@@ -9722,7 +9722,7 @@ function applyContextAdjustments(baseProjection, ctx) {
       return Array.isArray(arr) && arr.length >= min;
     }
         function getEffectivePaceClamp(league) {
-      if (league === "nba") return { min: 0.85, max: 1.15 };
+      if (league === "nba" || league === "wnba" || league === "wnba_pre") return { min: 0.85, max: 1.25 };
       if (league === "ncaa") return { min: 0.80, max: 1.12 };
       if ([
         "euroleague","eurocup","acb","lba","bbl","bcl","bsl","isl","aba","plk",
@@ -12585,6 +12585,20 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
             // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
   const vl = getMarketVolLimit(league, "ft");
 
+  // --- 10x SOS UPGRADE: DYNAMIC OPPONENT QUALITY SCALING ---
+  const baselineRating = 100;
+  if (aORTG.length >= 2 && bORTG.length >= 2) {
+    const avgOppDrtgA = avgOrNaN(bDRTG);
+    const avgOppDrtgB = avgOrNaN(aDRTG);
+    if (isFinite(avgOppDrtgA)) projAFT += (avgOppDrtgA - baselineRating) * 0.15;
+    if (isFinite(avgOppDrtgB)) projBFT += (avgOppDrtgB - baselineRating) * 0.15;
+  } else {
+    const avgAllowedA = avgOrNaN(parsed.aFTAllowed) || (eb / 2);
+    const avgAllowedB = avgOrNaN(parsed.bFTAllowed) || (eb / 2);
+    projAFT += ((eb / 2) - avgAllowedB) * 0.10;
+    projBFT += ((eb / 2) - avgAllowedA) * 0.10;
+  }
+
   if (isFinite(projAFT)) {
     projAFT = applyVolatility(projAFT, aVol, vl);
     projAFT = applyContextAdjustments(projAFT, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
@@ -13260,13 +13274,26 @@ async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
     onmessage = function(e) {
       const { mean, safeStdDev, line, runs } = e.data;
       let overHits = 0;
+      const usePoisson = mean < 140;
+
       for (let i = 0; i < runs; i++) {
-        let u1 = Math.random();
-        let u2 = Math.random();
-        while (u1 === 0) u1 = Math.random();
-        
-        let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-        let simulatedScore = Math.max(0, mean + (safeStdDev * z0));
+        let simulatedScore = 0;
+        if (usePoisson) {
+          let p = 0;
+          let k = 0;
+          let log_alpha = -mean;
+          while (true) {
+            p += Math.log(Math.random() || 0.0001);
+            if (p < log_alpha) { simulatedScore = k; break; }
+            k++;
+          }
+        } else {
+          let u1 = Math.random();
+          let u2 = Math.random();
+          while (u1 === 0) u1 = Math.random();
+          let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+          simulatedScore = Math.max(0, mean + (safeStdDev * z0));
+        }
         
         if (simulatedScore > line) overHits++;
       }
