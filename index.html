@@ -14136,63 +14136,1242 @@ function resolveStoredLineBeforeDecision({
 }
 
 function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diagnostics }) {
-    const tracked = [];
+  const tracked = [];
+  table.style.display = "table";
+  table.innerHTML = "<tr><th>Pick</th><th>Projection</th><th>Edge</th><th>Model Grade</th><th>Prediction</th></tr>";
+  
+  finalPicks.forEach(p => {
+    const isLock = p._idx === lockIdx && p.pick !== "NO PLAY" && p.pick !== "NaN";
+    const confText = (p.pick === "NO PLAY" || p.pick === "NaN") ? "NaN" : (p.confidence === "—" ? "NaN" : (p.confidence || "D"));
+    const shownLine = isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line;
+    const shownEdge = isFinite(p.displayEdge) ? p.displayEdge : p.edge;
+    
+    // FIX: Built DOM nodes strictly to prevent XSS injection
+    const row = table.insertRow();
+    
+    const tdPick = document.createElement("td");
+    tdPick.innerHTML = p.name + (p.usedMemory ? ' 🧠' : '');
+    row.appendChild(tdPick);
+
+    const tdProj = document.createElement("td");
+    tdProj.textContent = isFinite(p.proj) ? displayLine(p.proj) : "NaN";
+    row.appendChild(tdProj);
+
+    const tdEdge = document.createElement("td");
+    tdEdge.textContent = isFinite(shownEdge) && isFinite(shownLine) ? formatEdge(shownEdge, shownLine) : "NaN";
+    row.appendChild(tdEdge);
+
+    const tdConf = document.createElement("td");
+    tdConf.className = getConfidenceClass(confText);
+    tdConf.textContent = confText;
+    row.appendChild(tdConf);
+
+    const tdPred = document.createElement("td");
+    tdPred.className = getPredictionClass(p.pick);
+    tdPred.style.whiteSpace = "nowrap";
+    tdPred.style.fontSize = "11px";
+    tdPred.textContent = p.displayPick || p.pick;
+    if (isLock) {
+      const lockSpan = document.createElement("span");
+      lockSpan.className = "lock";
+      lockSpan.textContent = "🔒";
+      tdPred.appendChild(document.createTextNode(" "));
+      tdPred.appendChild(lockSpan);
+    }
+    row.appendChild(tdPred);
+
+    const marketKeyFromLogic = getMarketKeyFromName(p.name, p.marketKey);
+    const pickWithCorrectKey = { ...p, marketKey: marketKeyFromLogic };
+    const payload = buildTrackedPickPayload({ pickRow: pickWithCorrectKey, isLock, fixtureMeta, league, diagnostics });
+    if (payload) tracked.push(payload);
+  });
+  return tracked;
+}
+
+
+
+
+/* ── FIX 2: Error Boundary ─────────────────────────────────── */
+function withErrorBoundary(fn, context) {
+  return async function (...args) {
+    try {
+      return await fn.apply(this, args);
+    } catch (err) {
+      const msg = err?.message || String(err);
+      if (typeof engineDebug === "function")
+        engineDebug("ERROR BOUNDARY [" + context + "]: " + msg, { stack: err?.stack });
+      if (typeof triggerGlobalEngineAlert === "function")
+        triggerGlobalEngineAlert(context + " crashed: " + msg);
+      const t = document.getElementById("results");
+      if (t) {
+        t.style.display = "table";
+        const row = t.insertRow();
+        row.innerHTML = `<td colspan="5" style="color:#ff6b6b;text-align:left;padding:8px;">⚠ <b>${escapeHtml(context)}</b> hit an error: ${escapeHtml(msg)}</td>`;
+      }
+      const rb = document.getElementById("runBtn");
+      if (rb) rb.disabled = false;
+      return null;
+    }
+  };
+}
+
+/* ── FIX 3: Clean Input Layer ───────────────────────────────── */
+function extractInputs(league) {
+  const isNbaOrNcaa = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
+  function readLine(id) {
+    const v = parseMarketLine((document.getElementById(id)?.value || "").trim());
+    return isFinite(v) ? v : null;
+  }
+  function readSeries(id) {
+    return ((document.getElementById(id)?.value || "").trim()) ? parseGames(id) : null;
+  }
+  let h1Line = readLine("h1Market");
+  const ftLine = readLine("ftMarket");
+  if (!h1Line && ftLine && typeof getLeagueH1Ratio === "function")
+    h1Line = Math.round(ftLine * getLeagueH1Ratio(league) * 2) / 2;
+  const parsed = {
+    aFTScored:  readSeries("aFTScored"),  aFTAllowed: readSeries("aFTAllowed"),
+    bFTScored:  readSeries("bFTScored"),  bFTAllowed: readSeries("bFTAllowed"),
+    a1HScored:  readSeries("a1HScored"),  a1HAllowed: readSeries("a1HAllowed"),
+    b1HScored:  readSeries("b1HScored"),  b1HAllowed: readSeries("b1HAllowed"),
+    a2HScored:  readSeries("a2HScored"),  a2HAllowed: readSeries("a2HAllowed"),
+    b2HScored:  readSeries("b2HScored"),  b2HAllowed: readSeries("b2HAllowed"),
+    aQ1Scored:  readSeries("aQ1Scored"),  aQ1Allowed: readSeries("aQ1Allowed"),
+    aQ2Scored:  readSeries("aQ2Scored"),  aQ2Allowed: readSeries("aQ2Allowed"),
+    aQ3Scored:  readSeries("aQ3Scored"),  aQ3Allowed: readSeries("aQ3Allowed"),
+    aQ4Scored:  readSeries("aQ4Scored"),  aQ4Allowed: readSeries("aQ4Allowed"),
+    bQ1Scored:  readSeries("bQ1Scored"),  bQ1Allowed: readSeries("bQ1Allowed"),
+    bQ2Scored:  readSeries("bQ2Scored"),  bQ2Allowed: readSeries("bQ2Allowed"),
+    bQ3Scored:  readSeries("bQ3Scored"),  bQ3Allowed: readSeries("bQ3Allowed"),
+    bQ4Scored:  readSeries("bQ4Scored"),  bQ4Allowed: readSeries("bQ4Allowed"),
+    aFTH2H: readSeries("aFTH2H"),  bFTH2H: readSeries("bFTH2H"),
+    a1HH2H: readSeries("a1HH2H"),  b1HH2H: readSeries("b1HH2H"),
+    a2HH2H: readSeries("a2HH2H"),  b2HH2H: readSeries("b2HH2H"),
+    aQ1H2H: readSeries("aQ1H2H"),  bQ1H2H: readSeries("bQ1H2H"),
+    aQ2H2H: readSeries("aQ2H2H"),  bQ2H2H: readSeries("bQ2H2H"),
+    aQ3H2H: readSeries("aQ3H2H"),  bQ3H2H: readSeries("bQ3H2H"),
+    aQ4H2H: readSeries("aQ4H2H"),  bQ4H2H: readSeries("bQ4H2H"),
+    aFTScoredHome: readSeries("aFTScoredHome"), aFTAllowedHome: readSeries("aFTAllowedHome"),
+    aFTScoredAway: readSeries("aFTScoredAway"), aFTAllowedAway: readSeries("aFTAllowedAway"),
+    bFTScoredHome: readSeries("bFTScoredHome"), bFTAllowedHome: readSeries("bFTAllowedHome"),
+    bFTScoredAway: readSeries("bFTScoredAway"), bFTAllowedAway: readSeries("bFTAllowedAway"),
+  };
+  const lines = {
+    ftLine, h1Line,
+    h2Line:    isNbaOrNcaa ? readLine("h2Market") : null,
+    aLine:     readLine("teamAMarket"),
+    bLine:     readLine("teamBMarket"),
+    q1aLine:   readLine("q1TeamAMarket"),
+    q1bLine:   readLine("q1TeamBMarket"),
+    h1aLine:   readLine("h1TeamAMarket"),
+    h1bLine:   readLine("h1TeamBMarket"),
+    highQLine: readLine("highQTotalMarket"),
+    lowQLine:  readLine("lowQTotalMarket"),
+    raceRange: (document.getElementById("racePointsMarket")?.value || ""),
+  };
+  return { parsed, lines };
+}
+
+function validateExtractedInputs(extracted, league) {
+  const errors = [];
+  if (!league) return { ok: false, errorHtml: "⚠ Select a league first." };
+  const { parsed } = extracted;
+  const normA = normalizeTeamName(document.getElementById("teamAName")?.value || "");
+  const normB = normalizeTeamName(document.getElementById("teamBName")?.value || "");
+  const tAId = String(selectedTeamIds?.A || "");
+  const tBId = String(selectedTeamIds?.B || "");
+  if ((tAId && tAId === tBId) || (normA && normA === normB))
+    errors.push("Team A and Team B cannot be the same team.");
+  function chk(s, lbl) { if (s?.err) errors.push(`<b>${lbl}:</b> ${s.err}`); }
+  chk(parsed.aFTScored, "Team A FT Scored"); chk(parsed.aFTAllowed, "Team A FT Allowed");
+  chk(parsed.bFTScored, "Team B FT Scored"); chk(parsed.bFTAllowed, "Team B FT Allowed");
+  chk(parsed.a1HScored, "Team A 1H Scored"); chk(parsed.a1HAllowed, "Team A 1H Allowed");
+  chk(parsed.b1HScored, "Team B 1H Scored"); chk(parsed.b1HAllowed, "Team B 1H Allowed");
+  chk(parsed.a2HScored, "Team A 2H Scored"); chk(parsed.b2HScored,  "Team B 2H Scored");
+  chk(parsed.aFTH2H, "FT H2H (A)");  chk(parsed.bFTH2H, "FT H2H (B)");
+  chk(parsed.a1HH2H, "1H H2H (A)");  chk(parsed.b1HH2H, "1H H2H (B)");
+  ["Q1","Q2","Q3","Q4"].forEach(q => {
+    chk(parsed[`aQ${q}H2H`], q + " H2H (A)");
+    chk(parsed[`bQ${q}H2H`], q + " H2H (B)");
+  });
+  if (errors.length)
+    return { ok: false, errorHtml: "⚠ <b>Input Errors:</b><br>" + errors.join("<br>") };
+  return { ok: true };
+}
+/* ─────────────────────────────────────────────────────────────── */
+
+async function runEngine() {
+  const runBtn = document.getElementById("runBtn");
+  const table = document.getElementById("results");
+
+  g_engineDebugLog = [];
+    acknowledgeGlobalEngineAlert();
+  renderEngineDebugPanel();
+  if (runBtn) runBtn.disabled = true;
+  engineDebug("run start", {
+    trackerKey: getTrackerUserKey(),
+    trackerState: getTrackerStateDebugScore(g_trackerState),
+    build: APP_BUILD_VERSION
+  });
+
+  try {
+const _localState = await loadTrackerStateFromLocal();
+if (_localState) {
+  normalizeTrackerState(_localState);
+  backfillLineMemoryFromTrackedPicks();
+}
+
+    engineDebug("tracker primed for run", { trackerState: getTrackerStateDebugScore(g_trackerState) });
+
+    if (!table) return;
+
     table.style.display = "table";
     table.innerHTML = "<tr><th>Pick</th><th>Projection</th><th>Edge</th><th>Model Grade</th><th>Prediction</th></tr>";
-    
-    const isWnb = league === "wnba" || league === "wnba_pre";
-    const allowedWnbMarkets = ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b", "low_q_ou", "high_q_ou", "low_q", "high_q"];
 
-    finalPicks.forEach(p => {
-        const marketKeyFromLogic = getMarketKeyFromName(p.name, p.marketKey);
-        if (isWnb && !allowedWnbMarkets.includes(marketKeyFromLogic)) {
-            return;
-        }
-        const isLock = p._idx === lockIdx && p.pick !== "NO PLAY" && p.pick !== "NaN";
-        const confText = (p.pick === "NO PLAY" || p.pick === "NaN") ? "NaN" : (p.confidence === "—" ? "NaN" : (p.confidence || "D"));
-        const shownLine = isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line;
-        const shownEdge = isFinite(p.displayEdge) ? p.displayEdge : p.edge;
-        
-        const row = table.insertRow();
-        
-        const tdPick = document.createElement("td");
-        tdPick.innerHTML = p.name + (p.usedMemory ? ' 🧠' : '');
-        row.appendChild(tdPick);
+    const league = document.getElementById("leagueSelect")?.value || "";
+    const isNba = league === "nba";
+    const isNbaOrNcaa = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
 
-        const tdProj = document.createElement("td");
-        tdProj.textContent = isFinite(p.proj) ? displayLine(p.proj) : "NaN";
-        row.appendChild(tdProj);
+    if (!league) {
+      engineDebug("run blocked missing league");
+      showRunError(table, "⚠ Select a league first.");
+      return;
+    }
 
-        const tdEdge = document.createElement("td");
-        tdEdge.textContent = isFinite(shownEdge) && isFinite(shownLine) ? formatEdge(shownEdge, shownLine) : "NaN";
-        row.appendChild(tdEdge);
+        const teamAId = String(selectedTeamIds.A || "");
+    const teamBId = String(selectedTeamIds.B || "");
+    const teamANameNorm = normalizeTeamName(document.getElementById("teamAName")?.value || "");
+    const teamBNameNorm = normalizeTeamName(document.getElementById("teamBName")?.value || "");
 
-        const tdConf = document.createElement("td");
-        tdConf.className = getConfidenceClass(confText);
-        tdConf.textContent = confText;
-        row.appendChild(tdConf);
+        // FIX 15: Simplified duplicate team check for raw execution speed
+    const isDuplicate = (teamAId && teamAId === teamBId) || 
+                       (teamANameNorm && teamANameNorm === teamBNameNorm);
 
-        const tdPred = document.createElement("td");
-        tdPred.className = getPredictionClass(p.pick);
-        tdPred.style.whiteSpace = "nowrap";
-        tdPred.style.fontSize = "11px";
-        tdPred.textContent = p.displayPick || p.pick;
-        if (isLock) {
-            const lockSpan = document.createElement("span");
-            lockSpan.className = "lock";
-            lockSpan.textContent = "🔒";
-            tdPred.appendChild(document.createTextNode(" "));
-            tdPred.appendChild(lockSpan);
-        }
-        row.appendChild(tdPred);
 
-        const marketKeyFromLogic2 = getMarketKeyFromName(p.name, p.marketKey);
-        const pickWithCorrectKey = { ...p, marketKey: marketKeyFromLogic2 };
-        const payload = buildTrackedPickPayload({ pickRow: pickWithCorrectKey, isLock, fixtureMeta, league, diagnostics });
-        if (payload) tracked.push(payload);
+    if (isDuplicate) {
+      engineDebug("run blocked duplicate teams", { teamAId, teamBId, teamANameNorm });
+      showRunError(table, "⚠ Team A and Team B cannot be the same.");
+      return;
+    }
+
+
+    const _extracted = extractInputs(league);
+    const validation = validateExtractedInputs(_extracted, league);
+    if (!validation.ok) {
+      engineDebug("validation failed", { league, errorHtml: validation.errorHtml });
+      showRunError(table, validation.errorHtml);
+      return;
+    }
+
+    const { parsed, lines } = _extracted;
+const fixtureMeta = getCurrentFixtureMeta();
+    engineDebug("validation passed", {
+      league,
+      fixture: summarizeFixtureMetaForDebug(fixtureMeta),
+      sourceMeta: summarizeFetchMetaForDebug(),
+      rawLines: lines,
+      parsed: summarizeParsedForDebug(parsed)
     });
-    return tracked;
-}
+
+// 🛡️ ARCHITECTURE FIX: Deterministic Execution
+// Freezing the base state prevents intermediate functions from mutating the input lines
+const baseLines = Object.freeze({
+  ftLine: lines.ftLine,
+  h1Line: lines.h1Line,
+  h2Line: lines.h2Line,
+  aLine: lines.aLine,
+  bLine: lines.bLine
+});
+
+// PASS 1: Base calculation to establish preliminary projections for memory lookup
+const baseFtCalc = computeFTProjection({
+  league,
+  parsed,
+  lines: baseLines,
+  injMultA: g_injA.scoringMult,
+  injMultB: g_injB.scoringMult
+});
+
+const baseH1Calc = compute1HProjection({
+  league,
+  parsed,
+  lines: baseLines,
+  injMultA: g_injA.scoringMult,
+  injMultB: g_injB.scoringMult
+});
+
+const baseH2Calc = compute2HProjection({
+  league,
+  parsed,
+  lines: baseLines,
+  injMultA: g_injA.scoringMult,
+  injMultB: g_injB.scoringMult
+});
+
+    engineDebug("projection pass 1", {
+      ft: summarizeCalcForDebug(baseFtCalc),
+      h1: summarizeCalcForDebug(baseH1Calc),
+      h2: summarizeCalcForDebug(baseH2Calc)
+    });
+
+const resFT = resolveStoredLineBeforeDecision({
+  fixtureMeta, league, marketKey: "ft", currentLine: baseLines.ftLine, proj: baseFtCalc.ftProj, marketType: "ft", context: { aSc: baseFtCalc.aS, bSc: baseFtCalc.bS }
+});
+const resH1 = resolveStoredLineBeforeDecision({
+  fixtureMeta, league, marketKey: "h1", currentLine: baseLines.h1Line, proj: baseH1Calc.h1Proj, marketType: "h1", context: { aSc: baseH1Calc.aS1, bSc: baseH1Calc.bS1 }
+});
+const resH2 = resolveStoredLineBeforeDecision({
+  fixtureMeta, league, marketKey: "h2", currentLine: baseLines.h2Line, proj: baseH2Calc.h2Proj, marketType: "h2", context: { aSc: baseH2Calc.aS2, bSc: baseH2Calc.bS2 }
+});
+const resA = resolveStoredLineBeforeDecision({
+  fixtureMeta, league, marketKey: "team_a", currentLine: baseLines.aLine, proj: baseFtCalc.projAFT, marketType: "team", context: { teamSc: baseFtCalc.aS }
+});
+const resB = resolveStoredLineBeforeDecision({
+  fixtureMeta, league, marketKey: "team_b", currentLine: baseLines.bLine, proj: baseFtCalc.projBFT, marketType: "team", context: { teamSc: baseFtCalc.bS }
+});
+
+const finalLines = Object.freeze({
+  ftLine: resFT.line,
+  h1Line: resH1.line,
+  h2Line: resH2.line,
+  aLine: resA.line,
+  bLine: resB.line,
+  q1aLine: lines.q1aLine,
+  q1bLine: lines.q1bLine,
+  h1aLine: lines.h1aLine,
+  h1bLine: lines.h1bLine,
+  highQLine: lines.highQLine,
+  lowQLine: lines.lowQLine,
+  raceRange: lines.raceRange
+});
+
+const memoryFlags = {
+  ft: resFT.usedMemory,
+  h1: resH1.usedMemory,
+  h2: resH2.usedMemory,
+  team_a: resA.usedMemory,
+  team_b: resB.usedMemory
+};
+
+// PASS 2: Final deterministic calculation locked strictly to the resolved memory lines
+const ftCalc = computeFTProjection({
+  league,
+  parsed,
+  lines: finalLines,
+  injMultA: g_injA.scoringMult,
+  injMultB: g_injB.scoringMult
+});
+ftCalc.volatilityBlock = Math.max(ftCalc.aVol || 0, ftCalc.bVol || 0) > (LEAGUE_VOL_LIMITS[league] || 12) * 1.5;
+
+const h1Calc = compute1HProjection({
+  league,
+  parsed,
+  lines: finalLines,
+  injMultA: g_injA.scoringMult,
+  injMultB: g_injB.scoringMult
+});
+
+const h2Calc = compute2HProjection({
+  league,
+  parsed,
+  lines: finalLines,
+  injMultA: g_injA.scoringMult,
+  injMultB: g_injB.scoringMult
+});
+
+    engineDebug("line resolution", {
+      resolvedLines: finalLines
+    });
+
+const { ftLine, h1Line, h2Line, aLine, bLine } = finalLines;
+
+    engineDebug("projection pass 2", {
+      ft: summarizeCalcForDebug(ftCalc),
+      h1: summarizeCalcForDebug(h1Calc),
+      h2: summarizeCalcForDebug(h2Calc)
+    });
+
+                let ftPick = getPick(ftCalc.ftEdge, ftLine, league, "ft", { aSc: ftCalc.aS, bSc: ftCalc.bS, blowoutGap: ftCalc.blowoutGap });
+        let h1Pick = getPick(h1Calc.h1Edge, h1Line, league, "h1", { aSc: h1Calc.aS1, bSc: h1Calc.bS1 });
+        let h2Pick = getPick(h2Calc.h2Edge, h2Line, league, "h2", { aSc: h2Calc.aS2, bSc: h2Calc.bS2 });
+        let aPick = getPick(ftCalc.aEdge, aLine, league, "team", { teamSc: ftCalc.aS, blowoutGap: ftCalc.blowoutGap });
+        let bPick = getPick(ftCalc.bEdge, bLine, league, "team", { teamSc: ftCalc.bS, blowoutGap: ftCalc.blowoutGap });
+
+        // --- NEW LEVEL 2 SHIELD ---
+        const hasLevel2 = (g_massacreFetchContext.A.ortg10?.length >= 1) && 
+                          (g_massacreFetchContext.B.ortg10?.length >= 1);
+        // FIX: Shield no longer kills valid manual 1H data.
+        // Previously any NBA/WNBA game without ESPN box-score data lost ALL 1H/2H picks,
+        // even when the user had manually typed in 1H scored/allowed numbers.
+        const hasManual1H = (safeArr(parsed.a1HScored)?.length >= 2) && (safeArr(parsed.b1HScored)?.length >= 2);
+
+        if ((league === "nba" || league === "wnba" || league === "wnba_pre") && !hasLevel2 && !hasManual1H) {
+          h1Pick = "NO PLAY";
+          h2Pick = "NO PLAY";
+          h1Calc.projA1H = NaN;
+          h1Calc.projB1H = NaN;
+        }
+
+        if (ftCalc.ftSampleTier === "insufficient") {
+      ftPick = "NO PLAY";
+      aPick = "NO PLAY";
+      bPick = "NO PLAY";
+      
+      // FIX: Wipe out phantom projections if there is zero game data entered
+      h1Calc.h1Proj = NaN;
+      h1Calc.h1Edge = NaN;
+      h2Calc.h2Proj = NaN;
+      h2Calc.h2Edge = NaN;
+      ftCalc.ftProj = NaN;
+      ftCalc.ftEdge = NaN;
+      ftCalc.projAFT = NaN;
+      ftCalc.aEdge = NaN;
+      ftCalc.projBFT = NaN;
+      ftCalc.bEdge = NaN;
+    }
+
+    if (h1Calc.h1SampleTier === "insufficient") h1Pick = "NO PLAY";
+    if (h2Calc.h2SampleTier === "insufficient") h2Pick = "NO PLAY";
+    if (h2Calc.h2SampleTier === "thin" && !h2Calc.h2HasH2H) h2Pick = "NO PLAY";
+
+    const ftTrap = ftPick !== "NO PLAY" && isFinite(ftCalc.ftEdge) && detectTrap(ftCalc.ftEdge, ftLine, ftPick, league, "ft", (ftCalc.aVol || 0) + (ftCalc.bVol || 0));
+    const h1Trap = h1Pick !== "NO PLAY" && isFinite(h1Calc.h1Edge) && detectTrap(h1Calc.h1Edge, h1Line, h1Pick, league, "h1", (h1Calc.aVol1 || 0) + (h1Calc.bVol1 || 0));
+    const h2Trap = h2Pick !== "NO PLAY" && isFinite(h2Calc.h2Edge) && detectTrap(h2Calc.h2Edge, h2Line, h2Pick, league, "h2", (h2Calc.aVol2 || 0) + (h2Calc.bVol2 || 0));
+    const aTrap = aPick !== "NO PLAY" && detectTrap(ftCalc.aEdge, aLine, aPick, league, "team", ftCalc.aVol || 0);
+    const bTrap = bPick !== "NO PLAY" && detectTrap(ftCalc.bEdge, bLine, bPick, league, "team", ftCalc.bVol || 0);
+
+    if (ftTrap) ftPick = "NO PLAY";
+    if (h1Trap) h1Pick = "NO PLAY";
+    if (h2Trap) h2Pick = "NO PLAY";
+    if (aTrap) aPick = "NO PLAY";
+    if (bTrap) bPick = "NO PLAY";
+
+    engineDebug("pick decisions after trap filter", {
+      ft: summarizePickDecisionForDebug("FT Total", ftPick, ftLine, ftCalc.ftEdge, "", ftCalc.ftNote || ftCalc.ftProjectionNote || null, ftTrap),
+      h1: summarizePickDecisionForDebug("1H Total", h1Pick, h1Line, h1Calc.h1Edge, "", h1Calc.h1Note || h1Calc.h1ProjectionNote || null, h1Trap),
+      h2: summarizePickDecisionForDebug("2H Total", h2Pick, h2Line, h2Calc.h2Edge, "", h2Calc.h2Note || h2Calc.h2ProjectionNote || null, h2Trap),
+      teamA: summarizePickDecisionForDebug("Team A Total", aPick, aLine, ftCalc.aEdge, "", ftCalc.ftNote || ftCalc.ftProjectionNote || null, aTrap),
+      teamB: summarizePickDecisionForDebug("Team B Total", bPick, bLine, ftCalc.bEdge, "", ftCalc.ftNote || ftCalc.ftProjectionNote || null, bTrap)
+    });
+
+const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
+    const h1Note = h1Calc.h1Note || h1Calc.h1ProjectionNote || null;
+    const h2Note = h2Calc.h2Note || h2Calc.h2ProjectionNote || null;
+
+    const sharedInjuryNotes = [...(g_injA.notes || []), ...(g_injB.notes || [])];
+
+    const ftConfidence = getConfidenceGrade({
+      pick: ftPick,
+      note: ftNote,
+      line: ftLine,
+      edge: ftCalc.ftEdge,
+      sampleTier: ftCalc.ftSampleTier,
+      projectionOnly: ftCalc.ftProjectionOnly,
+      fullModel: ftCalc.ftFullModel,
+      trap: ftTrap,
+      hasH2H: ftCalc.ftHasH2H,
+      volatility: Math.max(ftCalc.aVol || 0, ftCalc.bVol || 0),
+      volLimit: ftCalc.vl,
+      injuryNotes: sharedInjuryNotes,
+      paceGapRisk: ftCalc.paceGapRisk,
+      defensiveFloorFlag: ftCalc.defensiveFloorFlag,
+      blowoutGap: ftCalc.blowoutGap,
+      marketKey: "ft"
+    });
+
+    // Use per-league vol limit scaled to halftime (÷2), with NBA/NCAA fallback
+    const h1VolLimit = Math.round((LEAGUE_VOL_LIMITS[league] || (league === "nba" ? 14 : 11)) / 2);
+
+    const h1Confidence = getConfidenceGrade({
+      pick: h1Pick,
+      note: h1Note,
+      line: h1Line,
+      edge: h1Calc.h1Edge,
+      sampleTier: h1Calc.h1SampleTier,
+      projectionOnly: h1Calc.h1ProjectionOnly,
+      fullModel: h1Calc.h1FullModel,
+      trap: h1Trap,
+      hasH2H: h1Calc.h1HasH2H,
+      volatility: Math.max(h1Calc.aVol1 || 0, h1Calc.bVol1 || 0),
+      volLimit: h1VolLimit,
+      injuryNotes: sharedInjuryNotes,
+      paceGapRisk: h1Calc.paceGapRisk,
+      defensiveFloorFlag: h1Calc.defensiveFloorFlag,
+      marketKey: "h1"
+    });
+
+    // Derived 1H projections get -1 confidence grade (estimated, not measured)
+    const h1ConfidenceFinal = (h1Calc.h1Derived && h1Confidence !== "NaN" && h1Confidence !== "—")
+      ? bumpConfidenceGrade(h1Confidence, -1)
+      : h1Confidence;
+
+    const h2VolLimit = Math.round((LEAGUE_VOL_LIMITS[league] || (league === "nba" ? 14 : 11)) / 2);
+
+    const h2Confidence = getConfidenceGrade({
+      pick: h2Pick,
+      note: h2Note,
+      line: h2Line,
+      edge: h2Calc.h2Edge,
+      sampleTier: h2Calc.h2SampleTier,
+      projectionOnly: h2Calc.h2ProjectionOnly,
+      fullModel: h2Calc.h2FullModel,
+      trap: h2Trap,
+      hasH2H: h2Calc.h2HasH2H,
+      volatility: Math.max(h2Calc.aVol2 || 0, h2Calc.bVol2 || 0),
+      volLimit: h2VolLimit,
+      injuryNotes: sharedInjuryNotes,
+      paceGapRisk: h2Calc.paceGapRisk,
+      defensiveFloorFlag: h2Calc.defensiveFloorFlag,
+      marketKey: "h2"
+    });
+
+    const aConfidence = getConfidenceGrade({
+      pick: aPick,
+      note: ftNote,
+      line: aLine,
+      edge: ftCalc.aEdge,
+      sampleTier: ftCalc.ftSampleTier,
+      projectionOnly: ftCalc.ftProjectionOnly,
+      fullModel: ftCalc.teamFullModel,
+      trap: aTrap,
+      hasH2H: ftCalc.ftHasH2H,
+      volatility: ftCalc.aVol,
+      volLimit: ftCalc.vl,
+      injuryNotes: g_injA.notes || [],
+      marketKey: "team_a"
+    });
+
+    const bConfidence = getConfidenceGrade({
+      pick: bPick,
+      note: ftNote,
+      line: bLine,
+      edge: ftCalc.bEdge,
+      sampleTier: ftCalc.ftSampleTier,
+      projectionOnly: ftCalc.ftProjectionOnly,
+      fullModel: ftCalc.teamFullModel,
+      trap: bTrap,
+      hasH2H: ftCalc.ftHasH2H,
+      volatility: ftCalc.bVol,
+      volLimit: ftCalc.vl,
+      injuryNotes: g_injB.notes || [],
+      marketKey: "team_b"
+    });
+
+    const intelligencePack = null;
+    const phase2Activation = (typeof getPhase2ActivationState === "function") ? getPhase2ActivationState() : null;
+
+    // --- MICROSCOPIC STREAK RADAR ---
+    const ctxA = getMassacreTeamContext("A", parsed);
+    const ctxB = getMassacreTeamContext("B", parsed);
+
+    function getMicroStreakBadge(scA, alA, scB, alB, line, isTeamMarket) {
+      if (!line) return "";
+      const countHits = (sc, al) => {
+        if (!sc || !sc.length) return null;
+        let o=0, u=0;
+        const len = Math.min(sc.length, al ? al.length : sc.length);
+        if (len < 5) return null; // Need at least a 5-game sample to declare a streak
+        for(let i=0; i<len; i++) {
+          const pts = al ? (Number(sc[i]) + Number(al[i])) : Number(sc[i]);
+          if (pts > line) o++;
+          else if (pts < line) u++;
+        }
+        return {o, u, len};
+      };
+      
+      // 8px is the smallest text modern browsers will physically render before blurring it out
+      const css = "font-size:8px; padding:1px 3px; border-radius:2px; margin-left:4px; vertical-align:middle; font-weight:900; letter-spacing:0.2px;";
+      
+      if (isTeamMarket) {
+        const st = countHits(scA, alA);
+        if (!st) return "";
+        if (st.o / st.len >= 0.8) return `<span style="${css} background:rgba(216,67,21,0.1); color:#d84315;">🔥 ${st.o}-${st.u} O</span>`;
+        if (st.u / st.len >= 0.8) return `<span style="${css} background:rgba(21,101,192,0.1); color:#1565c0;">❄️ ${st.u}-${st.o} U</span>`;
+      } else {
+        const stA = countHits(scA, alA);
+        const stB = countHits(scB, alB);
+        if (!stA || !stB) return "";
+        const tO = stA.o + stB.o;
+        const tU = stA.u + stB.u;
+        const tLen = stA.len + stB.len;
+        if (tO / tLen >= 0.8) return `<span style="${css} background:rgba(216,67,21,0.1); color:#d84315;">🔥 ${tO}-${tU} O</span>`;
+        if (tU / tLen >= 0.8) return `<span style="${css} background:rgba(21,101,192,0.1); color:#1565c0;">❄️ ${tU}-${tO} U</span>`;
+      }
+      return "";
+    }
+
+    const ftBadge = getMicroStreakBadge(ctxA.ftScored10, ctxA.ftAllowed10, ctxB.ftScored10, ctxB.ftAllowed10, ftLine, false);
+    const h1Badge = getMicroStreakBadge(ctxA.h1Scored10, ctxA.h1Allowed10, ctxB.h1Scored10, ctxB.h1Allowed10, h1Line, false);
+    const h2Badge = getMicroStreakBadge(ctxA.h2Scored10, ctxA.h2Allowed10, ctxB.h2Scored10, ctxB.h2Allowed10, h2Line, false);
+    const aBadge = getMicroStreakBadge(ctxA.ftScored10, null, null, null, aLine, true);
+    const bBadge = getMicroStreakBadge(ctxB.ftScored10, null, null, null, bLine, true);
+
+    function computeQ(qKey, lineVal) {
+      const supported = league === "nba" || league === "wnba" || league === "wnba_pre";
+      if (!supported) return null;
+
+      const aS = getManualSeries("A", qKey, parsed);
+      const bS = getManualSeries("B", qKey, parsed);
+      const pKeyA = "a" + qKey.toUpperCase() + "Allowed";
+      const pKeyB = "b" + qKey.toUpperCase() + "Allowed";
+      const aA = parsed[pKeyA]?.length ? parsed[pKeyA] : (g_massacreFetchContext.A[qKey + "Allowed"] || []);
+      const bA = parsed[pKeyB]?.length ? parsed[pKeyB] : (g_massacreFetchContext.B[qKey + "Allowed"] || []);
+
+                const tier = getSampleTier(aS, bS);
+          if (tier === "insufficient") return null;
+
+          let projA = (avgOrNaN(aS) * 0.55 + avgOrNaN(bA) * 0.45);
+          let projB = (avgOrNaN(bS) * 0.55 + avgOrNaN(aA) * 0.45);
+
+          const vCtxA = g_massacreFetchContext.A.venue;
+          const vCtxB = g_massacreFetchContext.B.venue;
+          if (vCtxA && vCtxB) {
+            const vScoredA = vCtxA[qKey + "Scored"] || [];
+            const vAllowedA = vCtxA[qKey + "Allowed"] || [];
+            const vScoredB = vCtxB[qKey + "Scored"] || [];
+            const vAllowedB = vCtxB[qKey + "Allowed"] || [];
+
+            const vProjA = (avgOrNaN(vScoredA) * 0.55 + avgOrNaN(vAllowedB) * 0.45);
+            const vProjB = (avgOrNaN(vScoredB) * 0.55 + avgOrNaN(vAllowedA) * 0.45);
+
+            const vWeight = league === "ncaa" ? 0.25 : 0.15;
+            if (isFinite(vProjA)) projA = (projA * (1 - vWeight)) + (vProjA * vWeight);
+            if (isFinite(vProjB)) projB = (projB * (1 - vWeight)) + (vProjB * vWeight);
+          }
+
+          const aH2H = getH2HSeries("A", qKey, parsed);
+          const bH2H = getH2HSeries("B", qKey, parsed);
+      const hasH2H = maybeReadH2HEnabled(qKey) && aH2H.length >= 2 && bH2H.length >= 2;
+
+      if (hasH2H) {
+        const hw = getH2HWeight(aH2H.length, bH2H.length, "h1", tier);
+        projA = (projA * (1 - hw)) + (avgOrNaN(aH2H) * hw);
+        projB = (projB * (1 - hw)) + (avgOrNaN(bH2H) * hw);
+      }
+
+      let qProj = projA + projB;
+      const vol = Math.max(stdDev(aS), stdDev(bS));
+      qProj = anchorProjection(qProj, lineVal, league, "h1");
+
+      const qEdge = lineVal ? qProj - lineVal : NaN;
+      const qPick = getPick(qEdge, lineVal, league, "h1", { aSc: avgOrNaN(aS), bSc: avgOrNaN(bS) });
+      const qConf = getConfidenceGrade({ 
+        pick: qPick, line: lineVal, edge: qEdge, sampleTier: tier, 
+        volatility: vol, volLimit: getMarketVolLimit(league, qKey), 
+        marketKey: "h1", hasH2H: hasH2H 
+      });
+
+      return { proj: qProj, edge: qEdge, pick: qPick, confidence: qConf, tier, projA, projB, hasH2H };
+    }
+
+    const q1 = computeQ("q1", parseMarketLine(document.getElementById("q1Market")?.value));
+    const q2 = computeQ("q2", parseMarketLine(document.getElementById("q2Market")?.value));
+    const q3 = computeQ("q3", parseMarketLine(document.getElementById("q3Market")?.value));
+        const q4 = computeQ("q4", parseMarketLine(document.getElementById("q4Market")?.value));
+
+    const oA = avgOrNaN(g_massacreFetchContext.A.ortg10);
+    const dA = avgOrNaN(g_massacreFetchContext.A.drtg10);
+    const netA = (isFinite(oA) && isFinite(dA)) ? (oA - dA) : (typeof ftCalc.synNetA === "number" ? ftCalc.synNetA : 0);
+    
+    const oB = avgOrNaN(g_massacreFetchContext.B.ortg10);
+    const dB = avgOrNaN(g_massacreFetchContext.B.drtg10);
+    const netB = (isFinite(oB) && isFinite(dB)) ? (oB - dB) : (typeof ftCalc.synNetB === "number" ? ftCalc.synNetB : 0);
+    
+    const projDiff = ftCalc.projAFT - ftCalc.projBFT;
+
+    function getPlayerMilestones() {
+      const sides = ["A", "B"];
+      const allPotentials = [];
+
+      sides.forEach(side => {
+        const roster = g_massacreFetchContext[side].roster || [];
+        const oppDRtg = side === "A" ? avgOrNaN(g_massacreFetchContext.B.drtg10) : avgOrNaN(g_massacreFetchContext.A.drtg10);
+        const teamNet = side === "A" ? netA : netB;
+        const paceAdj = (ftCalc.pace || 100) / 100;
+
+        roster.slice(0, 5).forEach(p => {
+          const adjP = p.ppg * paceAdj * (oppDRtg > 112 ? 1.07 : 0.95);
+          const adjR = p.rpg * paceAdj * (teamNet < 0 ? 1.05 : 0.98);
+          const adjA = p.apg * paceAdj * (teamNet > 0 ? 1.06 : 0.97);
+          const adj3 = (p.tpm || 0) * paceAdj;
+
+          // Score by % increase over average to find the "Outlier"
+          if (p.ppg > 8) allPotentials.push({ name: p.name + " Pts", pick: adjP.toFixed(1), score: (adjP - p.ppg) / p.ppg, grade: "B" });
+          if (p.rpg > 3) allPotentials.push({ name: p.name + " Reb", pick: adjR.toFixed(1), score: (adjR - p.rpg) / p.rpg, grade: "C" });
+          if (p.apg > 2) allPotentials.push({ name: p.name + " Ast", pick: adjA.toFixed(1), score: (adjA - p.apg) / p.apg, grade: "C" });
+          if (p.tpm > 1) allPotentials.push({ name: p.name + " 3PM", pick: adj3.toFixed(1), score: (adj3 - p.tpm) / p.tpm, grade: "B" });
+          
+          // Milestone bonuses
+          if (adjP > 9.5 && adjR > 9.5 && adjA > 9.5) allPotentials.push({ name: p.name + " Triple Double", pick: "HIGH PROB", score: 2.0, grade: "A" });
+          else if (adjP > 9.5 && (adjR > 9.5 || adjA > 9.5)) allPotentials.push({ name: p.name + " Double Double", pick: "HIGH PROB", score: 1.5, grade: "A" });
+        });
+      });
+
+      // Pick the single strongest outlier
+      const topPick = allPotentials.sort((a,b) => b.score - a.score)[0];
+      return topPick ? [topPick] : [];
+    }
+
+    const bestProp = getPlayerMilestones();
+    const playerPicks = bestProp.map((m, i) => ({
+      _idx: 100 + i, 
+      name: "⭐ " + m.name, 
+      marketKey: "player", 
+      marketType: "other", 
+      league, 
+      context: {}, 
+      line: 0, 
+      proj: NaN, 
+      edge: NaN, 
+      pick: m.pick, 
+      confidence: m.grade, 
+      note: "Top Value Signal"
+    }));
+
+    const picks = [
+      ...playerPicks,
+  {
+    _idx: 0,
+    name: "FT Total" + ftBadge,
+    marketKey: "ft",
+    marketType: "ft",
+    league,
+    context: { aSc: ftCalc.aS, bSc: ftCalc.bS },
+    line: ftLine,
+    proj: ftCalc.ftProj,
+    edge: ftCalc.ftEdge,
+    pick: ftPick,
+    confidence: ftConfidence,
+    note: ftNote,
+    fullModel: ftCalc.ftFullModel
+  },
+  {
+    _idx: 1,
+    name: "1H Total" + h1Badge,
+    marketKey: "h1",
+    marketType: "h1",
+    league,
+    context: { aSc: h1Calc.aS1, bSc: h1Calc.bS1 },
+    line: h1Line,
+    proj: h1Calc.h1Proj,
+    edge: h1Calc.h1Edge,
+    pick: h1Pick,
+    confidence: h1ConfidenceFinal,
+    note: h1Note,
+    fullModel: h1Calc.h1FullModel
+  },
+  {
+    _idx: 2,
+    name: "2H Total" + h2Badge,
+    marketKey: "h2",
+    marketType: "h2",
+    league,
+    context: { aSc: h2Calc.aS2, bSc: h2Calc.bS2 },
+    line: h2Line,
+    proj: h2Calc.h2Proj,
+    edge: h2Calc.h2Edge,
+    pick: h2Pick,
+    confidence: h2Confidence,
+    note: h2Note,
+    fullModel: h2Calc.h2FullModel
+  },
+      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: false, lockStrength: Math.abs((q1?.edge||0)/(q1?.line||1))*10 },
+      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: false, lockStrength: Math.abs((q2?.edge||0)/(q2?.line||1))*10 },
+      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: false, lockStrength: Math.abs((q3?.edge||0)/(q3?.line||1))*10 },
+      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: false, lockStrength: Math.abs((q4?.edge||0)/(q4?.line||1))*10 },
+  {
+    _idx: 3,
+    name: "Team A Total" + aBadge,
+    marketKey: "team_a",
+    marketType: "team",
+    league,
+    context: { teamSc: ftCalc.aS },
+    line: aLine,
+    proj: ftCalc.projAFT,
+    edge: ftCalc.aEdge,
+    pick: aPick,
+    confidence: aConfidence,
+    note: ftNote,
+    fullModel: ftCalc.teamFullModel
+  },
+  {
+    _idx: 4,
+    name: "Team B Total" + bBadge,
+    marketKey: "team_b",
+    marketType: "team",
+    league,
+    context: { teamSc: ftCalc.bS },
+    line: bLine,
+    proj: ftCalc.projBFT,
+    edge: ftCalc.bEdge,
+    pick: bPick,
+    confidence: bConfidence,
+    note: ftNote,
+    fullModel: ftCalc.teamFullModel
+  },
+    {
+    _idx: 44,
+    name: "Team A Q1",
+    marketKey: "q1_team_a",
+    marketType: "team",
+    league,
+    context: {},
+    line: finalLines.q1aLine,
+    proj: q1?.projA,
+    edge: finalLines.q1aLine && isFinite(q1?.projA) ? q1.projA - finalLines.q1aLine : NaN,
+    pick: (!finalLines.q1aLine || !isFinite(q1?.projA)) ? "NO PLAY" : getPick(q1.projA - finalLines.q1aLine, finalLines.q1aLine, league, "team", {}),
+    confidence: (!finalLines.q1aLine || !isFinite(q1?.projA)) ? "—" : (q1?.confidence || "—"),
+    note: null,
+    fullModel: false
+  },
+  {
+    _idx: 45,
+    name: "Team B Q1",
+    marketKey: "q1_team_b",
+    marketType: "team",
+    league,
+    context: {},
+    line: finalLines.q1bLine,
+    proj: q1?.projB,
+    edge: finalLines.q1bLine && isFinite(q1?.projB) ? q1.projB - finalLines.q1bLine : NaN,
+    pick: (!finalLines.q1bLine || !isFinite(q1?.projB)) ? "NO PLAY" : getPick(q1.projB - finalLines.q1bLine, finalLines.q1bLine, league, "team", {}),
+    confidence: (!finalLines.q1bLine || !isFinite(q1?.projB)) ? "—" : (q1?.confidence || "—"),
+    note: null,
+    fullModel: false
+  },
+  {
+    _idx: 48,
+    name: "Team A 1H",
+    marketKey: "h1_team_a",
+    marketType: "team",
+    league,
+    context: { teamSc: h1Calc.aS1 },
+    line: finalLines.h1aLine,
+    proj: h1Calc.projA1H,
+    edge: finalLines.h1aLine && isFinite(h1Calc.projA1H) ? h1Calc.projA1H - finalLines.h1aLine : NaN,
+    pick: (!finalLines.h1aLine || !isFinite(h1Calc.projA1H)) ? "NO PLAY" : getPick(h1Calc.projA1H - finalLines.h1aLine, finalLines.h1aLine, league, "team", { teamSc: h1Calc.aS1 }),
+    confidence: (!finalLines.h1aLine || !isFinite(h1Calc.projA1H)) ? "—" : h1Confidence,
+    note: h1Note,
+    fullModel: h1Calc.h1FullModel
+  },
+  {
+    _idx: 49,
+    name: "Team B 1H",
+    marketKey: "h1_team_b",
+    marketType: "team",
+    league,
+    context: { teamSc: h1Calc.bS1 },
+    line: finalLines.h1bLine,
+    proj: h1Calc.projB1H,
+    edge: finalLines.h1bLine && isFinite(h1Calc.projB1H) ? h1Calc.projB1H - finalLines.h1bLine : NaN,
+    pick: (!finalLines.h1bLine || !isFinite(h1Calc.projB1H)) ? "NO PLAY" : getPick(h1Calc.projB1H - finalLines.h1bLine, finalLines.h1bLine, league, "team", { teamSc: h1Calc.bS1 }),
+    confidence: (!finalLines.h1bLine || !isFinite(h1Calc.projB1H)) ? "—" : h1Confidence,
+    note: h1Note,
+    fullModel: h1Calc.h1FullModel
+  },
+  {
+    _idx: 20,
+    name: "HT/FT Double",
+    marketKey: "htft",
+    marketType: "other",
+    league,
+    proj: NaN,
+    edge: NaN,
+    pick: (function() {
+      if (!isFinite(h1Calc.projA1H) || !isFinite(h1Calc.projB1H) || !isFinite(ftCalc.projAFT) || !isFinite(ftCalc.projBFT)) return "NO PLAY";
+      const h1Win = h1Calc.projA1H > h1Calc.projB1H ? "Home" : "Away";
+      const ftWin = ftCalc.projAFT > ftCalc.projBFT ? "Home" : "Away";
+      return h1Win + "/" + ftWin;
+    })(),
+    confidence: (() => {
+      if (!isFinite(h1Calc.projA1H) || !isFinite(h1Calc.projB1H) || !isFinite(ftCalc.projAFT) || !isFinite(ftCalc.projBFT)) return "—";
+      const htMargin = Math.abs(h1Calc.projA1H - h1Calc.projB1H);
+      const ftMargin = Math.abs(ftCalc.projAFT - ftCalc.projBFT);
+      const sameWinner = (h1Calc.projA1H > h1Calc.projB1H) === (ftCalc.projAFT > ftCalc.projBFT);
+      if (!sameWinner) return htMargin >= 4 && ftMargin >= 6 ? "C" : "D";
+      if (htMargin >= 6 && ftMargin >= 10) return "B";
+      if (htMargin >= 3 && ftMargin >= 6) return "C";
+      return "D";
+    })(),
+    note: "Calculated from Period Projections"
+  },
+              {
+        _idx: 21,
+        name: "Winning Margin (Team)",
+        marketKey: "margin_team",
+        marketType: "other",
+        league,
+        pick: (function(){ 
+          if (!isFinite(projDiff)) return "NO PLAY";
+          if ((ftCalc.aVol || 0) + (ftCalc.bVol || 0) > 14) return "NO PLAY";
+          const w = projDiff > 0 ? "Home" : "Away"; const a = Math.abs(projDiff); 
+          if (a <= 5) return w+" by 1-5"; if (a <= 10) return w+" by 6-10"; 
+          if (a <= 15) return w+" by 11-15"; if (a <= 20) return w+" by 16-20"; 
+          if (a <= 25) return w+" by 21-25"; if (a <= 30) return w+" by 26-30"; 
+          return w+" by 31+"; 
+        })(),
+        confidence: (() => {
+          if (!isFinite(projDiff)) return "—";
+          if ((ftCalc.aVol || 0) + (ftCalc.bVol || 0) > 14) return "—";
+          const a = Math.abs(projDiff);
+          if (a >= 15) return "B";
+          if (a >= 8) return "C";
+          if (a >= 3) return "D";
+          return "—";
+        })(),
+        note: "Specific Team Margin"
+      },
+      {
+        _idx: 24,
+        name: "Winning Margin (Any)",
+        marketKey: "margin_any",
+        marketType: "other",
+        league,
+        pick: (function(){ 
+          if (!isFinite(projDiff)) return "NO PLAY";
+          if ((ftCalc.aVol || 0) + (ftCalc.bVol || 0) > 14) return "NO PLAY";
+          const a = Math.abs(projDiff); 
+          if (a <= 5) return "1-5"; if (a <= 10) return "6-10"; 
+          if (a <= 15) return "11-15"; if (a <= 20) return "16-20"; 
+          if (a <= 25) return "21-25"; if (a <= 30) return "26-30"; 
+          return "31+"; 
+        })(),
+        confidence: (() => {
+          if (!isFinite(projDiff)) return "—";
+          if ((ftCalc.aVol || 0) + (ftCalc.bVol || 0) > 14) return "—";
+          const a = Math.abs(projDiff);
+          if (a >= 15) return "B";
+          if (a >= 8) return "C";
+          if (a >= 3) return "D";
+          return "—";
+        })(),
+        note: "Any Team Gap"
+      },
+  {
+    _idx: 22,
+    name: "Highest Scoring Quarter",
+    marketKey: "high_q",
+    marketType: "other",
+    league,
+    pick: (function() {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4) return "NO PLAY";
+      const max = Math.max(...validQs);
+      const sorted = [...validQs].sort((a,b) => b - a);
+      if (sorted[0] - sorted[1] < 0.3) return "Equal";
+      const orig = [q1?.proj, q2?.proj, q3?.proj, q4?.proj];
+      return "Quarter " + (orig.indexOf(max) + 1);
+    })(),
+    confidence: (() => {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4) return "—";
+      const sorted = [...validQs].sort((a, b) => b - a);
+      const gap = sorted[0] - sorted[1];
+      if (gap >= 3) return "B";
+      if (gap >= 1.5) return "C";
+      if (gap >= 0.3) return "D";
+      return "—";
+    })(),
+    note: "Max Quarter Winner"
+  },
+  {
+    _idx: 23,
+    name: "Lowest Scoring Quarter",
+    marketKey: "low_q",
+    marketType: "other",
+    league,
+    pick: (function() {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4) return "NO PLAY";
+      const min = Math.min(...validQs);
+      const sorted = [...validQs].sort((a, b) => a - b);
+      if (sorted[1] - sorted[0] < 0.3) return "Equal";
+      const orig = [q1?.proj, q2?.proj, q3?.proj, q4?.proj];
+      return "Quarter " + (orig.indexOf(min) + 1);
+    })(),
+    confidence: (() => {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4) return "—";
+      const sorted = [...validQs].sort((a, b) => a - b);
+      const gap = sorted[1] - sorted[0];
+      if (gap >= 3) return "B";
+      if (gap >= 1.5) return "C";
+      if (gap >= 0.3) return "D";
+      return "—";
+    })(),
+    note: "Min Quarter Winner"
+  },
+  {
+    _idx: 25,
+    name: "Highest Q Total",
+    marketKey: "high_q_ou",
+    marketType: "h1",
+    league,
+    context: {},
+    line: finalLines.highQLine,
+    proj: (function() {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      return validQs.length === 4 ? Math.max(...validQs) : NaN;
+    })(),
+    edge: (function() {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      const p = validQs.length === 4 ? Math.max(...validQs) : NaN;
+      return finalLines.highQLine && isFinite(p) ? p - finalLines.highQLine : NaN;
+    })(),
+    pick: (function() {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      const p = validQs.length === 4 ? Math.max(...validQs) : NaN;
+      if (!finalLines.highQLine || !isFinite(p)) return "NO PLAY";
+      return getPick(p - finalLines.highQLine, finalLines.highQLine, league, "h1", {});
+    })(),
+    confidence: (() => {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4 || !finalLines.highQLine) return "—";
+      const proj = Math.max(...validQs);
+      const pct = Math.abs((proj - finalLines.highQLine) / finalLines.highQLine);
+      if (pct >= 0.07) return "B";
+      if (pct >= 0.05) return "C";
+      return "D";
+    })(),
+    note: null,
+    fullModel: false,
+    lockStrength: 0
+  },
+  {
+    _idx: 26,
+    name: "Lowest Q Total",
+    marketKey: "low_q_ou",
+    marketType: "h1",
+    league,
+    context: {},
+    line: finalLines.lowQLine,
+    proj: (function() {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      return validQs.length === 4 ? Math.min(...validQs) : NaN;
+    })(),
+    edge: (function() {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      const p = validQs.length === 4 ? Math.min(...validQs) : NaN;
+      return finalLines.lowQLine && isFinite(p) ? p - finalLines.lowQLine : NaN;
+    })(),
+    pick: (function() {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      const p = validQs.length === 4 ? Math.min(...validQs) : NaN;
+      if (!finalLines.lowQLine || !isFinite(p)) return "NO PLAY";
+      return getPick(p - finalLines.lowQLine, finalLines.lowQLine, league, "h1", {});
+    })(),
+    confidence: (() => {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4 || !finalLines.lowQLine) return "—";
+      const proj = Math.min(...validQs);
+      const pct = Math.abs((proj - finalLines.lowQLine) / finalLines.lowQLine);
+      if (pct >= 0.07) return "B";
+      if (pct >= 0.05) return "C";
+      return "D";
+    })(),
+    note: null,
+    fullModel: false,
+    lockStrength: 0
+  }
+    ];
+
+    if (ftCalc.ftSampleTier === "insufficient") {
+      picks.forEach(p => {
+        p.pick = "NO PLAY";
+        p.edge = NaN;
+        p.confidence = "NaN";
+        p.note = "No data entered";
+        p.lockStrength = 0;
+      });
+    }
+
+    const includeQs = league === "nba" || league === "wnba" || league === "wnba_pre";
+    
+    const finalPicks = picks.filter(p => {
+      if (p.marketKey === "player") return true;
+      if (p.marketKey === "ft" || p.marketKey === "team_a" || p.marketKey === "team_b" || p.marketKey === "h1") return true;
+      if (p.marketKey === "h2" || p.marketKey === "h1_team_a" || p.marketKey === "h1_team_b" || p.marketKey === "htft") return isNbaOrNcaa;
+      
+      const isQuarterMarket = p.marketKey.startsWith("q") || p.marketKey.includes("_q") || p.marketKey.includes("q_ou");
+      if (isQuarterMarket) return includeQs;
+      
+      return isNbaOrNcaa;
+    });
+
+    // Reorder: Strict Syndicate List Order (sorted by name length)
+    const mktOrderMap = { 
+      "player": 0, "ft": 1, "h1": 2, "h2": 3, 
+      "q1": 4, "q2": 5, "q3": 6, "q4": 7, 
+      "q1_team_a": 8, "q1_team_b": 9, 
+      "h1_team_a": 10, "h1_team_b": 11, 
+      "team_a": 12, "team_b": 13, 
+      "htft": 14, 
+      "low_q_ou": 15, "high_q_ou": 16, 
+      "margin_any": 17, "margin_team": 18, 
+      "low_q": 19, "high_q": 20 
+    };
+    finalPicks.sort((a, b) => (mktOrderMap[a.marketKey] || 99) - (mktOrderMap[b.marketKey] || 99));
+
+
+const rawMarketInputs = getRawMarketInputMap();
+const finalPicksForDisplay = finalPicks
+  .map(p => applySmartLineToPick(p, rawMarketInputs[p.marketKey], league))
+  .filter(Boolean);
+
+applySoftTrackerInfluenceToPicks(finalPicksForDisplay, fixtureMeta, phase2Activation);
+applyLeagueTrustToPicks(finalPicksForDisplay, league);
+
+// Fix C1: Plug in the Massacre MC machine
+await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtureMeta);
+
+// Fix H1: Attach the memory icons (🧠)
+finalPicksForDisplay.forEach(p => {
+  if (memoryFlags[p.marketKey]) p.usedMemory = true;
+});
+
+// --- STRICT A/B/C CONFIDENCE GATE ---
+finalPicksForDisplay.forEach(p => {
+  if (p.pick !== "NO PLAY") {
+    const grade = String(p.confidence || "").replace(/[^ABCD]/g, '').charAt(0);
+    if (grade !== "A" && grade !== "B" && grade !== "C") {
+      p.pick = "NO PLAY";
+      p.displayPick = "NO PLAY";
+      p.confidence = "—";
+      p.note = "Confidence gate: Lower grades blocked post-massacre";
+      p.lockRestricted = true;
+    }
+  }
+});
+
+persistLineMemoryFromFinalPicks(finalPicksForDisplay, fixtureMeta, league);
+
+const markets = finalPicksForDisplay.map(p => ({
+      _idx: p._idx,
+      edge: isFinite(p.displayEdge) ? p.displayEdge : p.edge,
+      line: isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line,
+      pick: p.pick,
+      fullModel: p.fullModel,
+      confidence: p.confidence,
+      note: p.note,
+      lockStrength: p.lockStrength,
+      lockRestricted: !!p.lockRestricted
+    }));
+        // --- JUMP-PROOF SYNDICATE DASHBOARD ---
+        const paceIcon = (ftCalc.pace > 100) ? "🔥" : "🧊";
+        const dashHtml = `
+        <div style="background: #333; color: #ffd700; padding: 8px 10px; font-weight: 800; font-size: 11px; display: flex; justify-content: space-between; border-bottom: 1px solid var(--panel-border);">
+          <span>SYNDICATE INSIGHT (LEVEL 2)</span>
+          <span style="color: ${ftCalc.ftFullModel ? '#4CAF50' : '#ffa500'}">${ftCalc.ftFullModel ? '🟢 FULL MODEL' : '🟡 LIMITED DATA'}</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; padding: 12px; text-align: center; gap: 5px;">
+          <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team A Net</div><div style="font-size: 18px; font-weight: 900; color: ${netA >= 0 ? '#3a9c35' : '#c91920'}">${netA.toFixed(1)}</div></div>
+          <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Exp. Pace</div><div style="font-size: 18px; font-weight: 900; color: var(--text);">${isFinite(ftCalc.pace) ? ftCalc.pace.toFixed(1) + ' ' + paceIcon : '—'}</div></div>
+          <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team B Net</div><div style="font-size: 18px; font-weight: 900; color: ${netB >= 0 ? '#3a9c35' : '#c91920'}">${netB.toFixed(1)}</div></div>
+        </div>`;
+
+        let existingDash = document.getElementById('syndicateDashboard');
+        if (!existingDash) {
+          existingDash = document.createElement('div');
+          existingDash.id = 'syndicateDashboard';
+          existingDash.style.cssText = "background: var(--panel); border: 1px solid var(--panel-border); margin: 10px 0; padding: 0; box-shadow: var(--shadow); font-family: sans-serif; min-height: 85px;";
+          table.parentNode.insertBefore(existingDash, table);
+        }
+        existingDash.innerHTML = dashHtml;
+
+    const lockIdx = selectLock(markets);
+
+    const trackedToSave = buildResultRows({
+  table,
+  finalPicks: finalPicksForDisplay,
+  lockIdx,
+  fixtureMeta,
+  league,
+      diagnostics: {
+      phase2Activation,
+      ftSampleTier: ftCalc.ftSampleTier,
+      h1SampleTier: h1Calc.h1SampleTier,
+      h2SampleTier: h2Calc.h2SampleTier,
+      ftProjectionOnly: ftCalc.ftProjectionOnly,
+      h1ProjectionOnly: h1Calc.h1ProjectionOnly,
+      h2ProjectionOnly: h2Calc.h2ProjectionOnly,
+      ftHasH2H: ftCalc.ftHasH2H,
+      h1HasH2H: h1Calc.h1HasH2H,
+      h2HasH2H: h2Calc.h2HasH2H,
+      q1HasH2H: !!q1?.hasH2H,
+      q2HasH2H: !!q2?.hasH2H,
+      q3HasH2H: !!q3?.hasH2H,
+      q4HasH2H: !!q4?.hasH2H,
+    pace: ftCalc.pace,
+    paceGapRisk: ftCalc.paceGapRisk,
+    h1PaceGapRisk: h1Calc.paceGapRisk,
+    h2PaceGapRisk: h2Calc.paceGapRisk,
+defensiveFloorFlag: ftCalc.defensiveFloorFlag,
+h1DefensiveFloorFlag: h1Calc.defensiveFloorFlag,
+h2DefensiveFloorFlag: h2Calc.defensiveFloorFlag,
+    blowoutGap: ftCalc.blowoutGap,
+    volatilityBlock: ftCalc.volatilityBlock,
+
+        aVol: ftCalc.aVol,
+    bVol: ftCalc.bVol,
+    aVol1: h1Calc.aVol1,
+    bVol1: h1Calc.bVol1,
+    aVol2: h2Calc.aVol2,
+    bVol2: h2Calc.bVol2,
+    netA: typeof netA !== 'undefined' ? Number(netA) : null,
+    netB: typeof netB !== 'undefined' ? Number(netB) : null,
+    injMultA: g_injA.scoringMult,
+    injMultB: g_injB.scoringMult,
+
+    ftFullModel: ftCalc.ftFullModel,
+    h1FullModel: h1Calc.h1FullModel,
+    h2FullModel: h2Calc.h2FullModel,
+    teamFullModel: ftCalc.teamFullModel,
+    intelligencePackSummary: intelligencePack
+  }
+});
+
+    engineDebug("final picks for display", finalPicksForDisplay.map(p => summarizePickDecisionForDebug(
+      p.name,
+      p.pick,
+      p.displayLineUsed ?? p.line,
+      isFinite(p.displayEdge) ? p.displayEdge : p.edge,
+      p.confidence,
+      p.note,
+      !!p.lockRestricted
+    )));
+
+// --- SNAPSHOT FOR AUDIT COPY ---
+window.__LAST_AUDIT_STATE = {
+  timestamp: new Date().toLocaleTimeString(),
+  league: league,
+  inputs: parsed,
+  resolvedLines: finalLines,
+  calcs: { 
+    ftCalc, h1Calc, h2Calc, 
+    q1: q1 || "null", q2: q2 || "null", q3: q3 || "null", q4: q4 || "null" 
+  },
+  massacreContext: {
+    teamA: {
+      rest: g_massacreFetchContext?.A?.restDays,
+      volatility: ftCalc.aVol
+    },
+    teamB: {
+      rest: g_massacreFetchContext?.B?.restDays,
+      volatility: ftCalc.bVol
+    }
+  },
+  picks: finalPicksForDisplay.map(p => ({
+    market: p.marketKey,
+    pick: p.pick,
+    edge: p.edge,
+    line: p.displayLineUsed ?? p.line,
+    confidence: p.confidence,
+    note: p.note,
+    massacreDiag: p.massacre || "None",
+    massacreProfile: p.massacreProfile || "None"
+  }))
+};
+// -------------------------------
 
 const actionablePicks = finalPicksForDisplay.filter(p =>
   p &&
@@ -14341,132 +15520,117 @@ if (trackedToSave.length) {
 
 
             function onLeagueChange() {
-    _fixtureLoadToken++;
-    closeDrop("dropA");
-    closeDrop("dropB");
-    unlockFetchBtn();
-    setStatusText("", "");
-    setFetchAuditIssues([]);
-    resetResultsTable();
+  _fixtureLoadToken++;
+  closeDrop("dropA");
+  closeDrop("dropB");
+  unlockFetchBtn();
+  setStatusText("", "");
+  setFetchAuditIssues([]);
+  resetResultsTable();
 
-    // --- NUKES ALL INPUTS AND DASHBOARD ON LEAGUE CHANGE ---
-    document.querySelectorAll(".wrapper input").forEach(i => {
+        // --- NUKES ALL INPUTS AND DASHBOARD ON LEAGUE CHANGE ---
+      document.querySelectorAll(".wrapper input").forEach(i => {
         if (i.type !== "checkbox") i.value = "";
         else i.checked = false;
         i.style.borderColor = "";
-    });
-    
-    const dash = document.getElementById("syndicateDashboard");
-    if (dash) dash.remove();
-    // -------------------------------------------------------
+      });
+      
+      const dash = document.getElementById("syndicateDashboard");
+      if (dash) dash.remove();
+      // -------------------------------------------------------
 
-    const league = document.getElementById("leagueSelect").value;
-    const isNbaOrNcaa = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
-    const isQs = league === "nba" || league === "wnba" || league === "wnba_pre";
+      const league = document.getElementById("leagueSelect").value;
+      const isNbaOrNcaa = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
+      const isQs = league === "nba" || league === "wnba" || league === "wnba_pre";
 
-    // --- FIX: ALWAYS clear period/quarter inputs when switching leagues! ---
-    setFieldValues(FIELD_GROUPS.periodInputs);
+      // --- FIX: ALWAYS clear period/quarter inputs when switching leagues! ---
+      setFieldValues(FIELD_GROUPS.periodInputs);
 
-    const teamMarketSection = document.getElementById("teamMarketSection");
-    if (teamMarketSection) {
+            const teamMarketSection = document.getElementById("teamMarketSection");
+      if (teamMarketSection) {
         teamMarketSection.style.gridTemplateColumns = "1fr 1fr";
-    }
+      }
 
-    document.getElementById("espnSection").style.display = isNbaOrNcaa ? "block" : "none";
-    
-    const qMarketsEl = document.getElementById("qMarketsSection");
-    if (qMarketsEl) qMarketsEl.style.display = isQs ? "grid" : "none";
-    document.getElementById("aQSection").style.display = isQs ? "block" : "none";
-    document.getElementById("bQSection").style.display = isQs ? "block" : "none";
+      document.getElementById("espnSection").style.display = isNbaOrNcaa ? "block" : "none";
+      
+      const qMarketsEl = document.getElementById("qMarketsSection");
+      if (qMarketsEl) qMarketsEl.style.display = isQs ? "grid" : "none";
+      document.getElementById("aQSection").style.display = isQs ? "block" : "none";
+      document.getElementById("bQSection").style.display = isQs ? "block" : "none";
 
-    // Hide all 1H, 2H, and Halves H2H for manual leagues
-    ["a1HSection", "b1HSection", "a2HSection", "b2HSection", "h2h1HSection", "h2h2HSection"].forEach(id => {
+      // Hide all 1H, 2H, and Halves H2H for manual leagues
+      ["a1HSection", "b1HSection", "a2HSection", "b2HSection", "h2h1HSection", "h2h2HSection"].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.style.display = isNbaOrNcaa ? "block" : "none";
-    });
-    const h2hQ = document.getElementById("h2hQSection");
-    if (h2hQ) h2hQ.style.display = (isQs && isNbaOrNcaa) ? "block" : "none";
-    
-    // Handle Market Lines (2H and High Q only visible for auto leagues)
-    const h2MarketEl = document.getElementById("h2MarketSection");
-    if (h2MarketEl) {
+      });
+      const h2hQ = document.getElementById("h2hQSection");
+      if (h2hQ) h2hQ.style.display = (isQs && isNbaOrNcaa) ? "block" : "none";
+      
+      // Handle Market Lines (2H and High Q only visible for auto leagues)
+      const h2MarketEl = document.getElementById("h2MarketSection");
+      if (h2MarketEl) {
         h2MarketEl.style.display = isNbaOrNcaa ? "grid" : "none";
-    }
+      }
 
-    // Other market sections — hide for manual leagues
-    ["h1TeamMarketSection", "exoticMarketSection", "q1q2MarketSection", "q3q4MarketSection", "q1TeamMarketSection"].forEach(id => {
+      // Other market sections — hide for manual leagues
+      ["h1TeamMarketSection", "exoticMarketSection", "q1q2MarketSection", "q3q4MarketSection", "q1TeamMarketSection"].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.style.display = isNbaOrNcaa ? "grid" : "none";
-    });
-    
-    const highQ = document.getElementById("highQTotalWrapper");
-    if (highQ) highQ.style.display = isNbaOrNcaa ? "block" : "none";
+      });
+      
+      const highQ = document.getElementById("highQTotalWrapper");
+if (highQ) highQ.style.display = isNbaOrNcaa ? "block" : "none";
 
-    // === WNBA INPUT REALIGNMENT GATE ===
-    const isWnb = league === "wnba" || league === "wnba_pre";
-    if (isWnb) {
-        if (document.getElementById("h1TeamMarketSection")) document.getElementById("h1TeamMarketSection").style.display = "none";
-        if (document.getElementById("q1TeamMarketSection")) document.getElementById("q1TeamMarketSection").style.display = "none";
-    }
-    const wnbHiddenInputs = ["h2Market", "racePointsMarket"];
-    wnbHiddenInputs.forEach(id => {
-        const el = document.getElementById(id);
-        if (el && el.parentElement) {
-            el.parentElement.style.display = isWnb ? "none" : "";
-        }
-    });
-    // ===================================
-
-    if (!isNbaOrNcaa) {
-        ["aAutoTag", "bAutoTag", "h2hAutoTag"].forEach(id => {
+              if (!isNbaOrNcaa) {
+          ["aAutoTag", "bAutoTag", "h2hAutoTag"].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.style.display = "none";
+          });
+
+          syncH2HCheckbox("h1", false);
+        }
+
+        ["aVenueSplitWrapper", "bVenueSplitWrapper"].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.style.display = isNbaOrNcaa ? "block" : "none";
         });
 
-        syncH2HCheckbox("h1", false);
-    }
+        selectedTeamIds = { A: null, B: null };
+      g_lastFetchedTeams = { A: "", B: "" };
+      g_fetchMeta = defaultFetchMeta();
+      g_massacreFetchContext = defaultMassacreFetchContext();
+      g_h2hManualPreference.ft = null;
+      g_h2hManualPreference.h1 = null;
+      g_h2hManualPreference.h2 = null;
 
-    ["aVenueSplitWrapper", "bVenueSplitWrapper"].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) el.style.display = isNbaOrNcaa ? "block" : "none";
-    });
+        syncAllH2HCheckboxes(false);
 
-    selectedTeamIds = { A: null, B: null };
-    g_lastFetchedTeams = { A: "", B: "" };
-    g_fetchMeta = defaultFetchMeta();
-    g_massacreFetchContext = defaultMassacreFetchContext();
-    g_h2hManualPreference.ft = null;
-    g_h2hManualPreference.h1 = null;
-    g_h2hManualPreference.h2 = null;
+  setDisplayValues(FIELD_GROUPS.autoTags, "none");
 
-    syncAllH2HCheckboxes(false);
+      _schedCache.clear();
+      _summaryCache.clear();
+      g_injA = defaultInjuryMeta();
+      g_injB = defaultInjuryMeta();
+      hideInjuryBox("A");
+      hideInjuryBox("B");
 
-    setDisplayValues(FIELD_GROUPS.autoTags, "none");
+      const fsel = document.getElementById("fixtureSelect");
+      if (fsel) { fsel.innerHTML = '<option value="">— Select match —</option>'; fsel.value = ""; }
 
-    _schedCache.clear();
-    _summaryCache.clear();
-    g_injA = defaultInjuryMeta();
-    g_injB = defaultInjuryMeta();
-    hideInjuryBox("A");
-    hideInjuryBox("B");
-
-    const fsel = document.getElementById("fixtureSelect");
-    if (fsel) { fsel.innerHTML = '<option value="">— Select match —</option>'; fsel.value = ""; }
-
-    if (!league) {
+      if (!league) {
         lockFrom("espnSection");
         accordionOpen("leagueSection");
         validateFetchSection();
         return;
+      }
+
+      updateSectionLocks();
+      if (isNbaOrNcaa) { accordionOpen("espnSection"); loadFixtures(0); }
+      else accordionOpen("marketSection");
+      validateFetchSection();
     }
 
-    updateSectionLocks();
-    if (isNbaOrNcaa) { accordionOpen("espnSection"); loadFixtures(0); }
-    else accordionOpen("marketSection");
-    validateFetchSection();
-}
-
-function toggleTheme() {
+        function toggleTheme() {
   const isDark = document.body.classList.toggle("dark-mode");
   localStorage.setItem("theme", isDark ? "dark" : "light");
 }
