@@ -3820,20 +3820,18 @@ function queueH2HCheckboxSync(forceAuto = false) {
     let g_injA = defaultInjuryMeta();
     let g_injB = defaultInjuryMeta();
 
-function defaultMassacreFetchContext() {
+function defaultFetchContext() {
   return {
     league: "",
     eventDate: "",
     A: { 
       overall: null, venue: null, lastGameDate: "", restDays: null,
-      ortg10: [], drtg10: [], pace10: [],
       q1Scored: [], q2Scored: [], q3Scored: [], q4Scored: [],
       q1Allowed: [], q2Allowed: [], q3Allowed: [], q4Allowed: [],
       roster: []
     },
     B: { 
       overall: null, venue: null, lastGameDate: "", restDays: null,
-      ortg10: [], drtg10: [], pace10: [],
       q1Scored: [], q2Scored: [], q3Scored: [], q4Scored: [],
       q1Allowed: [], q2Allowed: [], q3Allowed: [], q4Allowed: [],
       roster: []
@@ -3842,8 +3840,7 @@ function defaultMassacreFetchContext() {
   };
 }
 
-
-let g_massacreFetchContext = defaultMassacreFetchContext();
+let g_fetchContext = defaultFetchContext();
 /*
 HARD LOCK NOTICE
 
@@ -5807,49 +5804,7 @@ function validateFetchSection() {
   return isValid;
 }
 
-        // --- LEVEL 2 MATH MODULE ---
-function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 48) {
-  const getStat = (key) => {
-    const val = stats[key] || "0/0";
-    if (typeof val === "string" && val.includes("/")) return parseFloat(val.split("/")[1]) || 0;
-    return parseFloat(val) || 0;
-  };
 
-    const fga = getStat("fieldGoals");
-  const fta = getStat("freeThrows");
-
-  const orb = getStat("offensiveRebounds");
-  const tov = getStat("turnovers");
-
-  // 🛡️ MATH FIX: True Hollinger requires opponent ORB to balance.
-  // Since we only have 1 team's box score here, we dampen the ORB subtraction 
-  // by 75% to prevent pace warping in high-rebound variance games.
-  let possessions = 0.96 * (fga + (0.44 * fta) - (orb * 0.75) + tov);
-
-
-  // Guard: negative or zero possessions means the stat block is unusable.
-  // Return null so the caller can exclude this game rather than storing fabricated ratings.
-  if (possessions <= 0) {
-    console.warn("[BB Engine] calculateAdvancedMetrics: invalid possessions (" + possessions.toFixed(2) + ") — game excluded from Level 2 memory.");
-    return null;
-  }
-
-  // Guard: suspiciously low possessions that aren't negative — fall back to league average.
-  if (possessions < 50) possessions = (minutes >= 40 ? 100 : 50);
-
-  const ortg = (pointsScored / possessions) * 100;
-  // NOTE: True DRtg requires opponent possessions. We use own possessions as a close approximation.
-  // In most games the two counts differ by ≤ 2, so the error is small for FT markets.
-  const drtg = (pointsAllowed / possessions) * 100;
-  const pace = (possessions / minutes) * 48;
-
-  return {
-    possessions: parseFloat(possessions.toFixed(2)),
-    ortg: parseFloat(ortg.toFixed(2)),
-    drtg: parseFloat(drtg.toFixed(2)),
-    pace: parseFloat(pace.toFixed(2))
-  };
-}
 
 
 
@@ -10056,7 +10011,7 @@ function buildLooseParsedState() {
 }
 
 function getIntelContextScope(side, scopeName) {
-  const ctx = g_massacreFetchContext?.[side] || {};
+  const ctx = g_fetchContext?.[side] || {};
   return scopeName === "venue" ? (ctx.venue || {}) : (ctx.overall || {});
 }
 
@@ -10484,7 +10439,7 @@ function clearH2HFields() {
       resetResultsTable();
 
       if (changedSide === "A" || changedSide === "B") {
-        g_massacreFetchContext = defaultMassacreFetchContext();
+        g_fetchContext = defaultFetchContext();
         selectedTeamIds[changedSide] = null;
         g_lastFetchedTeams[changedSide] = "";
         setManualSource(changedSide);
@@ -11139,7 +11094,6 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
       let h2m = 0;
       let h2o = 0;
       let gotLS = false;
-      let advanced = null;
 
       try {
         const key = `${base}:sum:${ref.id}`;
@@ -11155,7 +11109,6 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
             })());
 
         const hc = data?.header?.competitions?.[0];
-        const boxscore = data?.boxscore;
 
         if (hc) {
           const competitors = hc?.competitors || [];
@@ -11183,48 +11136,6 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
               }
               [ms, os] = stripOTFromScores(ms, os, lm, lo, rules.regulationPeriods);
             }
-
-            // LEVEL 2 HIJACK: Advanced Box Score Extraction
-            if (boxscore && typeof boxscore === 'object') {
-              let sMap = {};
-              const safeTeams = Array.isArray(boxscore.teams) ? boxscore.teams : [];
-              const myBox = safeTeams.find(t => matchesTeam(t, tId));
-              
-              if (myBox && Array.isArray(myBox.statistics) && myBox.statistics.length > 0) {
-                myBox.statistics.forEach(s => { sMap[s.name] = s.displayValue; });
-              } else if (Array.isArray(boxscore.players)) {
-                // Rescue: Hunt down player stats if team stats are missing/corrupted
-                const safePlayers = boxscore.players || [];
-                const myPlayers = safePlayers.find(p => matchesTeam(p, tId));
-                if (myPlayers && Array.isArray(myPlayers.statistics) && myPlayers.statistics[0] && Array.isArray(myPlayers.statistics[0].athletes)) {
-                  let fga = 0, fta = 0, orb = 0, tov = 0;
-                  const keys = myPlayers.statistics[0].names || [];
-                  const iFga = keys.indexOf("FGA");
-                  const iFta = keys.indexOf("FTA");
-                  const iOrb = keys.indexOf("OREB");
-                  const iTov = keys.indexOf("TO");
-                  
-                  myPlayers.statistics[0].athletes.forEach(ath => {
-                    const st = ath.stats || [];
-                    if (iFga >= 0) fga += parseFloat(st[iFga]) || 0;
-                    if (iFta >= 0) fta += parseFloat(st[iFta]) || 0;
-                    if (iOrb >= 0) orb += parseFloat(st[iOrb]) || 0;
-                    if (iTov >= 0) tov += parseFloat(st[iTov]) || 0;
-                  });
-                  sMap = { fieldGoals: fga, freeThrows: fta, offensiveRebounds: orb, turnovers: tov };
-                }
-              }
-              
-              if (Object.keys(sMap).length > 0) {
-                const gameMinutes = leagueKey === "nba" ? 48 : 40;
-                const advResult = calculateAdvancedMetrics(sMap, ms, os, gameMinutes);
-                // Only store if valid — null means unusable stat block (negative possessions)
-                if (advResult) {
-                  advanced = advResult;
-                  trackerDebug(`Level 2 Stats Extracted: ${ref.id}`, advanced);
-                }
-              }
-            }
           }
         }
       } catch (e) {
@@ -11240,8 +11151,7 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
         h1o: gotLS && h1o > 0 ? Math.round(h1o) : null,
         h2m: gotLS && h2m > 0 ? Math.round(h2m) : null,
         h2o: gotLS && h2o > 0 ? Math.round(h2o) : null,
-        qs: ref.qs,
-        advanced: advanced
+        qs: ref.qs
       };
     })
   );
@@ -11276,10 +11186,6 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
         h2Allowed: h2Allowed10.slice(0, 5),
         q1Scored: qS.q1.slice(0, 5), q2Scored: qS.q2.slice(0, 5), q3Scored: qS.q3.slice(0, 5), q4Scored: qS.q4.slice(0, 5),
         q1Allowed: qA.q1.slice(0, 5), q2Allowed: qA.q2.slice(0, 5), q3Allowed: qA.q3.slice(0, 5), q4Allowed: qA.q4.slice(0, 5),
-        // LEVEL 2 MEMORY ARRAYS
-        ortg10: summaries.filter(s => s && s.advanced).map(s => s.advanced.ortg),
-        drtg10: summaries.filter(s => s && s.advanced).map(s => s.advanced.drtg),
-        pace10: summaries.filter(s => s && s.advanced).map(s => s.advanced.pace),
         scored10,
         allowed10,
         h1Scored10,
@@ -11942,7 +11848,7 @@ async function fetchESPN() {
     g_injA = injA; g_injB = injB;
 
     // FIX: _fetchToken comparison removed
-    g_massacreFetchContext = {
+    g_fetchContext = {
       league,
       eventDate: String(selectedFixture?.dataset?.eventDate || ""),
       A: {
@@ -11951,7 +11857,6 @@ async function fetchESPN() {
         q1Allowed: aStats?.q1Allowed || [], q2Allowed: aStats?.q2Allowed || [], q3Allowed: aStats?.q3Allowed || [], q4Allowed: aStats?.q4Allowed || [],
         roster: rostA || [],
         venue: aVenueStats ? { ...aVenueStats, ftScored10: aVenueStats.scored10 || [], ftAllowed10: aVenueStats.allowed10 || [] } : null,
-        ortg10: aStats?.ortg10 || [], drtg10: aStats?.drtg10 || [], pace10: aStats?.pace10 || [],
         lastGameDate: aStats?.lastGameDate || "",
         restDays: (() => {
           const lastMs = Date.parse(aStats?.lastGameDate || "");
@@ -11965,7 +11870,6 @@ async function fetchESPN() {
         q1Allowed: bStats?.q1Allowed || [], q2Allowed: bStats?.q2Allowed || [], q3Allowed: bStats?.q3Allowed || [], q4Allowed: bStats?.q4Allowed || [],
         roster: rostB || [],
         venue: bVenueStats ? { ...bVenueStats, ftScored10: bVenueStats.scored10 || [], ftAllowed10: bVenueStats.allowed10 || [] } : null,
-        ortg10: bStats?.ortg10 || [], drtg10: bStats?.drtg10 || [], pace10: bStats?.pace10 || [],
         lastGameDate: bStats?.lastGameDate || "",
         restDays: (() => {
           const lastMs = Date.parse(bStats?.lastGameDate || "");
@@ -12150,7 +12054,7 @@ function getFixtureSideRole(side) {
 }
 
 function getFetchedSeries(side, scope, marketKey, metric) {
-  const ctx = g_massacreFetchContext?.[side]?.[scope];
+  const ctx = g_fetchContext?.[side]?.[scope];
   if (!ctx) return [];
   const prefix = marketKey === "ft" ? "ft" : marketKey === "h1" ? "h1" : "h2";
   const suffix = metric === "allowed" ? "Allowed10" : "Scored10";
@@ -12187,7 +12091,7 @@ function getManualSeries(side, marketKey, parsed) {
     if (parsed[pKey] && parsed[pKey].length) return safeArr(parsed[pKey]);
   }
   const qKey = marketKey + "Scored";
-  const qData = g_massacreFetchContext[side][qKey];
+  const qData = g_fetchContext[side][qKey];
   if (Array.isArray(qData) && qData.length) return qData;
   return [];
 }
@@ -12465,14 +12369,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const cl = getEffectivePaceClamp(league);
 
-  const aORTG = g_massacreFetchContext.A.ortg10 || [];
-  const aDRTG = g_massacreFetchContext.A.drtg10 || [];
-  const bORTG = g_massacreFetchContext.B.ortg10 || [];
-  const bDRTG = g_massacreFetchContext.B.drtg10 || [];
-  const aPace = g_massacreFetchContext.A.pace10 || [];
-  const bPace = g_massacreFetchContext.B.pace10 || [];
-
-    const aFTS = getManualSeries("A", "ft", parsed);
+  const aFTS = getManualSeries("A", "ft", parsed);
   const bFTS = getManualSeries("B", "ft", parsed);
   const ftSampleTier = getSampleTier(aFTS, bFTS);
 
@@ -12489,45 +12386,31 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   let projAFT, projBFT, estMatchPace, synNetA = null, synNetB = null;
 
-  if (aORTG.length >= 2 && bORTG.length >= 2) {
-    const expEffA = (avgOrNaN(aORTG) + avgOrNaN(bDRTG)) / 2;
-    const expEffB = (avgOrNaN(bORTG) + avgOrNaN(aDRTG)) / 2;
-    const rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
-    estMatchPace = clampNumber(rawPace, cl.min * 100, cl.max * 100);
-    projAFT = (expEffA / 100) * estMatchPace * injMultA;
-    projBFT = (expEffB / 100) * estMatchPace * injMultB;
-  } else {
-        // --- SYNTHETIC LEVEL 2 MATH (For Manual Leagues) ---
+  // --- SYNTHETIC MATH ---
     const aS = avgOrNaN(aFTS);
     const bS = avgOrNaN(bFTS);
-    const aA = avgOrNaN(parsed.aFTAllowed) || (eb / 2); 
+    const aA = avgOrNaN(parsed.aFTAllowed) || (eb / 2);
     const bA = avgOrNaN(parsed.bFTAllowed) || (eb / 2);
 
-    // FIX 5: Decouple base pace from the raw Vegas total.
-    // Assign a true possession baseline based on league norms.
-    // LEAGUE-SPECIFIC BASE PACE: Each league derives its own basePace from LEAGUE_BASES / 2.2
-    // This stops NBL1 (~81 possessions) projecting at the same pace as French Pro B (~73).
     const basePace = league === "nba" ? 99.5 : league === "ncaa" ? 67.5 : (league === "wnba" || league === "wnba_pre") ? 90.0 : Math.round((LEAGUE_BASES[league] || 160) / 2.2);
-    
+
     const paceFactorA = (aS + aA) / eb;
     const paceFactorB = (bS + bA) / eb;
-    
-    // Dampen the pace factor so extreme scores translate to efficiency, not just hyper-speed
+
     const dampenedPaceA = 1 + ((paceFactorA - 1) * 0.4);
     const dampenedPaceB = 1 + ((paceFactorB - 1) * 0.4);
 
     estMatchPace = clampNumber(basePace * ((dampenedPaceA + dampenedPaceB) / 2), basePace * cl.min, basePace * cl.max);
-    
+
     const synOrtgA = (aS / (basePace * dampenedPaceA)) * 100;
     const synDrtgA = (aA / (basePace * dampenedPaceA)) * 100;
     const synOrtgB = (bS / (basePace * dampenedPaceB)) * 100;
     const synDrtgB = (bA / (basePace * dampenedPaceB)) * 100;
-    
+
     synNetA = synOrtgA - synDrtgA;
     synNetB = synOrtgB - synDrtgB;
     projAFT = ((synOrtgA + synDrtgB) / 2 / 100) * estMatchPace * injMultA;
     projBFT = ((synOrtgB + synDrtgA) / 2 / 100) * estMatchPace * injMultB;
-  }
 
   // --- H2H INJECTION FOR FT, TEAM A, AND TEAM B ---
   const aH2H = getH2HSeries("A", "ft", parsed);
@@ -12542,7 +12425,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
     const roleA = getFixtureSideRole("A");
   const homeEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5);
-  const hasVenueData = g_massacreFetchContext.A.venue?.ftScored10?.length >= 5;
+  const hasVenueData = g_fetchContext.A.venue?.ftScored10?.length >= 5;
   if (!hasVenueData) {
     if (roleA === "home") { projAFT += (homeEdge / 2); projBFT -= (homeEdge / 2); }
     else if (roleA === "away") { projAFT -= (homeEdge / 2); projBFT += (homeEdge / 2); }
@@ -12553,14 +12436,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
             // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
   const vl = getMarketVolLimit(league, "ft");
 
-  // --- 10x SOS UPGRADE: DYNAMIC OPPONENT QUALITY SCALING ---
-  const baselineRating = 100;
-  if (aORTG.length >= 2 && bORTG.length >= 2) {
-    const avgOppDrtgA = avgOrNaN(bDRTG);
-    const avgOppDrtgB = avgOrNaN(aDRTG);
-    if (isFinite(avgOppDrtgA)) projAFT += (avgOppDrtgA - baselineRating) * 0.15;
-    if (isFinite(avgOppDrtgB)) projBFT += (avgOppDrtgB - baselineRating) * 0.15;
-  } else {
+  // --- OPPONENT QUALITY SCALING ---
+  {
     const avgAllowedA = avgOrNaN(parsed.aFTAllowed) || (eb / 2);
     const avgAllowedB = avgOrNaN(parsed.bFTAllowed) || (eb / 2);
     projAFT += ((eb / 2) - avgAllowedB) * 0.10;
@@ -12600,8 +12477,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     aEdge: lines.aLine ? projAFT - lines.aLine : NaN,
     bEdge: lines.bLine ? projBFT - lines.bLine : NaN,
     aVol, bVol,
-    ftFullModel: ftSampleTier === "full" && aORTG.length >= 5,
-    teamFullModel: ftSampleTier === "full" && aORTG.length >= 5,
+    ftFullModel: ftSampleTier === "full",
+    teamFullModel: ftSampleTier === "full",
     blowoutGap: Math.abs(projAFT - projBFT),
     paceGapRisk: estMatchPace > 108 || estMatchPace < 92,
     vl: getMarketVolLimit(league, "ft"),
@@ -12655,13 +12532,6 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const bVol1Series = [...b1HS, ...a1HA].map(Number).filter(v => isFinite(v) && v > 0);
   const bVol1 = bVol1Series.length >= 2 ? stdDev(bVol1Series) : 0;
 
-  const aORTG = g_massacreFetchContext.A.ortg10 || [];
-  const aDRTG = g_massacreFetchContext.A.drtg10 || [];
-  const bORTG = g_massacreFetchContext.B.ortg10 || [];
-  const bDRTG = g_massacreFetchContext.B.drtg10 || [];
-  const aPace = g_massacreFetchContext.A.pace10 || [];
-  const bPace = g_massacreFetchContext.B.pace10 || [];
-
   if (sampleTier === "insufficient") {
     return { h1Proj: NaN, h1Edge: NaN, h1SampleTier: sampleTier, h1Note: "Insufficient sample — need 2+ FT games", h1Derived: false };
   }
@@ -12671,15 +12541,7 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   let projA1H, projB1H, estHalfPace;
 
-  if (aORTG.length >= 2 && bORTG.length >= 2) {
-    const expEffA = (avgOrNaN(aORTG) + avgOrNaN(bDRTG)) / 2;
-    const expEffB = (avgOrNaN(bORTG) + avgOrNaN(aDRTG)) / 2;
-    const rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
-    estHalfPace = rawPace / 2;
-    projA1H = (expEffA / 100) * estHalfPace * injMultA;
-    projB1H = (expEffB / 100) * estHalfPace * injMultB;
-  } else {
-    const avgA1HScored = avgOrNaN(a1HS);
+  const avgA1HScored = avgOrNaN(a1HS);
     const avgB1HScored = avgOrNaN(b1HS);
     const avgA1HAllowed = avgOrNaN(a1HA);
     const avgB1HAllowed = avgOrNaN(b1HA);
@@ -12690,7 +12552,6 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const aDef = isFinite(avgA1HAllowed) ? avgA1HAllowed : baseTeam1H;
     projA1H = ((aOff * 0.55) + (bDef * 0.45)) * injMultA;
     projB1H = ((bOff * 0.55) + (aDef * 0.45)) * injMultB;
-  }
 
   // H2H injection — also derive 1H H2H from FT H2H when in derived mode
   let aH2H1 = getH2HSeries("A", "h1", parsed);
@@ -12719,7 +12580,7 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const roleA = getFixtureSideRole("A");
   const homeEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5) / 2;
-  const hasVenueData = g_massacreFetchContext.A.venue?.h1Scored10?.length >= 5;
+  const hasVenueData = g_fetchContext.A.venue?.h1Scored10?.length >= 5;
   if (!hasVenueData) {
     if (roleA === "home") { projA1H += (homeEdge / 2); projB1H -= (homeEdge / 2); }
     else if (roleA === "away") { projA1H -= (homeEdge / 2); projB1H += (homeEdge / 2); }
@@ -12749,7 +12610,7 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     h1Note: note,
     h1ProjectionNote: null,
     aVol1, bVol1,
-    h1FullModel: sampleTier === "full" && aORTG.length >= 5,
+    h1FullModel: sampleTier === "full",
     paceGapRisk: false,
     aS1: avgOrNaN(a1HS),
     bS1: avgOrNaN(b1HS),
@@ -12784,7 +12645,7 @@ function deriveSecondHalfSeries(ftSeries, firstHalfSeries) {
 }
 
 function getExactFetchedSecondHalfSeries(side, bucket, kind, parsed) {
-  const ctx = g_massacreFetchContext?.[side] || {};
+  const ctx = g_fetchContext?.[side] || {};
   const scope = bucket === "venue" ? (ctx.venue || {}) : (ctx.overall || {});
   const key = kind === "scored" ? "h2Scored10" : "h2Allowed10";
   const exact = Array.isArray(scope?.[key])
@@ -12807,7 +12668,7 @@ function getExactFetchedSecondHalfSeries(side, bucket, kind, parsed) {
 }
 
 function getExactFetchedSecondHalfH2HSeries(side, parsed) {
-  const games = Array.isArray(g_massacreFetchContext?.h2hGames) ? g_massacreFetchContext.h2hGames : [];
+  const games = Array.isArray(g_fetchContext?.h2hGames) ? g_fetchContext.h2hGames : [];
   if (games.length) {
     const fixtureHomeId = String(getCurrentFixtureMeta()?.homeId || "");
     const out = [];
@@ -13372,8 +13233,8 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
 
 
 
-function getMassacreTeamContext(side, parsed) {
-  const ctx = g_massacreFetchContext?.[side] || {};
+function getTeamContext(side, parsed) {
+  const ctx = g_fetchContext?.[side] || {};
   const overall = ctx.overall || {};
   const pick = (arr) => Array.isArray(arr) && arr.length ? arr : null;
   return {
@@ -13692,20 +13553,7 @@ const { ftLine, h1Line, h2Line, aLine, bLine } = finalLines;
         let aPick = getPick(ftCalc.aEdge, aLine, league, "team", { teamSc: ftCalc.aS, blowoutGap: ftCalc.blowoutGap });
         let bPick = getPick(ftCalc.bEdge, bLine, league, "team", { teamSc: ftCalc.bS, blowoutGap: ftCalc.blowoutGap });
 
-        // --- NEW LEVEL 2 SHIELD ---
-        const hasLevel2 = (g_massacreFetchContext.A.ortg10?.length >= 1) && 
-                          (g_massacreFetchContext.B.ortg10?.length >= 1);
-        // FIX: Shield no longer kills valid manual 1H data.
-        // Previously any NBA/WNBA game without ESPN box-score data lost ALL 1H/2H picks,
-        // even when the user had manually typed in 1H scored/allowed numbers.
         const hasManual1H = (safeArr(parsed.a1HScored)?.length >= 2) && (safeArr(parsed.b1HScored)?.length >= 2);
-
-        if ((league === "nba" || league === "wnba" || league === "wnba_pre") && !hasLevel2 && !hasManual1H) {
-          h1Pick = "NO PLAY";
-          h2Pick = "NO PLAY";
-          h1Calc.projA1H = NaN;
-          h1Calc.projB1H = NaN;
-        }
 
         if (ftCalc.ftSampleTier === "insufficient") {
       ftPick = "NO PLAY";
@@ -13856,8 +13704,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const phase2Activation = (typeof getPhase2ActivationState === "function") ? getPhase2ActivationState() : null;
 
     // --- MICROSCOPIC STREAK RADAR ---
-    const ctxA = getMassacreTeamContext("A", parsed);
-    const ctxB = getMassacreTeamContext("B", parsed);
+    const ctxA = getTeamContext("A", parsed);
+    const ctxB = getTeamContext("B", parsed);
 
     function getMicroStreakBadge(scA, alA, scB, alB, line, isTeamMarket) {
       if (!line) return "";
@@ -13918,8 +13766,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
           let projA = (avgOrNaN(aS) * 0.55 + avgOrNaN(bA) * 0.45);
           let projB = (avgOrNaN(bS) * 0.55 + avgOrNaN(aA) * 0.45);
 
-          const vCtxA = g_massacreFetchContext.A.venue;
-          const vCtxB = g_massacreFetchContext.B.venue;
+          const vCtxA = g_fetchContext.A.venue;
+          const vCtxB = g_fetchContext.B.venue;
           if (vCtxA && vCtxB) {
             const vScoredA = vCtxA[qKey + "Scored"] || [];
             const vAllowedA = vCtxA[qKey + "Allowed"] || [];
@@ -13964,13 +13812,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const q3 = computeQ("q3", parseMarketLine(document.getElementById("q3Market")?.value));
         const q4 = computeQ("q4", parseMarketLine(document.getElementById("q4Market")?.value));
 
-    const oA = avgOrNaN(g_massacreFetchContext.A.ortg10);
-    const dA = avgOrNaN(g_massacreFetchContext.A.drtg10);
-    const netA = (isFinite(oA) && isFinite(dA)) ? (oA - dA) : (typeof ftCalc.synNetA === "number" ? ftCalc.synNetA : 0);
-    
-    const oB = avgOrNaN(g_massacreFetchContext.B.ortg10);
-    const dB = avgOrNaN(g_massacreFetchContext.B.drtg10);
-    const netB = (isFinite(oB) && isFinite(dB)) ? (oB - dB) : (typeof ftCalc.synNetB === "number" ? ftCalc.synNetB : 0);
+    const netA = (typeof ftCalc.synNetA === "number") ? ftCalc.synNetA : 0;
+    const netB = (typeof ftCalc.synNetB === "number") ? ftCalc.synNetB : 0;
     
     const projDiff = ftCalc.projAFT - ftCalc.projBFT;
 
@@ -13979,8 +13822,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       const allPotentials = [];
 
       sides.forEach(side => {
-        const roster = g_massacreFetchContext[side].roster || [];
-        const oppDRtg = side === "A" ? avgOrNaN(g_massacreFetchContext.B.drtg10) : avgOrNaN(g_massacreFetchContext.A.drtg10);
+        const roster = g_fetchContext[side].roster || [];
+        const oppDRtg = 100;
         const teamNet = side === "A" ? netA : netB;
         const paceAdj = (ftCalc.pace || 100) / 100;
 
