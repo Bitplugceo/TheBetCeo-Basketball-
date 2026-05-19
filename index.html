@@ -3063,12 +3063,7 @@ window.__BETCEO_ENGINE_BOOT_SEEN = true;
 // Unique ID to identify this specific browser session/tab
 window.__BETCEO_SESSION_ID = "sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 9);
 
-// ═══════════════════════════════════════════════════════
-// PARLAY BUILDER — Global State
-// ═══════════════════════════════════════════════════════
-let g_parlayStaging = [];
-let g_parlayView = "main";
-let g_parlayIdCounter = 0;
+
 
 // --- GOD-MODE WATCHDOG CORE ---
 
@@ -5049,6 +5044,7 @@ let g_trackerMarketTab = "core"; // 'core' or 'exotic'
 const TRACKER_DEBUG_LIMIT = 40;
 let g_trackerDebugLog = [];
 const g_settlementDebugLog = new Map(); // key: league:eventId:market → last attempt result
+const g_liveGameStatus = new Map(); // key: eventId → {period, clock, statusName, league}
 
 function isTrackerPicksView() {
   return g_trackerModalView === "picks";
@@ -6108,8 +6104,7 @@ Any suggestion made here without proof is an audit error.
     "marketSection",
     "teamASection",
     "teamBSection",
-    "h2hSection",
-    "intelSection"
+    "h2hSection"
   ].forEach(sectionId => {
     if (sectionId !== id && !(keepMarketOpen && sectionId === "marketSection")) {
       closeSection(sectionId);
@@ -6124,8 +6119,7 @@ Any suggestion made here without proof is an audit error.
     "marketSection",
     "teamASection",
     "teamBSection",
-    "h2hSection",
-    "intelSection"
+    "h2hSection"
   ];
 
   let locking = false;
@@ -7829,8 +7823,16 @@ function renderTrackedPicks() {
       const pId = (p.eventId || '') + p.signature.replace(/[^a-z0-9]/gi, '');
       const gameTs = safeParseDate(p.eventDate || p.createdAt);
       const isZombie = gameTs > 0 && (Date.now() - gameTs) > (36 * 60 * 60 * 1000);
+      const _liveInfo = p.eventId ? g_liveGameStatus.get(p.eventId) : null;
+      const _liveClockLabel = _liveInfo
+        ? (_liveInfo.clock === "HALF" ? "HALF" : `Q${_liveInfo.period || "?"} ${_liveInfo.clock}`)
+        : null;
+      const _pendingLabel = isZombie ? 'STALE' : (_liveClockLabel ? '' : 'PENDING');
+      const _liveBlock = _liveClockLabel
+        ? `<div style="color:#2aff9e;font-size:9px;font-weight:900;line-height:1.15;letter-spacing:0.2px;">🟢 LIVE</div><div style="color:#2aff9e;font-size:8px;font-weight:800;line-height:1.1;">${_liveClockLabel}</div>`
+        : '';
       statusHtml = `
-        <div id="disp-${pId}" onclick="document.getElementById('disp-${pId}').style.display='none'; document.getElementById('act-${pId}').style.display='flex';" style="font-weight:900; font-size:10px; cursor:pointer; text-decoration:underline dotted #ccc; ${isZombie ? 'color:#ff9800;' : ''}" title="${isZombie ? 'Game stale - manual check needed' : 'Click to settle'}">${isZombie ? 'STALE' : 'PENDING'}</div>
+        <div id="disp-${pId}" onclick="document.getElementById('disp-${pId}').style.display='none'; document.getElementById('act-${pId}').style.display='flex';" style="font-weight:900; font-size:10px; cursor:pointer; text-decoration:underline dotted #ccc; ${isZombie ? 'color:#ff9800;' : ''}" title="${isZombie ? 'Game stale - manual check needed' : (_liveClockLabel ? 'Live game — click to settle' : 'Click to settle')}">${_liveBlock}${_pendingLabel}</div>
         <div id="act-${pId}" style="display:none; flex-direction:column; align-items:center; gap:2px; margin-top:-2px;">
           <div style="font-size:8px; font-weight:900; opacity:0.6; margin-bottom:1px; color:var(--text);">SETTLE</div>
           <button onclick="settleTrackedPick('${p.signature}', 'win')" class="tracker-manual-btn" style="padding:0 !important; width:28px !important; min-width:28px !important; height:16px !important; min-height:16px !important; font-size:9px !important; line-height:16px !important;">W</button>
@@ -9482,10 +9484,21 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
             pick.settlementSource = "api";
             pick.settledVersion = ENGINE_MODEL_VERSION;
             changed = true;
+            g_liveGameStatus.delete(pick.eventId);
             trackerDebug("auto-settled pick", { eventId: pick.eventId, market: pick.marketKey, result: settled, actual: pick.actualScore, line: pick.lineAtPick || pick.line });
           }
         } else {
           g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: `⏳ NOT FINAL`, apiFinal, clock, period, stateName, statusName, settled: null, actual: null, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
+          const _isLiveNow = stateName === "in" || String(statusName || "").toUpperCase().includes("PROGRESS") || String(statusName || "").toUpperCase().includes("HALFTIME");
+          if (_isLiveNow && pick.eventId) {
+            const _isHalf = String(statusName || "").toUpperCase().includes("HALFTIME");
+            g_liveGameStatus.set(pick.eventId, {
+              period: Number(period || 0),
+              clock: _isHalf ? "HALF" : String(clock || ""),
+              statusName: String(statusName || ""),
+              league: pick.league || ""
+            });
+          }
         }
 
         // 🛡️ MEMORY LEAK FIX: Force eviction if the log map grows too large
@@ -14785,57 +14798,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     
     const projDiff = ftCalc.projAFT - ftCalc.projBFT;
 
-    function getPlayerMilestones() {
-      const sides = ["A", "B"];
-      const allPotentials = [];
-
-      sides.forEach(side => {
-        const roster = g_massacreFetchContext[side].roster || [];
-        const oppDRtg = side === "A" ? avgOrNaN(g_massacreFetchContext.B.drtg10) : avgOrNaN(g_massacreFetchContext.A.drtg10);
-        const teamNet = side === "A" ? netA : netB;
-        const paceAdj = (ftCalc.pace || 100) / 100;
-
-        roster.slice(0, 5).forEach(p => {
-          const adjP = p.ppg * paceAdj * (oppDRtg > 112 ? 1.07 : 0.95);
-          const adjR = p.rpg * paceAdj * (teamNet < 0 ? 1.05 : 0.98);
-          const adjA = p.apg * paceAdj * (teamNet > 0 ? 1.06 : 0.97);
-          const adj3 = (p.tpm || 0) * paceAdj;
-
-          // Score by % increase over average to find the "Outlier"
-          if (p.ppg > 8) allPotentials.push({ name: p.name + " Pts", pick: adjP.toFixed(1), score: (adjP - p.ppg) / p.ppg, grade: "B" });
-          if (p.rpg > 3) allPotentials.push({ name: p.name + " Reb", pick: adjR.toFixed(1), score: (adjR - p.rpg) / p.rpg, grade: "C" });
-          if (p.apg > 2) allPotentials.push({ name: p.name + " Ast", pick: adjA.toFixed(1), score: (adjA - p.apg) / p.apg, grade: "C" });
-          if (p.tpm > 1) allPotentials.push({ name: p.name + " 3PM", pick: adj3.toFixed(1), score: (adj3 - p.tpm) / p.tpm, grade: "B" });
-          
-          // Milestone bonuses
-          if (adjP > 9.5 && adjR > 9.5 && adjA > 9.5) allPotentials.push({ name: p.name + " Triple Double", pick: "HIGH PROB", score: 2.0, grade: "A" });
-          else if (adjP > 9.5 && (adjR > 9.5 || adjA > 9.5)) allPotentials.push({ name: p.name + " Double Double", pick: "HIGH PROB", score: 1.5, grade: "A" });
-        });
-      });
-
-      // Pick the single strongest outlier
-      const topPick = allPotentials.sort((a,b) => b.score - a.score)[0];
-      return topPick ? [topPick] : [];
-    }
-
-    const bestProp = getPlayerMilestones();
-    const playerPicks = bestProp.map((m, i) => ({
-      _idx: 100 + i, 
-      name: "⭐ " + m.name, 
-      marketKey: "player", 
-      marketType: "other", 
-      league, 
-      context: {}, 
-      line: 0, 
-      proj: NaN, 
-      edge: NaN, 
-      pick: m.pick, 
-      confidence: m.grade, 
-      note: "Top Value Signal"
-    }));
-
     const picks = [
-      ...playerPicks,
   {
     _idx: 0,
     name: "FT Total" + ftBadge,
@@ -15458,7 +15421,6 @@ if (trackedToSave.length) {
       });
 
       setFieldValues(FIELD_GROUPS.markets);
-      setFieldValues(FIELD_GROUPS.intelFields);
       setFieldValues(FIELD_GROUPS.teamAOverall);
       setFieldValues(FIELD_GROUPS.teamBOverall);
       setFieldValues(FIELD_GROUPS.h2h);
@@ -16112,22 +16074,7 @@ try {
   engineDebug("WATCHDOG CRITICAL: Audit engine crash");
 }
 
-async function fetchRemoteConfig() {
-  try {
-    const configUrl = WORKER_BASE_URL + "/config.json"; 
-    const res = await fetch(configUrl, { cache: "no-store" });
-    if (res.ok) {
-      const cloudConfig = await res.json();
-      if (cloudConfig.LEAGUE_BASES) LEAGUE_BASES = { ...LEAGUE_BASES, ...cloudConfig.LEAGUE_BASES };
-      if (cloudConfig.LEAGUE_VOL_LIMITS) LEAGUE_VOL_LIMITS = { ...LEAGUE_VOL_LIMITS, ...cloudConfig.LEAGUE_VOL_LIMITS };
-      engineDebug("WATCHDOG: Remote config loaded from Cloudflare.");
-    }
-  } catch (err) {
-    engineDebug("WATCHDOG: Remote config fetch failed, using local baselines.");
-  }
-}
 
-fetchRemoteConfig();
 
       // --- AUDIT COPY BUTTON LOGIC ---
       const auditCopyBtn = document.getElementById("auditCopyBtn");
