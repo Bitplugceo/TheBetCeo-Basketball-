@@ -9376,7 +9376,35 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
       window.runPhase2Simulator(touchedPick.league);
     }
   }
-  
+
+  // Phase 2 Retrospective Simulation Ignition: Re-run the backtest immediately after any
+  // manual settlement so the learning engine processes the new result without waiting
+  // for the next Run cycle. Requires a prior Run to have stored the context globals.
+  if (
+    ["win", "loss", "push"].includes(normalizedStatus) &&
+    typeof executeRetrospectiveBacktest === "function" &&
+    window.__lastRunParsed &&
+    window.__lastRunFinalLines &&
+    window.__lastRunLeague === (touchedPick && touchedPick.league)
+  ) {
+    setTimeout(async () => {
+      try {
+        await executeRetrospectiveBacktest({
+          league: window.__lastRunLeague,
+          parsed: window.__lastRunParsed,
+          lines: window.__lastRunFinalLines,
+          fixtureMeta: window.__lastRunFixtureMeta || {
+            eventId: (touchedPick && touchedPick.eventId) || "",
+            eventDate: (touchedPick && touchedPick.eventDate) || ""
+          }
+        });
+        engineDebug("Phase 2 post-settle retrospective complete", { league: window.__lastRunLeague });
+      } catch (err) {
+        engineDebug("Phase 2 post-settle retrospective error", err.message);
+      }
+    }, 400);
+  }
+
   renderTrackedPicks();
   scheduleTrackerSave();
 
@@ -14009,10 +14037,23 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta, league, diagnos
     fixtureMeta.eventId = "manual_" + league + "_" + Date.now();
   }
 
+  // Trust-advisory lean picks are allowed through so the tracker can learn from advisory leagues.
+  // Only hard-blocked picks (Massacre gate, Intel gate, Grade gate) are excluded.
+  const isAdvisoryLeanSave =
+    pickRow &&
+    pickRow.trustAction === "advisory" &&
+    pickRow.recommendationTier === "lean" &&
+    pickRow.pick !== "NO PLAY" &&
+    !!pickRow.note &&
+    !String(pickRow.note).startsWith("Massacre") &&
+    !String(pickRow.note).startsWith("Intel") &&
+    !String(pickRow.note).startsWith("Grade gate") &&
+    !String(pickRow.note).startsWith("Best on slate");
+
   if (
   !pickRow ||
   pickRow.pick === "NO PLAY" ||
-  (pickRow.note && !isExoticNoLine) ||
+  ((pickRow.note && !isExoticNoLine) && !isAdvisoryLeanSave) ||
   (!isFinite(pickRow.line) && !isExoticNoLine) ||
   !fixtureMeta?.eventId
 ) {
@@ -15619,6 +15660,25 @@ h2DefensiveFloorFlag: h2Calc.defensiveFloorFlag,
       p.note,
       !!p.lockRestricted
     )));
+
+// --- PHASE 2 RETROSPECTIVE SIMULATION IGNITION LOOP ---
+// Stores the last run context globally so the backtest can fire after manual settlements.
+// executeRetrospectiveBacktest scans g_lineMemorySnapshots for settled picks from this
+// matchup and compares them against the recalculated projections to shift learning models.
+window.__lastRunParsed = parsed;
+window.__lastRunFinalLines = finalLines;
+window.__lastRunLeague = league;
+window.__lastRunFixtureMeta = fixtureMeta;
+if (Object.keys(g_lineMemorySnapshots).length > 0) {
+  setTimeout(async () => {
+    try {
+      await executeRetrospectiveBacktest({ league, parsed, lines: finalLines, fixtureMeta });
+      engineDebug("Phase 2 retrospective complete", { league, snapshots: Object.keys(g_lineMemorySnapshots).length });
+    } catch (err) {
+      engineDebug("Phase 2 retrospective error", err.message);
+    }
+  }, 600);
+}
 
 // --- SNAPSHOT FOR AUDIT COPY ---
 window.__LAST_AUDIT_STATE = {
