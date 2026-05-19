@@ -6979,6 +6979,51 @@ async function refreshTrackerInBackground(forceHydrate = false) {
 }
 
 let _liveClockPollTimer = null;
+let _liveTickTimer = null;
+
+function parseClockToSeconds(clockStr) {
+  if (!clockStr || clockStr === "HALF") return null;
+  const parts = String(clockStr).split(":");
+  if (parts.length === 2) {
+    const m = parseInt(parts[0], 10);
+    const s = parseInt(parts[1], 10);
+    return (isFinite(m) && isFinite(s)) ? m * 60 + s : null;
+  }
+  const raw = parseFloat(clockStr);
+  return isFinite(raw) ? raw : null;
+}
+
+function secondsToClock(secs) {
+  const safe = Math.max(0, Math.floor(Number(secs) || 0));
+  const m = Math.floor(safe / 60);
+  const s = safe % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function _tickLiveClocks() {
+  if (g_liveGameStatus.size === 0) { stopLiveClockTicker(); return; }
+  document.querySelectorAll("[data-live-clk]").forEach(el => {
+    const eid = el.dataset.liveClk;
+    const info = g_liveGameStatus.get(eid);
+    if (!info || info.clock === "HALF") return;
+    const capturedAt = info.capturedAt || Date.now();
+    const origSecs = parseClockToSeconds(info.clock);
+    if (origSecs === null) return;
+    const elapsedSecs = (Date.now() - capturedAt) / 1000;
+    const currentSecs = Math.max(0, origSecs - elapsedSecs);
+    el.textContent = `Q${info.period || "?"} ${secondsToClock(currentSecs)}`;
+  });
+}
+
+function startLiveClockTicker() {
+  stopLiveClockTicker();
+  if (g_liveGameStatus.size === 0) return;
+  _liveTickTimer = setInterval(_tickLiveClocks, 1000);
+}
+
+function stopLiveClockTicker() {
+  if (_liveTickTimer) { clearInterval(_liveTickTimer); _liveTickTimer = null; }
+}
 
 function scheduleLiveClockPoll() {
   clearTimeout(_liveClockPollTimer);
@@ -7031,7 +7076,7 @@ async function pollLiveGameClocks() {
           const existing = g_liveGameStatus.get(eid);
           const newClock = isHalf ? "HALF" : clock;
           if (!existing || existing.period !== period || existing.clock !== newClock) {
-            g_liveGameStatus.set(eid, { period, clock: newClock, statusName, league });
+            g_liveGameStatus.set(eid, { period, clock: newClock, statusName, league, capturedAt: Date.now() });
             didChange = true;
           }
         } else if (state === "pre") {
@@ -7752,6 +7797,7 @@ function openTrackerModal() {
   primeTrackerStateForRun();
   refreshTrackerInBackground(false);
   scheduleLiveClockPoll();
+  startLiveClockTicker();
 }
 
 function closeTrackerModal() {
@@ -7761,6 +7807,7 @@ function closeTrackerModal() {
   clearTrackerFollowupRefresh();
   clearTimeout(_liveClockPollTimer);
   _liveClockPollTimer = null;
+  stopLiveClockTicker();
   modal.classList.remove("open");
   syncTrackerModalView();
   modal.setAttribute("aria-hidden", "true");
@@ -7893,7 +7940,7 @@ function renderTrackedPicks() {
         : null;
       const _pendingLabel = isZombie ? 'STALE' : (_liveClockLabel ? '' : 'PENDING');
       const _liveBlock = _liveClockLabel
-        ? `<div style="color:var(--muted);font-size:9px;font-weight:900;line-height:1.2;letter-spacing:0.1px;">● LIVE</div><div style="color:var(--muted);font-size:8px;font-weight:800;line-height:1.1;">${_liveClockLabel}</div>`
+        ? `<div style="color:var(--muted);font-size:9px;font-weight:900;line-height:1.2;letter-spacing:0.1px;">● LIVE</div><div data-live-clk="${p.eventId}" style="color:var(--muted);font-size:8px;font-weight:800;line-height:1.1;">${_liveClockLabel}</div>`
         : '';
       statusHtml = `
         <div id="disp-${pId}" onclick="document.getElementById('disp-${pId}').style.display='none'; document.getElementById('act-${pId}').style.display='flex';" style="font-weight:900; font-size:10px; cursor:pointer; text-decoration:underline dotted #ccc; ${isZombie ? 'color:#ff9800;' : ''}" title="${isZombie ? 'Game stale - manual check needed' : (_liveClockLabel ? 'Live game — click to settle' : 'Click to settle')}">${_liveBlock}${_pendingLabel}</div>
@@ -9560,7 +9607,8 @@ function settleTrackedPickFromCompetition(pick, competition, boxscore) {
               period: Number(period || 0),
               clock: _isHalf ? "HALF" : String(clock || ""),
               statusName: String(statusName || ""),
-              league: pick.league || ""
+              league: pick.league || "",
+              capturedAt: Date.now()
             });
           }
         }
