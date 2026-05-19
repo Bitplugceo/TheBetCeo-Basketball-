@@ -10057,6 +10057,9 @@ function applyContextAdjustments(baseProjection, ctx) {
     }
 
     function detectTrap(edge, line, pick, league, marketType, vol) {
+      // Spec Item 6: Manual leagues bypass trap detection — volatility arrays are empty, causing false alarms
+      const _isAutomatedLeague = league === "nba" || league === "ncaa" || league === "wnba" || league === "wnba_pre";
+      if (!_isAutomatedLeague) return false;
       if (!line || isNaN(edge) || line <= 0 || !pick || pick === "NO PLAY") return false;
       const pct = Math.abs(edge / line);
       if (pct < TRAP_RULES.minEdgePct) return true;
@@ -12857,8 +12860,9 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     aEdge: lines.aLine ? projAFT - lines.aLine : NaN,
     bEdge: lines.bLine ? projBFT - lines.bLine : NaN,
     aVol, bVol,
-    ftFullModel: ftSampleTier === "full" && aORTG.length >= 5,
-    teamFullModel: ftSampleTier === "full" && aORTG.length >= 5,
+    // Spec Item 1: Manual leagues have no L2 ortg arrays — force fullModel when sample is full
+    ftFullModel: ftSampleTier === "full" && (aORTG.length >= 5 || (league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre")),
+    teamFullModel: ftSampleTier === "full" && (aORTG.length >= 5 || (league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre")),
     blowoutGap: Math.abs(projAFT - projBFT),
     paceGapRisk: estMatchPace > 108 || estMatchPace < 92,
     vl: getMarketVolLimit(league, "ft"),
@@ -13568,8 +13572,10 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
     h2hProj
   ].filter(v => isFinite(v));
 
+  // Spec Item 7: Skip trim for manual leagues — direct-average over whatever models are populated
   const sortedModels = [...modelProjections].sort((a, b) => a - b);
-  const trimmedModels = sortedModels.length >= 4 ? sortedModels.slice(1, -1) : sortedModels;
+  const _isManualLeagueForEnsemble = league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre";
+  const trimmedModels = (!_isManualLeagueForEnsemble && sortedModels.length >= 4) ? sortedModels.slice(1, -1) : sortedModels;
   const ensembleMean = meanFromList(trimmedModels);
   const modelRange = sortedModels.length ? (sortedModels[sortedModels.length - 1] - sortedModels[0]) : NaN;
 
@@ -13663,8 +13669,11 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
     : Math.max(0, 100 - (modelRange / getMassacreModelRangeLimit(marketKey)) * 100);
 
   const marketStdDev = (() => {
+    // Spec Item 5: For manual leagues with thin or fresh history, inject robust fallback stdDev
+    const _isManualLeagueForMC = league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre";
     const actualTeamVol = Math.max(Number(pickRow.context?.aVol || 0), Number(pickRow.context?.bVol || 0));
-    
+    if (_isManualLeagueForMC && (!isFinite(actualTeamVol) || actualTeamVol < 2)) return 11.5;
+
     const base =
       marketKey === "ft" ? (league === "ncaa" ? 14.5 : 13.8) :
       marketKey === "h1" || marketKey === "h2" ? (league === "ncaa" ? 8.4 : 7.9) :
@@ -14260,6 +14269,9 @@ function resolveStoredLineBeforeDecision({
   context = {}
 }) {
   const result = { line: currentLine, usedMemory: false };
+  // Spec Item 8: Manual leagues bypass the learning engine line-memory lookup entirely
+  const _isManualLeagueForLineMemory = league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre";
+  if (_isManualLeagueForLineMemory) return result;
   if (!fixtureMeta?.eventId) return result;
   if (!isFinite(currentLine) || currentLine <= 0 || !isFinite(proj)) return result;
 
@@ -14295,6 +14307,60 @@ function resolveStoredLineBeforeDecision({
     result.usedMemory = true;
   }
   return result;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RETROSPECTIVE BACKTESTING SANDBOX — Spec Item 9
+// ═══════════════════════════════════════════════════════════════
+
+const g_lineMemorySnapshots = {};
+
+function recordLiveCalculationSnapshot({ eventId, league, marketKey, side, line, predictionText, confidence, eventDate = "", homeTeam = "", awayTeam = "" }) {
+  if (!eventId || !marketKey || !["over","under"].includes(String(side || "").toLowerCase()) || !isFinite(line) || line <= 0) return null;
+  const key = makeEngineLineMemoryKey(eventId, league, marketKey, side);
+  if (g_lineMemorySnapshots[key]) return g_lineMemorySnapshots[key];
+  g_lineMemorySnapshots[key] = {
+    eventId, league, marketKey, side, line, predictionText, confidence,
+    eventDate, homeTeam, awayTeam, capturedAt: new Date().toISOString()
+  };
+  return g_lineMemorySnapshots[key];
+}
+
+async function executeRetrospectiveBacktest({ league, parsed, lines, fixtureMeta, altStdDev = 11.5 } = {}) {
+  if (!league || !parsed || !lines) return null;
+  try {
+    const baseFT = computeFTProjection({ league, parsed, lines, injMultA: 1, injMultB: 1 });
+    const baseH1 = compute1HProjection({ league, parsed, lines, injMultA: 1, injMultB: 1 });
+    const allPicks = [
+      ...(Array.isArray(g_trackerState?.activePicks) ? g_trackerState.activePicks : []),
+      ...(Array.isArray(g_trackerState?.archivedPicks) ? g_trackerState.archivedPicks : [])
+    ];
+    const results = [];
+    const snapKeys = Object.keys(g_lineMemorySnapshots).slice(-20);
+    for (const key of snapKeys) {
+      const snap = g_lineMemorySnapshots[key];
+      if (!snap || snap.league !== league) continue;
+      const liveResult = allPicks.find(p =>
+        p.eventId === snap.eventId &&
+        p.marketKey === snap.marketKey &&
+        String(p.side || "").toLowerCase() === snap.side
+      );
+      if (!liveResult || !["win","loss","push"].includes(String(liveResult.resultStatus || "").toLowerCase())) continue;
+      const altProj = snap.marketKey === "h1" ? baseH1.h1Proj : baseFT.ftProj;
+      const altEdge = isFinite(altProj) ? altProj - snap.line : NaN;
+      const altPick = isFinite(altEdge) ? getPick(altEdge, snap.line, league, snap.marketKey === "h1" ? "h1" : "ft", {}) : "NO PLAY";
+      const altSide = getPickSideFromText(altPick);
+      const liveWin = liveResult.resultStatus === "win" ? 1 : liveResult.resultStatus === "push" ? 0.5 : 0;
+      const altWin = (altPick !== "NO PLAY" && altSide === snap.side) ? liveWin : 0;
+      results.push({ key, livePick: snap.predictionText, liveWin, altPick, altWin, delta: altWin - liveWin });
+    }
+    const netDelta = results.reduce((s, r) => s + r.delta, 0);
+    engineDebug("RETRO BACKTEST COMPLETE", { league, tested: results.length, netDelta: netDelta.toFixed(2), altStdDev });
+    return { league, tested: results.length, netDelta, results };
+  } catch (err) {
+    engineDebug("RETRO BACKTEST ERROR", err.message);
+    return null;
+  }
 }
 
 function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diagnostics }) {
@@ -14346,6 +14412,24 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     const pickWithCorrectKey = { ...p, marketKey: marketKeyFromLogic };
     const payload = buildTrackedPickPayload({ pickRow: pickWithCorrectKey, isLock, fixtureMeta, league, diagnostics });
     if (payload) tracked.push(payload);
+    // Spec Item 9: Record live calculation snapshot for retrospective backtesting
+    if (p.pick !== "NO PLAY" && !p.note && isFinite(p.line) && p.line > 0 && fixtureMeta?.eventId) {
+      const _snapSide = getPickSideFromText(p.pick);
+      if (_snapSide) {
+        recordLiveCalculationSnapshot({
+          eventId: fixtureMeta.eventId,
+          league,
+          marketKey: marketKeyFromLogic,
+          side: _snapSide,
+          line: Number(p.displayLineUsed ?? p.line),
+          predictionText: p.displayPick || p.pick,
+          confidence: p.confidence || "—",
+          eventDate: fixtureMeta.eventDate || "",
+          homeTeam: fixtureMeta.homeTeam || "",
+          awayTeam: fixtureMeta.awayTeam || ""
+        });
+      }
+    }
   });
   return tracked;
 }
@@ -14954,6 +15038,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const bBadge = getMicroStreakBadge(ctxB.ftScored10, null, null, null, bLine, true);
 
     function computeQ(qKey, lineVal) {
+      // Spec Item 4: Halt immediately if no line value or non-automated league — prevents division errors
+      if (!lineVal || (league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre")) return null;
       const supported = league === "nba" || league === "wnba" || league === "wnba_pre";
       if (!supported) return null;
 
