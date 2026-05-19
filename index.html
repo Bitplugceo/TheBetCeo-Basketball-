@@ -6960,25 +6960,89 @@ function queueTrackerFollowupRefresh(delayMs = 1200) {
 }
 
 async function refreshTrackerInBackground(forceHydrate = false) {
-  // If a refresh is already happening, don't just skip—wait a second then try one more time
   if (g_refreshTrackedPicksInFlight) {
     if (forceHydrate) queueTrackerFollowupRefresh(2000);
     return;
   }
-  
   g_refreshTrackedPicksInFlight = true;
-  
   try {
     await hydrateTrackedPicks(forceHydrate);
     await refreshTrackedPickResults();
     await forceTrackerSaveNow();
     engineDebug("Watchdog: Settle/Sync cycle complete.", "engine");
+    scheduleLiveClockPoll();
   } catch (err) {
     engineDebug("WATCHDOG ERROR: Sync cycle interrupted: " + err.message);
   } finally {
-    // Release the lock strictly after work is 100% complete
     g_refreshTrackedPicksInFlight = false;
   }
+}
+
+let _liveClockPollTimer = null;
+
+function scheduleLiveClockPoll() {
+  clearTimeout(_liveClockPollTimer);
+  _liveClockPollTimer = null;
+  if (g_liveGameStatus.size === 0) return;
+  _liveClockPollTimer = setTimeout(async () => {
+    _liveClockPollTimer = null;
+    await pollLiveGameClocks();
+  }, 28000);
+}
+
+async function pollLiveGameClocks() {
+  if (g_liveGameStatus.size === 0) return;
+  const active = Array.isArray(g_trackerState?.activePicks) ? g_trackerState.activePicks : [];
+  const byLeague = new Map();
+  active.forEach(p => {
+    if (!p?.eventId || !g_liveGameStatus.has(p.eventId)) return;
+    if (!byLeague.has(p.league)) byLeague.set(p.league, new Set());
+    byLeague.get(p.league).add(p.eventId);
+  });
+  if (!byLeague.size) { g_liveGameStatus.clear(); renderTrackedPicks(); return; }
+  let didChange = false;
+  for (const [league, eventIds] of byLeague) {
+    const base = getTrackedLeagueBase(league);
+    if (!base) continue;
+    try {
+      let data = null;
+      try {
+        const res = await fetch(`${base}/scoreboard?_=${Date.now()}`, { cache: "no-store" });
+        if (res.ok) data = await res.json();
+      } catch (e) {
+        data = await proxyFetch(`${base}/scoreboard`, 6000).catch(() => null);
+      }
+      if (!data) continue;
+      const events = data?.events || [];
+      events.forEach(ev => {
+        const eid = String(ev.id || "");
+        if (!eventIds.has(eid)) return;
+        const comp = ev?.competitions?.[0];
+        if (!comp) return;
+        const completed = !!(comp?.status?.type?.completed || comp?.status?.type?.state === "post" || comp?.status?.type?.name === "STATUS_FINAL");
+        if (completed) { g_liveGameStatus.delete(eid); didChange = true; return; }
+        const state = String(comp?.status?.type?.state || "");
+        const statusName = String(comp?.status?.type?.name || "");
+        const clock = String(comp?.status?.displayClock || "");
+        const period = Number(comp?.status?.period || 0);
+        const isHalf = statusName.toUpperCase().includes("HALFTIME");
+        const isLive = state === "in" || isHalf || statusName.toUpperCase().includes("PROGRESS");
+        if (isLive) {
+          const existing = g_liveGameStatus.get(eid);
+          const newClock = isHalf ? "HALF" : clock;
+          if (!existing || existing.period !== period || existing.clock !== newClock) {
+            g_liveGameStatus.set(eid, { period, clock: newClock, statusName, league });
+            didChange = true;
+          }
+        } else if (state === "pre") {
+          g_liveGameStatus.delete(eid);
+          didChange = true;
+        }
+      });
+    } catch (err) { /* silent */ }
+  }
+  if (didChange) renderTrackedPicks();
+  scheduleLiveClockPoll();
 }
 
 
@@ -7679,24 +7743,24 @@ function unlockPageBehindTracker() {
 function openTrackerModal() {
   const modal = document.getElementById("trackerModal");
   if (!modal) return;
-
   g_trackerModalView = "picks";
   lockPageBehindTracker();
   modal.classList.add("open");
   modal.setAttribute("aria-hidden", "false");
   updateTrackerInsightsButton();
   syncTrackerModalView();
-
   primeTrackerStateForRun();
   refreshTrackerInBackground(false);
+  scheduleLiveClockPoll();
 }
 
 function closeTrackerModal() {
   const modal = document.getElementById("trackerModal");
   if (!modal) return;
-
   g_trackerModalView = "picks";
   clearTrackerFollowupRefresh();
+  clearTimeout(_liveClockPollTimer);
+  _liveClockPollTimer = null;
   modal.classList.remove("open");
   syncTrackerModalView();
   modal.setAttribute("aria-hidden", "true");
@@ -7812,24 +7876,24 @@ function renderTrackedPicks() {
   requestAnimationFrame(() => {
       bodyEl.innerHTML = displayPicks.map(p => {
     const status = String(p.resultStatus || "pending").toLowerCase();
-    const statusClass = status === "win" ? "track-win" : status === "loss" ? "track-loss" : status === "push" ? "track-push" : "track-pending";
+    const _liveInfo = (status === 'pending' && p.eventId) ? g_liveGameStatus.get(p.eventId) : null;
+    const statusClass = status === "win" ? "track-win" : status === "loss" ? "track-loss" : status === "push" ? "track-push" : (_liveInfo ? "pred-noplay" : "track-pending");
     const edgeText = (p.edgePct == null || isNaN(p.edgePct)) ? "—" : (p.edgePct > 0 ? "+" : "") + Number(p.edgePct).toFixed(2) + "%";
 
     const grade = String(p.confidenceGrade || p.confidence || "—").toUpperCase();
     const gradeClass = getConfidenceClass(grade);
-    
-                let statusHtml = "";
+
+    let statusHtml = "";
     if (status === 'pending') {
       const pId = (p.eventId || '') + p.signature.replace(/[^a-z0-9]/gi, '');
       const gameTs = safeParseDate(p.eventDate || p.createdAt);
       const isZombie = gameTs > 0 && (Date.now() - gameTs) > (36 * 60 * 60 * 1000);
-      const _liveInfo = p.eventId ? g_liveGameStatus.get(p.eventId) : null;
       const _liveClockLabel = _liveInfo
         ? (_liveInfo.clock === "HALF" ? "HALF" : `Q${_liveInfo.period || "?"} ${_liveInfo.clock}`)
         : null;
       const _pendingLabel = isZombie ? 'STALE' : (_liveClockLabel ? '' : 'PENDING');
       const _liveBlock = _liveClockLabel
-        ? `<div style="color:#2aff9e;font-size:9px;font-weight:900;line-height:1.15;letter-spacing:0.2px;">🟢 LIVE</div><div style="color:#2aff9e;font-size:8px;font-weight:800;line-height:1.1;">${_liveClockLabel}</div>`
+        ? `<div style="color:var(--muted);font-size:9px;font-weight:900;line-height:1.2;letter-spacing:0.1px;">● LIVE</div><div style="color:var(--muted);font-size:8px;font-weight:800;line-height:1.1;">${_liveClockLabel}</div>`
         : '';
       statusHtml = `
         <div id="disp-${pId}" onclick="document.getElementById('disp-${pId}').style.display='none'; document.getElementById('act-${pId}').style.display='flex';" style="font-weight:900; font-size:10px; cursor:pointer; text-decoration:underline dotted #ccc; ${isZombie ? 'color:#ff9800;' : ''}" title="${isZombie ? 'Game stale - manual check needed' : (_liveClockLabel ? 'Live game — click to settle' : 'Click to settle')}">${_liveBlock}${_pendingLabel}</div>
