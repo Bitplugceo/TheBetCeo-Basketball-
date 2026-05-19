@@ -2616,9 +2616,9 @@ body.dark-mode .tracker-analytics-section-head {
 <div class="section" id="marketSection">
   <h3>Market Lines</h3>
 
-  <div id="ftH1MarketRow" style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
     <div><label id="ftMarketLabel">FT Total</label><input id="ftMarket" placeholder="150.5 - 160.5" /></div>
-    <div id="h1MarketSection"><label>1H Total</label><input id="h1Market" placeholder="75.5 - 85.5" /></div>
+    <div><label>1H Total</label><input id="h1Market" placeholder="75.5 - 85.5" /></div>
   </div>
 
   <div id="h2MarketSection" style="display: none; grid-template-columns: 1fr; gap: 8px; margin-top: 6px;">
@@ -3090,6 +3090,7 @@ try {
 }
 
     if (typeof getDynamicWeights !== 'function') issues.push("CRITICAL: getDynamicWeights logic is missing.");
+    if (typeof runMassacreMonteCarlo !== 'function') issues.push("CRITICAL: Monte Carlo Worker bridge is broken.");
 
     // 2. Structural Test: Try to run a fake calculation to see if math is 'sane'
     try {
@@ -3307,7 +3308,31 @@ const MODEL_TUNING = {
   recencyWeights: [1.35, 1.20, 1.00, 0.85, 0.70]
 };
 
-
+const MASSACRE_TUNING = {
+  modelCountFloor: 3,
+  monteCarloRuns: { nba: 6500, ncaa: 9000, other: 5000 },
+  maxModelRange: { ft: 22, h1: 13, h2: 13, team: 12 },
+  thresholds: {
+    nba: {
+      ft:   { sim: 57, brutality: 60, agreement: 2, convergence: 0 },
+      h1:   { sim: 56, brutality: 57, agreement: 2, convergence: 0 },
+      h2:   { sim: 56, brutality: 57, agreement: 2, convergence: 0 },
+      team: { sim: 55, brutality: 55, agreement: 1, convergence: -1 }
+    },
+    ncaa: {
+      ft:   { sim: 59, brutality: 62, agreement: 2, convergence: 0 },
+      h1:   { sim: 58, brutality: 59, agreement: 2, convergence: 0 },
+      h2:   { sim: 58, brutality: 59, agreement: 2, convergence: 0 },
+      team: { sim: 56, brutality: 56, agreement: 1, convergence: -1 }
+    },
+    other: {
+      ft:   { sim: 57, brutality: 58, agreement: 2, convergence: 0 },
+      h1:   { sim: 56, brutality: 55, agreement: 1, convergence: -1 },
+      h2:   { sim: 56, brutality: 55, agreement: 1, convergence: -1 },
+      team: { sim: 55, brutality: 53, agreement: 1, convergence: -1 }
+    }
+  }
+};
 
 const TEAM_MEMORY_RULES = {
   minSample: 8,
@@ -5268,7 +5293,7 @@ function buildReportDebugCard(title, lines = [], limit = 10, emptyText = "No act
     if (rawText.includes("toggletheme") || rawText.includes("dark-mode")) {
       moduleName = "UI THEME / ICON SYSTEM";
       fixAdvice = "Check the Basketball Icon logic. Fix the specific text to restore the UI Theme.";
-    } else if (rawText.includes("runengine")) {
+    } else if (rawText.includes("runengine") || rawText.includes("massacre")) {
       moduleName = "PREDICTION INTELLIGENCE";
       fixAdvice = "A math formula or data input in the Run button is invalid. Trace the calculation block.";
     } else if (rawText.includes("fetch") || rawText.includes("network") || rawText.includes("promise") || rawText.includes("cloudflare")) {
@@ -7470,7 +7495,7 @@ function archiveExpiredTrackedPicks() {
         bVol: lean.diagnostics.bVol
       };
     }
-    delete lean.diagnostics; delete lean.trackerFeedback;
+    delete lean.diagnostics; delete lean.massacre; delete lean.trackerFeedback;
     delete lean.shadowTrackerFeedback; delete lean.teamMemory; delete lean.intelligence; delete lean.shadowIntelligence;
     return lean;
   };
@@ -7724,26 +7749,18 @@ function renderTrackedPicks() {
   window.__trackerRenderLimit = window.__trackerRenderLimit || 50;
   const displayPicks = visiblePicks
     .sort((a, b) => {
-      // 1. Pending picks stay at the top, settled sink to the bottom
+      // 1. Pending picks stay at the top
       const aPending = String(a.resultStatus || "pending").toLowerCase() === "pending";
       const bPending = String(b.resultStatus || "pending").toLowerCase() === "pending";
-
+      
       if (aPending && !bPending) return -1;
       if (!aPending && bPending) return 1;
+      
+      // 2. Time-based sort
+      const timeDiff = getTrackedPickTimeMs(b) - getTrackedPickTimeMs(a);
+      if (Math.abs(timeDiff) > 1000) return timeDiff; // Only matter if differ by >1 sec
 
-      // 2. Time-based sort — pending: ascending (earliest game first); settled: descending (most recent first)
-      const timeDiff = aPending
-        ? getTrackedPickTimeMs(a) - getTrackedPickTimeMs(b)
-        : getTrackedPickTimeMs(b) - getTrackedPickTimeMs(a);
-      if (Math.abs(timeDiff) > 1000) return timeDiff;
-
-      // 3. Game identity tiebreaker — keep all picks from the same game together even if same tip-off time
-      const aGame = String(a.eventId || a.homeTeam || "");
-      const bGame = String(b.eventId || b.homeTeam || "");
-      if (aGame < bGame) return -1;
-      if (aGame > bGame) return 1;
-
-      // 4. Within the same game, enforce strict market order
+      // 3. Fallback to strict market order if saved at same time (sorted by name length)
       const mktOrderMap = { 
         "player": 0, "ft": 1, "h1": 2, "h2": 3, 
         "q1": 4, "q2": 5, "q3": 6, "q4": 7, 
@@ -7820,7 +7837,7 @@ function renderTrackedPicks() {
 
     return `
       <tr>
-        <td>${safeText(formatTrackedDate(p.eventDate || p.createdAt))}</td>
+        <td>${safeText(formatTrackedDate(p.createdAt || p.eventDate))}</td>
         <td style="font-weight:900; text-transform:uppercase;">${safeText((p.homeTeam || "—") + " vs " + (p.awayTeam || "—"))}</td>
         <td style="font-weight:800;">${safeText(String(p.marketName || "—").split('<')[0].trim())}</td>
         <td>${isFinite(p.line) ? safeText(displayLine(p.line)) : "—"}</td>
@@ -9518,10 +9535,11 @@ function addTrackedPicks(newPicks) {
         netB: p.diagnostics.netB,
         aVol: p.diagnostics.aVol,
         bVol: p.diagnostics.bVol,
+        simPct: p.diagnostics.massacre?.simPct,
         edgePct: p.edgePct,
         grade: p.confidenceGrade
       };
-      delete p.diagnostics; delete p.trackerFeedback;
+      delete p.diagnostics; delete p.massacre; delete p.trackerFeedback;
       delete p.shadowTrackerFeedback; delete p.teamMemory;
     }
     if (!p.signature) p.signature = makeTrackedSignature(p);
@@ -9775,7 +9793,11 @@ function applyContextAdjustments(baseProjection, ctx) {
     (marketType === "h1") ? (periodThresholds.h1 + Number(rules.underExtra || 0)) :
     Number(rules.under ?? PICK_RULES.default.under);
 
-  // h2 removed; h1 uses the standard league threshold — no artificial bump
+  // --- MICRO-MARKET EDGE BUMP ---
+  if (marketType === "h1" || marketType === "h2") {
+    overMin = Math.max(overMin, 0.055);
+    underMin = Math.max(underMin, 0.060);
+  }
 
   const pct = Math.abs(edge / line);
   if (edge === 0) return "NO PLAY";
@@ -9864,9 +9886,12 @@ function applyContextAdjustments(baseProjection, ctx) {
     const aFullModelBonus = a.fullModel ? 0.6 : 0;
     const bFullModelBonus = b.fullModel ? 0.6 : 0;
 
+    const aMassacreBonus = isFinite(Number(a.lockStrength)) ? Number(a.lockStrength) : 0;
+    const bMassacreBonus = isFinite(Number(b.lockStrength)) ? Number(b.lockStrength) : 0;
+
     // 3. Final Lock Score calculation includes the Tier Bonus
-    const aLockScore = aEdgePct + aFullModelBonus + aTierBonus;
-    const bLockScore = bEdgePct + bFullModelBonus + bTierBonus;
+    const aLockScore = aEdgePct + aFullModelBonus + aMassacreBonus + aTierBonus;
+    const bLockScore = bEdgePct + bFullModelBonus + bMassacreBonus + bTierBonus;
 
     if (Math.abs(bLockScore - aLockScore) > 0.0001) return bLockScore - aLockScore;
     if (Math.abs(bEdgePct - aEdgePct) > 0.0001) return bEdgePct - aEdgePct;
@@ -12363,7 +12388,7 @@ function getPredictionExplanationMeta(pickRow, league, diagnostics = {}) {
     : NaN;
 
   if (pickRow.note) {
-    const severity = /Intel gate|Range gate|Insufficient|Thin/i.test(String(pickRow.note))
+    const severity = /Massacre gate|Intel gate|Range gate|Insufficient|Thin/i.test(String(pickRow.note))
       ? "warn"
       : (trust.mode === "block" ? "error" : trust.mode === "advisory" ? "warn" : "info");
     return { severity, text: String(pickRow.note) };
@@ -12608,8 +12633,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     aEdge: lines.aLine ? projAFT - lines.aLine : NaN,
     bEdge: lines.bLine ? projBFT - lines.bLine : NaN,
     aVol, bVol,
-    ftFullModel: ftSampleTier === "full" && (aORTG.length >= 5 || (league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre")),
-    teamFullModel: ftSampleTier === "full" && (aORTG.length >= 5 || (league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre")),
+    ftFullModel: ftSampleTier === "full" && aORTG.length >= 5,
+    teamFullModel: ftSampleTier === "full" && aORTG.length >= 5,
     blowoutGap: Math.abs(projAFT - projBFT),
     paceGapRisk: estMatchPace > 108 || estMatchPace < 92,
     vl: getMarketVolLimit(league, "ft"),
@@ -12962,7 +12987,793 @@ function getMarketVolLimit(league, marketKey) {
   return LEAGUE_VOL_LIMITS[league] || LEAGUE_VOL_LIMITS.unknown;
 }
 
+function getMassacreThresholdBucket(league, marketKey) {
+  const leagueBucket =
+    league === "nba" ? MASSACRE_TUNING.thresholds.nba :
+    league === "ncaa" ? MASSACRE_TUNING.thresholds.ncaa :
+    MASSACRE_TUNING.thresholds.other;
 
+  const marketBucket =
+    marketKey === "ft" ? "ft" :
+    marketKey === "h1" ? "h1" :
+    marketKey === "h2" ? "h2" :
+    marketKey.startsWith("q") ? "h1" :
+    "team";
+
+  return leagueBucket[marketBucket] || leagueBucket.ft;
+}
+
+function getMassacreRuns(league) {
+  if (league === "nba") return MASSACRE_TUNING.monteCarloRuns.nba;
+  if (league === "ncaa") return MASSACRE_TUNING.monteCarloRuns.ncaa;
+  return MASSACRE_TUNING.monteCarloRuns.other;
+}
+
+function getMassacreModelRangeLimit(marketKey) {
+  if (marketKey === "ft") return MASSACRE_TUNING.maxModelRange.ft;
+  if (marketKey === "h1") return MASSACRE_TUNING.maxModelRange.h1;
+  if (marketKey === "h2") return MASSACRE_TUNING.maxModelRange.h2;
+  if (marketKey.startsWith("q") && marketKey.length === 2) return 7.5;
+  return MASSACRE_TUNING.maxModelRange.team;
+}
+
+function getMassacreTeamContext(side, parsed) {
+  const data = side === "A"
+    ? {
+        ftScored: safeArr(parsed.aFTScored) || [],
+        ftAllowed: [],
+        h1Scored: safeArr(parsed.a1HScored) || [],
+        h1Allowed: [],
+        h2Scored: safeArr(parsed.a2HScored) || getExactFetchedSecondHalfSeries("A", "overall", "scored", parsed),
+        h2Allowed: [],
+        venueFTScored: [],
+        venueFTAllowed: [],
+        venueH1Scored: [],
+        venueH1Allowed: [],
+        venueH2Scored: [],
+        venueH2Allowed: []
+      }
+    : {
+        ftScored: safeArr(parsed.bFTScored) || [],
+        ftAllowed: [],
+        h1Scored: safeArr(parsed.b1HScored) || [],
+        h1Allowed: [],
+        h2Scored: safeArr(parsed.b2HScored) || getExactFetchedSecondHalfSeries("B", "overall", "scored", parsed),
+        h2Allowed: [],
+        venueFTScored: [],
+        venueFTAllowed: [],
+        venueH1Scored: [],
+        venueH1Allowed: [],
+        venueH2Scored: [],
+        venueH2Allowed: []
+      };
+
+  const ctx = g_massacreFetchContext?.[side] || {};
+  const overall = ctx.overall || {};
+  const venue = ctx.venue || {};
+
+  return {
+    ftScored10: Array.isArray(overall.ftScored10) && overall.ftScored10.length ? overall.ftScored10 : data.ftScored,
+    ftAllowed10: Array.isArray(overall.ftAllowed10) && overall.ftAllowed10.length ? overall.ftAllowed10 : data.ftAllowed,
+    h1Scored10: Array.isArray(overall.h1Scored10) && overall.h1Scored10.length ? overall.h1Scored10 : data.h1Scored,
+    h1Allowed10: Array.isArray(overall.h1Allowed10) && overall.h1Allowed10.length ? overall.h1Allowed10 : data.h1Allowed,
+    h2Scored10: Array.isArray(overall.h2Scored10) && overall.h2Scored10.length ? overall.h2Scored10 : data.h2Scored,
+    h2Allowed10: Array.isArray(overall.h2Allowed10) && overall.h2Allowed10.length ? overall.h2Allowed10 : data.h2Allowed,
+
+    venueFTScored10: Array.isArray(venue.ftScored10) && venue.ftScored10.length ? venue.ftScored10 : data.venueFTScored,
+    venueFTAllowed10: Array.isArray(venue.ftAllowed10) && venue.ftAllowed10.length ? venue.ftAllowed10 : data.venueFTAllowed,
+    venueH1Scored10: Array.isArray(venue.h1Scored10) && venue.h1Scored10.length ? venue.h1Scored10 : data.venueH1Scored,
+    venueH1Allowed10: Array.isArray(venue.h1Allowed10) && venue.h1Allowed10.length ? venue.h1Allowed10 : data.venueH1Allowed,
+    venueH2Scored10: Array.isArray(venue.h2Scored10) && venue.h2Scored10.length ? venue.h2Scored10 : data.venueH2Scored,
+    venueH2Allowed10: Array.isArray(venue.h2Allowed10) && venue.h2Allowed10.length ? venue.h2Allowed10 : data.venueH2Allowed,
+
+    ftScored5: data.ftScored,
+    ftAllowed5: data.ftAllowed,
+    h1Scored5: data.h1Scored,
+    h1Allowed5: data.h1Allowed,
+    h2Scored5: data.h2Scored,
+    h2Allowed5: data.h2Allowed,
+    venueFTScored5: data.venueFTScored,
+    venueFTAllowed5: data.venueFTAllowed,
+    venueH1Scored5: data.venueH1Scored,
+    venueH1Allowed5: data.venueH1Allowed,
+    venueH2Scored5: data.venueH2Scored,
+    venueH2Allowed5: data.venueH2Allowed,
+
+    restDays: ctx.restDays,
+    lastGameDate: ctx.lastGameDate || ""
+  };
+}
+
+function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
+  const games = Array.isArray(g_massacreFetchContext?.h2hGames) ? g_massacreFetchContext.h2hGames : [];
+  if (!games || !games.length) {
+    if (marketKey === "ft") {
+      return { 
+        A: (parsed && parsed.aFTH2H) ? safeArr(parsed.aFTH2H) : [], 
+        B: (parsed && parsed.bFTH2H) ? safeArr(parsed.bFTH2H) : [] 
+      };
+    }
+    if (marketKey === "h1") {
+      return { 
+        A: (parsed && parsed.a1HH2H) ? safeArr(parsed.a1HH2H) : [], 
+        B: (parsed && parsed.b1HH2H) ? safeArr(parsed.b1HH2H) : [] 
+      };
+    }
+    if (marketKey === "h2") {
+      return {
+        A: getExactFetchedSecondHalfH2HSeries("A", parsed),
+        B: getExactFetchedSecondHalfH2HSeries("B", parsed)
+      };
+    }
+    if (marketKey.startsWith("q") && marketKey.length === 2) {
+      return {
+        A: (parsed && parsed[`a${marketKey.toUpperCase()}H2H`]) ? safeArr(parsed[`a${marketKey.toUpperCase()}H2H`]) : [],
+        B: (parsed && parsed[`b${marketKey.toUpperCase()}H2H`]) ? safeArr(parsed[`b${marketKey.toUpperCase()}H2H`]) : []
+      };
+    }
+    return { A: [], B: [] };
+  }
+
+
+  const fixtureHomeId = String(fixtureMeta?.homeId || "");
+  const A = [];
+  const B = [];
+
+  games.slice(0, 10).forEach(g => {
+    const teamAIsHome = fixtureHomeId && String(g.teamAId || "") === fixtureHomeId;
+    
+    const valueA =
+      marketKey === "ft" ? (teamAIsHome ? g.scoreA : g.scoreB) :
+      marketKey === "h1" ? (teamAIsHome ? g.h1A : g.h1B) :
+      marketKey === "h2" ? (teamAIsHome ? g.h2A : g.h2B) :
+      marketKey === "q1" ? (teamAIsHome ? g.q1A : g.q1B) :
+      marketKey === "q2" ? (teamAIsHome ? g.q2A : g.q2B) :
+      marketKey === "q3" ? (teamAIsHome ? g.q3A : g.q3B) :
+      marketKey === "q4" ? (teamAIsHome ? g.q4A : g.q4B) : 0;
+
+    const valueB =
+      marketKey === "ft" ? (teamAIsHome ? g.scoreB : g.scoreA) :
+      marketKey === "h1" ? (teamAIsHome ? g.h1B : g.h1A) :
+      marketKey === "h2" ? (teamAIsHome ? g.h2B : g.h2A) :
+      marketKey === "q1" ? (teamAIsHome ? g.q1B : g.q1A) :
+      marketKey === "q2" ? (teamAIsHome ? g.q2B : g.q2A) :
+      marketKey === "q3" ? (teamAIsHome ? g.q3B : g.q3A) :
+      marketKey === "q4" ? (teamAIsHome ? g.q4B : g.q4A) : 0;
+
+    if (isFinite(Number(valueA)) && Number(valueA) > 0) A.push(Number(valueA));
+    if (isFinite(Number(valueB)) && Number(valueB) > 0) B.push(Number(valueB));
+  });
+
+  return { A, B };
+}
+
+
+function getMassacreMarketWindowSet(marketKey, parsed, fixtureMeta) {
+  const A = getMassacreTeamContext("A", parsed);
+  const B = getMassacreTeamContext("B", parsed);
+
+  const map = {
+    ft: {
+      overallA10Scored: A.ftScored10, overallA10Allowed: A.ftAllowed10,
+      overallB10Scored: B.ftScored10, overallB10Allowed: B.ftAllowed10,
+      overallA5Scored: A.ftScored5, overallA5Allowed: A.ftAllowed5,
+      overallB5Scored: B.ftScored5, overallB5Allowed: B.ftAllowed5,
+      venueAScored: A.venueFTScored10, venueAAllowed: A.venueFTAllowed10,
+      venueBScored: B.venueFTScored10, venueBAllowed: B.venueFTAllowed10
+    },
+    h1: {
+      overallA10Scored: A.h1Scored10, overallA10Allowed: A.h1Allowed10,
+      overallB10Scored: B.h1Scored10, overallB10Allowed: B.h1Allowed10,
+      overallA5Scored: A.h1Scored5, overallA5Allowed: A.h1Allowed5,
+      overallB5Scored: B.h1Scored5, overallB5Allowed: B.h1Allowed5,
+      venueAScored: A.venueH1Scored10, venueAAllowed: A.venueH1Allowed10,
+      venueBScored: B.venueH1Scored10, venueBAllowed: B.venueH1Allowed10
+    },
+    h2: {
+      overallA10Scored: A.h2Scored10,
+      overallA10Allowed: A.h2Allowed10,
+      overallB10Scored: B.h2Scored10,
+      overallB10Allowed: B.h2Allowed10,
+      overallA5Scored: A.h2Scored5,
+      overallA5Allowed: A.h2Allowed5,
+      overallB5Scored: B.h2Scored5,
+      overallB5Allowed: B.h2Allowed5,
+      venueAScored: A.venueH2Scored10,
+      venueAAllowed: A.venueH2Allowed10,
+      venueBScored: B.venueH2Scored10,
+      venueBAllowed: B.venueH2Allowed10
+    },
+    team_a: {
+      overallA10Scored: A.ftScored10, overallA10Allowed: A.ftAllowed10,
+      overallB10Scored: B.ftScored10, overallB10Allowed: B.ftAllowed10,
+      overallA5Scored: A.ftScored5, overallA5Allowed: A.ftAllowed5,
+      overallB5Scored: B.ftScored5, overallB5Allowed: B.ftAllowed5,
+      venueAScored: A.venueFTScored10, venueAAllowed: A.venueFTAllowed10,
+      venueBScored: B.venueFTScored10, venueBAllowed: B.venueFTAllowed10
+    },
+    team_b: {
+      overallA10Scored: A.ftScored10, overallA10Allowed: A.ftAllowed10,
+      overallB10Scored: B.ftScored10, overallB10Allowed: B.ftAllowed10,
+      overallA5Scored: A.ftScored5, overallA5Allowed: A.ftAllowed5,
+      overallB5Scored: B.ftScored5, overallB5Allowed: B.ftAllowed5,
+      venueAScored: A.venueFTScored10, venueAAllowed: A.venueFTAllowed10,
+      venueBScored: B.venueFTScored10, venueBAllowed: B.venueFTAllowed10
+    }
+  };
+
+  ["q1", "q2", "q3", "q4"].forEach(q => {
+    const getQ = (t, s) => safeArr(parsed?.[`${t}${q.toUpperCase()}${s}`]) || [];
+    map[q] = {
+      overallA10Scored: getQ('a', 'Scored'), overallA10Allowed: getQ('a', 'Allowed'),
+      overallB10Scored: getQ('b', 'Scored'), overallB10Allowed: getQ('b', 'Allowed'),
+      overallA5Scored: getQ('a', 'Scored'), overallA5Allowed: getQ('a', 'Allowed'),
+      overallB5Scored: getQ('b', 'Scored'), overallB5Allowed: getQ('b', 'Allowed'),
+      venueAScored: getQ('a', 'Scored'), venueAAllowed: getQ('a', 'Allowed'),
+      venueBScored: getQ('b', 'Scored'), venueBAllowed: getQ('b', 'Allowed')
+    };
+  });
+
+  const windows = map[marketKey] || map.ft;
+  windows.h2h = getMassacreH2HSeries(
+    marketKey === "team_a" || marketKey === "team_b" ? "ft" : marketKey,
+    fixtureMeta,
+    parsed
+  );
+
+  windows.restA = A.restDays;
+  windows.restB = B.restDays;
+  return windows;
+}
+
+function projectMassacreTotal(aSc, aAll, bSc, bAll) {
+  if (!Array.isArray(aSc) || !Array.isArray(aAll) || !Array.isArray(bSc) || !Array.isArray(bAll)) return NaN;
+  const ASc = avgOrNaN(aSc);
+  const AAll = avgOrNaN(aAll);
+  const BSc = avgOrNaN(bSc);
+  const BAll = avgOrNaN(bAll);
+  if (![ASc, AAll, BSc, BAll].every(v => isFinite(v))) return NaN;
+  return (0.55 * ASc + 0.45 * BAll) + (0.55 * BSc + 0.45 * AAll);
+}
+
+function projectMassacreTeam(side, aSc, aAll, bSc, bAll) {
+  const ASc = avgOrNaN(aSc);
+  const AAll = avgOrNaN(aAll);
+  const BSc = avgOrNaN(bSc);
+  const BAll = avgOrNaN(bAll);
+  if (![ASc, AAll, BSc, BAll].every(v => isFinite(v))) return NaN;
+  return side === "A"
+    ? (0.55 * ASc + 0.45 * BAll)
+    : (0.55 * BSc + 0.45 * AAll);
+}
+
+function meanFromList(values) {
+  const clean = (values || []).map(Number).filter(v => isFinite(v));
+  return clean.length ? clean.reduce((s, v) => s + v, 0) / clean.length : NaN;
+}
+
+function getMassacreNormalRandom() {
+  let u = 0;
+  let v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+// Fix 7 + 9: Async Poisson-Based Monte Carlo
+// --- NEW BLOCK (THE FIX) ---
+async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
+  if (!isFinite(mean) || !isFinite(stdDev) || !isFinite(line) || stdDev <= 0) {
+    return { overPct: 50, underPct: 50 };
+  }
+
+  // 🛡️ MATH FIX: Prevent Zero-Variance trap. 
+  // If a team scores exactly the same in a small sample, Box-Muller dies.
+  const safeStdDev = Math.max(stdDev, 3.5);
+
+  const workerCode = `
+    onmessage = function(e) {
+      const { mean, safeStdDev, line, runs } = e.data;
+      let overHits = 0;
+      const usePoisson = mean < 140;
+
+      for (let i = 0; i < runs; i++) {
+        let simulatedScore = 0;
+        if (usePoisson) {
+          let p = 0;
+          let k = 0;
+          let log_alpha = -mean;
+          while (true) {
+            p += Math.log(Math.random() || 0.0001);
+            if (p < log_alpha) { simulatedScore = k; break; }
+            k++;
+          }
+        } else {
+          let u1 = Math.random();
+          let u2 = Math.random();
+          while (u1 === 0) u1 = Math.random();
+          let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+          simulatedScore = Math.max(0, mean + (safeStdDev * z0));
+        }
+        
+        if (simulatedScore > line) overHits++;
+      }
+      const overPct = (overHits / runs) * 100;
+      postMessage({ overPct, underPct: 100 - overPct });
+    };
+  `;
+
+    const blob = new Blob([workerCode], { type: "application/javascript" });
+        let workerUrl, worker;
+  try {
+    workerUrl = URL.createObjectURL(blob); 
+    worker = new Worker(workerUrl);
+  } catch (err) {
+    if (workerUrl) URL.revokeObjectURL(workerUrl);
+    console.warn("[BB Engine] Worker blocked (Private Mode/CSP). Running Monte Carlo synchronously.");
+    let overHits = 0;
+    for (let i = 0; i < runs; i++) {
+      let u1 = Math.random(), u2 = Math.random();
+      while (u1 === 0) u1 = Math.random();
+      let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+      if (mean + (safeStdDev * z0) > line) overHits++;
+    }
+    const overPct = (overHits / runs) * 100;
+    return { overPct, underPct: 100 - overPct };
+  }
+
+
+  let failsafeTimer;
+
+  const workerPromise = new Promise((resolve, reject) => {
+    worker.onmessage = (e) => {
+      clearTimeout(failsafeTimer);
+      worker.terminate();
+      URL.revokeObjectURL(workerUrl); 
+      resolve(e.data);
+    };
+    worker.onerror = (err) => {
+      clearTimeout(failsafeTimer);
+      worker.terminate();
+      URL.revokeObjectURL(workerUrl);
+      reject(err);
+    };
+    
+    worker.postMessage({ mean, safeStdDev, line, runs }); 
+  });
+
+
+  const timeoutPromise = new Promise((resolve) => {
+    failsafeTimer = setTimeout(() => {
+      worker.terminate();
+      URL.revokeObjectURL(workerUrl);
+      console.warn("[BB Engine] Worker timed out. Reverting to median.");
+      resolve({ overPct: 50, underPct: 50 });
+    }, 3000); 
+  });
+
+  return Promise.race([workerPromise, timeoutPromise]);
+}
+
+
+async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
+
+
+  const marketKey = getMarketKeyFromName(pickRow?.name);
+  const side = getPickSideFromText(pickRow?.pick);
+  const thresholds = getMassacreThresholdBucket(league, marketKey);
+  const windows = getMassacreMarketWindowSet(marketKey, parsed, fixtureMeta);
+
+  const isTeamMarket = marketKey === "team_a" || marketKey === "team_b";
+  const teamSide = marketKey === "team_b" ? "B" : "A";
+
+  const isQ = marketKey.startsWith("q") && marketKey.length === 2;
+
+  let recentProj = isTeamMarket
+    ? projectMassacreTeam(teamSide, windows.overallA5Scored, windows.overallA5Allowed, windows.overallB5Scored, windows.overallB5Allowed)
+    : projectMassacreTotal(windows.overallA5Scored, windows.overallA5Allowed, windows.overallB5Scored, windows.overallB5Allowed);
+
+  let seasonishProj = isTeamMarket
+    ? projectMassacreTeam(teamSide, windows.overallA10Scored, windows.overallA10Allowed, windows.overallB10Scored, windows.overallB10Allowed)
+    : projectMassacreTotal(windows.overallA10Scored, windows.overallA10Allowed, windows.overallB10Scored, windows.overallB10Allowed);
+
+  let venueProj = isTeamMarket
+    ? projectMassacreTeam(teamSide, windows.venueAScored, windows.venueAAllowed, windows.venueBScored, windows.venueBAllowed)
+    : projectMassacreTotal(windows.venueAScored, windows.venueAAllowed, windows.venueBScored, windows.venueBAllowed);
+
+  const h2hProj = (() => {
+    const hA = windows.h2h?.A || [];
+    const hB = windows.h2h?.B || [];
+    if (!hA.length || !hB.length) return NaN;
+    
+    // --- QUARTER FIX: H2H Arrays for Quarters are already per-team quarter scores. Just sum them. ---
+    const rawProj = isTeamMarket
+      ? (teamSide === "A" ? avgOrNaN(hA) : avgOrNaN(hB))
+      : (avgOrNaN(hA) + avgOrNaN(hB));
+      
+    // The previous quarter arrays (recent/seasonish/venue) were full game totals we had to divide by 4.
+    // The h2h array for quarters is already quarter-sized. No division needed.
+    return rawProj;
+  })();
+
+  const trendAdj = isFinite(recentProj) && isFinite(seasonishProj)
+    ? (recentProj - seasonishProj) * 0.35
+    : 0;
+
+  const momentumProj = isFinite(pickRow?.proj) ? pickRow.proj + trendAdj : NaN;
+
+  const modelProjections = [
+    Number(pickRow?.proj),
+    recentProj,
+    seasonishProj,
+    venueProj,
+    momentumProj,
+    h2hProj
+  ].filter(v => isFinite(v));
+
+  const sortedModels = [...modelProjections].sort((a, b) => a - b);
+  const trimmedModels = sortedModels.length >= 4 ? sortedModels.slice(1, -1) : sortedModels;
+  const ensembleMean = meanFromList(trimmedModels);
+  const modelRange = sortedModels.length ? (sortedModels[sortedModels.length - 1] - sortedModels[0]) : NaN;
+
+  const buffer =
+    marketKey === "ft" ? 1.75 :
+    marketKey === "h1" || marketKey === "h2" ? 1.25 :
+    marketKey.startsWith("q") ? 0.75 :
+    1.0;
+
+  let agreement = 0;
+  let disagreement = 0;
+  trimmedModels.forEach(proj => {
+    const edge = proj - pickRow.line;
+    if (Math.abs(edge) < buffer) return;
+    const modelSide = edge > 0 ? "over" : "under";
+    if (modelSide === side) agreement++;
+    else disagreement++;
+  });
+
+  const offenseBaseline =
+    (marketKey === "h1" || marketKey === "h2") ? (LEAGUE_BASES[league] || LEAGUE_BASES.unknown) / 2 :
+    isQ ? (LEAGUE_BASES[league] || LEAGUE_BASES.unknown) / 4 :
+    (LEAGUE_BASES[league] || LEAGUE_BASES.unknown);
+
+  let overallTotal10 =
+    isTeamMarket
+      ? projectMassacreTeam(teamSide, windows.overallA10Scored, windows.overallA10Allowed, windows.overallB10Scored, windows.overallB10Allowed)
+      : projectMassacreTotal(windows.overallA10Scored, windows.overallA10Allowed, windows.overallB10Scored, windows.overallB10Allowed);
+
+  let overallTotal5 =
+    isTeamMarket
+      ? projectMassacreTeam(teamSide, windows.overallA5Scored, windows.overallA5Allowed, windows.overallB5Scored, windows.overallB5Allowed)
+      : projectMassacreTotal(windows.overallA5Scored, windows.overallA5Allowed, windows.overallB5Scored, windows.overallB5Allowed);
+
+  const paceMetric = (() => {
+    const a = avgOrNaN(windows.overallA10Scored) + avgOrNaN(windows.overallA10Allowed);
+    const b = avgOrNaN(windows.overallB10Scored) + avgOrNaN(windows.overallB10Allowed);
+    if (!isFinite(a) || !isFinite(b)) return NaN;
+    return (a + b) / 2;
+  })();
+
+  const paceLayer =
+    !isFinite(paceMetric) ? 0 :
+    paceMetric >= offenseBaseline * 1.03 ? 1 :
+    paceMetric <= offenseBaseline * 0.97 ? -1 : 0;
+
+  const offenseLayer =
+    !isFinite(overallTotal10) ? 0 :
+    overallTotal10 >= offenseBaseline * 1.02 ? 1 :
+    overallTotal10 <= offenseBaseline * 0.98 ? -1 : 0;
+
+  const defenseLayer = (() => {
+    const aAllow = avgOrNaN(windows.overallA10Allowed);
+    const bAllow = avgOrNaN(windows.overallB10Allowed);
+    const baselineTeam = offenseBaseline / 2;
+    if (!isFinite(aAllow) || !isFinite(bAllow)) return 0;
+    const combined = aAllow + bAllow;
+    return combined >= baselineTeam * 2 * 1.02 ? 1 :
+      combined <= baselineTeam * 2 * 0.98 ? -1 : 0;
+  })();
+
+  const momentumLayer =
+    !isFinite(overallTotal5) || !isFinite(overallTotal10) ? 0 :
+    overallTotal5 - overallTotal10 >= buffer ? 1 :
+    overallTotal10 - overallTotal5 >= buffer ? -1 : 0;
+
+  const venueLayer =
+    !isFinite(venueProj) || !isFinite(seasonishProj) ? 0 :
+    venueProj - seasonishProj >= buffer ? 1 :
+    seasonishProj - venueProj >= buffer ? -1 : 0;
+
+  const h2hLayer =
+    !isFinite(h2hProj) ? 0 :
+    h2hProj - pickRow.line >= buffer ? 1 :
+    pickRow.line - h2hProj >= buffer ? -1 : 0;
+
+  const restLayer = (() => {
+    const aRest = Number(windows.restA);
+    const bRest = Number(windows.restB);
+    if (!isFinite(aRest) || !isFinite(bRest)) return 0;
+    if (aRest <= 0 || bRest <= 0) return -1;
+    if (aRest >= 2 && bRest >= 2) return 1;
+    return 0;
+  })();
+
+  const rawConvergence = paceLayer + offenseLayer + defenseLayer + momentumLayer + venueLayer + h2hLayer + restLayer;
+  const alignedConvergence = side === "over" ? rawConvergence : -rawConvergence;
+
+  const stabilityScore = !isFinite(modelRange)
+    ? 0
+    : Math.max(0, 100 - (modelRange / getMassacreModelRangeLimit(marketKey)) * 100);
+
+  const marketStdDev = (() => {
+    const actualTeamVol = Math.max(Number(pickRow.context?.aVol || 0), Number(pickRow.context?.bVol || 0));
+    
+    const base =
+      marketKey === "ft" ? (league === "ncaa" ? 14.5 : 13.8) :
+      marketKey === "h1" || marketKey === "h2" ? (league === "ncaa" ? 8.4 : 7.9) :
+      marketKey.startsWith("q") ? (league === "ncaa" ? 4.8 : 4.5) :
+      8.0;
+
+    const blendedBase = actualTeamVol > 0 ? (actualTeamVol * 0.6) + (base * 0.4) : base;
+
+    const rangeAdj = isFinite(modelRange) ? modelRange * 0.18 : 0;
+    const instabilityAdj = stabilityScore < 55 ? 1.2 : stabilityScore < 70 ? 0.6 : 0;
+    return blendedBase + rangeAdj + instabilityAdj;
+  })();
+
+  const sim = await runMassacreMonteCarlo(
+    isFinite(ensembleMean) ? ensembleMean : Number(pickRow?.proj),
+    marketStdDev,
+    Number(pickRow?.line),
+    getMassacreRuns(league)
+  );
+
+
+  const simPct = side === "over" ? sim.overPct : sim.underPct;
+
+  const agreementScore = trimmedModels.length
+    ? (agreement / trimmedModels.length) * 18
+    : 0;
+
+  const edgeScore = isFinite(Number(pickRow?.edge)) && isFinite(Number(pickRow?.line)) && Number(pickRow.line) > 0
+    ? Math.min(22, Math.abs((pickRow.edge / pickRow.line) * 100) * 3.2)
+    : 0;
+
+  const simScore = Math.max(0, Math.min(26, (simPct - 50) * 0.9));
+  const convergenceScore = Math.max(0, Math.min(14, alignedConvergence * 2.5));
+  const stabilityWeight = Math.max(0, Math.min(12, stabilityScore * 0.12));
+  const layerSupport = [paceLayer, offenseLayer, defenseLayer, momentumLayer, venueLayer, h2hLayer, restLayer]
+    .filter(v => (side === "over" ? v > 0 : v < 0)).length;
+  const layerScore = Math.max(0, Math.min(8, layerSupport * 1.4));
+
+  const brutalityScore = Math.max(
+    0,
+    Math.min(100, edgeScore + simScore + agreementScore + convergenceScore + stabilityWeight + layerScore)
+  );
+
+  const failedReasons = [];
+  if (trimmedModels.length < MASSACRE_TUNING.modelCountFloor) failedReasons.push("thin model stack");
+  if (agreement < thresholds.agreement) failedReasons.push(`agreement ${agreement}/${trimmedModels.length || 0}`);
+  if (simPct < thresholds.sim) failedReasons.push(`sim ${simPct.toFixed(1)}%`);
+  if (alignedConvergence < thresholds.convergence) failedReasons.push(`convergence ${alignedConvergence}`);
+  if (brutalityScore < thresholds.brutality) failedReasons.push(`score ${brutalityScore.toFixed(0)}`);
+  if (isFinite(modelRange) && modelRange > getMassacreModelRangeLimit(marketKey)) failedReasons.push(`range ${modelRange.toFixed(1)}`);
+
+  return {
+    marketKey,
+    modelCount: trimmedModels.length,
+    agreement,
+    disagreement,
+    ensembleMean,
+    modelRange,
+    stabilityScore,
+    rawConvergence,
+    alignedConvergence,
+    simPct,
+    brutalityScore,
+    failedReasons,
+    layerSupport,
+    paceLayer,
+    offenseLayer,
+    defenseLayer,
+    momentumLayer,
+    venueLayer,
+    h2hLayer,
+    restLayer,
+    lockStrength:
+      Math.max(0, simPct - 50) * 0.18 +
+      Math.max(0, brutalityScore - 50) * 0.04
+  };
+}
+
+function getMassacreProfile(diag, pickRow, league) {
+  const marketKey = diag?.marketKey || getMarketKeyFromName(pickRow?.name);
+  const thresholds = getMassacreThresholdBucket(league, marketKey);
+  const rangeLimit = getMassacreModelRangeLimit(marketKey);
+  const edgePct = isFinite(Number(pickRow?.edge)) && isFinite(Number(pickRow?.line)) && Number(pickRow.line) > 0
+    ? Math.abs((Number(pickRow.edge) / Number(pickRow.line)) * 100)
+    : 0;
+
+  const simGap = Math.max(0, Number(thresholds.sim || 0) - Number(diag?.simPct || 0));
+  const brutalityGap = Math.max(0, Number(thresholds.brutality || 0) - Number(diag?.brutalityScore || 0));
+  const agreementGap = Math.max(0, Number(thresholds.agreement || 0) - Number(diag?.agreement || 0));
+  const convergenceGap = Math.max(0, Number(thresholds.convergence || 0) - Number(diag?.alignedConvergence || 0));
+  const rangeGap = Math.max(0, Number(diag?.modelRange || 0) - Number(rangeLimit || 0));
+
+  const reasons = { severe: [], moderate: [], mild: [] };
+
+  if ((diag?.modelCount || 0) < 2) reasons.severe.push("thin model stack");
+  else if ((diag?.modelCount || 0) < MASSACRE_TUNING.modelCountFloor) reasons.moderate.push("thin model stack");
+
+  if (simGap > 5.5) reasons.severe.push(`sim ${Number(diag?.simPct || 0).toFixed(1)}%`);
+  else if (simGap > 2.5) reasons.moderate.push(`sim ${Number(diag?.simPct || 0).toFixed(1)}%`);
+  else if (simGap > 0) reasons.mild.push(`sim ${Number(diag?.simPct || 0).toFixed(1)}%`);
+
+  if (brutalityGap > 14) reasons.severe.push(`score ${Number(diag?.brutalityScore || 0).toFixed(0)}`);
+  else if (brutalityGap > 7) reasons.moderate.push(`score ${Number(diag?.brutalityScore || 0).toFixed(0)}`);
+  else if (brutalityGap > 0) reasons.mild.push(`score ${Number(diag?.brutalityScore || 0).toFixed(0)}`);
+
+  if (agreementGap > 1) reasons.moderate.push(`agreement ${Number(diag?.agreement || 0)}/${Number(diag?.modelCount || 0)}`);
+  else if (agreementGap > 0) reasons.mild.push(`agreement ${Number(diag?.agreement || 0)}/${Number(diag?.modelCount || 0)}`);
+
+  if (convergenceGap > 4.5) reasons.severe.push(`convergence ${Number(diag?.alignedConvergence || 0)}`);
+  else if (convergenceGap > 2) reasons.moderate.push(`convergence ${Number(diag?.alignedConvergence || 0)}`);
+  else if (convergenceGap > 0) reasons.mild.push(`convergence ${Number(diag?.alignedConvergence || 0)}`);
+
+  if (rangeGap > 6) reasons.severe.push(`range ${Number(diag?.modelRange || 0).toFixed(1)}`);
+  else if (rangeGap > 2.5) reasons.moderate.push(`range ${Number(diag?.modelRange || 0).toFixed(1)}`);
+  else if (rangeGap > 0) reasons.mild.push(`range ${Number(diag?.modelRange || 0).toFixed(1)}`);
+
+  const strongEdge = edgePct >= 6;
+  const premiumEdge = edgePct >= 8;
+  const extremeConflict =
+    Number(diag?.agreement || 0) === 0 &&
+    Number(diag?.disagreement || 0) >= 2 &&
+    Number(diag?.alignedConvergence || 0) <= (Number(thresholds.convergence || 0) - 3);
+
+  const hardBlock =
+    (diag?.modelCount || 0) < 2 ||
+    extremeConflict ||
+    (simGap > 6 && brutalityGap > 10) ||
+    (rangeGap > 7 && agreementGap > 0 && edgePct < 7.5) ||
+    (reasons.severe.length >= 2 && !premiumEdge);
+
+  const leanOnly = !hardBlock && (
+    reasons.severe.length >= 1 ||
+    reasons.moderate.length >= 2 ||
+    (reasons.moderate.length >= 1 && !strongEdge) ||
+    (reasons.mild.length >= 2 && edgePct < 6.75)
+  );
+
+  const cautionOnly = !hardBlock && !leanOnly && (reasons.moderate.length > 0 || reasons.mild.length > 0);
+  const cautionReasons = [...reasons.moderate, ...reasons.mild].slice(0, 3);
+  const rescueEligible = !extremeConflict && edgePct >= 5 && simGap <= 3 && brutalityGap <= 10 && (diag?.modelCount || 0) >= 2;
+  const rescueScore =
+    edgePct * 5 +
+    Math.max(0, Number(diag?.simPct || 0) - 50) +
+    Math.max(0, Number(diag?.brutalityScore || 0) - 45) -
+    rangeGap * 2 -
+    Math.max(0, convergenceGap - 1) * 2;
+
+  return {
+    marketKey,
+    thresholds,
+    edgePct,
+    simGap,
+    brutalityGap,
+    agreementGap,
+    convergenceGap,
+    rangeGap,
+    reasons,
+    hardBlock,
+    leanOnly,
+    cautionOnly,
+    cautionReasons,
+    rescueEligible,
+    rescueScore,
+    strongEdge,
+    premiumEdge
+  };
+}
+
+function rescueBestMassacreLean(picks) {
+  if (!Array.isArray(picks) || !picks.length) return;
+
+  const hasPlayOrLean = picks.some(p =>
+    p &&
+    typeof p.pick === "string" &&
+    p.pick !== "NO PLAY" &&
+    (!p.note || p.recommendationTier === "lean")
+  );
+
+  if (hasPlayOrLean) return;
+
+  const candidate = [...picks]
+    .filter(p =>
+      p &&
+      p.massacreProfile?.rescueEligible &&
+      p.massacreOriginalPick &&
+      p.massacreDecision === "blocked"
+    )
+    .sort((a, b) => {
+      const aScore = Number(a.massacreProfile?.rescueScore || 0);
+      const bScore = Number(b.massacreProfile?.rescueScore || 0);
+      if (Math.abs(bScore - aScore) > 0.001) return bScore - aScore;
+      return Math.abs((Number(b.edge || 0) / Math.max(1, Number(b.line || 1))) * 100) -
+        Math.abs((Number(a.edge || 0) / Math.max(1, Number(a.line || 1))) * 100);
+    })[0];
+
+  if (!candidate) return;
+
+  const reasons = [
+    ...((candidate.massacreProfile?.cautionReasons || []).slice(0, 2)),
+    ...((candidate.massacreProfile?.reasons?.severe || []).slice(0, 1))
+  ].filter(Boolean);
+
+  candidate.pick = candidate.massacreOriginalPick;
+  candidate.recommendationTier = "lean";
+  candidate.confidence = "—";
+  candidate.note = "Best on slate lean: " + (reasons.length ? reasons.join(" • ") : "gate softened");
+  candidate.massacreDecision = "lean_rescue";
+}
+
+async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta) {
+  if (!Array.isArray(picks)) return;
+
+  // Run all simulations in parallel across background threads
+  const promises = picks.map(async (p) => {
+    if (!p || p.note || p.pick === "NO PLAY") return;
+
+    const side = getPickSideFromText(p.pick);
+    if (!side) return;
+
+    // --- EXOTIC BYPASS ---
+    // High/Low Q Totals and Margins don't fit standard Monte Carlo Bell Curves
+    const isExotic = ["htft", "margin_any", "margin_team", "player", "high_q", "low_q", "high_q_ou", "low_q_ou"].includes(p.marketKey);
+    if (isExotic) return;
+
+    const originalPick = p.pick;
+    const diag = await evaluateMassacreForPick(p, league, parsed, fixtureMeta);
+    const profile = getMassacreProfile(diag, p, league);
+
+    p.massacre = diag;
+    p.massacreProfile = profile;
+    p.massacreOriginalPick = originalPick;
+    p.lockStrength = diag.lockStrength;
+    p.recommendationTier = p.recommendationTier || "play";
+
+    if (profile.hardBlock) {
+      p.pick = "NO PLAY";
+      p.displayPick = "NO PLAY";
+      p.confidence = "—";
+      p.note = "Massacre gate: " + [...profile.reasons.severe, ...profile.cautionReasons].slice(0, 3).join(" • ");
+      p.massacreDecision = "blocked";
+      return;
+    }
+
+    if (profile.leanOnly) {
+      p.pick = originalPick;
+      p.recommendationTier = "lean";
+      p.confidence = "—";
+      p.note = "Lean only: " + [...profile.reasons.severe, ...profile.cautionReasons].slice(0, 3).join(" • ");
+      p.massacreDecision = "lean";
+      return;
+    }
+
+    p.massacreDecision = profile.cautionOnly ? "caution" : "pass";
+
+    if (diag.brutalityScore >= 78 && diag.simPct >= (profile.thresholds.sim + 4) && diag.agreement >= Math.max(2, profile.thresholds.agreement)) {
+      p.confidence = bumpConfidenceGrade(p.confidence, 1);
+    } else if (profile.cautionOnly) {
+      p.confidence = bumpConfidenceGrade(p.confidence, -1);
+    } else if (diag.brutalityScore < (profile.thresholds.brutality - 4) || diag.simPct < (profile.thresholds.sim - 2)) {
+      p.confidence = bumpConfidenceGrade(p.confidence, -1);
+    }
+  });
+
+  await Promise.all(promises);
+  rescueBestMassacreLean(picks);
+}
 
 
 
@@ -13271,7 +14082,8 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta, league, diagnos
       trackerSoftInfluence: pickRow.trackerSoftInfluence || null,
       trackerFeedback: pickRow.trackerFeedback || null,
       shadowTrackerFeedback: pickRow.shadowTrackerFeedback || null,
-      teamMemory: pickRow.teamMemory || null
+      teamMemory: pickRow.teamMemory || null,
+      massacre: pickRow.massacre || null
     },
     createdAt: nowIso
   };
@@ -13379,20 +14191,6 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
 
 
 
-
-function getMassacreTeamContext(side, parsed) {
-  const ctx = g_massacreFetchContext?.[side] || {};
-  const overall = ctx.overall || {};
-  const pick = (arr) => Array.isArray(arr) && arr.length ? arr : null;
-  return {
-    ftScored10:  pick(overall.ftScored10)  || pick(overall.scored10)   || getManualSeries(side, "ft", parsed) || [],
-    ftAllowed10: pick(overall.ftAllowed10) || pick(overall.allowed10)  || getManualAllowedSeries(side, "ft", parsed) || [],
-    h1Scored10:  pick(overall.h1Scored10)  || pick(overall.h1Scored)   || getManualSeries(side, "h1", parsed) || [],
-    h1Allowed10: pick(overall.h1Allowed10) || pick(overall.h1Allowed)  || getManualAllowedSeries(side, "h1", parsed) || [],
-    h2Scored10:  pick(overall.h2Scored10)  || pick(overall.h2Scored)   || getManualSeries(side, "h2", parsed) || [],
-    h2Allowed10: pick(overall.h2Allowed10) || pick(overall.h2Allowed)  || getManualAllowedSeries(side, "h2", parsed) || []
-  };
-}
 
 /* ── FIX 2: Error Boundary ─────────────────────────────────── */
 function withErrorBoundary(fn, context) {
@@ -14398,7 +15196,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const finalPicks = picks.filter(p => {
       if (isWnbaRun)   return wnbaAllowedMarkets.has(p.marketKey);
       if (isNbaOrNcaa) return nbaAllowedMarkets.has(p.marketKey);
-      return ["ft", "team_a", "team_b"].includes(p.marketKey);
+      return ["ft", "h1", "team_a", "team_b"].includes(p.marketKey);
     });
 
     // Reorder: FT → 1H → Team A/B → Q1-Q4 → 1H Teams → Highest/Lowest Q
@@ -14420,7 +15218,8 @@ const finalPicksForDisplay = finalPicks
 applySoftTrackerInfluenceToPicks(finalPicksForDisplay, fixtureMeta, phase2Activation);
 applyLeagueTrustToPicks(finalPicksForDisplay, league);
 
-
+// Fix C1: Plug in the Massacre MC machine
+await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtureMeta);
 
 // Fix H1: Attach the memory icons (🧠)
 finalPicksForDisplay.forEach(p => {
@@ -14548,13 +15347,25 @@ window.__LAST_AUDIT_STATE = {
     ftCalc, h1Calc, h2Calc, 
     q1: q1 || "null", q2: q2 || "null", q3: q3 || "null", q4: q4 || "null" 
   },
+  massacreContext: {
+    teamA: {
+      rest: g_massacreFetchContext?.A?.restDays,
+      volatility: ftCalc.aVol
+    },
+    teamB: {
+      rest: g_massacreFetchContext?.B?.restDays,
+      volatility: ftCalc.bVol
+    }
+  },
   picks: finalPicksForDisplay.map(p => ({
     market: p.marketKey,
     pick: p.pick,
     edge: p.edge,
     line: p.displayLineUsed ?? p.line,
     confidence: p.confidence,
-    note: p.note
+    note: p.note,
+    massacreDiag: p.massacre || "None",
+    massacreProfile: p.massacreProfile || "None"
   }))
 };
 // -------------------------------
@@ -14735,11 +15546,7 @@ if (trackedToSave.length) {
 
             const teamMarketSection = document.getElementById("teamMarketSection");
       if (teamMarketSection) {
-        teamMarketSection.style.gridTemplateColumns = isNbaOrNcaa ? "1fr 1fr" : "1fr";
-      }
-      const ftH1MarketRow = document.getElementById("ftH1MarketRow");
-      if (ftH1MarketRow) {
-        ftH1MarketRow.style.gridTemplateColumns = isNbaOrNcaa ? "1fr 1fr" : "1fr";
+        teamMarketSection.style.gridTemplateColumns = "1fr 1fr";
       }
 
       document.getElementById("espnSection").style.display = isNbaOrNcaa ? "block" : "none";
@@ -14762,9 +15569,6 @@ if (trackedToSave.length) {
       if (h2hQ) h2hQ.style.display = (isQs && isNbaOrNcaa) ? "block" : "none";
       
             // Handle Market Lines — 2H market removed from all leagues
-      // 1H Total market: NBA/NCAA only
-      const h1MarketEl = document.getElementById("h1MarketSection");
-      if (h1MarketEl) h1MarketEl.style.display = isNbaOrNcaa ? "block" : "none";
       // 1H Team A/B market: NBA/NCAA only
       const h1TeamEl = document.getElementById("h1TeamMarketSection");
       if (h1TeamEl) h1TeamEl.style.display = (isNbaOrNcaa && !isWnba) ? "grid" : "none";
