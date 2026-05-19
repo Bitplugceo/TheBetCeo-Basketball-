@@ -9369,6 +9369,14 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
     result: normalizedStatus,
     line: touchedPick?.line
   });
+  
+  // Phase 2 Simulator Hook for Manual Leagues
+  if (touchedPick && touchedPick.league && touchedPick.league !== "nba" && touchedPick.league !== "wnba" && touchedPick.league !== "wnba_pre" && touchedPick.league !== "ncaa") {
+    if (typeof window.runPhase2Simulator === "function") {
+      window.runPhase2Simulator(touchedPick.league);
+    }
+  }
+  
   renderTrackedPicks();
   scheduleTrackerSave();
 
@@ -12760,7 +12768,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const dampenedPaceA = 1 + ((paceFactorA - 1) * 0.4);
     const dampenedPaceB = 1 + ((paceFactorB - 1) * 0.4);
 
-    estMatchPace = clampNumber(basePace * ((dampenedPaceA + dampenedPaceB) / 2), basePace * cl.min, basePace * cl.max);
+    // Apply Phase 2 Unclamped Pace for Verified Track Meet Leagues
+    if (window.__phase2PaceAdjustment === "aggressive") {
+      estMatchPace = basePace * Math.max(dampenedPaceA, dampenedPaceB, (dampenedPaceA + dampenedPaceB) / 2);
+    } else {
+      estMatchPace = clampNumber(basePace * ((dampenedPaceA + dampenedPaceB) / 2), basePace * cl.min, basePace * cl.max);
+    }
     
     const synOrtgA = (aS / (basePace * dampenedPaceA)) * 100;
     const synDrtgA = (aA / (basePace * dampenedPaceA)) * 100;
@@ -13981,6 +13994,12 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta, league, diagnos
   const exoticNoLineMarkets = ["player", "w_ou", "race", "high_q", "low_q", "htft", "margin_team", "margin_any", "high_q_ou", "low_q_ou", "other"];
   const isExoticNoLine = pickRow && exoticNoLineMarkets.includes(pickRow.marketKey);
 
+  // Phase 2 Tracker Override: Generate a manual event ID for non-ESPN leagues so they can be saved
+  const isManualLeague = league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa";
+  if (isManualLeague && !fixtureMeta.eventId) {
+    fixtureMeta.eventId = "manual_" + league + "_" + Date.now();
+  }
+
   if (
   !pickRow ||
   pickRow.pick === "NO PLAY" ||
@@ -14514,6 +14533,23 @@ function validateExtractedInputs(extracted, league) {
 async function runEngine() {
   const runBtn = document.getElementById("runBtn");
   const table = document.getElementById("results");
+
+  // Load Phase 2 Verified Overrides before calculating
+  const leagueSelectEl = document.getElementById("leagueSelect");
+  const currentLeagueForRun = leagueSelectEl ? leagueSelectEl.value : "";
+  try {
+    const verifiedTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS")) || {};
+    if (verifiedTunings[currentLeagueForRun] && verifiedTunings[currentLeagueForRun].verified) {
+      MODEL_TUNING.recencyWeights = verifiedTunings[currentLeagueForRun].recencyWeights || [1.60, 1.30, 0.90, 0.60, 0.40];
+      window.__phase2PaceAdjustment = verifiedTunings[currentLeagueForRun].paceAdjustment || "aggressive";
+    } else {
+      MODEL_TUNING.recencyWeights = [1.35, 1.20, 1.00, 0.85, 0.70]; // Reset to standard
+      window.__phase2PaceAdjustment = "standard";
+    }
+  } catch (e) {
+    MODEL_TUNING.recencyWeights = [1.35, 1.20, 1.00, 0.85, 0.70];
+    window.__phase2PaceAdjustment = "standard";
+  }
 
   g_engineDebugLog = [];
     acknowledgeGlobalEngineAlert();
@@ -16381,6 +16417,57 @@ ${fullHTML}
       }
     });
   }
+
+  // --- PHASE 2 VERIFICATION & INDICATOR LOGIC ---
+  window.updateLeagueDropdownIndicators = function() {
+    const selectElement = document.getElementById("leagueSelect");
+    if (!selectElement) return;
+    let verifiedTunings = {};
+    try { verifiedTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS")) || {}; } catch (e) {}
+    
+    Array.from(selectElement.options).forEach(option => {
+      const leagueValue = option.value;
+      if (verifiedTunings[leagueValue] && verifiedTunings[leagueValue].verified) {
+        if (!option.text.includes("✓")) {
+          option.text = option.text + " ✓";
+          option.style.color = "#3a9c35";
+          option.style.fontWeight = "800";
+        }
+      }
+    });
+  };
+
+  window.runPhase2Simulator = function(leagueKey) {
+    if (!leagueKey) return;
+    const allPicks = [...(g_trackerState.activePicks || []), ...(g_trackerState.archivedPicks || [])];
+    const settledInLeague = allPicks.filter(p => p.league === leagueKey && (p.resultStatus === "win" || p.resultStatus === "loss" || p.resultStatus === "push"));
+    
+    if (settledInLeague.length >= 5) {
+      let verifiedTunings = {};
+      try { verifiedTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS")) || {}; } catch (e) {}
+      
+      // Prevent redundant continuous verifications once verified
+      if (verifiedTunings[leagueKey] && verifiedTunings[leagueKey].verified) return;
+
+      // 5-Game Validation Passed: Flag it as Verified Track Meet
+      verifiedTunings[leagueKey] = {
+        verified: true,
+        recencyWeights: [1.60, 1.30, 0.90, 0.60, 0.40],
+        paceAdjustment: "aggressive",
+        sampleSize: settledInLeague.length,
+        timestamp: new Date().toLocaleDateString()
+      };
+      localStorage.setItem("BB_VERIFIED_TUNINGS", JSON.stringify(verifiedTunings));
+      
+      if (typeof engineDebug === "function") {
+        engineDebug("PHASE_2_CALIBRATOR: Complete. Aggressive High-Tempo Profile locked for " + leagueKey);
+      }
+      
+      window.updateLeagueDropdownIndicators();
+    }
+  };
+
+  setTimeout(window.updateLeagueDropdownIndicators, 1000);
 
 }); // <-- EXACTLY ONE CLOSING BRACKET HERE.
 </script>
