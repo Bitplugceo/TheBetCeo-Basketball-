@@ -3925,43 +3925,48 @@ async function readAsyncStorage(key) {
 }
 
 async function writeAsyncStorage(key, value) {
+  // 🛡️ PRE-EMPTIVE QUOTA RESCUE: Applies to both IndexedDB and localStorage safely
+  if (typeof value === 'string' && value.length > 4500000 && value.includes('"archivedPicks"')) {
+    try {
+      let parsed = JSON.parse(value);
+      if (parsed.archivedPicks && parsed.archivedPicks.length > 150) {
+        console.warn("[BB Engine] Pre-emptive Quota Rescue: Slicing archive to 150.");
+        parsed.archivedPicks = parsed.archivedPicks.slice(0, 150);
+        value = JSON.stringify(parsed);
+        if (typeof g_trackerState !== "undefined" && g_trackerState) {
+          g_trackerState.archivedPicks = parsed.archivedPicks;
+        }
+      }
+    } catch(e) {}
+  }
+
   try {
     const db = await initBBDatabase();
-    return new Promise((resolve, reject) => {
+    return await new Promise((resolve, reject) => {
       const tx = db.transaction(BB_STORE_NAME, "readwrite");
       tx.objectStore(BB_STORE_NAME).put(value, key);
       tx.oncomplete = () => resolve(true);
       tx.onerror = () => reject(tx.error);
     });
   } catch (err) {
-    // IndexedDB unavailable — fall back to localStorage.
+    // IndexedDB unavailable or Quota Exceeded — fall back to localStorage.
     try {
       const serialized = typeof value === "string" ? value : JSON.stringify(value);
       localStorage.setItem(key, serialized);
       return true;
     } catch (lsErr) {
-      // FIX 13: Storage Quota Timebomb Rescue
-      // If we hit the 5MB wall, intercept the crash and slice the archive to survive
       if (lsErr.name === 'QuotaExceededError' && typeof value === 'string' && value.includes('"archivedPicks"')) {
         try {
           let parsed = JSON.parse(value);
-          if (parsed.archivedPicks && parsed.archivedPicks.length > 150) {
-            console.warn("[BB Engine] Quota exceeded. Slicing archive down to 150 to survive 5MB limit.");
-            engineDebug("Quota Rescue", "Sliced archive to 150 picks to survive localStorage 5MB limit.");
-
-            parsed.archivedPicks = parsed.archivedPicks.slice(0, 150);
+          if (parsed.archivedPicks && parsed.archivedPicks.length > 100) {
+            parsed.archivedPicks = parsed.archivedPicks.slice(0, 100);
             localStorage.setItem(key, JSON.stringify(parsed));
-
-            // FIX: Mutate the live state so the engine stops trying to save 2000 items
             if (typeof g_trackerState !== "undefined" && g_trackerState) {
               g_trackerState.archivedPicks = parsed.archivedPicks;
             }
-
             return true;
           }
-        } catch (rescueErr) {
-          // Fall through to standard error log
-        }
+        } catch (rescueErr) {}
       }
 
       console.error("[BB Engine] writeAsyncStorage localStorage fallback failed — data NOT saved:", lsErr?.name, lsErr?.message);
@@ -6669,18 +6674,15 @@ function normalizeTrackerState(raw) {
     ? raw.lineMemory
     : {};
 
-  const supportedTrackerPick = pick => isTrackerSupportedLeague(pick?.league);
-
+  // 🛡️ FILTER FIX: Removed isTrackerSupportedLeague to stop purging manual leagues
   const normalizedActive = Array.isArray(raw?.activePicks)
     ? raw.activePicks
         .map(p => ensureTrackedPickKeys(p))
-        .filter(supportedTrackerPick)
         .slice(0, TRACKED_PICKS_LIMIT)
     : [];
   const normalizedArchived = Array.isArray(raw?.archivedPicks)
     ? raw.archivedPicks
         .map(p => ensureTrackedPickKeys(p))
-        .filter(supportedTrackerPick)
         .slice(0, TRACKER_ARCHIVED_LIMIT)
     : [];
   const reconciled = reconcileTrackerBucketConflicts(normalizedActive, normalizedArchived);
@@ -10615,8 +10617,7 @@ function applyIntelligenceLayerToPicks(picks, intelligencePack, league) {
       return;
     }
 
-    p.edge = adjustedEdge;
-    p.proj = p.line + adjustedEdge;
+    // 🛡️ MATH FIX: Removed p.edge mutation (p.edge = adjustedEdge) to prevent double-penalizing downstream lock formulas
 
     if (hypotheticalPick && hypotheticalPick !== "NO PLAY" && getPickSideFromText(hypotheticalPick) === side) {
       p.pick = hypotheticalPick;
@@ -14031,29 +14032,26 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta, league, diagnos
   const exoticNoLineMarkets = ["player", "w_ou", "race", "high_q", "low_q", "htft", "margin_team", "margin_any", "high_q_ou", "low_q_ou", "other"];
   const isExoticNoLine = pickRow && exoticNoLineMarkets.includes(pickRow.marketKey);
 
-  // Phase 2 Tracker Override: Generate a manual event ID for non-ESPN leagues so they can be saved
+  // Phase 2 Tracker Override: Generate a deterministic manual event ID so manual leagues can merge line updates
   const isManualLeague = league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa";
   if (isManualLeague && !fixtureMeta.eventId) {
-    fixtureMeta.eventId = "manual_" + league + "_" + Date.now();
+    const safeHome = (fixtureMeta.homeTeam || "home").replace(/\s+/g, "");
+    const safeAway = (fixtureMeta.awayTeam || "away").replace(/\s+/g, "");
+    fixtureMeta.eventId = `manual_${league}_${safeHome}_${safeAway}`;
   }
 
-  // Trust-advisory lean picks are allowed through so the tracker can learn from advisory leagues.
-  // Only hard-blocked picks (Massacre gate, Intel gate, Grade gate) are excluded.
-  const isAdvisoryLeanSave =
+  // 🛡️ ADVISORY PARADOX FIX: Allow all legitimate picks to save regardless of warning notes, unless they are hard-blocked
+  const isSavablePick =
     pickRow &&
-    pickRow.trustAction === "advisory" &&
-    pickRow.recommendationTier === "lean" &&
     pickRow.pick !== "NO PLAY" &&
-    !!pickRow.note &&
-    !String(pickRow.note).startsWith("Massacre") &&
-    !String(pickRow.note).startsWith("Intel") &&
-    !String(pickRow.note).startsWith("Grade gate") &&
-    !String(pickRow.note).startsWith("Best on slate");
+    !String(pickRow.note).startsWith("Massacre gate") &&
+    !String(pickRow.note).startsWith("Intel gate") &&
+    !String(pickRow.note).startsWith("Grade gate");
 
   if (
   !pickRow ||
   pickRow.pick === "NO PLAY" ||
-  ((pickRow.note && !isExoticNoLine) && !isAdvisoryLeanSave) ||
+  ((pickRow.note && !isExoticNoLine) && !isSavablePick) ||
   (!isFinite(pickRow.line) && !isExoticNoLine) ||
   !fixtureMeta?.eventId
 ) {
@@ -14900,6 +14898,12 @@ const { ftLine, h1Line, h2Line, aLine, bLine } = finalLines;
       ftCalc.aEdge = NaN;
       ftCalc.projBFT = NaN;
       ftCalc.bEdge = NaN;
+
+      // 🛡️ PHANTOM QUARTER FIX
+      if (q1) { q1.proj = NaN; q1.edge = NaN; q1.pick = "NO PLAY"; }
+      if (q2) { q2.proj = NaN; q2.edge = NaN; q2.pick = "NO PLAY"; }
+      if (q3) { q3.proj = NaN; q3.edge = NaN; q3.pick = "NO PLAY"; }
+      if (q4) { q4.proj = NaN; q4.edge = NaN; q4.pick = "NO PLAY"; }
     }
 
     if (h1Calc.h1SampleTier === "insufficient") h1Pick = "NO PLAY";
@@ -15555,10 +15559,7 @@ finalPicksForDisplay.forEach(p => {
   if (p.pick !== "NO PLAY") {
     const grade = String(p.confidence || "").replace(/[^ABCD]/g, '').charAt(0);
     if (grade !== "A" && grade !== "B") {
-      p.pick = "NO PLAY";
-      p.displayPick = "NO PLAY";
-      p.confidence = "—";
-      p.note = "Grade gate: Only A and B allowed";
+      // 🛡️ GRADE GATE FIX: Removed the hard NO PLAY override so manual leagues and weaker tracker picks can still be saved/learned from.
       p.lockRestricted = true;
     }
   }
