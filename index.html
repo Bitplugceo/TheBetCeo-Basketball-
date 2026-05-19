@@ -7003,17 +7003,38 @@ function secondsToClock(secs) {
 function _tickLiveClocks() {
   if (document.hidden) return;
   if (g_liveGameStatus.size === 0) { stopLiveClockTicker(); return; }
+
+  const expiredEventIds = [];
+
   document.querySelectorAll("[data-live-clk]").forEach(el => {
     const eid = el.dataset.liveClk;
     const info = g_liveGameStatus.get(eid);
     if (!info || info.clock === "HALF") return;
+
     const capturedAt = info.capturedAt || Date.now();
     const origSecs = parseClockToSeconds(info.clock);
     if (origSecs === null) return;
-    const elapsedSecs = (Date.now() - capturedAt) / 1000;
+
+    // Cap elapsed to origSecs — phone sleep/wake can never jump the clock past 0 or backward
+    const elapsedSecs = Math.min((Date.now() - capturedAt) / 1000, origSecs);
     const currentSecs = Math.max(0, origSecs - elapsedSecs);
-    el.textContent = `Q${info.period || "?"} ${secondsToClock(currentSecs)}`;
+
+    if (currentSecs <= 0) {
+      el.textContent = "ENDED";
+      // Only fire the settlement trigger once per expired game clock
+      if (!info._expiredAt) {
+        info._expiredAt = Date.now();
+        expiredEventIds.push(eid);
+      }
+    } else {
+      el.textContent = `Q${info.period || "?"} ${secondsToClock(currentSecs)}`;
+    }
   });
+
+  // When any clock hits 0, fire a live settlement check on-screen within 2 seconds — no refresh needed
+  if (expiredEventIds.length && !g_refreshTrackedPicksInFlight) {
+    setTimeout(() => refreshTrackerInBackground(true), 2000);
+  }
 }
 
 function startLiveClockTicker() {
@@ -16055,10 +16076,15 @@ window.addEventListener("online", () => refreshTrackerInBackground(true));
           stopLiveClockTicker();
         } else {
           debouncedRefreshBackground(false);
-          if (document.getElementById("trackerModal")?.classList.contains("open") && g_liveGameStatus.size > 0) {
-            stopLiveClockTicker();
-            pollLiveGameClocks().then(() => startLiveClockTicker());
+                if (g_liveGameStatus.size > 0) {
+        // Re-poll on wake regardless of modal state so background settlement still works
+        stopLiveClockTicker();
+        pollLiveGameClocks().then(() => {
+          if (document.getElementById("trackerModal")?.classList.contains("open")) {
+            startLiveClockTicker();
           }
+        });
+      }
         }
       });
 
