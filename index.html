@@ -8037,7 +8037,7 @@ function renderTrackedPicks() {
     return `
       <tr>
         <td>${safeText(formatTrackedDate(p.eventDate || p.createdAt))}</td>
-        <td style="font-weight:900; text-transform:uppercase;">${safeText((p.homeTeam || "—") + " vs " + (p.awayTeam || "—"))}</td>
+        <td style="font-weight:900; text-transform:uppercase;">${safeText(((p.homeTeam && p.homeTeam !== "—") ? p.homeTeam : "A") + " vs " + ((p.awayTeam && p.awayTeam !== "—") ? p.awayTeam : "B"))}</td>
         <td style="font-weight:800;">${safeText(String(p.marketName || "—").split('<')[0].trim())}</td>
         <td>${isFinite(p.line) ? safeText(displayLine(p.line)) : "—"}</td>
         <td style="white-space: nowrap; font-size: 11px;">${safeText(p.predictionText || "—")}${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
@@ -9297,7 +9297,17 @@ function canManuallySettleTrackedPick(pick) {
 
 
 async function settleTrackedPick(signature, status) {
-  if (!confirm(`Confirm: Mark this pick as ${status.toUpperCase()}?`)) return;
+  let pick = g_trackerState.activePicks.find(p => p.signature === signature);
+  if (!pick) pick = g_trackerState.archivedPicks.find(p => p.signature === signature);
+  if (!pick) return;
+  const _sA = (pick.homeTeam && pick.homeTeam !== "—") ? pick.homeTeam : "A";
+  const _sB = (pick.awayTeam && pick.awayTeam !== "—") ? pick.awayTeam : "B";
+  const score = prompt(
+    `${status.toUpperCase()} — Enter final score:\n${_sA} vs ${_sB}\n(e.g. 110-105 — or leave blank)`,
+    pick.actualScore || ""
+  );
+  if (score === null) return;
+  if (score.trim()) pick.actualScore = score.trim();
   await applyManualSettlementToTrackedPick(signature, status);
 }
 
@@ -9306,7 +9316,9 @@ async function settleTrackedPickManualFull(signature) {
   if (!pick) pick = g_trackerState.archivedPicks.find(p => p.signature === signature);
   if (!pick) return;
   
-  const score = prompt(`Enter score for ${pick.homeTeam} vs ${pick.awayTeam} (e.g. 110-105):`, pick.actualScore || "");
+  const _tA = (pick.homeTeam && pick.homeTeam !== "—") ? pick.homeTeam : "A";
+  const _tB = (pick.awayTeam && pick.awayTeam !== "—") ? pick.awayTeam : "B";
+  const score = prompt(`Enter final score for ${_tA} vs ${_tB}\n(e.g. 110-105 — or leave blank to skip):`, pick.actualScore || "");
   if (score === null) return;
   
   const result = prompt("Type 'W' for Win, 'L' for Loss, 'P' for Push, or 'PENDING' to revert a mistake:", pick.resultStatus || "").toLowerCase();
@@ -14227,11 +14239,11 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta, league, diagnos
     eventId: fixtureMeta.eventId || "",
     eventDate: fixtureMeta.eventDate || "",
     league,
-    homeTeam: fixtureMeta.homeTeam || "—",
-    awayTeam: fixtureMeta.awayTeam || "—",
+    homeTeam: (fixtureMeta.homeTeam && fixtureMeta.homeTeam !== "—") ? fixtureMeta.homeTeam : "A",
+    awayTeam: (fixtureMeta.awayTeam && fixtureMeta.awayTeam !== "—") ? fixtureMeta.awayTeam : "B",
     homeId: fixtureMeta.homeId || "",
     awayId: fixtureMeta.awayId || "",
-    fixtureLabel: `${fixtureMeta.homeTeam || "—"} vs ${fixtureMeta.awayTeam || "—"}`,
+    fixtureLabel: `${(fixtureMeta.homeTeam && fixtureMeta.homeTeam !== "—") ? fixtureMeta.homeTeam : "A"} vs ${(fixtureMeta.awayTeam && fixtureMeta.awayTeam !== "—") ? fixtureMeta.awayTeam : "B"}`,
     marketKey,
     marketName: (pickRow.name || "Other").split('<')[0].trim(),
     projection: isFinite(pickRow.proj) ? Number(pickRow.proj) : null,
@@ -16587,29 +16599,126 @@ ${fullHTML}
   window.runPhase2Simulator = function(leagueKey) {
     if (!leagueKey) return;
     const allPicks = [...(g_trackerState.activePicks || []), ...(g_trackerState.archivedPicks || [])];
-    const settledInLeague = allPicks.filter(p => p.league === leagueKey && (p.resultStatus === "win" || p.resultStatus === "loss" || p.resultStatus === "push"));
-    
-    if (settledInLeague.length >= 5) {
-      let verifiedTunings = {};
-      try { verifiedTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS")) || {}; } catch (e) {}
-      
-      // Prevent redundant continuous verifications once verified
-      if (verifiedTunings[leagueKey] && verifiedTunings[leagueKey].verified) return;
+    const settledInLeague = allPicks.filter(p =>
+      p.league === leagueKey &&
+      (p.resultStatus === "win" || p.resultStatus === "loss" || p.resultStatus === "push")
+    );
 
-      // 5-Game Validation Passed: Flag it as Verified Track Meet
-      verifiedTunings[leagueKey] = {
-        verified: true,
-        recencyWeights: [1.60, 1.30, 0.90, 0.60, 0.40],
-        paceAdjustment: "aggressive",
-        sampleSize: settledInLeague.length,
-        timestamp: new Date().toLocaleDateString()
+    if (settledInLeague.length < 5) {
+      engineDebug("PHASE_2: Need " + (5 - settledInLeague.length) + " more settled picks from " + leagueKey + " before calibration.");
+      return;
+    }
+
+    let verifiedTunings = {};
+    try { verifiedTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS")) || {}; } catch (e) {}
+
+    // Re-run if we have new picks since last verification (lets the engine keep learning)
+    const existing = verifiedTunings[leagueKey];
+    if (existing && existing.verified && Number(existing.sampleSize || 0) >= settledInLeague.length) return;
+
+    // ── SIX CANDIDATE CONFIGURATIONS TO BACKTEST ──────────────────────────────
+    const candidates = [
+      { label: "standard",           weights: [1.35, 1.20, 1.00, 0.85, 0.70], paceAdj: "standard",   edgeMult: 1.00 },
+      { label: "aggressive_recency", weights: [1.60, 1.30, 0.90, 0.60, 0.40], paceAdj: "aggressive", edgeMult: 1.00 },
+      { label: "heavy_recent",       weights: [2.00, 1.50, 1.00, 0.60, 0.30], paceAdj: "standard",   edgeMult: 1.00 },
+      { label: "flat_weights",       weights: [1.00, 1.00, 1.00, 1.00, 1.00], paceAdj: "standard",   edgeMult: 1.00 },
+      { label: "edge_strict",        weights: [1.35, 1.20, 1.00, 0.85, 0.70], paceAdj: "standard",   edgeMult: 1.30 },
+      { label: "moderate_recency",   weights: [1.45, 1.25, 1.00, 0.80, 0.60], paceAdj: "standard",   edgeMult: 1.00 }
+    ];
+
+    const volLimit = LEAGUE_VOL_LIMITS[leagueKey] || 12;
+
+    // ── SCORE EACH CANDIDATE AGAINST ACTUAL SETTLED RESULTS ───────────────────
+    const scores = candidates.map(candidate => {
+      let wins = 0, saves = 0, total = 0;
+
+      settledInLeague.forEach(pick => {
+        const edgePct    = Math.abs(Number(pick.edgePct || 0));
+        const side       = String(pick.side || getPickSideFromText(pick.predictionText || "")).toLowerCase();
+        const result     = String(pick.resultStatus || "").toLowerCase();
+        const aVol       = Number(pick.diagnostics?.aVol ?? pick.godsEyeMemory?.aVol ?? 0);
+        const bVol       = Number(pick.diagnostics?.bVol ?? pick.godsEyeMemory?.bVol ?? 0);
+        const maxVol     = Math.max(aVol, bVol);
+        const marketKey  = String(pick.marketKey || "ft");
+        const isHighVol  = maxVol > volLimit * 1.30;
+
+        if (!side || !["win", "loss", "push"].includes(result)) return;
+
+        // How much the recency bias shifts our projection confidence
+        const recencyBoost    = (candidate.weights[0] - 1.35) * 0.40;
+        const adjustedEdgePct = (edgePct * (1 + recencyBoost)) / candidate.edgeMult;
+
+        const overThresh  = (marketKey === "h1" || marketKey === "h2") ? 5.0 : 5.0;
+        const underThresh = (marketKey === "h1" || marketKey === "h2") ? 5.5 : 5.5;
+
+        // Aggressive pace mode over-inflates high-vol leagues (e.g. WNBA) → penalise
+        const aggressivePaceDanger = candidate.paceAdj === "aggressive" && isHighVol &&
+                                     result === "loss" && side === "over";
+
+        const wouldTake = !aggressivePaceDanger &&
+                          ((side === "over"  && adjustedEdgePct >= overThresh) ||
+                           (side === "under" && adjustedEdgePct >= underThresh));
+
+        total++;
+
+        if (!wouldTake) {
+          if (result === "loss")  saves += 0.70;  // Correctly avoided a loser
+          else if (result === "win") wins -= 0.30; // Wrongly skipped a winner
+          return;
+        }
+
+        if (result === "win")   wins += 1.00;
+        else if (result === "push") wins += 0.50;
+        // loss: +0 — let it count against the score naturally
+      });
+
+      const score   = total > 0 ? (wins + saves) / total : 0;
+      const winRate = total > 0 ? wins / total : 0;
+      return {
+        ...candidate,
+        wins:    Math.round(wins * 10) / 10,
+        saves:   Math.round(saves * 10) / 10,
+        total,
+        score,
+        winRate
       };
-      localStorage.setItem("BB_VERIFIED_TUNINGS", JSON.stringify(verifiedTunings));
-      
-      if (typeof engineDebug === "function") {
-        engineDebug("PHASE_2_CALIBRATOR: Complete. Aggressive High-Tempo Profile locked for " + leagueKey);
-      }
-      
+    });
+
+    scores.sort((a, b) => b.score - a.score);
+    const best     = scores[0];
+    const standard = scores.find(s => s.label === "standard");
+    const improvement = best.score - (standard?.score || 0);
+
+    engineDebug("PHASE_2_BACKTEST for " + leagueKey + " (" + settledInLeague.length + " games)",
+      scores.map(s => s.label + ": " + (s.score * 100).toFixed(1) +
+        "% (W" + s.wins + " S" + s.saves + "/" + s.total + ")").join(" | ")
+    );
+
+    // Only adopt a non-standard config if it beats standard by ≥6% — prevents noise-driven changes
+    const chosenConfig = (improvement >= 0.06 && best.label !== "standard") ? best : standard;
+
+    verifiedTunings[leagueKey] = {
+      verified:       true,
+      recencyWeights: chosenConfig.weights,
+      paceAdjustment: chosenConfig.paceAdj,
+      sampleSize:     settledInLeague.length,
+      bestConfig:     chosenConfig.label,
+      score:          (chosenConfig.score * 100).toFixed(1) + "%",
+      improvement:    improvement >= 0.06
+                        ? "+" + (improvement * 100).toFixed(1) + "% vs standard"
+                        : "standard is optimal for this league",
+      timestamp:      new Date().toLocaleDateString()
+    };
+
+    localStorage.setItem("BB_VERIFIED_TUNINGS", JSON.stringify(verifiedTunings));
+    engineDebug(
+      "PHASE_2_CALIBRATOR: Locked '" + chosenConfig.label + "' for " + leagueKey +
+      " | sample=" + settledInLeague.length +
+      " | score=" + (chosenConfig.score * 100).toFixed(1) + "%" +
+      (improvement >= 0.06 ? " | +" + (improvement * 100).toFixed(1) + "% over standard" : " | standard held")
+    );
+
+    if (typeof window.updateLeagueDropdownIndicators === "function") {
       window.updateLeagueDropdownIndicators();
     }
   };
@@ -16629,7 +16738,7 @@ const AFDB = (function() {
   let _log = [];
   let _isOpen = false;
   let _showOnlyErrors = true; 
-  let _currentLogLevel = 'ALL';
+  let _currentLogLevel = 'ERROR';
 
   const LEVELS = {
     BOOT:    { color:'#7aa6ff' }, NET:     { color:'#4ea9ff' },
