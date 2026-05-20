@@ -3351,9 +3351,9 @@ const TRACKER_POLICY = {
 
 const TRACKER_SOFT_EFFECTS = {
   enabled: true,
-  minSettled: 20,       // Issue 18: graduated — start observing at 20
-  minSettledMild: 50,   // Issue 18: apply mild effects (factor 0.96–1.04) at 50
-  minSettledFull: 100,  // Issue 18: full effect range at 100
+  minSettled: 5,        // Gap 2 Bayesian: prior-anchored learning starts at pick 5
+  minSettledMild: 20,   // mild effects (factor 0.96–1.04) from pick 20
+  minSettledFull: 50,   // full effect range from pick 50
   strongFactorBoost: 1.05,
   weakFactorCut: 0.94,
   hardBlockFactor: 0.88,
@@ -3462,6 +3462,14 @@ const PICK_RULES = {
   h1:      { underExtra: 0.005, underBlockRatio: 0.82 },
   h2:      { underExtra: 0.005, underBlockRatio: 0.82 }
 };
+
+// Gap 1: Per-league underBlockRatio — European and Asian leagues suppress fewer valid Unders
+function getLeagueUnderBlockRatio(league) {
+  const l = String(league || "").toLowerCase();
+  if (EUROPE_EDGE_LEAGUES.includes(l)) return 0.78;  // tighter defensive patterns
+  if (ASIA_EDGE_LEAGUES.includes(l)) return 0.80;    // moderate variance
+  return 0.82;                                        // NBA, NCAA, WNBA, Americas, default
+}
 
 
 
@@ -6592,6 +6600,18 @@ function ensureTrackedPickKeys(pick = {}) {
   ).toUpperCase();
   next.projection = isFinite(Number(next.projection)) ? Number(next.projection) : (isFinite(Number(next.proj)) ? Number(next.proj) : null);
   next.lineAtPick = isFinite(Number(next.lineAtPick)) ? Number(next.lineAtPick) : (isFinite(Number(next.line)) ? Number(next.line) : null);
+  // Gap 3 CLV: closing line storage and CLV calculation
+  next.closingLine = (next.closingLine !== undefined && next.closingLine !== null && isFinite(Number(next.closingLine))) ? Number(next.closingLine) : null;
+  next.clv = (() => {
+    if (next.closingLine !== null && isFinite(Number(next.closingLine)) && isFinite(Number(next.lineAtPick ?? next.line))) {
+      const cl = Number(next.closingLine);
+      const lp = Number(next.lineAtPick ?? next.line);
+      const s = String(next.side || "").toLowerCase();
+      if (s === "under") return Math.round((lp - cl) * 100) / 100;
+      if (s === "over")  return Math.round((cl - lp) * 100) / 100;
+    }
+    return null;
+  })();
   next.edge = isFinite(Number(next.edge)) ? Number(next.edge) : null;
   next.edgePct = isFinite(Number(next.edgePct)) ? Number(next.edgePct) : (isFinite(Number(next.edge)) && isFinite(Number(next.lineAtPick)) && Number(next.lineAtPick) ? (Number(next.edge) / Number(next.lineAtPick)) * 100 : null);
   next.trackerSoftInfluence = next.trackerSoftInfluence || next?.diagnostics?.trackerSoftInfluence || null;
@@ -8343,6 +8363,16 @@ function renderTrackerAnalytics() {
     return (rank[a.key] ?? 9) - (rank[b.key] ?? 9) || b.settled - a.settled;
   });
 
+  // Gap 3 CLV: compute CLV performance buckets for analytics
+  const clvPicks = learningPicks.filter(p => p.closingLine !== null && p.closingLine !== undefined && isFinite(Number(p.closingLine)));
+  const clvPositive = clvPicks.filter(p => isFinite(Number(p.clv)) && Number(p.clv) > 0);
+  const clvNeutral  = clvPicks.filter(p => isFinite(Number(p.clv)) && Number(p.clv) === 0);
+  const clvNegative = clvPicks.filter(p => isFinite(Number(p.clv)) && Number(p.clv) < 0);
+  const clvPositiveRecord = buildRecord(clvPositive);
+  const clvNeutralRecord  = buildRecord(clvNeutral);
+  const clvNegativeRecord = buildRecord(clvNegative);
+  const hasCLVData = clvPicks.length > 0;
+
   const bestPickShadow = buildBestPickOnlyShadowExperiment(learningPicks);
 
   const selectedLeagueKey = normalizeLeagueTrustKey(document.getElementById("leagueSelect")?.value || "unknown");
@@ -8678,6 +8708,31 @@ function renderTrackerAnalytics() {
         </div>
       </div>
 
+      ${hasCLVData ? `
+      <div class="tracker-analytics-card">
+        <div class="tracker-analytics-card-head">
+          <div class="tracker-analytics-card-title">CLV (Closing Line Value)</div>
+          <div class="tracker-analytics-card-meta">${clvPicks.length} picks with closing line data</div>
+        </div>
+        <div class="tracker-analytics-card-body">
+          <div class="tracker-report-subtitle">CLV = how your pick line compares to where the market closed. Positive CLV = you beat the closing line. This is the single strongest long-term edge signal. Enter closing lines via the CUSTOM settle button.</div>
+          <div class="table-wrap tracker-report-table-wrap">
+            <table class="tracker-analytics-table">
+              <thead><tr><th>CLV Direction</th><th class="num">Picks</th><th class="num">Wins</th><th class="num">Losses</th><th class="num">Pushes</th><th class="rate">Win rate</th></tr></thead>
+              <tbody>
+                ${clvPositive.length ? `<tr><td>Positive (beat line)</td><td class="num">${clvPositive.length}</td><td class="num">${clvPositiveRecord.wins}</td><td class="num">${clvPositiveRecord.losses}</td><td class="num">${clvPositiveRecord.pushes}</td><td class="rate">${safeText(formatPct(clvPositiveRecord.winPct))}</td></tr>` : ""}
+                ${clvNeutral.length  ? `<tr><td>Flat (at line)</td><td class="num">${clvNeutral.length}</td><td class="num">${clvNeutralRecord.wins}</td><td class="num">${clvNeutralRecord.losses}</td><td class="num">${clvNeutralRecord.pushes}</td><td class="rate">${safeText(formatPct(clvNeutralRecord.winPct))}</td></tr>` : ""}
+                ${clvNegative.length ? `<tr><td>Negative (missed line)</td><td class="num">${clvNegative.length}</td><td class="num">${clvNegativeRecord.wins}</td><td class="num">${clvNegativeRecord.losses}</td><td class="num">${clvNegativeRecord.pushes}</td><td class="rate">${safeText(formatPct(clvNegativeRecord.winPct))}</td></tr>` : ""}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>` : `
+      <div class="tracker-analytics-card">
+        <div class="tracker-analytics-card-head"><div class="tracker-analytics-card-title">CLV (Closing Line Value)</div><div class="tracker-analytics-card-meta">No data yet</div></div>
+        <div class="tracker-analytics-card-body"><div class="tracker-report-subtitle">Use the CUSTOM settle button on any pick and enter the closing line to start CLV tracking. Even 20 CLV data points gives stronger signal than 100 W/L results alone.</div></div>
+      </div>`}
+
       <div class="tracker-analytics-grid two">
         <div class="tracker-analytics-card">
           <div class="tracker-analytics-card-head">
@@ -8950,10 +9005,11 @@ function settledTrackerScore(stat) {
 }
 
 function getTrackerFeedbackMinSample(marketKey) {
-  if (marketKey === "ft") return 14;
-  if (marketKey === "team_a" || marketKey === "team_b") return 12;
-  if (marketKey === "h1" || marketKey === "h2") return 10;
-  return 12;
+  // Gap 2 Bayesian: Bayesian prior absorbs early noise — lower gates let signal emerge sooner
+  if (marketKey === "ft") return 5;
+  if (marketKey === "team_a" || marketKey === "team_b") return 5;
+  if (marketKey === "h1" || marketKey === "h2") return 4;
+  return 5;
 }
 
 function createTrackerFeedbackBucket() {
@@ -9008,7 +9064,10 @@ function getTrackerFeedbackSignal(profile, marketKey, side, league) {
 
   const applyTier = (stat, mode) => {
     if (!stat) return;
-    const score = settledTrackerScore(stat);
+    // Gap 2 Bayesian: blend raw win rate toward a 50% prior (12-game weight)
+    // With 5 picks: prior dominates → mild signal. With 20+ picks: data dominates → strong signal.
+    const _priorWins = 12 * 0.50;
+    const score = (stat.wins + (stat.pushes || 0) * 0.5 + _priorWins) / (stat.settled + 12);
     if (!isFinite(score)) return;
 
     if (mode === "marketSide") {
@@ -9474,7 +9533,25 @@ async function settleTrackedPickManualFull(signature) {
   const _tB = (pick.awayTeam && pick.awayTeam !== "—") ? pick.awayTeam : "B";
   const score = prompt(`Enter final score for ${_tA} vs ${_tB}\n(e.g. 110-105 — or leave blank to skip):`, pick.actualScore || "");
   if (score === null) return;
-  
+
+  // Gap 3 CLV: optional closing line entry for CLV tracking
+  const _clvHint = pick.closingLine !== null && pick.closingLine !== undefined ? String(pick.closingLine) : "";
+  const closingLineInput = prompt(
+    `Optional — Closing line for CLV tracking (leave blank to skip).\nPick line was: ${pick.lineAtPick ?? pick.line}`,
+    _clvHint
+  );
+  if (closingLineInput !== null && closingLineInput.trim() !== "") {
+    const _cl = parseFloat(closingLineInput.trim());
+    if (isFinite(_cl) && _cl > 0) {
+      pick.closingLine = _cl;
+      const _lp = Number(pick.lineAtPick ?? pick.line);
+      const _s = String(pick.side || "").toLowerCase();
+      if (isFinite(_lp) && _lp > 0) {
+        pick.clv = _s === "under" ? Math.round((_lp - _cl) * 100) / 100 : Math.round((_cl - _lp) * 100) / 100;
+      }
+    }
+  }
+
   const result = prompt("Type 'W' for Win, 'L' for Loss, 'P' for Push, or 'PENDING' to revert a mistake:", pick.resultStatus || "").toLowerCase();
   if (!result) return;
   
@@ -10213,7 +10290,7 @@ function applyContextAdjustments(baseProjection, ctx) {
   if (!line || isNaN(edge) || isNaN(line) || line <= 0) return "NO PLAY";
   const periodThresholds = getLeagueEdgeThresholds(league || "unknown");
   const rules = PICK_RULES[marketType] || PICK_RULES.default;
-  const underBlockRatio = rules.underBlockRatio ?? PICK_RULES.default.underBlockRatio;
+  const underBlockRatio = getLeagueUnderBlockRatio(league || "");
 
   // Issue 15: Use league-specific FT thresholds where available
   let overMin =
@@ -12984,15 +13061,25 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       estMatchPace = clampNumber(basePace * ((dampenedPaceA + dampenedPaceB) / 2), basePace * cl.min, basePace * cl.max);
     }
     
-    const synOrtgA = (aS / (basePace * dampenedPaceA)) * 100;
-    const synDrtgA = (aA / (basePace * dampenedPaceA)) * 100;
-    const synOrtgB = (bS / (basePace * dampenedPaceB)) * 100;
-    const synDrtgB = (bA / (basePace * dampenedPaceB)) * 100;
-    
-    synNetA = synOrtgA - synDrtgA;
-    synNetB = synOrtgB - synDrtgB;
-    projAFT = ((synOrtgA + synDrtgB) / 2 / 100) * estMatchPace * injMultA;
-    projBFT = ((synOrtgB + synDrtgA) / 2 / 100) * estMatchPace * injMultB;
+    // Gap 4: Clamp raw synORTG/synDRTG to a realistic basketball range before using them
+    const synOrtgA = clampNumber((aS / (basePace * dampenedPaceA)) * 100, 80, 130);
+    const synDrtgA = clampNumber((aA / (basePace * dampenedPaceA)) * 100, 80, 130);
+    const synOrtgB = clampNumber((bS / (basePace * dampenedPaceB)) * 100, 80, 130);
+    const synDrtgB = clampNumber((bA / (basePace * dampenedPaceB)) * 100, 80, 130);
+
+    // Gap 4: Clamp net ratings to [-15, 15] — prevents -20 outliers from thin samples
+    synNetA = clampNumber(synOrtgA - synDrtgA, -15, 15);
+    synNetB = clampNumber(synOrtgB - synDrtgB, -15, 15);
+
+    // Gap 4: Minimum 3-game sample guard — below that, fall back to simple blended average
+    const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
+    if (!hasSufficientSynthSample) {
+      projAFT = isFinite(aS) ? aS * injMultA : NaN;
+      projBFT = isFinite(bS) ? bS * injMultB : NaN;
+    } else {
+      projAFT = ((synOrtgA + synDrtgB) / 2 / 100) * estMatchPace * injMultA;
+      projBFT = ((synOrtgB + synDrtgA) / 2 / 100) * estMatchPace * injMultB;
+    }
   }
 
   // --- H2H INJECTION FOR FT, TEAM A, AND TEAM B ---
@@ -14374,6 +14461,8 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta, league, diagnos
     projection: isFinite(pickRow.proj) ? Number(pickRow.proj) : null,
     line: trackedLine,
     lineAtPick: trackedLine,
+    closingLine: null,
+    clv: null,
     decisionLine: isFinite(pickRow.decisionLine) ? Number(pickRow.decisionLine) : Number(pickRow.line),
     rawLine: isFinite(pickRow.line) ? Number(pickRow.line) : null,
     smartLineApplied: false,
