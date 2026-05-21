@@ -3768,6 +3768,44 @@ function getLeagueH1Ratio(league) {
   return LEAGUE_H1_RATIO[String(league || "").toLowerCase()] || LEAGUE_H1_RATIO.default;
 }
 
+// ── LEAGUE CONFIG MAP: Unified per-league parameter accessor ──────
+// Bundles LEAGUE_BASES, LEAGUE_VOL_LIMITS, LEAGUE_PACE_BASES,
+// LEAGUE_H1_RATIO, and LEAGUE_HOME_EDGE into one object built at
+// init time. To update a league's style, change the source constants
+// above; getLeagueConfig() will reflect the change automatically.
+const LEAGUE_CONFIG_MAP = (function() {
+  const map = {};
+  const allKeys = new Set([
+    ...Object.keys(LEAGUE_BASES),
+    ...Object.keys(LEAGUE_VOL_LIMITS),
+    ...Object.keys(LEAGUE_PACE_BASES),
+    ...Object.keys(LEAGUE_H1_RATIO),
+    ...Object.keys(LEAGUE_HOME_EDGE)
+  ]);
+  allKeys.forEach(function(key) {
+    map[key] = {
+      scoringBaseline: LEAGUE_BASES[key]      || LEAGUE_BASES.unknown      || 160,
+      volatilityLimit: LEAGUE_VOL_LIMITS[key] || 12,
+      paceBase:        LEAGUE_PACE_BASES[key] || LEAGUE_PACE_BASES.default || 74,
+      h1Ratio:         LEAGUE_H1_RATIO[key]   || LEAGUE_H1_RATIO.default   || 0.487,
+      homeEdge:        LEAGUE_HOME_EDGE[key]  || 1.5
+    };
+  });
+  return map;
+})();
+
+function getLeagueConfig(league) {
+  const key = String(league || "unknown").trim().toLowerCase();
+  return LEAGUE_CONFIG_MAP[key] || {
+    scoringBaseline: 160,
+    volatilityLimit: 12,
+    paceBase:        74,
+    h1Ratio:         0.487,
+    homeEdge:        1.5
+  };
+}
+// ─────────────────────────────────────────────────────────────────
+
 function deriveH1SeriesFromFT(ftSeries, ratio) {
   return (ftSeries || [])
     .map(v => Math.round(Number(v) * ratio * 2) / 2)
@@ -9624,6 +9662,11 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
   // Sweep in case we just reverted a 2-day old pick
   archiveExpiredTrackedPicks();
 
+  // Calibration diagnostic: record prediction vs actual variance for drift tracking
+  if (["win","loss","push"].includes(normalizedStatus) && typeof recordPickVariance === "function") {
+    recordPickVariance(updatedPick);
+  }
+
   rebuildTrackerStats();
   saveTrackerStateToLocal();
   trackerDebug("manual settle applied", {
@@ -14906,19 +14949,33 @@ async function runEngine() {
   const runBtn = document.getElementById("runBtn");
   const table = document.getElementById("results");
 
-  // Load Phase 2 Verified Overrides before calculating
+    // Load Phase 2 Verified Overrides — FT silo first, then combined, then league defaults
   const leagueSelectEl = document.getElementById("leagueSelect");
   const currentLeagueForRun = leagueSelectEl ? leagueSelectEl.value : "";
   try {
-    const verifiedTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS")) || {};
-    if (verifiedTunings[currentLeagueForRun] && verifiedTunings[currentLeagueForRun].verified) {
-      MODEL_TUNING.recencyWeights = verifiedTunings[currentLeagueForRun].recencyWeights || [1.60, 1.30, 0.90, 0.60, 0.40];
-      window.__phase2PaceAdjustment = verifiedTunings[currentLeagueForRun].paceAdjustment || "aggressive";
+    const ftSiloTunings  = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS_FT")) || {};
+    const h1SiloTunings  = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS_H1")) || {};
+    const allSiloTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS"))    || {};
+
+    const activeFTConfig = ftSiloTunings[currentLeagueForRun]  || allSiloTunings[currentLeagueForRun];
+    const activeH1Config = h1SiloTunings[currentLeagueForRun]  || allSiloTunings[currentLeagueForRun];
+
+    if (activeFTConfig && activeFTConfig.verified) {
+      MODEL_TUNING.recencyWeights     = activeFTConfig.recencyWeights || [1.60, 1.30, 0.90, 0.60, 0.40];
+      window.__phase2PaceAdjustment   = activeFTConfig.paceAdjustment || "aggressive";
+      window.__phase2H1RecencyWeights = activeH1Config && activeH1Config.verified
+        ? (activeH1Config.recencyWeights || MODEL_TUNING.recencyWeights)
+        : null;
     } else {
-      // Issue 12: Use league-calibrated defaults instead of always falling back to NBA weights
-      MODEL_TUNING.recencyWeights = getLeagueRecencyDefaults(currentLeagueForRun);
-      window.__phase2PaceAdjustment = "standard";
+      MODEL_TUNING.recencyWeights     = getLeagueRecencyDefaults(currentLeagueForRun);
+      window.__phase2PaceAdjustment   = "standard";
+      window.__phase2H1RecencyWeights = null;
     }
+  } catch (e) {
+    MODEL_TUNING.recencyWeights     = getLeagueRecencyDefaults(currentLeagueForRun);
+    window.__phase2PaceAdjustment   = "standard";
+    window.__phase2H1RecencyWeights = null;
+  }
   } catch (e) {
     MODEL_TUNING.recencyWeights = getLeagueRecencyDefaults(currentLeagueForRun);
     window.__phase2PaceAdjustment = "standard";
@@ -16776,21 +16833,32 @@ ${fullHTML}
     });
   };
 
-  window.runPhase2Simulator = function(leagueKey) {
+  window.runPhase2Simulator = function(leagueKey, marketFilter) {
     if (!leagueKey) return;
     const allPicks = [...(g_trackerState.activePicks || []), ...(g_trackerState.archivedPicks || [])];
-    const settledInLeague = allPicks.filter(p =>
-      p.league === leagueKey &&
-      (p.resultStatus === "win" || p.resultStatus === "loss" || p.resultStatus === "push")
-    );
+    const settledInLeague = allPicks.filter(p => {
+      if (p.league !== leagueKey) return false;
+      if (!["win","loss","push"].includes(String(p.resultStatus || "").toLowerCase())) return false;
+      if (!marketFilter) return true;
+      if (marketFilter === "ft")  return ["ft","team_a","team_b"].includes(p.marketKey);
+      if (marketFilter === "h1")  return ["h1","h1_team_a","h1_team_b"].includes(p.marketKey);
+      if (marketFilter === "h2")  return p.marketKey === "h2";
+      return p.marketKey === marketFilter;
+    });
 
-    if (settledInLeague.length < 5) {
-      engineDebug("PHASE_2: Need " + (5 - settledInLeague.length) + " more settled picks from " + leagueKey + " before calibration.");
+    const PHASE2_MIN_SAMPLE = 30;
+    const siloKey = marketFilter ? ("BB_VERIFIED_TUNINGS_" + marketFilter.toUpperCase()) : "BB_VERIFIED_TUNINGS";
+
+    if (settledInLeague.length < PHASE2_MIN_SAMPLE) {
+      engineDebug(
+        "PHASE_2 [" + (marketFilter || "ALL") + "]: Need " + (PHASE2_MIN_SAMPLE - settledInLeague.length) +
+        " more settled picks from " + leagueKey + " before calibration. (" + settledInLeague.length + "/" + PHASE2_MIN_SAMPLE + ")"
+      );
       return;
     }
 
     let verifiedTunings = {};
-    try { verifiedTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS")) || {}; } catch (e) {}
+    try { verifiedTunings = JSON.parse(localStorage.getItem(siloKey)) || {}; } catch (e) {}
 
     // Re-run if we have new picks since last verification (lets the engine keep learning)
     const existing = verifiedTunings[leagueKey];
@@ -16883,6 +16951,7 @@ ${fullHTML}
       paceAdjustment: chosenConfig.paceAdj,
       sampleSize:     settledInLeague.length,
       bestConfig:     chosenConfig.label,
+      marketSilo:     marketFilter || "all",
       score:          (chosenConfig.score * 100).toFixed(1) + "%",
       improvement:    improvement >= 0.06
                         ? "+" + (improvement * 100).toFixed(1) + "% vs standard"
@@ -16890,9 +16959,10 @@ ${fullHTML}
       timestamp:      new Date().toLocaleDateString()
     };
 
-    localStorage.setItem("BB_VERIFIED_TUNINGS", JSON.stringify(verifiedTunings));
+    localStorage.setItem(siloKey, JSON.stringify(verifiedTunings));
     engineDebug(
-      "PHASE_2_CALIBRATOR: Locked '" + chosenConfig.label + "' for " + leagueKey +
+      "PHASE_2_CALIBRATOR [" + (marketFilter || "ALL") + "]: Locked '" + chosenConfig.label + "' for " + leagueKey +
+      " | silo=" + siloKey +
       " | sample=" + settledInLeague.length +
       " | score=" + (chosenConfig.score * 100).toFixed(1) + "%" +
       (improvement >= 0.06 ? " | +" + (improvement * 100).toFixed(1) + "% over standard" : " | standard held")
@@ -16900,6 +16970,12 @@ ${fullHTML}
 
     if (typeof window.updateLeagueDropdownIndicators === "function") {
       window.updateLeagueDropdownIndicators();
+    }
+
+    // Automatically spawn market-specific silo calibrations after the full-market run
+    if (!marketFilter) {
+      setTimeout(() => window.runPhase2Simulator(leagueKey, "ft"), 200);
+      setTimeout(() => window.runPhase2Simulator(leagueKey, "h1"), 400);
     }
   };
 
