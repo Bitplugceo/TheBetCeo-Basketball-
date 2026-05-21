@@ -7651,7 +7651,7 @@ function mergeTrackerStates(localState, serverState) {
   return {
     vId: Math.max(local.vId || 1, server.vId || 1) + 1,
     sId: server.sId || local.sId,
-    activePicks: mergeTrackerActivePicks(local.activePicks, server.activePicks),
+    activePicks: mergeTrackerActivePicks(local.activePicks, server.activePicks, local.archivedPicks),
     archivedPicks: mergeTrackerArchivedPicks(local.archivedPicks, server.archivedPicks),
     stats: useServerStats ? (server.stats || local.stats) : (local.stats || server.stats),
     updatedAt: new Date().toISOString(),
@@ -7659,8 +7659,17 @@ function mergeTrackerStates(localState, serverState) {
   };
 }
 
-function mergeTrackerActivePicks(localActive = [], serverActive = []) {
+function mergeTrackerActivePicks(localActive = [], serverActive = [], localArchived = []) {
   const merged = new Map();
+
+  // Build settled-archived slot key set to block server regression (Bug 1 fix)
+  const settledArchivedKeys = new Set();
+  (localArchived || []).forEach(raw => {
+    const pick = ensureTrackedPickKeys(raw || {});
+    if (!isTrackedPickSettled(pick)) return;
+    const slotKey = makeTrackerActiveMergeKey(pick);
+    if (slotKey) settledArchivedKeys.add(slotKey);
+  });
 
   // Step 1: Local is the authoritative baseline
   (localActive || []).forEach(raw => {
@@ -7674,6 +7683,10 @@ function mergeTrackerActivePicks(localActive = [], serverActive = []) {
     const pick = ensureTrackedPickKeys(raw || {});
     const key = makeTrackerActiveMergeKey(pick) || makeTrackedSignature(pick);
     if (!key) return;
+
+    // Block server-pending if locally settled in archive — prevents regression to pending
+    const slotKey = makeTrackerActiveMergeKey(pick);
+    if (slotKey && settledArchivedKeys.has(slotKey)) return;
 
     if (!merged.has(key)) {
       merged.set(key, pick); // Add missing server picks
@@ -7856,7 +7869,7 @@ function archiveExpiredTrackedPicks() {
         // cutoffMs is 10 hours. We add 3 hours to tipoff time to account for game duration
         const isExpired = refTs === 0 || (now - (refTs + (3 * 60 * 60 * 1000))) >= cutoffMs;
         // Fix H2: Prevent discaring older pending picks that need manual settlement
-        const isGhost = gameTs > 0 && (now - gameTs) / (1000 * 60 * 60 * 24) > 7 && String(p.resultStatus) !== 'pending';
+        const isGhost = gameTs > 0 && (now - gameTs) / (1000 * 60 * 60 * 24) > 7;
 
         if ((isSettled && isExpired) || isGhost) {
           moveToArchived.push(stripHeavyData(p));
@@ -13094,8 +13107,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const ftHasH2H = maybeReadH2HEnabled("ft") && aH2H.length >= 2 && bH2H.length >= 2;
 
   if (ftHasH2H) {
-    const hw = getH2HWeight(aH2H.length, bH2H.length, "ft", ftSampleTier, 0, league);
-    projAFT = (projAFT * (1 - hw)) + (avgOrNaN(aH2H) * hw);
+    const avgAH2H = avgOrNaN(aH2H);
+    const ftDivergence = isFinite(avgAH2H) && isFinite(projAFT) ? (avgAH2H - projAFT) : 0;
+    const hw = getH2HWeight(aH2H.length, bH2H.length, "ft", ftSampleTier, ftDivergence, league);
+    projAFT = (projAFT * (1 - hw)) + (avgAH2H * hw);
     projBFT = (projBFT * (1 - hw)) + (avgOrNaN(bH2H) * hw);
   }
 
@@ -13124,8 +13139,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const avgAllowedA = avgOrNaN(parsed.aFTAllowed) || (eb / 2);
     const avgAllowedB = avgOrNaN(parsed.bFTAllowed) || (eb / 2);
     const halfBase = eb / 2;
-    const oppQualityA = ((halfBase - avgAllowedB) / halfBase) * 100;
-    const oppQualityB = ((halfBase - avgAllowedA) / halfBase) * 100;
+    const oppQualityA = ((avgAllowedB - halfBase) / halfBase) * 100;
+    const oppQualityB = ((avgAllowedA - halfBase) / halfBase) * 100;
     projAFT += oppQualityA * 0.15;
     projBFT += oppQualityB * 0.15;
   }
@@ -13221,8 +13236,10 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const h1HasH2H = maybeReadH2HEnabled("h1") && aH2H1.length >= 2 && bH2H1.length >= 2;
 
   if (h1HasH2H) {
-    const hw1 = getH2HWeight(aH2H1.length, bH2H1.length, "h1", sampleTier, 0, league);
-    projA1H = (projA1H * (1 - hw1)) + (avgOrNaN(aH2H1) * hw1);
+    const avgAH2H1 = avgOrNaN(aH2H1);
+    const h1Divergence = isFinite(avgAH2H1) && isFinite(projA1H) ? (avgAH2H1 - projA1H) : 0;
+    const hw1 = getH2HWeight(aH2H1.length, bH2H1.length, "h1", sampleTier, h1Divergence, league);
+    projA1H = (projA1H * (1 - hw1)) + (avgAH2H1 * hw1);
     projB1H = (projB1H * (1 - hw1)) + (avgOrNaN(bH2H1) * hw1);
   }
 
