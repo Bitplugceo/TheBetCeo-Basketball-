@@ -8026,7 +8026,15 @@ function archiveExpiredTrackedPicks() {
         // no timestamp are kept and will be caught by the 7-day ghost sweep instead.
         // Do not restore the refTs === 0 → immediately expired behavior.
         const isExpired = refTs > 0 && (now - (refTs + (3 * 60 * 60 * 1000))) >= cutoffMs;
-        const isTimestamplessSettled = refTs === 0 && !isSettled === false && isSettled;
+        // [FIXED: TIMESTAMPLESS_SETTLED_EXPRESSION] — The prior expression contained
+        // `!isSettled === false && isSettled` which reduced to just `isSettled` by
+        // operator precedence (!x === false → x), making the middle clause dead weight.
+        // No wrong behavior but the redundancy was a maintenance trap — a future reader
+        // modifying it could inadvertently invert the logic. LOCK: Intent is strictly:
+        // archive settled picks that have no timestamp. Pending no-timestamp picks are
+        // intentionally kept here and caught by the isGhost sweep instead. Do not restore
+        // the triple-clause form or add additional conditions without proving a new case.
+        const isTimestamplessSettled = refTs === 0 && isSettled;
         // Fix H2: Prevent discarding older pending picks that need manual settlement
         const isGhost = gameTs > 0 && (now - gameTs) / (1000 * 60 * 60 * 24) > 7;
 
@@ -8349,6 +8357,11 @@ function renderTrackedPicks() {
     const edgeText = (p.edgePct == null || isNaN(p.edgePct)) ? "—" : (p.edgePct > 0 ? "+" : "") + Number(p.edgePct).toFixed(2) + "%";
 
     const grade = String(p.confidenceGrade || p.confidence || "—").toUpperCase();
+    // [FIXED: TRACKER_GRADE_CLASS_UNUSED] — gradeClass was computed here but the
+    // template below hardcoded class="conf-none" for every pick, making all A/B/C/D
+    // grades render identically as gray. LOCK: gradeClass feeds getConfidenceClass()
+    // which returns conf-a / conf-b / conf-c / conf-d / conf-none. Do not hardcode
+    // conf-none in the grade <td> or this fix silently reverts on every render.
     const gradeClass = getConfidenceClass(grade);
 
     let statusHtml = "";
@@ -8398,7 +8411,7 @@ function renderTrackedPicks() {
         <td style="font-weight:800;">${safeText(String(p.marketName || "—").split('<')[0].trim())}</td>
         <td>${isFinite(p.line) ? safeText(displayLine(p.line)) : "—"}</td>
         <td style="white-space: nowrap; font-size: 11px;">${safeText(p.predictionText || "—")}${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
-        <td class="conf-none">${safeText(grade)}</td>
+        <td class="${gradeClass}">${safeText(grade)}</td>
         <td>${safeText(edgeText)}</td>
         <td class="${statusClass}"><div class="tracker-status-stack">${statusHtml}</div></td>
       </tr>
@@ -9941,7 +9954,13 @@ function settleTrackedPickFromCompetition(pick, competition) {
   if (market === "ft") {
      actual = sHome + sAway;
   } else if (market === "h1") {
-     if (h1Home === null || h1Away === null) return "pending";
+     // [FIXED: H1_GUARD_NULL_TO_FALSY] — h1Home and h1Away are initialized as 0 and
+     // are never assigned null, so the prior === null guard never triggered. When ESPN
+     // returns a final game with missing linescores (lsHome.length < 2) both values
+     // stay 0, actual becomes 0, and the pick settled as UNDER regardless of result.
+     // LOCK: Use the same !x && !x falsy pattern as every other period market in this
+     // function. Do not restore the null check — it is provably unreachable.
+     if (!h1Home && !h1Away) return "pending";
      actual = h1Home + h1Away;
   } else if (market === "h2") {
      if (!h2Home && !h2Away) return "pending";
@@ -10370,9 +10389,17 @@ function applyContextAdjustments(baseProjection, _ctx) {
     }
 
 
+    // [FIXED: WNBA_THRESHOLD_ROUTING] — WNBA and WNBA_PRE were falling through to
+    // LEAGUE_EDGE_THRESHOLDS.default (6.5% FT / 6.7% 1H) instead of their calibrated
+    // values (6.2% FT / 5.8% 1H), silently blocking valid WNBA picks since FIX 5 added
+    // the data but never wired the lookup. LOCK: This routing must mirror
+    // LEAGUE_EDGE_THRESHOLDS exactly. If you add a new league key to that constant,
+    // add a corresponding guard here. Do not remove the wnba/wnba_pre line without
+    // updating both structures simultaneously.
     function getLeagueEdgeThresholds(league) {
       if (league === "nba") return LEAGUE_EDGE_THRESHOLDS.nba;
       if (league === "ncaa") return LEAGUE_EDGE_THRESHOLDS.ncaa;
+      if (league === "wnba" || league === "wnba_pre") return LEAGUE_EDGE_THRESHOLDS.wnba;
       if (EUROPE_EDGE_LEAGUES.includes(league)) return LEAGUE_EDGE_THRESHOLDS.europe;
       if (ASIA_EDGE_LEAGUES.includes(league)) return LEAGUE_EDGE_THRESHOLDS.asia;
       return LEAGUE_EDGE_THRESHOLDS.default;
@@ -10439,8 +10466,13 @@ function applyContextAdjustments(baseProjection, _ctx) {
   // #14 dead guard removed — h2 always returns NaN edge, isNaN check above already short-circuits
 
   // --- NEW OT / FOUL GAME SHIELD ---
-  // If we are looking at a full-game or team Under, and the projected spread is within 1.0 points, veto it.
-  if (edge < 0 && (marketType === "ft" || marketType === "team") && context.blowoutGap !== undefined) {
+  // [FIXED: PICK_RULES_TEAM_DEAD_BRANCH] — `marketType === "team"` was never passed by
+  // any call site; all team markets enter getPick as "ft" or "h1". The dead branch was
+  // present in both the OT shield and the under-block below. LOCK: Do not add "team"
+  // back to either guard. If team markets ever need a distinct marketType, wire it at
+  // every call site first and add a matching PICK_RULES entry simultaneously. The OT
+  // shield and under-block must stay in sync — both check "ft" only.
+  if (edge < 0 && marketType === "ft" && context.blowoutGap !== undefined) {
     if (context.blowoutGap <= 1.0) {
        return "NO PLAY"; 
     }
@@ -10450,11 +10482,6 @@ function applyContextAdjustments(baseProjection, _ctx) {
   if (edge < 0) {
     if (marketType === "ft" && isFinite(context.aSc) && isFinite(context.bSc)) {
       if (context.aSc >= line * underBlockRatio || context.bSc >= line * underBlockRatio) {
-        return "NO PLAY";
-      }
-    }
-    if (marketType === "team" && isFinite(context.teamSc)) {
-      if (context.teamSc >= line * underBlockRatio) {
         return "NO PLAY";
       }
     }
