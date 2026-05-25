@@ -3164,6 +3164,7 @@ const BB_CONFIG = {
   version: "Path-A-v1"
 };
 
+// [DESIGN CHOICE: RESERVED_ADAPTER] — defined for future use; intentionally not wired into live pick path.
 /**
  * FIX 1: ESPN ADAPTER LAYER (Clean Version)
  * Shields the math engine from ESPN API changes.
@@ -4838,7 +4839,14 @@ async function loadTrackerStateFromLocal() {
       const raw = await readAsyncStorage(key);
       if (!raw) continue;
 
-      let parsed = (typeof raw === 'string') ? JSON.parse(raw) : raw;
+      let parsed;
+      try {
+        parsed = (typeof raw === 'string') ? JSON.parse(raw) : raw;
+      } catch (parseErr) {
+        engineDebug("loadTrackerStateFromLocal: corrupt key skipped", { key, error: parseErr.message });
+        continue;  // skip this key, keep scanning remaining candidates
+      }
+
       if (!parsed || typeof parsed !== "object") continue;
       
       if (!bestState || isBetterTrackerStateCandidate(parsed, bestState)) {
@@ -7430,7 +7438,11 @@ async function pollLiveGameClocks() {
 
 async function hydrateTrackedPicks(force = false) {
   if (g_trackerHydratePromise && !force) return g_trackerHydratePromise;
-
+  if (g_trackerHydratePromise && force) {
+    // Wait for the running hydration to finish before starting a fresh one.
+    // Prevents the old finally block from nulling the new promise reference prematurely.
+    await g_trackerHydratePromise.catch(() => {});
+  }
   g_trackerHydratePromise = (async () => {
     trackerDebug("hydrate start", { force, key: getTrackerUserKey() });
 const localState = (await loadTrackerStateFromLocal()) || createEmptyTrackerState();
@@ -13540,14 +13552,14 @@ function getMassacreNormalRandom() {
 
 // Fix 7 + 9: Async Poisson-Based Monte Carlo
 // --- NEW BLOCK (THE FIX) ---
-async function runMassacreMonteCarlo(mean, stdDev, line, runs = 8000) {
-  if (!isFinite(mean) || !isFinite(stdDev) || !isFinite(line) || stdDev <= 0) {
+async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
+  if (!isFinite(mean) || !isFinite(simStdDev) || !isFinite(line) || simStdDev <= 0) {
     return { overPct: 50, underPct: 50 };
   }
 
   // 🛡️ MATH FIX: Prevent Zero-Variance trap. 
   // If a team scores exactly the same in a small sample, Box-Muller dies.
-  const safeStdDev = Math.max(stdDev, 3.5);
+  const safeStdDev = Math.max(simStdDev, 3.5);
 
   const workerCode = `
     onmessage = function(e) {
