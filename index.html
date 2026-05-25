@@ -4022,7 +4022,10 @@ let g_lastFetchedTeams = { A: "", B: "" };
 
     let g_fetchMeta = defaultFetchMeta();
 
-const g_h2hManualPreference = { ft: null, h1: null, h2: null };
+// LOCK: q1-q4 added — previously only ft/h1/h2 existed. syncH2HCheckbox was already called
+// for q1-q4 by syncAllH2HCheckboxes, but g_h2hManualPreference.q1 etc. were undefined,
+// meaning the user's checkbox preference for quarters was silently lost between engine calls.
+const g_h2hManualPreference = { ft: null, h1: null, h2: null, q1: null, q2: null, q3: null, q4: null };
 
 function getH2HFieldIds(kind) {
   const map = {
@@ -4844,15 +4847,18 @@ async function saveTrackerStateToLocal() {
 
 
 
-    const activeKeys = [
-      getTrackerLocalStateStableKey(),
-      getTrackerLocalStateBuildKey(APP_BUILD_VERSION)
-    ].filter(Boolean);
-    
-    const uniqueKeys = [...new Set(activeKeys)];
-    
-    const results = await Promise.all(uniqueKeys.map(key => writeAsyncStorage(key, payload)));
-    
+    // LOCK: Writes to the stable key only — not to both stable and build-versioned keys.
+    // Writing duplicate large JSON payloads on every save cycle accelerated storage quota
+    // exhaustion on mobile Safari, leading to QuotaExceededError and silent data loss.
+    // The build-versioned keys are read-only fallback targets during hydration — do not
+    // add them back to the write path.
+    const primaryKey = getTrackerLocalStateStableKey();
+    if (!primaryKey) {
+      throw new Error("Local storage write completely failed (no valid storage key).");
+    }
+
+    const results = await Promise.all([writeAsyncStorage(primaryKey, payload)]);
+
     if (results.length > 0 && results.every(res => res === false)) {
       throw new Error("Local storage write completely failed (Quota Exceeded or Blocked).");
     }
@@ -5299,7 +5305,9 @@ function trackerDebug(message, extra = null) {
     g_trackerDebugLog.unshift(line);
     if (g_trackerDebugLog.length > TRACKER_DEBUG_LIMIT) g_trackerDebugLog = g_trackerDebugLog.slice(0, TRACKER_DEBUG_LIMIT);
     
-    if (getDebugSeverity(line) === "error") {
+    // LOCK: isIgnoredEngineWatchLine is wired here — previously the function was defined
+    // but never called, so its entire protective purpose was silently inactive.
+    if (!isIgnoredEngineWatchLine(line) && getDebugSeverity(line) === "error") {
       triggerGlobalEngineAlert(line);
     }
     renderTrackerDebugPanel();
@@ -5335,7 +5343,9 @@ function engineDebug(message, extra = null) {
     g_engineDebugLog.unshift(line);
     if (g_engineDebugLog.length > ENGINE_DEBUG_LIMIT) g_engineDebugLog = g_engineDebugLog.slice(0, ENGINE_DEBUG_LIMIT);
     
-    if (getDebugSeverity(line) === "error") {
+    // LOCK: isIgnoredEngineWatchLine is wired here — previously the function was defined
+    // but never called, so its entire protective purpose was silently inactive.
+    if (!isIgnoredEngineWatchLine(line) && getDebugSeverity(line) === "error") {
       triggerGlobalEngineAlert(line);
     }
     renderEngineDebugPanel();
@@ -5380,24 +5390,19 @@ function acknowledgeGlobalEngineAlert() {
 function getDebugSeverity(line) {
   const text = String(line || "").toLowerCase();
   if (!text) return "";
-  if (
-    text.includes("kept local payload over worse server response") ||
-    text.includes("ignored worse server response") ||
-    text.includes("refresh settled pick") ||
-    text.includes("merge kept settled over pending") ||
-    text.includes("merge replaced pending pick with settled") ||
-    text.includes("push succeeded") ||
-    text.includes("finished with no tracker changes")
-  ) {
-    return "ok";
-  }
+  // LOCK: "nan" intentionally removed — confidence grade "NaN" (used for all NO PLAY picks)
+  // serializes as the string "nan" in JSON and triggered a false red-screen alert on every
+  // single run that had at least one NO PLAY, which is nearly every run. Do not re-add "nan".
+  // LOCK: "invalid" intentionally scoped to specific tokens — bare text.includes("invalid")
+  // was too broad and false-fired on browser/library messages unrelated to engine errors.
   if (
     text.includes(" fail") ||
     text.includes("failed") ||
     text.includes("error") ||
     text.includes("missing competition data") ||
-    text.includes("invalid") ||
-    text.includes("nan") ||
+    text.includes("invalid token") ||
+    text.includes("invalid state") ||
+    text.includes("invalid operation") ||
     text.includes("mismatch") ||
     text.includes("rejected") ||
     text.includes("runtime") ||
@@ -5608,9 +5613,17 @@ function isIgnoredEngineWatchLine(line = "") {
   const text = String(line || "").toLowerCase().trim();
   if (!text) return false;
 
+  // LOCK: This list suppresses known-benign log patterns that match error keywords but
+  // represent intentional engine states, not real crashes. Add patterns here instead of
+  // weakening getDebugSeverity. Previously this function was defined but never called anywhere
+  // — it was dead code whose entire protective purpose was silently inactive.
   return text.includes("validation failed") ||
     text.includes("run blocked missing league") ||
-    text.includes("run blocked duplicate teams");
+    text.includes("run blocked duplicate teams") ||
+    text.includes("finished with no tracker changes") ||
+    text.includes("no tracker changes") ||
+    text.includes("confidence\":\"nan") ||
+    text.includes("\"no-play\"");
 }
 
 window.addEventListener("unhandledrejection", event => {
@@ -5730,13 +5743,16 @@ function summarizeCalcForDebug(calc = {}) {
   };
 }
 
+// LOCK: confidence is normalized from "NaN" to "no-play" to prevent the bare string "nan"
+// from appearing in serialized debug logs and triggering false red-screen alerts via getDebugSeverity.
+// Do not revert the .replace() — "NaN" as a string in any debug line would re-trigger the false alert.
 function summarizePickDecisionForDebug(name, pick, line, edge, confidence, note, trap = false) {
   return {
     name,
     pick,
     line: Number(line),
     edge: Number(edge),
-    confidence: String(confidence || ""),
+    confidence: String(confidence || "").replace(/^NaN$/i, "no-play"),
     note: note ? String(note) : "",
     trap: !!trap
   };
@@ -6050,7 +6066,13 @@ function validateFetchSection() {
   if (fetchBtn) fetchBtn.disabled = !isValid;
 
   setFetchInputErrors(hasActivity ? errors : []);
-  if (isValid) acknowledgeGlobalEngineAlert(); // Instantly clears red screen when teams are valid
+  // LOCK: Engine alert is only auto-cleared when inputs become valid AND there is no other
+  // active engine error. Previously this cleared the red screen simply by typing valid team
+  // names, which silently hid real errors (network failures, tracker sync issues) that had
+  // nothing to do with the team inputs. Do not restore the unconditional clear.
+  if (isValid && !g_engineAlertNeedsReview) {
+    acknowledgeGlobalEngineAlert();
+  }
   return isValid;
 }
 
@@ -6090,7 +6112,10 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
   // NOTE: True DRtg requires opponent possessions. We use own possessions as a close approximation.
   // In most games the two counts differ by ≤ 2, so the error is small for FT markets.
   const drtg = (pointsAllowed / possessions) * 100;
-  const pace = (possessions / minutes) * 48;
+  // LOCK: safeMinutes guards against division by zero — if minutes is 0 or non-finite,
+  // pace would be Infinity and propagate NaN through the entire Level 2 math pipeline.
+  const safeMinutes = (isFinite(minutes) && minutes > 0) ? minutes : 48;
+  const pace = (possessions / safeMinutes) * 48;
 
   return {
     possessions: parseFloat(possessions.toFixed(2)),
@@ -6265,8 +6290,13 @@ Any suggestion made here without proof is an audit error.
             async function fetchJson(requestUrl, label) {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+        // LOCK: Named handler so it can be removed in the finally block.
+        // Anonymous listeners were accumulating on window.__abortSignal on every single fetch
+        // and were never cleaned up, causing a persistent memory leak across the session.
+        let _proxyAbortHandler = null;
         if (window.__abortSignal) {
-          window.__abortSignal.addEventListener('abort', () => ctrl.abort());
+          _proxyAbortHandler = () => ctrl.abort();
+          window.__abortSignal.addEventListener('abort', _proxyAbortHandler);
         }
         try {
                     // 🛡️ SECURITY FIX: Removed exposed client-side token.
@@ -6283,7 +6313,14 @@ Any suggestion made here without proof is an audit error.
         } catch (e) {
           if (e.name === 'AbortError') throw new Error(`${label} Timeout after ${timeoutMs/1000}s`);
           throw e;
-        } finally { clearTimeout(timer); }
+        } finally {
+          clearTimeout(timer);
+          // LOCK: Abort listener is explicitly removed to prevent memory leak.
+          if (window.__abortSignal && _proxyAbortHandler) {
+            window.__abortSignal.removeEventListener('abort', _proxyAbortHandler);
+            _proxyAbortHandler = null;
+          }
+        }
       }
 
       try {
@@ -7029,7 +7066,10 @@ async function forceTrackerSaveNow() {
   }
 
   g_trackerState.updatedAt = new Date().toISOString();
-  saveTrackerStateToLocal();
+  // LOCK: saveTrackerStateToLocal is async and must be awaited — omitting await caused local
+  // IndexedDB serialization to race against the subsequent network sync in flushTrackerSave,
+  // potentially leaving local and remote states out of sync on every forced save cycle.
+  await saveTrackerStateToLocal();
   g_trackerSaveVersion = Math.max(g_trackerSaveVersion + 1, g_trackerPersistedVersion + 1);
 
   try {
@@ -7900,10 +7940,17 @@ function archiveExpiredTrackedPicks() {
         const gameTs = safeParseDate(p.eventDate) || safeParseDate(p.createdAt) || 0;
         // Use gameTs for the archive clock so late manual settlements don't keep games hostage in activePicks
         const refTs = gameTs > 0 ? gameTs : (safeParseDate(p.settledAt) || 0);
-        
-        // cutoffMs is 10 hours. We add 3 hours to tipoff time to account for game duration
-        const isExpired = refTs === 0 || (now - (refTs + (3 * 60 * 60 * 1000))) >= cutoffMs;
-        // Fix H2: Prevent discaring older pending picks that need manual settlement
+
+        // LOCK: Picks with no timestamp (refTs === 0) are no longer instantly archived.
+        // Previously, refTs === 0 made isExpired unconditionally true — any pick saved without
+        // an eventDate or createdAt (common for manual leagues with no fixture selected) would
+        // vanish from the live tracker on the very next archive sweep, silently and permanently.
+        // FIX: Only settled picks with no timestamp are immediately archived. Pending picks with
+        // no timestamp are kept and will be caught by the 7-day ghost sweep instead.
+        // Do not restore the refTs === 0 → immediately expired behavior.
+        const isExpired = refTs > 0 && (now - (refTs + (3 * 60 * 60 * 1000))) >= cutoffMs;
+        const isTimestamplessSettled = refTs === 0 && !isSettled === false && isSettled;
+        // Fix H2: Prevent discarding older pending picks that need manual settlement
         const isGhost = gameTs > 0 && (now - gameTs) / (1000 * 60 * 60 * 24) > 7;
 
         // DESIGN CHOICE [CLOSED — ISSUE 10]: The isGhost rule (archive picks whose game
@@ -7913,7 +7960,7 @@ function archiveExpiredTrackedPicks() {
         // fully supported. Manual leagues with very delayed settlement should settle picks
         // within 7 days of the game date. This behavior must not be changed without an
         // explicit owner decision. DO NOT flag this as a bug in future audits.
-        if ((isSettled && isExpired) || isGhost) {
+        if ((isSettled && isExpired) || isTimestamplessSettled || isGhost) {
           moveToArchived.push(stripHeavyData(p));
           changed = true;
         } else {
@@ -8230,6 +8277,10 @@ function renderTrackedPicks() {
     let statusHtml = "";
     if (status === 'pending') {
       const pId = (p.eventId || '') + p.signature.replace(/[^a-z0-9]/gi, '');
+      // LOCK: Signature is escaped for safe use inside inline onclick string attributes.
+      // Team names containing apostrophes (e.g. "O'Sullivan") break the single-quote delimiters
+      // in onclick handlers, silently preventing settlement buttons from functioning entirely.
+      const escapedSig = p.signature.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
       const gameTs = safeParseDate(p.eventDate || p.createdAt);
       const isZombie = gameTs > 0 && (Date.now() - gameTs) > (36 * 60 * 60 * 1000);
       const _liveClockLabel = _liveInfo
@@ -8249,13 +8300,15 @@ function renderTrackedPicks() {
         <div id="disp-${pId}" onclick="document.getElementById('disp-${pId}').style.display='none'; document.getElementById('act-${pId}').style.display='flex';" style="font-weight:900; font-size:10px; cursor:pointer; text-decoration:underline dotted #ccc; ${isZombie ? 'color:#ff9800;' : ''}" title="${isZombie ? 'Game stale - manual check needed' : (_liveClockLabel ? 'Live game — click to settle' : 'Click to settle')}">${_liveBlock}${_pendingLabel}</div>
         <div id="act-${pId}" style="display:none; flex-direction:column; align-items:center; gap:2px; margin-top:-2px;">
           <div style="font-size:8px; font-weight:900; opacity:0.6; margin-bottom:1px; color:var(--text);">SETTLE</div>
-          <button onclick="settleTrackedPick('${p.signature}', 'win')" class="tracker-manual-btn" style="padding:0 !important; width:28px !important; min-width:28px !important; height:16px !important; min-height:16px !important; font-size:9px !important; line-height:16px !important;">W</button>
-          <button onclick="settleTrackedPick('${p.signature}', 'loss')" class="tracker-manual-btn" style="padding:0 !important; width:28px !important; min-width:28px !important; height:16px !important; min-height:16px !important; font-size:9px !important; line-height:16px !important;">L</button>
-          <button onclick="settleTrackedPick('${p.signature}', 'push')" class="tracker-manual-btn" style="padding:0 !important; width:28px !important; min-width:28px !important; height:16px !important; min-height:16px !important; font-size:9px !important; line-height:16px !important;">P</button>
-          <div style="font-size:8px; text-decoration:underline; cursor:pointer; margin-top:2px; font-weight:800; opacity:0.7;" onclick="settleTrackedPickManualFull('${p.signature}')">CUSTOM</div>
+          <button onclick="settleTrackedPick('${escapedSig}', 'win')" class="tracker-manual-btn" style="padding:0 !important; width:28px !important; min-width:28px !important; height:16px !important; min-height:16px !important; font-size:9px !important; line-height:16px !important;">W</button>
+          <button onclick="settleTrackedPick('${escapedSig}', 'loss')" class="tracker-manual-btn" style="padding:0 !important; width:28px !important; min-width:28px !important; height:16px !important; min-height:16px !important; font-size:9px !important; line-height:16px !important;">L</button>
+          <button onclick="settleTrackedPick('${escapedSig}', 'push')" class="tracker-manual-btn" style="padding:0 !important; width:28px !important; min-width:28px !important; height:16px !important; min-height:16px !important; font-size:9px !important; line-height:16px !important;">P</button>
+          <div style="font-size:8px; text-decoration:underline; cursor:pointer; margin-top:2px; font-weight:800; opacity:0.7;" onclick="settleTrackedPickManualFull('${escapedSig}')">CUSTOM</div>
         </div>`;
     } else {
-      statusHtml = `<div onclick="settleTrackedPickManualFull('${p.signature}')" style="cursor:pointer;" title="Click to edit or revert">${status.toUpperCase()}</div>`;
+      // LOCK: escapedSig used instead of p.signature — apostrophes in team names break onclick.
+      const escapedSig = p.signature.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      statusHtml = `<div onclick="settleTrackedPickManualFull('${escapedSig}')" style="cursor:pointer;" title="Click to edit or revert">${status.toUpperCase()}</div>`;
       if (p.engineResultStatus && p.engineResultStatus !== status) {
          statusHtml += `<div style="font-size:8px; color:var(--tracker-subtext); margin-top:2px; font-weight:800;">MID: ${p.engineResultStatus.toUpperCase()}</div>`;
       }
@@ -9647,12 +9700,16 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
   // Phase 2 Retrospective Simulation Ignition: Re-run the backtest immediately after any
   // manual settlement so the learning engine processes the new result without waiting
   // for the next Run cycle. Requires a prior Run to have stored the context globals.
+  // LOCK: Both league AND eventId must match the last Run before firing the retrospective.
+  // Previously only league was checked — settling any NBA pick triggered a backtest using
+  // a completely different game's parsed data, producing meaningless comparison results.
   if (
     ["win", "loss", "push"].includes(normalizedStatus) &&
     typeof executeRetrospectiveBacktest === "function" &&
     window.__lastRunParsed &&
     window.__lastRunFinalLines &&
-    window.__lastRunLeague === (touchedPick && touchedPick.league)
+    window.__lastRunLeague === (touchedPick && touchedPick.league) &&
+    window.__lastRunFixtureMeta?.eventId === (touchedPick && touchedPick.eventId)
   ) {
     setTimeout(async () => {
       try {
@@ -11066,13 +11123,14 @@ function clearH2HFields() {
   const isNbaOrNcaa = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
 
   if (!league) {
+    // LOCK: "intelSection" removed — this element does not exist in the HTML.
+    // The dead DOM query ran on every league change returning null each time, wasting cycles.
     [
       "espnSection",
       "marketSection",
       "teamASection",
       "teamBSection",
-      "h2hSection",
-      "intelSection"
+      "h2hSection"
     ].forEach(lockSection);
     return;
   }
@@ -13978,8 +14036,14 @@ function rescueBestMassacreLean(picks) {
 async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta) {
   if (!Array.isArray(picks)) return;
 
-  // Run all simulations in parallel across background threads
-  const promises = picks.map(async (p) => {
+  // LOCK: Batched execution — do NOT revert to Promise.all(picks.map(...)).
+  // The original code spawned 10-12 simultaneous Web Workers on every run (one per pick).
+  // On a mobile phone at low battery this causes thermal throttling, UI jank, and tab crashes.
+  // Desktop: 5 concurrent workers max. Mobile: 2 concurrent workers max.
+  const _isMobileDevice = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+  const _massacreBatchSize = _isMobileDevice ? 2 : 5;
+
+  const _runOneMassacrePick = async (p) => {
     if (!p || p.note || p.pick === "NO PLAY") return;
 
     const side = getPickSideFromText(p.pick);
@@ -14027,9 +14091,12 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
     } else if (diag.brutalityScore < (profile.thresholds.brutality - 4) || diag.simPct < (profile.thresholds.sim - 2)) {
       p.confidence = bumpConfidenceGrade(p.confidence, -1);
     }
-  });
+  };
 
-  await Promise.all(promises);
+  for (let _bi = 0; _bi < picks.length; _bi += _massacreBatchSize) {
+    await Promise.all(picks.slice(_bi, _bi + _massacreBatchSize).map(_runOneMassacrePick));
+  }
+
   rescueBestMassacreLean(picks);
 }
 
@@ -14489,19 +14556,37 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     const shownLine = isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line;
     const shownEdge = isFinite(p.displayEdge) ? p.displayEdge : p.edge;
     
-    // FIX: Built DOM nodes strictly to prevent XSS injection
+    // LOCK: Badge HTML is separated from the text label and appended safely.
+    // Mixing engine-generated badge HTML with the name string via innerHTML is structurally
+    // fragile — if user-controlled data ever reaches p.name in a future refactor it becomes XSS.
     const row = table.insertRow();
-    
+
     const tdPick = document.createElement("td");
-    tdPick.innerHTML = p.name + (p.usedMemory ? ' 🧠' : '');
+    const _nameStr = String(p.name || "");
+    const _badgeIdx = _nameStr.indexOf('<span');
+    if (_badgeIdx !== -1) {
+      tdPick.appendChild(document.createTextNode(_nameStr.slice(0, _badgeIdx)));
+      const _badgeEl = document.createElement("span");
+      _badgeEl.innerHTML = _nameStr.slice(_badgeIdx); // badge HTML is engine-generated only, not user input
+      tdPick.appendChild(_badgeEl);
+    } else {
+      tdPick.textContent = _nameStr;
+    }
+    if (p.usedMemory) tdPick.appendChild(document.createTextNode(' 🧠'));
     row.appendChild(tdPick);
 
+    // LOCK: displayLine returns "—" for NaN/undefined/null — the raw string "NaN" must
+    // never be shown to the user in the results table. It also serializes into debug logs
+    // and triggered false red-screen alerts via the (now-removed) "nan" check in getDebugSeverity.
     const tdProj = document.createElement("td");
-    tdProj.textContent = isFinite(p.proj) ? displayLine(p.proj) : "NaN";
+    tdProj.textContent = displayLine(p.proj);
     row.appendChild(tdProj);
 
+    // LOCK: Edge display uses "—" fallback, not "NaN" — keeps the table clean for NO PLAY rows.
     const tdEdge = document.createElement("td");
-    tdEdge.textContent = isFinite(shownEdge) && isFinite(shownLine) ? formatEdge(shownEdge, shownLine) : "NaN";
+    tdEdge.textContent = (isFinite(shownEdge) && isFinite(shownLine) && shownLine > 0)
+      ? formatEdge(shownEdge, shownLine)
+      : "—";
     row.appendChild(tdEdge);
 
     const tdConf = document.createElement("td");
@@ -14764,8 +14849,15 @@ async function runEngine() {
     window.__phase2H1RecencyWeights = null;
   }
 
-  g_engineDebugLog = [];
-    acknowledgeGlobalEngineAlert();
+  // LOCK: Debug log is never wiped on Run — a boundary marker is inserted instead.
+  // Wiping destroyed pre-run error evidence (fetch failures, tracker sync issues) that
+  // occurred before the user pressed Run, making the root cause permanently untraceable.
+  // Do not restore the wipe. Add a separator instead so prior context is always visible.
+  g_engineDebugLog.unshift(`[${new Date().toLocaleTimeString([], {hour12:false})}] ══ NEW RUN ══`);
+  if (g_engineDebugLog.length > ENGINE_DEBUG_LIMIT) {
+    g_engineDebugLog = g_engineDebugLog.slice(0, ENGINE_DEBUG_LIMIT);
+  }
+  acknowledgeGlobalEngineAlert();
   renderEngineDebugPanel();
   if (runBtn) runBtn.disabled = true;
   engineDebug("run start", {
@@ -15121,12 +15213,19 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       
       // 8px is the smallest text modern browsers will physically render before blurring it out
       const css = "font-size:8px; padding:1px 3px; border-radius:2px; margin-left:4px; vertical-align:middle; font-weight:900; letter-spacing:0.2px;";
-      
+      // LOCK: Colors adapt to dark mode — hardcoded #d84315 and #1565c0 were unreadable in
+      // dark theme (dark blue on near-black background). Do not hardcode hex values here again.
+      const _isDarkMode = document.body.classList.contains('dark-mode');
+      const _overColor = _isDarkMode ? '#ff8c69' : '#d84315';
+      const _underColor = _isDarkMode ? '#70a8ff' : '#1565c0';
+      const _overBg = _isDarkMode ? 'rgba(255,100,50,0.15)' : 'rgba(216,67,21,0.1)';
+      const _underBg = _isDarkMode ? 'rgba(78,169,255,0.15)' : 'rgba(21,101,192,0.1)';
+
       if (isTeamMarket) {
         const st = countHits(scA, alA);
         if (!st) return "";
-        if (st.o / st.len >= 0.8) return `<span style="${css} background:rgba(216,67,21,0.1); color:#d84315;">🔥 ${st.o}-${st.u} O</span>`;
-        if (st.u / st.len >= 0.8) return `<span style="${css} background:rgba(21,101,192,0.1); color:#1565c0;">❄️ ${st.u}-${st.o} U</span>`;
+        if (st.o / st.len >= 0.8) return `<span style="${css} background:${_overBg}; color:${_overColor};">🔥 ${st.o}-${st.u} O</span>`;
+        if (st.u / st.len >= 0.8) return `<span style="${css} background:${_underBg}; color:${_underColor};">❄️ ${st.u}-${st.o} U</span>`;
       } else {
         const stA = countHits(scA, alA);
         const stB = countHits(scB, alB);
@@ -15134,8 +15233,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
         const tO = stA.o + stB.o;
         const tU = stA.u + stB.u;
         const tLen = stA.len + stB.len;
-        if (tO / tLen >= 0.8) return `<span style="${css} background:rgba(216,67,21,0.1); color:#d84315;">🔥 ${tO}-${tU} O</span>`;
-        if (tU / tLen >= 0.8) return `<span style="${css} background:rgba(21,101,192,0.1); color:#1565c0;">❄️ ${tU}-${tO} U</span>`;
+        if (tO / tLen >= 0.8) return `<span style="${css} background:${_overBg}; color:${_overColor};">🔥 ${tO}-${tU} O</span>`;
+        if (tU / tLen >= 0.8) return `<span style="${css} background:${_underBg}; color:${_underColor};">❄️ ${tU}-${tO} U</span>`;
       }
       return "";
     }
@@ -15506,7 +15605,13 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       if (pct >= 0.05) return "C";
       return "D";
     })(),
-    note: null,
+    // LOCK: User gets an explicit reason when this market shows NO PLAY — previously it
+    // silently showed blank/NaN with no explanation when any of the 4 quarter lines was missing.
+    note: (() => {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4) return `Need all Q1–Q4 lines entered (have ${validQs.length}/4)`;
+      return null;
+    })(),
     fullModel: false,
     lockStrength: 0
   },
@@ -15542,7 +15647,13 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       if (pct >= 0.05) return "C";
       return "D";
     })(),
-    note: null,
+    // LOCK: User gets an explicit reason when this market shows NO PLAY — previously it
+    // silently showed blank/NaN with no explanation when any of the 4 quarter lines was missing.
+    note: (() => {
+      const validQs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(isFinite);
+      if (validQs.length < 4) return `Need all Q1–Q4 lines entered (have ${validQs.length}/4)`;
+      return null;
+    })(),
     fullModel: false,
     lockStrength: 0
   }
@@ -15722,25 +15833,19 @@ if (Object.keys(g_lineMemorySnapshots).length > 0) {
   }, 600);
 }
 
-// --- SNAPSHOT FOR AUDIT COPY ---
+// LOCK: Audit snapshot stores summaries only — not full calc objects.
+// Storing ftCalc/h1Calc/h2Calc in their entirety caused significant memory pressure on mobile
+// because the old reference and the new one coexist during GC, and these objects can be 50-100KB each.
+// Do not re-add full calc objects to this snapshot.
 window.__LAST_AUDIT_STATE = {
   timestamp: new Date().toLocaleTimeString(),
-  league: league,
-  inputs: parsed,
+  league,
   resolvedLines: finalLines,
-  calcs: { 
-    ftCalc, h1Calc, h2Calc, 
-    q1: q1 || "null", q2: q2 || "null", q3: q3 || "null", q4: q4 || "null" 
-  },
-    massacreContext: {
-    teamA: {
-      rest: g_massacreFetchContext?.A?.restDays,
-      volatility: ftCalc.aVol
-    },
-    teamB: {
-      rest: g_massacreFetchContext?.B?.restDays,
-      volatility: ftCalc.bVol
-    }
+  calcSummary: {
+    ftProj: ftCalc.ftProj, ftEdge: ftCalc.ftEdge, ftSampleTier: ftCalc.ftSampleTier,
+    h1Proj: h1Calc.h1Proj, h1Edge: h1Calc.h1Edge, h1SampleTier: h1Calc.h1SampleTier,
+    pace: ftCalc.pace, aVol: ftCalc.aVol, bVol: ftCalc.bVol,
+    blowoutGap: ftCalc.blowoutGap, paceGapRisk: ftCalc.paceGapRisk
   },
   picks: finalPicksForDisplay.map(p => ({
     market: p.marketKey,
@@ -15749,8 +15854,13 @@ window.__LAST_AUDIT_STATE = {
     line: p.displayLineUsed ?? p.line,
     confidence: p.confidence,
     note: p.note,
-    massacreDiag: p.massacre || "None",
-    massacreProfile: p.massacreProfile || "None"
+    massacreDiag: p.massacre ? {
+      simPct: p.massacre.simPct,
+      brutalityScore: p.massacre.brutalityScore,
+      agreement: p.massacre.agreement,
+      failedReasons: p.massacre.failedReasons
+    } : "None",
+    massacreDecision: p.massacreDecision || "None"
   }))
 };
 // -------------------------------
@@ -16243,10 +16353,16 @@ window.addEventListener("online", () => refreshTrackerInBackground(true));
 
 
 
-           [["useFTH2H","ft"], ["use1HH2H","h1"], ["use2HH2H","h2"]].forEach(([id, kind]) => {
+           // LOCK: All 7 H2H checkboxes registered — previously only ft/h1/h2 were wired.
+      // Q1-Q4 checkboxes (useQ1H2H through useQ4H2H) had no change handlers at all,
+      // making their state changes completely inert — toggling them did nothing to the engine.
+      [["useFTH2H","ft"], ["use1HH2H","h1"], ["use2HH2H","h2"],
+       ["useQ1H2H","q1"], ["useQ2H2H","q2"], ["useQ3H2H","q3"], ["useQ4H2H","q4"]].forEach(([id, kind]) => {
         const el = document.getElementById(id);
         if (el) el.addEventListener("change", () => {
-          g_h2hManualPreference[kind] = el.checked;
+          if (Object.prototype.hasOwnProperty.call(g_h2hManualPreference, kind)) {
+            g_h2hManualPreference[kind] = el.checked;
+          }
           invalidateFetchedAudit();
           updateSectionLocks();
           updateIntelligencePack();
@@ -16833,7 +16949,11 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
     const league = document.getElementById('leagueSelect') && document.getElementById('leagueSelect').value;
     const tA = document.getElementById('teamAName') && document.getElementById('teamAName').value;
     const tB = document.getElementById('teamBName') && document.getElementById('teamBName').value;
-    if (league && league !== 'unknown' && tA && tB) {
+    // LOCK: fetchESPN is only called for leagues that actually support it.
+    // Previously AFDB would call fetchESPN for manual leagues, silently overwriting
+    // user-typed data with a failed fetch result. Do not remove the isEspnLeague guard.
+    const isEspnLeague = ['nba', 'ncaa', 'wnba', 'wnba_pre'].includes(String(league || '').toLowerCase());
+    if (isEspnLeague && tA && tB) {
       try { await fetchESPN(); }
       catch(e) { log('ERROR','NETWORK','Live sweep failed: ' + e.message); totalSuspects++; }
     }
@@ -16869,7 +16989,22 @@ window.engineDebug = function(msg, extra) {
   if (_originalEngineDebug) _originalEngineDebug(msg, extra);
   const msgStr = String(msg).toLowerCase();
   if (msgStr.includes("fetch") || msgStr.includes("load failed") || msgStr.includes("networkerror")) return;
-  const isErr = msgStr.includes("error") || msgStr.includes("fail") || msgStr.includes("critical");
+  // LOCK: Severity uses the full serialized line (msg + data), matching the same logic used
+  // inside engineDebug itself. Previously only msg was checked — errors buried in the data
+  // object triggered the red screen while AFDB showed nothing, making the engine appear clean.
+  // LOCK: "nan" explicitly excluded — confidence grade "NaN" serializes as "nan" and must not
+  // be treated as an error. Do not remove the !fullLine.includes("nan") exclusion.
+  let _aDetail = "";
+  if (extra !== null && extra !== undefined) {
+    try { _aDetail = JSON.stringify(extra); } catch(e) { _aDetail = String(extra); }
+  }
+  const _aFullLine = _aDetail ? (msgStr + " | " + _aDetail.toLowerCase()) : msgStr;
+  const isErr = (_aFullLine.includes("error") || _aFullLine.includes("fail") ||
+                 _aFullLine.includes("critical") || _aFullLine.includes("crash") ||
+                 _aFullLine.includes("blocked") || _aFullLine.includes("exception")) &&
+                !_aFullLine.includes("nan") &&
+                !(msgStr.includes("run blocked") || msgStr.includes("validation failed") ||
+                  msgStr.includes("finished with no tracker changes"));
   AFDB.log(isErr ? 'ERROR' : 'ENGINE', 'ENGINE', msg, extra);
 };
 
@@ -16877,7 +17012,16 @@ window.trackerDebug = function(msg, extra) {
   if (_originalTrackerDebug) _originalTrackerDebug(msg, extra);
   const msgStr = String(msg).toLowerCase();
   if (msgStr.includes("fetch") || msgStr.includes("load failed") || msgStr.includes("networkerror")) return;
-  const isErr = msgStr.includes("error") || msgStr.includes("fail");
+  // LOCK: Aligned with engineDebug override — full line checked, not just msg subject.
+  // "nan" excluded for the same reason as engineDebug. Do not remove the exclusion.
+  let _tDetail = "";
+  if (extra !== null && extra !== undefined) {
+    try { _tDetail = JSON.stringify(extra); } catch(e) { _tDetail = String(extra); }
+  }
+  const _tFullLine = _tDetail ? (msgStr + " | " + _tDetail.toLowerCase()) : msgStr;
+  const isErr = (_tFullLine.includes("error") || _tFullLine.includes("fail") ||
+                 _tFullLine.includes("critical") || _tFullLine.includes("crash")) &&
+                !_tFullLine.includes("nan");
   AFDB.log(isErr ? 'ERROR' : 'TRACKER', 'TRACKER', msg, extra);
 };
 
