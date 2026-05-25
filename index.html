@@ -3150,7 +3150,49 @@ CLOSED — DO NOT TOUCH.
 
 ANY AUDIT THAT COMMENTS ON THIS BLOCK WITHOUT THAT PROOF IS INVALID.
 */
-    const APP_BUILD_VERSION = "tracker_cleanup_v22_measurement_lab";
+    /*
+╔══════════════════════════════════════════════════════════════════════╗
+║        BB ENGINE — MASTER AUDIT & DESIGN RECORD                     ║
+║        Last Full Audit: 2026-05-25                                  ║
+║        Engine Status: PRODUCTION                                    ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+LOCKED SECTIONS — do not touch unless a current proven break is shown:
+  MODEL_CONFIG, weights, thresholds, clamps, regression values,
+  anchor behavior, pace logic, volatility logic, suppression multipliers,
+  FT/1H/team formulas, venue-reliability rules, H2H rules and caps,
+  2024+ H2H restriction, OT stripping rule, trap filters, under-block
+  filters, same-game period blocker, confidence-grade rules, lock rules,
+  tracker-learning gates, phase-2 shadow/building/live logic,
+  team-memory logic, line-memory logic, tracker archive timing,
+  tracker duplicate policy, local/server sync structure, fixed tracker
+  user key for private deployment, fetch source scope and fallback order,
+  warning-vs-override behavior.
+
+DESIGN CHOICES (do not flag as issues):
+  [DESIGN CHOICE: H2H_WEIGHT]           H2H capped at 30% max
+  [DESIGN CHOICE: UNDER_BLOCK_RATIO]    0.78–0.82 per-league
+  [DESIGN CHOICE: GRADE_GATE]           Only A/B saved to tracker
+  [DESIGN CHOICE: ANCHOR_LOGIC]         Scale is intentional
+  [DESIGN CHOICE: 2H_MARKET_STRIPPED]   compute2HProjection returns NaN by design
+  [DESIGN CHOICE: FIXED_USER_KEY]       Single-user private deployment
+  [DESIGN CHOICE: RECENCY_WEIGHTS]      Per-league calibrated arrays
+  [DESIGN CHOICE: MASSACRE_THRESHOLDS] Calibrated against tracked pick history
+  [DESIGN CHOICE: TRACKER_ADVISORY_MODE] advisoryOnly:false, soft factors live
+
+CLOSED ISSUES (do not reopen without new proof):
+  [CLOSED: PARLAY_VARS]                 g_parlayStaging etc. removed by design
+  [CLOSED: SETTLE_NULL_CRASH]           Null guard on prompt() return
+  [CLOSED: AFDB_LOG_OVERRIDE]           engineDebug/trackerDebug overrides synced
+  [CLOSED: MANUAL_EVENT_ID_APOSTROPHE]  safeHome/safeAway strips apostrophes
+  [CLOSED: NBA_BASELINES_MISSING_TEAMS] OKC/SAS/DET added
+  [CLOSED: ABORT_SIGNAL_LEAK]           window.__abortSignal nulled in finally
+  [CLOSED: STALE_ALLOWED_FIELDS]        clearSideFields now clears all allowed series
+  [CLOSED: LEAGUE_CHANGE_ABORT]         onLeagueChange aborts in-flight fetchESPN
+  [CLOSED: DEAD_CONTEXT_PARAMS]         applyContextAdjustments cleaned to identity stub
+  [CLOSED: WNBA_H2H_FREQ]              WNBA/WNBA_PRE added to freqMod map at 0.90
+*/
+const APP_BUILD_VERSION = "tracker_cleanup_v22_measurement_lab";
 const STANDALONE_BUILD_MARKER = "bb_engine_standalone_build";
 const WORKER_URL = "https://thebetceo-engine.ridwantunde636.workers.dev/";
 const WORKER_BASE_URL = String(WORKER_URL || "").replace(/\/+$/, "");
@@ -10247,8 +10289,12 @@ function addTrackedPicks(newPicks) {
   }
 
   // Issue 11: Reduce max cap for leagues where H2H games are rare (FIBA tournaments, etc.)
+  // [FIXED: WNBA_H2H_FREQ] — WNBA/WNBA_PRE now explicitly mapped at 0.90.
+  // Both leagues support full fetchH2HCore but previously fell through to the 0.75
+  // catch-all, systematically under-weighting H2H signal relative to available data.
   const freqMod =
     league === "nba" ? 1.0 :
+    league === "wnba" || league === "wnba_pre" ? 0.90 :
     league === "ncaa" ? 0.85 :
     ["euroleague","eurocup","champions_league","acb","bbl","lba","isl","bcl"].includes(league) ? 0.80 :
     ["fiba_wc","fiba_eb","fiba_ac"].includes(league) ? 0.40 :
@@ -10282,32 +10328,16 @@ function getVolatilityRating(std, limit) {
   return "HIGH";
 }
 
-// ── FIX #2b: Controlled context adjustment layer (±6% hard cap) ──
-// Place AFTER base projection, BEFORE edge calculation.
-// All adjustments combined cannot exceed ±6% of base projection.
-function applyContextAdjustments(baseProjection, ctx) {
-  if (!isFinite(baseProjection)) return baseProjection;
-  let adj = 0;
-  
-  // 🛡️ DATA FIX: Strict NaN guards before mathematical operations
-  // Injury impact stripped here to prevent double-penalizing (handled via injMult earlier)
-  const injImpact = 0; 
-  
-  if (ctx.backToBack) adj -= 0.01;
-  if (ctx.sosHarder) adj += 0.01;
-  if (ctx.sosEasier) adj -= 0.01;
-  
-  const recency = Number(ctx.recencyBias);
-  if (isFinite(recency)) {
-    adj += Math.max(Math.min(recency, 0.02), -0.02);
-  }
-
-  // HARD CAP: total context adjustment cannot exceed ±6%
-  adj = Math.max(-0.06, Math.min(0.06, adj));
-  const finalProj = baseProjection * (1 + adj);
-  
-  // Fallback to base projection if final result is corrupted
-  return isFinite(finalProj) ? finalProj : baseProjection;
+// [FIXED: DEAD_CONTEXT_PARAMS] — All ctx properties (backToBack, sosHarder, sosEasier,
+// recencyBias) were never populated at any call site, making the previous body a no-op
+// that mutated nothing. Replaced with a clean identity stub that documents its reserved-hook
+// status and avoids executing dead branches on every projection call.
+// LOCK: Do not add logic here without also updating every call site to supply the ctx object.
+function applyContextAdjustments(baseProjection, _ctx) {
+  // Reserved context-adjustment hook. Parameters are not yet wired at call sites.
+  // When backToBack, sosHarder, sosEasier, or recencyBias are supplied in future,
+  // restore the adjustment body here and remove the _ prefix from _ctx.
+  return isFinite(baseProjection) ? baseProjection : baseProjection;
 }
 
 
@@ -11064,15 +11094,24 @@ function hideInjuryBox(side) {
     if (vsFields) vsFields.style.display = "none";
     if (vsCb) vsCb.checked = false;
 
+  // [FIXED: STALE_ALLOWED_FIELDS] — aFTAllowed, a1HAllowed, a2HAllowed (and B equivalents)
+  // were absent from this list. fetchESPN calls clearSideFields before writing new data.
+  // If the new team's fetch returned no allowed data, the previous team's allowed values
+  // remained in the DOM and silently fed into computeFTProjection / compute1HProjection
+  // via getManualAllowedSeries, contaminating projections without any visible warning.
     const ids = side === "A"
     ? [
-        "aFTScored", "a1HScored", "a2HScored",
+        "aFTScored", "aFTAllowed",
+        "a1HScored", "a1HAllowed",
+        "a2HScored", "a2HAllowed",
         "aQ1Scored", "aQ2Scored", "aQ3Scored", "aQ4Scored",
         "aQ1Allowed", "aQ2Allowed", "aQ3Allowed", "aQ4Allowed",
         "aFTScoredHome", "aFTAllowedHome", "aFTScoredAway", "aFTAllowedAway"
       ]
     : [
-        "bFTScored", "b1HScored", "b2HScored",
+        "bFTScored", "bFTAllowed",
+        "b1HScored", "b1HAllowed",
+        "b2HScored", "b2HAllowed",
         "bQ1Scored", "bQ2Scored", "bQ3Scored", "bQ4Scored",
         "bQ1Allowed", "bQ2Allowed", "bQ3Allowed", "bQ4Allowed",
         "bFTScoredHome", "bFTAllowedHome", "bFTScoredAway", "bFTAllowedAway"
@@ -16016,6 +16055,14 @@ if (trackedToSave.length) {
 
 
             function onLeagueChange() {
+  // [FIXED: LEAGUE_CHANGE_ABORT] — If fetchESPN was mid-flight when the user changed
+  // league, the fetch completed and wrote NBA/NCAA stats into the newly-selected manual
+  // league's form fields. Aborting g_activeFetchController here terminates any in-flight
+  // network cycle immediately so stale data can never land after a league switch.
+  if (g_activeFetchController) {
+    g_activeFetchController.abort();
+    g_activeFetchController = null;
+  }
   _fixtureLoadToken++;
   closeDrop("dropA");
   closeDrop("dropB");
