@@ -3191,39 +3191,6 @@ CLOSED ISSUES (do not reopen without new proof):
   [CLOSED: LEAGUE_CHANGE_ABORT]         onLeagueChange aborts in-flight fetchESPN
   [CLOSED: DEAD_CONTEXT_PARAMS]         applyContextAdjustments cleaned to identity stub
   [CLOSED: WNBA_H2H_FREQ]              WNBA/WNBA_PRE added to freqMod map at 0.90
-  [CLOSED: WNBA_THRESHOLD_ROUTING]      getLeagueEdgeThresholds did not route wnba/wnba_pre to
-                                        calibrated WNBA thresholds (was falling through to default
-                                        6.5%/6.7%). Fixed: wnba/wnba_pre now return
-                                        LEAGUE_EDGE_THRESHOLDS.wnba (6.2% FT / 5.8% 1H).
-  [CLOSED: H1_GUARD_NULL_TO_FALSY]      settleTrackedPickFromCompetition H1 branch used
-                                        h1Home === null guard which can never be true (h1Home is
-                                        always initialised to 0). Fixed to !h1Home && !h1Away,
-                                        matching all other period markets in the function.
-  [CLOSED: TRACKER_GRADE_CLASS_UNUSED]  renderTrackedPicks computed gradeClass via
-                                        getConfidenceClass() but the grade <td> hardcoded
-                                        class="conf-none" for every pick. Fixed: grade <td>
-                                        now uses ${gradeClass} for correct A/B/C/D colors.
-  [CLOSED: TIMESTAMPLESS_SETTLED_EXPRESSION] archiveExpiredTrackedPicks isTimestamplessSettled
-                                        contained dead redundant clause (!isSettled === false &&
-                                        isSettled) which reduced to just isSettled by operator
-                                        precedence. Fixed to refTs === 0 && isSettled.
-                                        Behavior unchanged, expression now unambiguous.
-  [CLOSED: PICK_RULES_TEAM_DEAD_BRANCH] getPick OT shield and under-block contained dead
-                                        marketType === "team" branches. No call site ever passes
-                                        "team" as marketType. Both dead branches removed.
-  [CLOSED: SIGNATURE_PAREN_ESCAPE]      ) was not escaped in escapedSig / _geSig onclick
-                                        signatures. Team names containing ) (e.g. manual entry
-                                        "Utah Jazz (2024)") broke onclick attribute parsing.
-                                        Fixed: .replace(/\)/g, '\\x29') added to all three
-                                        signature escape chains. normalizeTeamName also strips ()
-                                        as belt-and-suspenders.
-  [CLOSED: DEAD_FETCHNBA_WRAPPERS]      fetchNbaSchedule and fetchNbaH2H were thin wrappers
-                                        around fetchScheduleCore/fetchH2HCore but were never
-                                        called — fetchESPN calls the core functions directly.
-                                        Both permanently deleted.
-  [CLOSED: DEAD_KEEPALIVE_FN]           queueTrackerKeepaliveSave was defined but never called.
-                                        The actual exit handler is handleExit() wired to pagehide.
-                                        Permanently deleted.
 */
 const APP_BUILD_VERSION = "tracker_cleanup_v22_measurement_lab";
 const STANDALONE_BUILD_MARKER = "bb_engine_standalone_build";
@@ -4330,7 +4297,7 @@ const TRACKER_SAVE_DEBOUNCE_MS = 400;
 const TRACKER_SAVE_RETRY_BASE_MS = 1500;
 const TRACKER_SAVE_RETRY_MAX_MS = 15000;
 const TRACKER_NETWORK_TIMEOUT_MS = BB_CONFIG.timeouts.fetch;
-const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_V";
+const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_X";
 const ENGINE_MODEL_VERSION = "engine_v2_final";
 const TRACKER_LEARNING_ENABLED = true;
 
@@ -6259,12 +6226,9 @@ function safeText(str) {
 }
 
     function normalizeTeamName(name) {
-      // [CLOSED: SIGNATURE_PAREN_ESCAPE] — () stripped here as belt-and-suspenders so
-      // manually-entered team names like "Utah Jazz (2024)" can never produce a signature
-      // containing ) that would break the onclick single-quote delimiter chain.
       return String(name || "")
         .toLowerCase()
-        .replace(/[.''()]/g, "")
+        .replace(/[.'']/g, "")
         .replace(/\bsaint\b/g, "st")
         .replace(/\ba&m\b/g, "a and m")
         .replace(/&/g, " and ")
@@ -7185,11 +7149,29 @@ async function forceTrackerSaveNow() {
   }
 }
 
-// [CLOSED: DEAD_KEEPALIVE_FN] queueTrackerKeepaliveSave permanently deleted.
-// It was defined but never called anywhere. The actual pagehide exit handler is:
-//   const handleExit = () => { pushTrackerStateToServer(g_trackerState, true); };
-//   window.addEventListener("pagehide", handleExit);
-// DO NOT re-add this function.
+function queueTrackerKeepaliveSave() {
+  try {
+    syncLineMemoryIntoTrackerState();
+    g_trackerState.updatedAt = new Date().toISOString();
+    saveTrackerStateToLocal();
+
+    if (isTrackerStateMeaningfullyEmpty(g_trackerState)) return;
+
+    const payload = JSON.stringify(g_trackerState);
+
+    fetch(TRACKER_API_URL, {
+      method: "POST",
+      headers: getTrackerHeaders(true),
+      body: payload,
+      keepalive: true,
+      cache: "no-store"
+    }).catch(err => {
+      console.error("[BB Engine] tracker keepalive save failed", err);
+    });
+  } catch (err) {
+    console.error("[BB Engine] queueTrackerKeepaliveSave failed", err);
+  }
+}
 
 function withTrackerCacheBust(url) {
   try {
@@ -8384,13 +8366,11 @@ function renderTrackedPicks() {
 
     let statusHtml = "";
     if (status === 'pending') {
-            const pId = (p.eventId || '') + p.signature.replace(/[^a-z0-9]/gi, '');
-        // LOCK: Signature is escaped for safe use inside inline onclick string attributes.
-        // Team names containing apostrophes (e.g. "O'Sullivan") break the single-quote delimiters
-        // in onclick handlers, silently preventing settlement buttons from functioning entirely.
-        // [CLOSED: SIGNATURE_PAREN_ESCAPE] ) escaped to \x29 — a team name like "Utah Jazz (2024)"
-        // in a manual league would break the onclick="...('sig')" delimiter without this guard.
-        const escapedSig = p.signature.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\)/g, '\\x29');
+      const pId = (p.eventId || '') + p.signature.replace(/[^a-z0-9]/gi, '');
+      // LOCK: Signature is escaped for safe use inside inline onclick string attributes.
+      // Team names containing apostrophes (e.g. "O'Sullivan") break the single-quote delimiters
+      // in onclick handlers, silently preventing settlement buttons from functioning entirely.
+      const escapedSig = p.signature.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
       const gameTs = safeParseDate(p.eventDate || p.createdAt);
       const isZombie = gameTs > 0 && (Date.now() - gameTs) > (36 * 60 * 60 * 1000);
       const _liveClockLabel = _liveInfo
@@ -8416,9 +8396,8 @@ function renderTrackedPicks() {
           <div style="font-size:8px; text-decoration:underline; cursor:pointer; margin-top:2px; font-weight:800; opacity:0.7;" onclick="settleTrackedPickManualFull('${escapedSig}')">CUSTOM</div>
         </div>`;
     } else {
-      // LOCK: escapedSig used instead of p.signature — apostrophes and parentheses in team names
-      // break the onclick single-quote delimiter chain. [CLOSED: SIGNATURE_PAREN_ESCAPE]
-      const escapedSig = p.signature.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\)/g, '\\x29');
+      // LOCK: escapedSig used instead of p.signature — apostrophes in team names break onclick.
+      const escapedSig = p.signature.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
       statusHtml = `<div onclick="settleTrackedPickManualFull('${escapedSig}')" style="cursor:pointer;" title="Click to edit or revert">${status.toUpperCase()}</div>`;
       if (p.engineResultStatus && p.engineResultStatus !== status) {
          statusHtml += `<div style="font-size:8px; color:var(--tracker-subtext); margin-top:2px; font-weight:800;">MID: ${p.engineResultStatus.toUpperCase()}</div>`;
@@ -8432,7 +8411,7 @@ function renderTrackedPicks() {
         <td style="font-weight:800;">${safeText(String(p.marketName || "—").split('<')[0].trim())}</td>
         <td>${isFinite(p.line) ? safeText(displayLine(p.line)) : "—"}</td>
         <td style="white-space: nowrap; font-size: 11px;">${safeText(p.predictionText || "—")}${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
-        <td class="conf-none">${safeText(grade)}</td>
+        <td class="${gradeClass}">${safeText(grade)}</td>
         <td>${safeText(edgeText)}</td>
         <td class="${statusClass}"><div class="tracker-status-stack">${statusHtml}</div></td>
       </tr>
@@ -9140,8 +9119,7 @@ function renderTrackerAnalytics() {
                   const nB = (diag.netB !== undefined && diag.netB !== null && !isNaN(diag.netB)) ? (diag.netB > 0 ? '+' : '') + diag.netB.toFixed(1) : "—";
                   const edge = p.edgePct ? (p.edgePct > 0 ? '+' : '') + p.edgePct.toFixed(1) + '%' : '—';
                   // [FIXED: GODS_EYE_GESIG] — _geSig was referenced in the God's Eye onclick but never declared in this map callback. Every settlement click called settleTrackedPickManualFull('undefined') and silently failed. Declared here immediately before the return template literal.
-                  // [CLOSED: SIGNATURE_PAREN_ESCAPE] ) escaped to \x29 — same guard as renderTrackedPicks escapedSig.
-                  const _geSig = p.signature.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\)/g, '\\x29');
+                  const _geSig = p.signature.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
                   
                   return `
                     <tr>
@@ -10383,10 +10361,6 @@ function applyContextAdjustments(baseProjection, _ctx) {
 
 
     function getSampleTier(...arrays) {
-      // [CLOSED: SAMPLETER_ZERO_ARG] Defensive guard: Math.min(...[]) === Infinity which
-      // would make a zero-argument call silently return "full". Not currently reachable
-      // but prevents a future refactor from producing a silent wrong value.
-      if (!arrays.length) return "insufficient";
       const lens = arrays.map(a => Array.isArray(a) ? a.length : 0);
       const minLen = Math.min(...lens);
       if (minLen >= 5) return "full";
@@ -12254,14 +12228,16 @@ async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
     .slice(0, 10);
 }
 
-// [CLOSED: DEAD_FETCHNBA_WRAPPERS] fetchNbaSchedule and fetchNbaH2H permanently deleted.
-// fetchESPN calls fetchScheduleCore(espnBase, teamId, league, ...) and fetchH2HCore(..., league)
-// directly for all non-NCAA leagues. These NBA-specific wrappers were never called anywhere
-// in the build. DO NOT re-add them. fetchNcaaSchedule and fetchNcaaH2H are kept because
-// fetchESPN explicitly calls them for the ncaa branch.
+async function fetchNbaSchedule(base, teamId, requiredVenue, allowFallback = true) {
+  return fetchScheduleCore(base, teamId, "nba", requiredVenue, allowFallback);
+}
 
 async function fetchNcaaSchedule(base, teamId, requiredVenue, allowFallback = true) {
   return fetchScheduleCore(base, teamId, "ncaa", requiredVenue, allowFallback);
+}
+
+async function fetchNbaH2H(base, teamAId, teamBId) {
+  return fetchH2HCore(base, teamAId, teamBId, "nba");
 }
 
 async function fetchNcaaH2H(base, teamAId, teamBId) {
