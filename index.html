@@ -7060,7 +7060,7 @@ async function flushTrackerSave() {
     if (pushed && pushed.state) {
       const merged = mergeTrackerStates(snapshot, pushed.state);
       normalizeTrackerState(merged);
-      saveTrackerStateToLocal();
+      await saveTrackerStateToLocal(); // [FIXED: FLUSH_SAVE_AWAIT] — missing await caused the async IndexedDB write to race against the subsequent server push on rapid tab close, potentially leaving local and remote states out of sync.
     }
   } catch (err) {
     trackerDebug("flush save failed", { error: String(err) });
@@ -9051,6 +9051,8 @@ function renderTrackerAnalytics() {
                   const nA = (diag.netA !== undefined && diag.netA !== null && !isNaN(diag.netA)) ? (diag.netA > 0 ? '+' : '') + diag.netA.toFixed(1) : "—";
                   const nB = (diag.netB !== undefined && diag.netB !== null && !isNaN(diag.netB)) ? (diag.netB > 0 ? '+' : '') + diag.netB.toFixed(1) : "—";
                   const edge = p.edgePct ? (p.edgePct > 0 ? '+' : '') + p.edgePct.toFixed(1) + '%' : '—';
+                  // [FIXED: GODS_EYE_GESIG] — _geSig was referenced in the God's Eye onclick but never declared in this map callback. Every settlement click called settleTrackedPickManualFull('undefined') and silently failed. Declared here immediately before the return template literal.
+                  const _geSig = p.signature.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
                   
                   return `
                     <tr>
@@ -9715,9 +9717,14 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
   });
   
   // Phase 2 Simulator Hook for Manual Leagues
+  // [FIXED: PHASE2_SIMULATOR_THROW] — unguarded call propagated QuotaExceededError from localStorage on full-storage devices, skipping renderTrackedPicks() and scheduleTrackerSave() below and leaving the tracker UI stale after every manual settlement on a non-ESPN league.
   if (touchedPick && touchedPick.league && touchedPick.league !== "nba" && touchedPick.league !== "wnba" && touchedPick.league !== "wnba_pre" && touchedPick.league !== "ncaa") {
-    if (typeof window.runPhase2Simulator === "function") {
-      window.runPhase2Simulator(touchedPick.league);
+    try {
+      if (typeof window.runPhase2Simulator === "function") {
+        window.runPhase2Simulator(touchedPick.league);
+      }
+    } catch (e) {
+      engineDebug("Phase 2 simulator error (non-critical)", e.message);
     }
   }
 
@@ -12787,74 +12794,11 @@ function getH2HSeries(side, marketKey, parsed) {
 }
 
 
-function buildTeamMarketProjection({
-  league, marketKey, side, ownRecentSeries, oppAllowedSeries,
-  ownVenueSeries, oppVenueAllowedSeries, h2hSeries, line = NaN,
-  injMult = 1, sampleTier = "thin"
-}) {
-  const ownRecent = avgOrNaN(ownRecentSeries);
-  const oppAllowed = avgOrNaN(oppAllowedSeries);
-  const ownVenue = avgOrNaN(ownVenueSeries);
-  const oppVenueAllowed = avgOrNaN(oppVenueAllowedSeries);
-  const venueBlend = avgFinite([ownVenue, oppVenueAllowed]);
-  const h2h = avgOrNaN(h2hSeries);
-
-  const seriesForVol = [...(ownRecentSeries||[]), ...(oppAllowedSeries||[])].map(Number).filter(v=>isFinite(v));
-  const vol = seriesForVol.length >= 2 ? stdDev(seriesForVol) : 0;
-  
-  // 1. Get Dynamically Calibrated Weights
-  const weights = getDynamicWeights(sampleTier, vol, league);
-
-  // 2. Build the Projection Pipeline
-  const parts = [];
-  if (isFinite(ownRecent)) parts.push({ value: ownRecent, weight: weights.teamWeight });
-  if (isFinite(oppAllowed)) parts.push({ value: oppAllowed, weight: weights.oppWeight });
-  
-  if (isFinite(venueBlend)) {
-    // Venue data is weighted higher in NCAA where home court is massive
-    const vWeight = league === "ncaa" ? 0.25 : 0.15;
-    parts.push({ value: venueBlend, weight: vWeight });
-  }
-
-  if (isFinite(h2h) && h2hSeries.length >= 2) {
-    // ANOMALY FIX: Calculate divergence (weirdness) before weighting
-    const divergence = isFinite(ownRecent) ? (h2h - ownRecent) : 0;
-            const hw = getH2HWeight(h2hSeries.length, h2hSeries.length, marketKey, sampleTier, divergence, league);
-    parts.push({ value: h2h, weight: hw });
-  }
-
-  const weightSum = parts.reduce((sum, p) => sum + p.weight, 0);
-  let proj = weightSum > 0 ? parts.reduce((sum, p) => sum + (p.value * p.weight), 0) / weightSum : NaN;
-
-  // 3. Regression to League Baseline (Dynamic)
-  const baseline = (LEAGUE_BASES[league] || 160) / (marketKey === "ft" ? 2 : 4);
-  if (isFinite(proj)) {
-    proj = (proj * weights.regressionWeight) + (baseline * weights.baselineWeight);
-  }
-
-      // 4. Final Adjustments
-  const role = getFixtureSideRole(side);
-  const hasVenueData = ownVenueSeries?.length >= 5;
-  
-  if (!hasVenueData && isFinite(proj)) {
-    // FIX 4: Explicitly scale the home edge for the period to prevent spread double-counting.
-    // The total game edge is split between the two teams (+ for home, - for away).
-    // For a half (like 2H), the edge itself must be halved first, then split.
-    const fullGameEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5);
-    const periodEdge = marketKey === "ft" ? fullGameEdge : (fullGameEdge / 2);
-    
-    if (role === "home") proj += (periodEdge / 2);
-    if (role === "away") proj -= (periodEdge / 2);
-  }
-
-
-  if (isFinite(proj)) proj *= clampNumber(injMult, 0.75, 1.0);
-  if (isFinite(proj)) proj = anchorProjection(proj, line, league, "team");
-
-  // FIX 8: Return the context variables so 2H diagnostics aren't undefined
-  return { proj, vol, featureCount: parts.length, role, ownRecent, oppAllowed };
-
-}
+// [FIXED: DEAD_BUILDTEAMMARKET_FN] — buildTeamMarketProjection was defined (~60 lines) but never called anywhere in the live pick path.
+// computeFTProjection handles all team projections inline. This function had zero effect on any pick ever generated.
+// [DESIGN CHOICE: BUILDTEAMMARKET_DELETED] Permanently removed. DO NOT re-add.
+// DO NOT wire into computeFTProjection without an explicit owner decision and full regression test of NBA/WNBA team markets.
+// LOCK: CLOSED — DO NOT TOUCH.
 
 
 /*
@@ -14576,7 +14520,7 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
   
   finalPicks.forEach(p => {
     const isLock = p._idx === lockIdx && p.pick !== "NO PLAY" && p.pick !== "NaN";
-    const confText = (p.pick === "NO PLAY" || p.pick === "NaN") ? "NaN" : (p.confidence === "—" ? "NaN" : (p.confidence || "D"));
+    const confText = (p.pick === "NO PLAY") ? "NaN" : (p.confidence === "—" ? "NaN" : (p.confidence || "D")); // [FIXED: DEAD_NAN_CHECK] — p.pick === "NaN" can never be true (picks are "NO PLAY", "OVER X.X", or "UNDER X.X"); removed dead branch.
     const shownLine = isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line;
     const shownEdge = isFinite(p.displayEdge) ? p.displayEdge : p.edge;
     
@@ -16786,7 +16730,12 @@ ${fullHTML}
       timestamp:      new Date().toLocaleDateString()
     };
 
-    localStorage.setItem(siloKey, JSON.stringify(verifiedTunings));
+    // [FIXED: PHASE2_LOCALSTORAGE_QUOTA] — unguarded localStorage.setItem throws QuotaExceededError on full-storage devices, crashing the calibrator and propagating up through runPhase2Simulator into applyManualSettlementToTrackedPick.
+    try {
+      localStorage.setItem(siloKey, JSON.stringify(verifiedTunings));
+    } catch (e) {
+      engineDebug("Phase 2 calibration save failed (storage full)", e.message);
+    }
     engineDebug(
       "PHASE_2_CALIBRATOR [" + (marketFilter || "ALL") + "]: Locked '" + chosenConfig.label + "' for " + leagueKey +
       " | silo=" + siloKey +
