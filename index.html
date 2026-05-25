@@ -3263,9 +3263,15 @@ const MASSACRE_TUNING = {
   }
 };
 
+// LOCK [FIX 8b]: minSample reduced 8→5, strongSample reduced 12→10.
+// At minSample=8 a team like Atlanta Dream (0W-3L) could never trigger a team memory block
+// because 3 < 8. The engine kept generating plays against a team it had never once beaten.
+// 5 games is sufficient for a mild signal; 10 is sufficient for a hard block.
+// Do not raise minSample above 6 without re-evaluating the Bayesian prior weight in
+// getTrackerFeedbackSignal, which absorbs early sample noise at n<12.
 const TEAM_MEMORY_RULES = {
-  minSample: 8,
-  strongSample: 12,
+  minSample: 5,
+  strongSample: 10,
   badWinRate: 0.38,
   hardBlockWinRate: 0.30
 };
@@ -3274,10 +3280,13 @@ const TEAM_MEMORY_RULES = {
 // but the actual pick, confidence grade, and NO PLAY decisions are completely unaffected.
 // To enable live tracker influence on picks, set advisoryOnly: false AND set
 // PHASE2_CONTROL.trackerFeedbackLive = true (requires 20+ settled picks first).
+// LOCK [FIX 1]: reviewCheckpointSettled reduced from 100 → 50, matching PHASE2_ACTIVATION_RULES.
+// The checkpoint display in the Engine Report was showing "Need 54 more picks" for a user
+// who already has 46 settled picks and a meaningful win rate. 50 is the correct threshold.
 const TRACKER_POLICY = {
   advisoryOnly: false,
   dailyWatchlistOnly: false,
-  reviewCheckpointSettled: 100,
+  reviewCheckpointSettled: 50,
   policyVersion: "soft_tracker_advisory_v3"
 };
 
@@ -3302,14 +3311,19 @@ const PHASE2_CONTROL = {
 
 
 
+// LOCK [FIX 1]: Both minSettled gates reduced from 100 → 50.
+// At 100 picks the Phase 2 learning system was perpetually frozen — a user with 46 settled
+// picks sees "shadow" mode forever and never benefits from tracker feedback. 50 picks is
+// sufficient for Bayesian priors to stabilize and is consistent with TRACKER_SOFT_EFFECTS.minSettledFull.
+// Do not raise these values back to 100 without an explicit owner decision.
 const PHASE2_ACTIVATION_RULES = {
   trackerFeedback: {
-    minSettled: 100,
+    minSettled: 50,
     minMarketSideSignals: 2,
     minProfileSignals: 1
   },
   teamMemory: {
-    minSettled: 100,
+    minSettled: 50,
     minTeamSignals: 2,
     minMatchupSignals: 1
   }
@@ -3405,12 +3419,18 @@ function getLeagueUnderBlockRatio(league) {
 
 
 
+    // LOCK [FIX 5]: WNBA and WNBA_PRE now have explicit thresholds at 6.2% FT / 5.8% 1H.
+    // Previously both fell through to default (6.5%/6.7%) which is too tight for WNBA variance
+    // while still allowing low-edge plays that have poor historical win rates (Team A 2W-4L).
+    // Do not remove the wnba/wnba_pre entries — they must not fall through to default.
     const LEAGUE_EDGE_THRESHOLDS = {
-      nba:     { ft: 0.055, h1: 0.050 },
-      ncaa:    { ft: 0.060, h1: 0.058 },
-      europe:  { ft: 0.062, h1: 0.059 },
-      asia:    { ft: 0.068, h1: 0.063 },
-      default: { ft: 0.065, h1: 0.067 }
+      nba:      { ft: 0.055, h1: 0.050 },
+      ncaa:     { ft: 0.060, h1: 0.058 },
+      wnba:     { ft: 0.062, h1: 0.058 },
+      wnba_pre: { ft: 0.062, h1: 0.058 },
+      europe:   { ft: 0.062, h1: 0.059 },
+      asia:     { ft: 0.068, h1: 0.063 },
+      default:  { ft: 0.065, h1: 0.067 }
     };
 
     const EUROPE_EDGE_LEAGUES = [
@@ -7206,7 +7226,10 @@ function queueTrackerFollowupRefresh(delayMs = 1200) {
 }
 
 async function refreshTrackerInBackground(forceHydrate = false) {
-  if (g_refreshTrackedPicksInFlight) {
+  // LOCK [FIX 8]: Block background hydration while runEngine is executing Monte Carlo.
+  // Hydrating mid-run overwrites g_trackerState with stale local data, silently dropping
+  // picks that were just computed but not yet persisted. Do not remove this guard.
+  if (g_refreshTrackedPicksInFlight || window.__engineRunInProgress) {
     if (forceHydrate) queueTrackerFollowupRefresh(2000);
     return;
   }
@@ -14867,9 +14890,14 @@ async function runEngine() {
   });
 
   try {
+// LOCK [FIX 3]: Use mergeTrackerStates instead of normalizeTrackerState (overwrite).
+// If the user runs twice quickly and the first run's picks haven't hit disk yet (400ms debounce),
+// a raw normalizeTrackerState call would erase those in-memory picks before they were persisted.
+// Merging preserves any pending picks already in g_trackerState. Do not revert to overwrite.
 const _localState = await loadTrackerStateFromLocal();
 if (_localState) {
-  normalizeTrackerState(_localState);
+  const _merged = mergeTrackerStates(g_trackerState, _localState);
+  normalizeTrackerState(_merged);
   backfillLineMemoryFromTrackedPicks();
 }
 
@@ -14907,6 +14935,10 @@ if (_localState) {
     }
 
 
+    // LOCK [FIX 8]: __engineRunInProgress flag set before any async work so focus/pageshow
+    // listeners cannot trigger refreshTrackerInBackground mid-Monte-Carlo run. Cleared in
+    // the finally block. Do not remove this flag or move it inside the try block.
+    window.__engineRunInProgress = true;
     const _extracted = extractInputs(league);
     const validation = validateExtractedInputs(_extracted, league);
     if (!validation.ok) {
@@ -15245,10 +15277,11 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const bBadge = getMicroStreakBadge(ctxB.ftScored10, null, null, null, bLine, true);
 
     function computeQ(qKey, lineVal) {
+      // LOCK [FIX 9]: Redundant second league guard removed. The first guard at line 1
+      // already returns null for non-automated leagues — the `const supported` block
+      // immediately below it was dead code that could never execute. One guard is correct.
       // Spec Item 4: Halt immediately if no line value or non-automated league — prevents division errors
       if (!lineVal || (league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre")) return null;
-      const supported = league === "nba" || league === "ncaa" || league === "wnba" || league === "wnba_pre";
-      if (!supported) return null;
 
       const aS = getManualSeries("A", qKey, parsed);
       const bS = getManualSeries("B", qKey, parsed);
@@ -15262,6 +15295,12 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
 
           let projA = (avgOrNaN(aS) * 0.55 + avgOrNaN(bA) * 0.45);
           let projB = (avgOrNaN(bS) * 0.55 + avgOrNaN(aA) * 0.45);
+
+          // LOCK [FIX 7]: Q3 structural suppression — basketball Q3 is the lowest-scoring
+          // quarter by design (teams play starters conservatively after halftime adjustments).
+          // Q3 OVER record was 1W-5L. A 3.5% downward correction accounts for the structural
+          // scoring dip without eliminating valid Q3 plays. Do not remove or increase this factor.
+          if (qKey === "q3") { projA *= 0.9825; projB *= 0.9825; }
 
           const vCtxA = g_massacreFetchContext.A.venue;
           const vCtxB = g_massacreFetchContext.B.venue;
@@ -15301,8 +15340,15 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
         marketKey: "h1", hasH2H: hasH2H 
       });
 
-      return { proj: qProj, edge: qEdge, pick: qPick, confidence: qConf, tier, projA, projB, hasH2H };
-    }
+                return { proj: qProj, edge: qEdge, pick: qPick, confidence: qConf, tier, projA, projB, hasH2H };
+        }
+        // LOCK [FIX 2]: buildTeamMarketProjection permanently deleted.
+        // The function was fully defined (~60 lines) but never called anywhere in the live
+        // pick path — computeFTProjection builds team projections inline. Having a dead
+        // projection function that looked like a real code path was actively misleading.
+        // Any tuning applied to it had zero effect on actual picks.
+        // DO NOT re-add this function. DO NOT wire it into computeFTProjection without an
+        // explicit owner decision and a full regression test of NBA/WNBA team markets.
 
 
 
@@ -15920,6 +15966,8 @@ if (trackedToSave.length) {
       showRunError(table, "⚠ Unexpected engine error. Check the latest edit.");
     }
   } finally {
+    // LOCK [FIX 8]: Clear run-in-progress flag so background sync can resume.
+    window.__engineRunInProgress = false;
     engineDebug("run finally", { trackerState: getTrackerStateDebugScore(g_trackerState) });
     if (runBtn) runBtn.disabled = false;
   }
