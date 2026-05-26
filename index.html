@@ -7469,10 +7469,18 @@ async function pollLiveGameClocks() {
             didChange = true;
             return;
           }
+          // Extract live scores from competitors
+            const _pCompetitors = comp?.competitors || [];
+            const _pHome = _pCompetitors.find(c => c.homeAway === "home");
+            const _pAway = _pCompetitors.find(c => c.homeAway === "away");
+            const _pHomeScore = _pHome ? (parseFloat(_pHome.score) || 0) : null;
+            const _pAwayScore = _pAway ? (parseFloat(_pAway.score) || 0) : null;
           if (!existing || existing.period !== period || existing.clock !== newClock) {
             g_liveGameStatus.set(eid, {
               period, clock: newClock, statusName, league, capturedAt: Date.now(),
               clockFrozen: false,
+              homeScore: _pHomeScore,
+              awayScore: _pAwayScore,
               _expiredAt: existing?._expiredAt ?? null  // preserve ENDED marker across polls
             });
             didChange = true;
@@ -7482,7 +7490,14 @@ async function pollLiveGameClocks() {
               existing.clockFrozen = true;
               didChange = true;
             }
+            // Always refresh scores even when clock is frozen
+            if (_pHomeScore !== null && (existing.homeScore !== _pHomeScore || existing.awayScore !== _pAwayScore)) {
+              existing.homeScore = _pHomeScore;
+              existing.awayScore = _pAwayScore;
+              didChange = true;
+            }
           }
+---
         } else if (state === "pre") {
           g_liveGameStatus.delete(eid);
           didChange = true;
@@ -8402,9 +8417,13 @@ function renderTrackedPicks() {
           })())
         : null;
       const _pendingLabel = isZombie ? 'STALE' : (_liveClockLabel ? '' : 'PENDING');
-      const _liveBlock = _liveClockLabel
-        ? `<div style="color:var(--muted);font-size:9px;font-weight:900;line-height:1.2;letter-spacing:0.1px;">● LIVE</div><div data-live-clk="${p.eventId}" style="color:var(--muted);font-size:8px;font-weight:800;line-height:1.1;">${_liveClockLabel}</div>`
+      const _liveScoreStr = (_liveInfo && isFinite(_liveInfo.homeScore) && isFinite(_liveInfo.awayScore))
+        ? `${Math.round(_liveInfo.homeScore)} : ${Math.round(_liveInfo.awayScore)}`
         : '';
+      const _liveBlock = _liveClockLabel
+        ? `<div style="color:var(--muted);font-size:9px;font-weight:900;line-height:1.2;letter-spacing:0.1px;">● LIVE</div><div data-live-clk="${p.eventId}" style="color:var(--muted);font-size:8px;font-weight:800;line-height:1.1;">${_liveClockLabel}</div>${_liveScoreStr ? `<div style="color:var(--text);font-size:10px;font-weight:900;line-height:1.3;margin-top:2px;letter-spacing:0.3px;">${_liveScoreStr}</div>` : ''}`
+        : '';
+---
       statusHtml = `
         <div id="disp-${pId}" onclick="document.getElementById('disp-${pId}').style.display='none'; document.getElementById('act-${pId}').style.display='flex';" style="font-weight:900; font-size:10px; cursor:pointer; text-decoration:underline dotted #ccc; ${isZombie ? 'color:#ff9800;' : ''}" title="${isZombie ? 'Game stale - manual check needed' : (_liveClockLabel ? 'Live game — click to settle' : 'Click to settle')}">${_liveBlock}${_pendingLabel}</div>
         <div id="act-${pId}" style="display:none; flex-direction:column; align-items:center; gap:2px; margin-top:-2px;">
@@ -9913,15 +9932,41 @@ function handleTrackedPicksActionClick(event) {
       return total;
     }
 
-function settleTrackedPickFromCompetition(pick, competition) {
+    function isPickPeriodComplete(marketKey, currentPeriod, isHalfTime, isGameFinal, regulationPeriods) {
+  if (isGameFinal) return true;
+  const p = Number(currentPeriod || 0);
+  const isNCAAStyle = regulationPeriods === 2;
+  if (isNCAAStyle) {
+    if (marketKey === 'h1' || marketKey === 'h1_team_a' || marketKey === 'h1_team_b') return p >= 2 || isHalfTime;
+    return isGameFinal;
+  }
+  switch (marketKey) {
+    case 'q1': case 'q1_team_a': case 'q1_team_b': return p >= 2;
+    case 'q2': return p >= 3 || isHalfTime;
+    case 'h1': case 'h1_team_a': case 'h1_team_b': return p >= 3 || isHalfTime;
+    case 'q3': return p >= 4;
+    default: return isGameFinal;
+  }
+}
+
+    function settleTrackedPickFromCompetition(pick, competition, allowPartialSettlement = false) {
+---
   if (!pick || !competition) return "pending";
 
   const status = competition?.status?.type?.name || "";
   const state = competition?.status?.type?.state || "";
   const completed = competition?.status?.type?.completed || false;
 
-  // Ensure the game is actually over
-  if (!completed && state !== "post" && status !== "STATUS_FINAL") return "pending";
+  // Ensure the game is actually over (or the pick's specific period is complete)
+  if (allowPartialSettlement && !completed) {
+    const _curPeriod = Number(competition?.status?.period || 0);
+    const _isHalfNow = String(status).toUpperCase().includes("HALFTIME");
+    const _regP = LEAGUE_FETCH_RULES[pick.league || ""]?.regulationPeriods ?? 4;
+    if (!isPickPeriodComplete(pick.marketKey, _curPeriod, _isHalfNow, false, _regP)) return "pending";
+  } else if (!allowPartialSettlement) {
+    if (!completed && state !== "post" && status !== "STATUS_FINAL") return "pending";
+  }
+---
 
   const competitors = competition.competitors || [];
   const home = competitors.find(c => c.homeAway === "home") || competitors[0];
@@ -10152,12 +10197,18 @@ function settleTrackedPickFromCompetition(pick, competition) {
             g_liveGameStatus.delete(pick.eventId);
             trackerDebug("auto-settled pick", { eventId: pick.eventId, market: pick.marketKey, result: settled, actual: pick.actualScore, line: pick.lineAtPick || pick.line });
           }
-        } else {
+                } else {
           g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: `⏳ NOT FINAL`, apiFinal, clock, period, stateName, statusName, settled: null, actual: null, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
           const _isLiveNow = stateName === "in" || String(statusName || "").toUpperCase().includes("PROGRESS") || String(statusName || "").toUpperCase().includes("HALFTIME");
           if (_isLiveNow && pick.eventId) {
             const _isHalf = String(statusName || "").toUpperCase().includes("HALFTIME");
             const _existingLive = g_liveGameStatus.get(pick.eventId);
+            // Extract live scores
+            const _rlCompetitors = competition?.competitors || [];
+            const _rlHome = _rlCompetitors.find(c => c.homeAway === "home");
+            const _rlAway = _rlCompetitors.find(c => c.homeAway === "away");
+            const _rlHomeScore = _rlHome ? (parseFloat(_rlHome.score) || 0) : null;
+            const _rlAwayScore = _rlAway ? (parseFloat(_rlAway.score) || 0) : null;
             // Dead-game guard: do not resurrect a game the ticker already stamped as ENDED
             if (!(_existingLive?._expiredAt && (Date.now() - _existingLive._expiredAt) > 5 * 60 * 1000)) {
               g_liveGameStatus.set(pick.eventId, {
@@ -10167,10 +10218,31 @@ function settleTrackedPickFromCompetition(pick, competition) {
                 league: pick.league || "",
                 capturedAt: Date.now(),
                 clockFrozen: false,
-                _expiredAt: _existingLive?._expiredAt ?? null  // preserve ENDED marker
+                homeScore: _rlHomeScore,
+                awayScore: _rlAwayScore,
+                _expiredAt: _existingLive?._expiredAt ?? null  // preserve ENDED marker across polls
               });
             }
+            // Period-aware settlement: settle Q1/Q2/H1/Q3 picks the moment their period ends
+            const _regPeriods = LEAGUE_FETCH_RULES[pick.league || ""]?.regulationPeriods ?? 4;
+            const _periodDone = isPickPeriodComplete(pick.marketKey, Number(period || 0), _isHalf, false, _regPeriods);
+            const _isPeriodMarket = ["q1","q2","q3","h1","q1_team_a","q1_team_b","h1_team_a","h1_team_b"].includes(pick.marketKey);
+            if (_periodDone && _isPeriodMarket) {
+              const midSettled = settleTrackedPickFromCompetition(pick, competition, true);
+              if (midSettled && midSettled !== "pending" && pick.resultStatus !== midSettled) {
+                pick.resultStatus = midSettled;
+                pick.settledAt = new Date().toISOString();
+                pick.settlementSource = "api_period";
+                pick.settledVersion = ENGINE_MODEL_VERSION;
+                changed = true;
+                g_liveGameStatus.delete(pick.eventId);
+                g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: `✅ PERIOD SETTLED: ${midSettled.toUpperCase()}`, apiFinal: false, clock, period, settled: midSettled, actual: pick.actualScore, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
+                trackerDebug("period-settled pick", { eventId: pick.eventId, market: pick.marketKey, result: midSettled, actual: pick.actualScore });
+              }
+            }
           }
+        }
+---
         }
 
         // ISSUE 11 FIX [CLOSED]: The original guard deleted only ONE entry per loop iteration,
