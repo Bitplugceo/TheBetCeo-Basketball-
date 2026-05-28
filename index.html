@@ -3301,28 +3301,38 @@ function ssProcessTeamEvents(events, teamId, label) {
     const myScore = isHome ? ev.homeScore : ev.awayScore;
     const oppScore = isHome ? ev.awayScore : ev.homeScore;
     if (myScore && oppScore) {
-              // Use normaltime to strip OT; fall back to current/display
+        // Use normaltime to strip OT; fall back to current/display
         const myFT = Number(myScore.normaltime ?? myScore.current ?? myScore.display ?? 0);
         const oppFT = Number(oppScore.normaltime ?? oppScore.current ?? oppScore.display ?? 0);
       if (myFT > 0) {
         scoredList.push(myFT);
         allowedList.push(oppFT);
-        const myQ1 = Number(myScore.period1 ?? 0);
-        const myQ2 = Number(myScore.period2 ?? 0);
-        const myQ3 = Number(myScore.period3 ?? 0);
-        const myQ4 = Number(myScore.period4 ?? 0);
-        const oppQ1 = Number(oppScore.period1 ?? 0);
-        const oppQ2 = Number(oppScore.period2 ?? 0);
-        const oppQ3 = Number(oppScore.period3 ?? 0);
-        const oppQ4 = Number(oppScore.period4 ?? 0);
-        if (myQ1 > 0 || myQ2 > 0) {
+        // FIX: Use null-coalescing with explicit null check so period scores of 0 are preserved.
+        // Previously `?? 0` was correct but Number(null ?? 0) === 0 was masking missing data.
+        // Now we check if the period field exists at all before pushing quarter arrays.
+        const myQ1 = myScore.period1 != null ? Number(myScore.period1) : null;
+        const myQ2 = myScore.period2 != null ? Number(myScore.period2) : null;
+        const myQ3 = myScore.period3 != null ? Number(myScore.period3) : null;
+        const myQ4 = myScore.period4 != null ? Number(myScore.period4) : null;
+        const oppQ1 = oppScore.period1 != null ? Number(oppScore.period1) : null;
+        const oppQ2 = oppScore.period2 != null ? Number(oppScore.period2) : null;
+        const oppQ3 = oppScore.period3 != null ? Number(oppScore.period3) : null;
+        const oppQ4 = oppScore.period4 != null ? Number(oppScore.period4) : null;
+        // Only push quarter data if we have at least Q1 and Q2 from BOTH teams
+        const hasValidQuarters = myQ1 !== null && myQ2 !== null && oppQ1 !== null && oppQ2 !== null;
+        if (hasValidQuarters) {
           q1ScoredList.push(myQ1); q2ScoredList.push(myQ2);
-          q3ScoredList.push(myQ3); q4ScoredList.push(myQ4);
+          // Q3/Q4: push 0 if field is null (game may not have Q3/Q4 period data in SofaScore)
+          q3ScoredList.push(myQ3 !== null ? myQ3 : 0);
+          q4ScoredList.push(myQ4 !== null ? myQ4 : 0);
           q1AllowedList.push(oppQ1); q2AllowedList.push(oppQ2);
-          q3AllowedList.push(oppQ3); q4AllowedList.push(oppQ4);
-          if (myQ1 + myQ2 > 0) {
-            h1ScoredList.push(myQ1 + myQ2);
-            h1AllowedList.push(oppQ1 + oppQ2);
+          q3AllowedList.push(oppQ3 !== null ? oppQ3 : 0);
+          q4AllowedList.push(oppQ4 !== null ? oppQ4 : 0);
+          const h1S = myQ1 + myQ2;
+          const h1A = oppQ1 + oppQ2;
+          if (h1S > 0 || h1A > 0) {
+            h1ScoredList.push(h1S);
+            h1AllowedList.push(h1A);
           }
         }
       }
@@ -3331,25 +3341,32 @@ function ssProcessTeamEvents(events, teamId, label) {
   });
 
   // 2. Process venue splits from the entire available pool to guarantee we get 5 games
+  // FIX: Separate home/away passes so venue counts are independent and don't starve each other
   completedAll.forEach(ev => {
     const isHome = String(ev.homeTeam?.id) === String(teamId);
-    const myScore = isHome ? ev.homeScore : ev.awayScore;
-    const oppScore = isHome ? ev.awayScore : ev.homeScore;
+    if (!isHome) return; // home pass only
+    const myScore = ev.homeScore;
+    const oppScore = ev.awayScore;
     if (myScore && oppScore) {
       const myFT = Number(myScore.normaltime ?? myScore.current ?? myScore.display ?? 0);
       const oppFT = Number(oppScore.normaltime ?? oppScore.current ?? oppScore.display ?? 0);
-      if (myFT > 0) {
-        if (isHome) {
-          if (homeScoredList.length < 5) {
-            homeScoredList.push(myFT);
-            homeAllowedList.push(oppFT);
-          }
-        } else {
-          if (awayScoredList.length < 5) {
-            awayScoredList.push(myFT);
-            awayAllowedList.push(oppFT);
-          }
-        }
+      if (myFT > 0 && homeScoredList.length < 5) {
+        homeScoredList.push(myFT);
+        homeAllowedList.push(oppFT);
+      }
+    }
+  });
+  completedAll.forEach(ev => {
+    const isHome = String(ev.homeTeam?.id) === String(teamId);
+    if (isHome) return; // away pass only
+    const myScore = ev.awayScore;
+    const oppScore = ev.homeScore;
+    if (myScore && oppScore) {
+      const myFT = Number(myScore.normaltime ?? myScore.current ?? myScore.display ?? 0);
+      const oppFT = Number(oppScore.normaltime ?? oppScore.current ?? oppScore.display ?? 0);
+      if (myFT > 0 && awayScoredList.length < 5) {
+        awayScoredList.push(myFT);
+        awayAllowedList.push(oppFT);
       }
     }
   });
@@ -3591,67 +3608,67 @@ function extractH2HFromPastedEvents() {
   const h2hAQ1 = [], h2hBQ1 = [], h2hAQ2 = [], h2hBQ2 = [];
   const h2hAQ3 = [], h2hBQ3 = [], h2hAQ4 = [], h2hBQ4 = [];
   h2hMatches.forEach(m => {
-    const isAHome = String(m.homeTeam?.id) === String(idA);
+    const isAHome = String(m.homeTeam?.id) === String(resolvedIdA);
     const myScoreObj = isAHome ? m.homeScore : m.awayScore;
     const oppScoreObj = isAHome ? m.awayScore : m.homeScore;
     const myFT = Number(myScoreObj?.normaltime ?? myScoreObj?.current ?? myScoreObj?.display ?? 0);
     const oppFT = Number(oppScoreObj?.normaltime ?? oppScoreObj?.current ?? oppScoreObj?.display ?? 0);
     if (myFT > 0) {
-					h2hA.push(myFT); h2hB.push(oppFT);
-					const mQ1 = Number(myScoreObj?.period1 ?? 0);
-				const mQ2 = Number(myScoreObj?.period2 ?? 0);
-				const mQ3 = Number(myScoreObj?.period3 ?? 0);
-				const mQ4 = Number(myScoreObj?.period4 ?? 0);
-				const oQ1 = Number(oppScoreObj?.period1 ?? 0);
-				const oQ2 = Number(oppScoreObj?.period2 ?? 0);
-				const oQ3 = Number(oppScoreObj?.period3 ?? 0);
-				const oQ4 = Number(oppScoreObj?.period4 ?? 0);
-      // Push H2H quarter data if at least Q1+Q2 are valid; Q3/Q4 only if non-zero
-      const hasQ1Q2 = mQ1 > 0 && mQ2 > 0 && oQ1 > 0 && oQ2 > 0;
-      if (hasQ1Q2) {
-        h2hA1H.push(mQ1 + mQ2); h2hB1H.push(oQ1 + oQ2);
-        h2hAQ1.push(mQ1); h2hBQ1.push(oQ1);
-        h2hAQ2.push(mQ2); h2hBQ2.push(oQ2);
-        if (mQ3 > 0 && mQ4 > 0 && oQ3 > 0 && oQ4 > 0) {
-          h2hAQ3.push(mQ3); h2hBQ3.push(oQ3);
-          h2hAQ4.push(mQ4); h2hBQ4.push(oQ4);
+          h2hA.push(myFT); h2hB.push(oppFT);
+          // FIX: null-safe period extraction
+          const mQ1 = myScoreObj?.period1 != null ? Number(myScoreObj.period1) : null;
+          const mQ2 = myScoreObj?.period2 != null ? Number(myScoreObj.period2) : null;
+          const mQ3 = myScoreObj?.period3 != null ? Number(myScoreObj.period3) : null;
+          const mQ4 = myScoreObj?.period4 != null ? Number(myScoreObj.period4) : null;
+          const oQ1 = oppScoreObj?.period1 != null ? Number(oppScoreObj.period1) : null;
+          const oQ2 = oppScoreObj?.period2 != null ? Number(oppScoreObj.period2) : null;
+          const oQ3 = oppScoreObj?.period3 != null ? Number(oppScoreObj.period3) : null;
+          const oQ4 = oppScoreObj?.period4 != null ? Number(oppScoreObj.period4) : null;
+          const hasQ1Q2 = mQ1 !== null && mQ2 !== null && oQ1 !== null && oQ2 !== null;
+          if (hasQ1Q2) {
+            h2hA1H.push(mQ1 + mQ2); h2hB1H.push(oQ1 + oQ2);
+            h2hAQ1.push(mQ1); h2hBQ1.push(oQ1);
+            h2hAQ2.push(mQ2); h2hBQ2.push(oQ2);
+            if (mQ3 !== null && mQ4 !== null && oQ3 !== null && oQ4 !== null) {
+              h2hAQ3.push(mQ3); h2hBQ3.push(oQ3);
+              h2hAQ4.push(mQ4); h2hBQ4.push(oQ4);
+            }
+          }
+        }
+      });
+        if (h2hA.length >= 2) {
+          document.getElementById("aFTH2H").value = h2hA.join(",");
+          document.getElementById("bFTH2H").value = h2hB.join(",");
+          const h2hCb = document.getElementById("useFTH2H");
+          if (h2hCb) h2hCb.checked = true;
+          if (h2hA1H.length >= 2) {
+            document.getElementById("a1HH2H").value = h2hA1H.join(",");
+            document.getElementById("b1HH2H").value = h2hB1H.join(",");
+            const h1Cb = document.getElementById("use1HH2H");
+            if (h1Cb) h1Cb.checked = true;
+          }
+          if (h2hAQ1.length >= 2) {
+            document.getElementById("aQ1H2H").value = h2hAQ1.join(",");
+            document.getElementById("bQ1H2H").value = h2hBQ1.join(",");
+            document.getElementById("aQ2H2H").value = h2hAQ2.join(",");
+            document.getElementById("bQ2H2H").value = h2hBQ2.join(",");
+            if (h2hAQ3.length >= 2) {
+              document.getElementById("aQ3H2H").value = h2hAQ3.join(",");
+              document.getElementById("bQ3H2H").value = h2hBQ3.join(",");
+            }
+            if (h2hAQ4.length >= 2) {
+              document.getElementById("aQ4H2H").value = h2hAQ4.join(",");
+              document.getElementById("bQ4H2H").value = h2hBQ4.join(",");
+            }
+            ["useQ1H2H","useQ2H2H","useQ3H2H","useQ4H2H"].forEach(id => {
+              const cb = document.getElementById(id); if (cb) cb.checked = true;
+            });
+          }
+          syncAllH2HCheckboxes(false);
+          engineDebug("SS H2H auto-filled", { games: h2hA.length });
         }
       }
-    }
-   });
-  if (h2hA.length >= 2) {
-    document.getElementById("aFTH2H").value = h2hA.join(",");
-    document.getElementById("bFTH2H").value = h2hB.join(",");
-    const h2hCb = document.getElementById("useFTH2H");
-    if (h2hCb) h2hCb.checked = true;
-    if (h2hA1H.length >= 2) {
-      document.getElementById("a1HH2H").value = h2hA1H.join(",");
-      document.getElementById("b1HH2H").value = h2hB1H.join(",");
-      const h1Cb = document.getElementById("use1HH2H");
-      if (h1Cb) h1Cb.checked = true;
-    }
-    if (h2hAQ1.length >= 2) {
-      document.getElementById("aQ1H2H").value = h2hAQ1.join(",");
-      document.getElementById("bQ1H2H").value = h2hBQ1.join(",");
-      document.getElementById("aQ2H2H").value = h2hAQ2.join(",");
-      document.getElementById("bQ2H2H").value = h2hBQ2.join(",");
-      if (h2hAQ3.length >= 2) {
-        document.getElementById("aQ3H2H").value = h2hAQ3.join(",");
-        document.getElementById("bQ3H2H").value = h2hBQ3.join(",");
-      }
-      if (h2hAQ4.length >= 2) {
-        document.getElementById("aQ4H2H").value = h2hAQ4.join(",");
-        document.getElementById("bQ4H2H").value = h2hBQ4.join(",");
-      }
-      ["useQ1H2H","useQ2H2H","useQ3H2H","useQ4H2H"].forEach(id => {
-        const cb = document.getElementById(id); if (cb) cb.checked = true;
-      });
-    }
-    syncAllH2HCheckboxes(false);
-    engineDebug("Pasted JSON H2H auto-filled", { games: h2hA.length });
-  }
-}
-}
+    } catch (h2hErr) {
 
 async function fetchSofascoreStats() {
   const nameA = (document.getElementById("ssTeamAName")?.value || "").trim();
