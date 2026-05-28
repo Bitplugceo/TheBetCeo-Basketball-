@@ -5794,20 +5794,20 @@ function acknowledgeGlobalEngineAlert() {
 }
 
 function triggerTrackerMilitaryRaid() {
-  const existing = document.getElementById("militaryRaidToast");
-  if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
-  const toast = document.createElement("div");
-  toast.id = "militaryRaidToast";
-  toast.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#c0392b;color:#fff;font-size:20px;font-weight:900;padding:18px 32px;z-index:999999;border-radius:6px;letter-spacing:1px;text-align:center;box-shadow:0 6px 24px rgba(0,0,0,0.55);pointer-events:none;";
-  toast.textContent = "Triggered ⚡️";
-  document.body.appendChild(toast);
-  setTimeout(() => {
-    toast.textContent = "Completed ⚡️";
-    toast.style.background = "#1a7a3c";
-  }, 2000);
-  setTimeout(() => {
-    if (toast.parentNode) toast.parentNode.removeChild(toast);
-  }, 3200);
+  const titleEl = document.getElementById("trackerHeadTitle");
+  if (titleEl) {
+    const _origTitle = titleEl.textContent;
+    titleEl.textContent = "Triggered ⚡️";
+    titleEl.style.color = "#ff6b6b";
+    setTimeout(() => {
+      titleEl.textContent = "Completed ⚡️";
+      titleEl.style.color = "#4ade80";
+    }, 2000);
+    setTimeout(() => {
+      titleEl.textContent = _origTitle;
+      titleEl.style.color = "";
+    }, 3400);
+  }
   if (typeof AFDB !== "undefined" && typeof AFDB.runTestFetch === "function") {
     AFDB.runTestFetch();
   }
@@ -10296,6 +10296,49 @@ function handleTrackedPicksActionClick(event) {
   const state = competition?.status?.type?.state || "";
   const completed = competition?.status?.type?.completed || false;
 
+  // ── EARLY QOU SETTLEMENT: fires before the period guard ────────────────────
+  const _eqMkt = pick.marketKey;
+  if ((_eqMkt === "high_q_ou" || _eqMkt === "low_q_ou") && !completed) {
+    const _eqComps = competition.competitors || [];
+    const _eqHome = _eqComps.find(c => c.homeAway === "home") || _eqComps[0];
+    const _eqAway = _eqComps.find(c => c.homeAway === "away") || _eqComps[1];
+    if (_eqHome && _eqAway) {
+      const _eqGV = v => (v === null || v === undefined) ? 0 : typeof v === "object" ? parseFloat(v.value ?? v.displayValue ?? 0) : parseFloat(v) || 0;
+      const _eqLH = _eqHome.linescores || [];
+      const _eqLA = _eqAway.linescores || [];
+      const _eqML = parseFloat(pick.line);
+      const _eqPS = getPickSideFromText(String(pick.predictionText || pick.side || ""));
+      const _eqCurP = Number(competition?.status?.period || 0);
+      const _eqClk = String(competition?.status?.displayClock || "");
+      const _eqClkZero = _eqClk === "0.0" || _eqClk === "0:00";
+      // Quarters that are definitively complete: all periods before the current running one.
+      // If the clock is already at 0:00, the current period is also complete.
+      const _eqEff = _eqClkZero ? _eqCurP : Math.max(0, _eqCurP - 1);
+      const _eqN = Math.min(_eqEff, 4, _eqLH.length, _eqLA.length);
+      if (_eqPS && isFinite(_eqML) && _eqN >= 1) {
+        const _eqQTs = [];
+        for (let _qi = 0; _qi < _eqN; _qi++) {
+          const _qt = _eqGV(_eqLH[_qi]) + _eqGV(_eqLA[_qi]);
+          if (_qt > 0) _eqQTs.push(_qt);
+        }
+        // low_q_ou: needs at least 2 confirmed quarters to avoid single-quarter noise
+        if (_eqMkt === "low_q_ou" && _eqQTs.length >= 2) {
+          const _eqMin = Math.min(..._eqQTs);
+          // OVER: if the minimum so far is already ≤ line, the over can never win
+          if (_eqPS === "over" && _eqMin <= _eqML) { pick.actualScore = _eqMin; pick.engineResultStatus = "loss"; return "loss"; }
+          // UNDER: if the minimum so far is already < line, the under is already secured
+          if (_eqPS === "under" && _eqMin < _eqML) { pick.actualScore = _eqMin; pick.engineResultStatus = "win"; return "win"; }
+        }
+        // high_q_ou: one confirmed quarter above the line is enough
+        if (_eqMkt === "high_q_ou" && _eqQTs.length >= 1) {
+          const _eqMax = Math.max(..._eqQTs);
+          if (_eqPS === "over" && _eqMax > _eqML) { pick.actualScore = _eqMax; pick.engineResultStatus = "win"; return "win"; }
+          if (_eqPS === "under" && _eqMax > _eqML) { pick.actualScore = _eqMax; pick.engineResultStatus = "loss"; return "loss"; }
+        }
+      }
+    }
+  }
+
   // Ensure the game is actually over (or the pick's specific period is complete)
   if (allowPartialSettlement && !completed) {
     const _curPeriod = Number(competition?.status?.period || 0);
@@ -10579,6 +10622,20 @@ function handleTrackedPicksActionClick(event) {
                     g_liveGameStatus.delete(pick.eventId);
                     g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: `✅ PERIOD SETTLED: ${midSettled.toUpperCase()}`, apiFinal: false, clock, period, settled: midSettled, actual: pick.actualScore, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
                     trackerDebug("period-settled pick", { eventId: pick.eventId, market: pick.marketKey, result: midSettled, actual: pick.actualScore });
+                  }
+                }
+                // Early settlement for High/Low Q Total picks — settle the moment the result is mathematically certain
+                if (["high_q_ou", "low_q_ou"].includes(pick.marketKey) && Number(period || 0) >= 2) {
+                  const _qouEarly = settleTrackedPickFromCompetition(pick, competition, true);
+                  if (_qouEarly && _qouEarly !== "pending" && pick.resultStatus !== _qouEarly) {
+                    pick.resultStatus = _qouEarly;
+                    pick.settledAt = new Date().toISOString();
+                    pick.settlementSource = "api_early_qou";
+                    pick.settledVersion = ENGINE_MODEL_VERSION;
+                    changed = true;
+                    g_liveGameStatus.delete(pick.eventId);
+                    g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: `✅ EARLY QOU: ${_qouEarly.toUpperCase()}`, apiFinal: false, clock, period, settled: _qouEarly, actual: pick.actualScore, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
+                    trackerDebug("early qou settled", { eventId: pick.eventId, market: pick.marketKey, result: _qouEarly, actual: pick.actualScore });
                   }
                 }
               }
