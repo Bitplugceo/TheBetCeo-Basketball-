@@ -3310,29 +3310,54 @@ function ssProcessTeamEvents(events, teamId, label) {
   const homeScoredList = [], homeAllowedList = [];
   const awayScoredList = [], awayAllowedList = [];
 
-  const completed = events.filter(e => {
+  const completedAll = events.filter(e => {
     if (e.status?.type !== "finished") return false;
     const hId = String(e.homeTeam?.id || "");
     const aId = String(e.awayTeam?.id || "");
     return hId === String(teamId) || aId === String(teamId);
-  }).reverse().slice(0, 10);
+  }).reverse();
 
-  engineDebug("ssProcessTeamEvents", { label, count: completed.length });
+  engineDebug("ssProcessTeamEvents completed overall count: " + completedAll.length, { label });
 
-  completed.forEach((ev, idx) => {
+  // 1. Process overall scores (last 10 finished games)
+  const overallGames = completedAll.slice(0, 10);
+  overallGames.forEach((ev, idx) => {
     const isHome = String(ev.homeTeam?.id) === String(teamId);
     const myScore = isHome ? ev.homeScore : ev.awayScore;
     const oppScore = isHome ? ev.awayScore : ev.homeScore;
     if (myScore && oppScore) {
-      const myFT = Number(myScore.normaltime ?? myScore.current ?? myScore.display ?? 0);
-      const oppFT = Number(oppScore.normaltime ?? oppScore.current ?? oppScore.display ?? 0);
+      // Prioritize final current/display scores over quarter normaltime scores
+      const myFT = Number(myScore.current ?? myScore.display ?? myScore.normaltime ?? 0);
+      const oppFT = Number(oppScore.current ?? oppScore.display ?? oppScore.normaltime ?? 0);
       if (myFT > 0) {
         scoredList.push(myFT);
         allowedList.push(oppFT);
-        if (isHome) { homeScoredList.push(myFT); homeAllowedList.push(oppFT); }
-        else { awayScoredList.push(myFT); awayAllowedList.push(oppFT); }
       }
-      engineDebug("ssProcessTeamEvents match #" + (idx + 1), { myFT, oppFT, isHome });
+      engineDebug("ssProcessTeamEvents overall match #" + (idx + 1), { myFT, oppFT, isHome });
+    }
+  });
+
+  // 2. Process venue splits from the entire available pool to guarantee we get 5 games
+  completedAll.forEach(ev => {
+    const isHome = String(ev.homeTeam?.id) === String(teamId);
+    const myScore = isHome ? ev.homeScore : ev.awayScore;
+    const oppScore = isHome ? ev.awayScore : ev.homeScore;
+    if (myScore && oppScore) {
+      const myFT = Number(myScore.current ?? myScore.display ?? myScore.normaltime ?? 0);
+      const oppFT = Number(oppScore.current ?? oppScore.display ?? oppScore.normaltime ?? 0);
+      if (myFT > 0) {
+        if (isHome) {
+          if (homeScoredList.length < 5) {
+            homeScoredList.push(myFT);
+            homeAllowedList.push(oppFT);
+          }
+        } else {
+          if (awayScoredList.length < 5) {
+            awayScoredList.push(myFT);
+            awayAllowedList.push(oppFT);
+          }
+        }
+      }
     }
   });
 
@@ -3373,6 +3398,10 @@ function searchSofascorePlayer(side) {
   }
 }
 
+// Global event schedule storage for dynamic Head-To-Head auto-filling
+window.__lastEventsA = null;
+window.__lastEventsB = null;
+
 function parseSofascoreIndividual(side) {
   const pasteEl = document.getElementById(side === "A" ? "ssPasteA" : "ssPasteB");
   const rawText = (pasteEl?.value || "").trim();
@@ -3383,6 +3412,10 @@ function parseSofascoreIndividual(side) {
     const parsed = JSON.parse(rawText);
     const events = parsed.events || [];
     if (!events.length) throw new Error("No events found in pasted JSON.");
+
+    // Store schedule events globally
+    if (side === "A") window.__lastEventsA = events;
+    else window.__lastEventsB = events;
 
     // Auto-detect team ID by frequency
     let idVal = (document.getElementById(side === "A" ? "ssTeamAId" : "ssTeamBId")?.value || "").trim();
@@ -3455,6 +3488,9 @@ function parseSofascoreIndividual(side) {
       }
     }
 
+    // Try finding and auto-filling H2H inputs from current pasted context
+    extractH2HFromPastedEvents();
+
     if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " stats loaded from pasted JSON!"; }
     if (pasteEl) pasteEl.value = "";
 
@@ -3465,6 +3501,59 @@ function parseSofascoreIndividual(side) {
   } catch (err) {
     if (st) { st.style.color = "#d92d2a"; st.textContent = "❌ Parse failed: " + err.message; }
     engineDebug("parseSofascoreIndividual failed", { side, error: err.message });
+  }
+}
+
+// Extraction utility to parse Head-to-Head schedules from pasted schedules
+function extractH2HFromPastedEvents() {
+  const idA = document.getElementById("ssTeamAId")?.value.trim();
+  const idB = document.getElementById("ssTeamBId")?.value.trim();
+  if (!idA || !idB) return;
+
+  const allEvents = [
+    ...(window.__lastEventsA || []),
+    ...(window.__lastEventsB || [])
+  ];
+
+  if (!allEvents.length) return;
+
+  const uniqueEvents = [];
+  const seenIds = new Set();
+  allEvents.forEach(ev => {
+    if (ev.id && !seenIds.has(ev.id)) {
+      seenIds.add(ev.id);
+      uniqueEvents.push(ev);
+    }
+  });
+
+  const h2hMatches = uniqueEvents.filter(ev => {
+    const sType = ev.status?.type ?? "";
+    const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
+    if (!isTerminal) return false;
+    const hId = String(ev.homeTeam?.id ?? "");
+    const aId = String(ev.awayTeam?.id ?? "");
+    return (hId === idA && aId === idB) || (hId === idB && aId === idA);
+  }).sort((a, b) => {
+    const tA = a.startTimestamp || 0;
+    const tB = b.startTimestamp || 0;
+    return tB - tA; // Newest first
+  }).slice(0, 5);
+
+  if (h2hMatches.length >= 2) {
+    const h2hA = [], h2hB = [];
+    h2hMatches.forEach(m => {
+      const isAHome = String(m.homeTeam?.id) === idA;
+      const myScore = Number((isAHome ? m.homeScore : m.awayScore)?.current ?? m.homeScore?.display ?? m.homeScore?.normaltime ?? 0);
+      const oppScore = Number((isAHome ? m.awayScore : m.homeScore)?.current ?? m.awayScore?.display ?? m.awayScore?.normaltime ?? 0);
+      if (myScore > 0) { h2hA.push(myScore); h2hB.push(oppScore); }
+    });
+    if (h2hA.length >= 2) {
+      document.getElementById("aFTH2H").value = h2hA.join(",");
+      document.getElementById("bFTH2H").value = h2hB.join(",");
+      const h2hCb = document.getElementById("useFTH2H");
+      if (h2hCb) h2hCb.checked = true;
+      engineDebug("Pasted JSON H2H auto-filled", { games: h2hA.length });
+    }
   }
 }
 
@@ -5899,11 +5988,11 @@ function triggerTrackerMilitaryRaid() {
     setTimeout(() => {
       statusEl.textContent = "Completed ⚡️";
       statusEl.style.color = "#4ade80";
-    }, 2000);
+    }, 500);
     setTimeout(() => {
       statusEl.textContent = "";
       statusEl.style.color = "";
-    }, 3400);
+    }, 1000);
   }
   if (typeof AFDB !== "undefined" && typeof AFDB.runTestFetch === "function") {
     AFDB.runTestFetch();
