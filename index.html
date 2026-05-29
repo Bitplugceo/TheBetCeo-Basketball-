@@ -3568,6 +3568,15 @@ function parseSofascoreIndividual(side) {
     if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " stats loaded from pasted JSON!"; }
     if (pasteEl) pasteEl.value = "";
 
+    // Propagate Sofascore team name into the main engine name input so the tracker
+    // saves the real team name instead of a generic "A VS B" label.
+    // Only copies when the main field is empty — never overwrites a manually typed name.
+    const _ssNameSrc  = document.getElementById(side === "A" ? "ssTeamAName" : "ssTeamBName");
+    const _mainNameEl = document.getElementById(side === "A" ? "teamAName" : "teamBName");
+    if (_ssNameSrc && _mainNameEl && _ssNameSrc.value.trim() && !_mainNameEl.value.trim()) {
+      _mainNameEl.value = _ssNameSrc.value.trim();
+    }
+
     openSection("marketSection");
     openSection("teamASection");
     openSection("teamBSection");
@@ -3667,8 +3676,37 @@ function extractH2HFromPastedEvents() {
         const cb = document.getElementById(id); if (cb) cb.checked = true;
       });
     }
-    syncAllH2HCheckboxes(false);
-    engineDebug("Pasted JSON H2H auto-filled", { games: h2hA.length });
+          syncAllH2HCheckboxes(false);
+      engineDebug("Pasted JSON H2H auto-filled", { games: h2hA.length });
+  }
+
+  // Scan pasted events for the upcoming scheduled fixture between the two teams.
+  // When found, stores eventId + eventDate in window.__manualFixtureMeta so
+  // getCurrentFixtureMeta() can tag manual picks with a real game reference.
+  const _scheduledMatch = uniqueEvents.find(ev => {
+    const _sType = String(ev.status?.type ?? "").toLowerCase();
+    const _isUpcoming = _sType === "notstarted" || _sType === "scheduled" ||
+      (!ev.status?.finished && !ev.started && !ev.status?.started);
+    if (!_isUpcoming) return false;
+    const _hId = String(ev.homeTeam?.id ?? "");
+    const _aId = String(ev.awayTeam?.id ?? "");
+    return (_hId === idA && _aId === idB) || (_hId === idB && _aId === idA);
+  });
+
+  if (_scheduledMatch) {
+    const _ts      = Number(_scheduledMatch.startTimestamp || 0);
+    const _isAHome = String(_scheduledMatch.homeTeam?.id) === idA;
+    const _nameA   = document.getElementById("ssTeamAName")?.value.trim() || "";
+    const _nameB   = document.getElementById("ssTeamBName")?.value.trim() || "";
+    window.__manualFixtureMeta = {
+      eventId:   `ss_${_scheduledMatch.id || Date.now()}`,
+      eventDate: _ts > 0 ? new Date(_ts * 1000).toISOString() : new Date().toISOString(),
+      homeTeam:  _isAHome ? _nameA : _nameB,
+      awayTeam:  _isAHome ? _nameB : _nameA,
+      homeId:    String(_scheduledMatch.homeTeam?.id ?? ""),
+      awayId:    String(_scheduledMatch.awayTeam?.id ?? "")
+    };
+    engineDebug("Sofascore upcoming fixture confirmed", window.__manualFixtureMeta);
   }
 }
 }
@@ -9018,13 +9056,20 @@ function getCurrentFixtureMeta() {
     ) || null;
   })();
 
+  // For the Sofascore JSON workflow: blend in auto-detected fixture when team names match.
+  // Provides real eventId + eventDate for manual league picks without ESPN fixture selection.
+  const _mfm = window.__manualFixtureMeta || null;
+  const _useManualFixture = !matchedOpt && _mfm &&
+    normalizeTeamName(_mfm.homeTeam || "") === normA &&
+    normalizeTeamName(_mfm.awayTeam || "") === normB;
+
   return {
-    eventId: matchedOpt ? (matchedOpt.value || "") : "",
-    eventDate: matchedOpt ? (matchedOpt.dataset.eventDate || "") : "",
-    homeTeam: matchedOpt ? (matchedOpt.dataset.home || teamAName) : teamAName,
-    awayTeam: matchedOpt ? (matchedOpt.dataset.away || teamBName) : teamBName,
-    homeId: matchedOpt ? (matchedOpt.dataset.homeId || String(selectedTeamIds.A || "")) : String(selectedTeamIds.A || ""),
-    awayId: matchedOpt ? (matchedOpt.dataset.awayId || String(selectedTeamIds.B || "")) : String(selectedTeamIds.B || "")
+    eventId:   matchedOpt ? (matchedOpt.value || "")                                        : (_useManualFixture ? _mfm.eventId   : ""),
+    eventDate: matchedOpt ? (matchedOpt.dataset.eventDate || "")                            : (_useManualFixture ? _mfm.eventDate : ""),
+    homeTeam:  matchedOpt ? (matchedOpt.dataset.home  || teamAName)                         : teamAName,
+    awayTeam:  matchedOpt ? (matchedOpt.dataset.away  || teamBName)                         : teamBName,
+    homeId:    matchedOpt ? (matchedOpt.dataset.homeId || String(selectedTeamIds.A || ""))  : (_useManualFixture ? _mfm.homeId : String(selectedTeamIds.A || "")),
+    awayId:    matchedOpt ? (matchedOpt.dataset.awayId || String(selectedTeamIds.B || ""))  : (_useManualFixture ? _mfm.awayId : String(selectedTeamIds.B || ""))
   };
 }
 
@@ -15179,17 +15224,22 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
   const isExoticNoLine = pickRow && exoticNoLineMarkets.includes(pickRow.marketKey);
 
   const isManualLeague = league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa";
-  if (isManualLeague && !fixtureMeta.eventId) {
-    // ISSUE 3 FIX [CLOSED]: Strip apostrophes and other injection-unsafe characters from
-    // manual event IDs. The original regex only removed whitespace, leaving apostrophes
-    // (e.g. O'Sullivan → O'Sullivan) intact inside the eventId string. These apostrophes
-    // then broke inline onclick attribute single-quote delimiters in renderTrackedPicks,
-    // silently preventing settlement buttons from appearing or functioning.
-    // The fix strips whitespace AND all shell/HTML/JS-unsafe characters in one pass.
-    const safeHome = (fixtureMeta.homeTeam || "home").replace(/[\s'"`<>&]/g, "");
-    const safeAway = (fixtureMeta.awayTeam || "away").replace(/[\s'"`<>&]/g, "");
-    fixtureMeta.eventId = `manual_${league}_${safeHome}_${safeAway}`;
-  }
+if (isManualLeague && !fixtureMeta.eventId) {
+  // ISSUE 3 FIX [CLOSED]: Strip apostrophes and other injection-unsafe characters from
+  // manual event IDs. The original regex only removed whitespace, leaving apostrophes
+  // (e.g. O'Sullivan → O'Sullivan) intact inside the eventId string. These apostrophes
+  // then broke inline onclick attribute single-quote delimiters in renderTrackedPicks,
+  // silently preventing settlement buttons from appearing or functioning.
+  // The fix strips whitespace AND all shell/HTML/JS-unsafe characters in one pass.
+  const safeHome = (fixtureMeta.homeTeam || "home").replace(/[\s'"`<>&]/g, "");
+  const safeAway = (fixtureMeta.awayTeam || "away").replace(/[\s'"`<>&]/g, "");
+  fixtureMeta.eventId = `manual_${league}_${safeHome}_${safeAway}`;
+}
+// Manual picks with no eventDate are invisible in the tracker — gameTs === 0 fails
+// every visibility and archival check. Guarantee a timestamp so picks surface immediately.
+if (isManualLeague && !fixtureMeta.eventDate) {
+  fixtureMeta.eventDate = new Date().toISOString();
+}
 
   // 🛡️ ADVISORY PARADOX FIX: Allow all legitimate picks to save regardless of warning notes, unless they are hard-blocked
   const isSavablePick =
