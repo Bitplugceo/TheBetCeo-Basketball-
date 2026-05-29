@@ -1,4 +1,4 @@
-D
+F
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3419,20 +3419,61 @@ function updateSofascoreLinks(side) {
   }
 }
 
-function searchSofascorePlayer(side) {
+async function searchSofascorePlayer(side) {
   const nameEl = document.getElementById(side === "A" ? "ssTeamAName" : "ssTeamBName");
   const rawName = (nameEl?.value || "").trim();
   if (!rawName) { alert("Enter a player/team name first."); return; }
   const searchName = rawName.split(",")[0].trim();
-  const searchUrl = "https://api.sofascore.com/api/v1/search/all?q=" + encodeURIComponent(searchName);
-  window.open(searchUrl, "_blank");
   const st = document.getElementById("ssH2HStatus");
   if (st) {
     st.style.color = "#d98a00";
     st.style.display = "block";
-    st.textContent = "🔍 Search opened for " + side + " — find the team ID in the JSON and paste it above.";
+    st.textContent = "🔍 Searching SofaScore for basketball teams...";
+  }
+  try {
+    const searchData = await ssFetch("https://api.sofascore.com/api/v1/search/all?q=" + encodeURIComponent(searchName));
+    const results = (searchData.results || []).filter(r => r.type === "team" && r.entity?.sport?.slug === "basketball");
+    if (st) {
+      if (results.length === 0) {
+        st.style.color = "#d92d2a";
+        st.textContent = "❌ No basketball teams found matching '" + searchName + "'.";
+      } else {
+        st.style.color = "#2f8f4a";
+        let html = "<b>Select Team " + side + ":</b><br>";
+        results.slice(0, 5).forEach(r => {
+          const team = r.entity;
+          const country = team.country?.name ? ` (${team.country.name})` : '';
+          html += `<div style="margin: 4px 0;"><button type="button" onclick="selectSofascoreTeam('${side}', '${team.name.replace(/'/g, "\\'")}', '${team.id}')" style="background:#49a443;margin:0 4px 0 0;padding:2px 6px;font-size:10px;color:#fff;border:none;cursor:pointer;">Select</button> <b>${team.name}</b>${country} [ID: ${team.id}]</div>`;
+        });
+        st.innerHTML = html;
+      }
+    }
+  } catch (err) {
+    if (st) {
+      st.style.color = "#d92d2a";
+      st.textContent = "❌ Search failed: " + err.message;
+    }
+    engineDebug("searchSofascorePlayer failed", { error: err.message });
   }
 }
+
+window.selectSofascoreTeam = function(side, name, id) {
+  const nameEl = document.getElementById(side === "A" ? "ssTeamAName" : "ssTeamBName");
+  const idEl = document.getElementById(side === "A" ? "ssTeamAId" : "ssTeamBId");
+  if (nameEl) {
+    nameEl.value = name;
+    validateSofascoreSection();
+  }
+  if (idEl) {
+    idEl.value = id;
+    updateSofascoreLinks(side);
+  }
+  const st = document.getElementById("ssH2HStatus");
+  if (st) {
+    st.style.display = "none";
+    st.innerHTML = "";
+  }
+};
 
 // Global event schedule storage for dynamic Head-To-Head auto-filling
 window.__lastEventsA = null;
@@ -3693,136 +3734,6 @@ async function extractH2HFromPastedEvents() {
       }
     });
 
-    engineDebug("After local merge, total H2H candidates", { count: h2hMatches.length });
-
-    // Re-sort after merge and cap at 10
-    h2hMatches = h2hMatches
-      .sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0))
-      .slice(0, 10);
-  }
-
-  // If still nothing, bail
-  if (!h2hMatches.length) {
-    engineDebug("extractH2HFromPastedEvents: no H2H matches found after all sources");
-  }
-
-  // Build the uniqueEvents reference needed for the scheduled fixture scan below
-  const _allLocalForScan = [];
-  const _scanSeenIds = new Set();
-  [...(window.__lastEventsA || []), ...(window.__lastEventsB || [])].forEach(ev => {
-    if (ev.id && !_scanSeenIds.has(ev.id)) { _scanSeenIds.add(ev.id); _allLocalForScan.push(ev); }
-  });
-  const uniqueEvents = _allLocalForScan;
-
-  if (h2hMatches.length >= 2) {
-    const h2hA = [], h2hB = [];
-    const h2hA1H = [], h2hB1H = [];
-    const h2hAQ1 = [], h2hBQ1 = [], h2hAQ2 = [], h2hBQ2 = [];
-    const h2hAQ3 = [], h2hBQ3 = [], h2hAQ4 = [], h2hBQ4 = [];
-
-    // Use all found matches (up to 10) for extraction, then fill up to 5 valid scores
-    h2hMatches.forEach(m => {
-      const isAHome = String(m.homeTeam?.id) === idA;
-      const myScoreObj = isAHome ? m.homeScore : m.awayScore;
-      const oppScoreObj = isAHome ? m.awayScore : m.homeScore;
-      const myFT = Number(myScoreObj?.normaltime ?? myScoreObj?.current ?? myScoreObj?.display ?? 0);
-      const oppFT = Number(oppScoreObj?.normaltime ?? oppScoreObj?.current ?? oppScoreObj?.display ?? 0);
-      if (myFT > 0 && h2hA.length < 5) {
-        h2hA.push(myFT); h2hB.push(oppFT);
-        const mQ1 = Number(myScoreObj?.period1 ?? 0);
-        const mQ2 = Number(myScoreObj?.period2 ?? 0);
-        const mQ3 = Number(myScoreObj?.period3 ?? 0);
-        const mQ4 = Number(myScoreObj?.period4 ?? 0);
-        const oQ1 = Number(oppScoreObj?.period1 ?? 0);
-        const oQ2 = Number(oppScoreObj?.period2 ?? 0);
-        const oQ3 = Number(oppScoreObj?.period3 ?? 0);
-        const oQ4 = Number(oppScoreObj?.period4 ?? 0);
-        if (mQ1 > 0 || mQ2 > 0) {
-          h2hA1H.push(mQ1 + mQ2); h2hB1H.push(oQ1 + oQ2);
-          h2hAQ1.push(mQ1); h2hBQ1.push(oQ1);
-          h2hAQ2.push(mQ2); h2hBQ2.push(oQ2);
-          h2hAQ3.push(mQ3); h2hBQ3.push(oQ3);
-          h2hAQ4.push(mQ4); h2hBQ4.push(oQ4);
-        }
-      }
-    });
-
-    if (h2hA.length >= 2) {
-      document.getElementById("aFTH2H").value = h2hA.join(",");
-      document.getElementById("bFTH2H").value = h2hB.join(",");
-      const h2hCb = document.getElementById("useFTH2H");
-      if (h2hCb) h2hCb.checked = true;
-      if (h2hA1H.length >= 2) {
-        document.getElementById("a1HH2H").value = h2hA1H.join(",");
-        document.getElementById("b1HH2H").value = h2hB1H.join(",");
-        const h1Cb = document.getElementById("use1HH2H");
-        if (h1Cb) h1Cb.checked = true;
-      }
-      if (h2hAQ1.length >= 2) {
-        document.getElementById("aQ1H2H").value = h2hAQ1.join(",");
-        document.getElementById("bQ1H2H").value = h2hBQ1.join(",");
-        document.getElementById("aQ2H2H").value = h2hAQ2.join(",");
-        document.getElementById("bQ2H2H").value = h2hBQ2.join(",");
-        document.getElementById("aQ3H2H").value = h2hAQ3.join(",");
-        document.getElementById("bQ3H2H").value = h2hBQ3.join(",");
-        document.getElementById("aQ4H2H").value = h2hAQ4.join(",");
-        document.getElementById("bQ4H2H").value = h2hBQ4.join(",");
-        ["useQ1H2H","useQ2H2H","useQ3H2H","useQ4H2H"].forEach(id => {
-          const cb = document.getElementById(id); if (cb) cb.checked = true;
-        });
-      }
-      syncAllH2HCheckboxes(false);
-      engineDebug("Pasted JSON H2H auto-filled", { games: h2hA.length, q1Games: h2hAQ1.length });
-    }
-  }
-
-  // Scan pasted events for the upcoming scheduled fixture between the two teams.
-  // When found, stores eventId + eventDate in window.__manualFixtureMeta so
-  // getCurrentFixtureMeta() can tag manual picks with a real game reference.
-  const _scheduledMatch = uniqueEvents.find(ev => {
-    const _sType = String(ev.status?.type ?? "").toLowerCase();
-    const _isUpcoming = _sType === "notstarted" || _sType === "scheduled" ||
-      (!ev.status?.finished && !ev.started && !ev.status?.started);
-    if (!_isUpcoming) return false;
-    const _hId = String(ev.homeTeam?.id ?? "");
-    const _aId = String(ev.awayTeam?.id ?? "");
-    return (_hId === idA && _aId === idB) || (_hId === idB && _aId === idA);
-  });
-
-  if (_scheduledMatch) {
-    const _ts      = Number(_scheduledMatch.startTimestamp || 0);
-    const _isAHome = String(_scheduledMatch.homeTeam?.id) === idA;
-    const _nameA   = document.getElementById("ssTeamAName")?.value.trim() || "";
-    const _nameB   = document.getElementById("ssTeamBName")?.value.trim() || "";
-    window.__manualFixtureMeta = {
-      eventId:   `ss_${_scheduledMatch.id || Date.now()}`,
-      eventDate: _ts > 0 ? new Date(_ts * 1000).toISOString() : new Date().toISOString(),
-      homeTeam:  _isAHome ? _nameA : _nameB,
-      awayTeam:  _isAHome ? _nameB : _nameA,
-      homeId:    String(_scheduledMatch.homeTeam?.id ?? ""),
-      awayId:    String(_scheduledMatch.awayTeam?.id ?? "")
-    };
-    engineDebug("Sofascore upcoming fixture confirmed", window.__manualFixtureMeta);
-  }
-});
-
-    const localH2H = uniqueLocalEvents.filter(ev => {
-      const sType = ev.status?.type ?? "";
-      const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
-      if (!isTerminal) return false;
-      const hId = String(ev.homeTeam?.id ?? "");
-      const aId = String(ev.awayTeam?.id ?? "");
-      return (hId === idA && aId === idB) || (hId === idB && aId === idA);
-    });
-
-    // Merge: add any local H2H games not already in the API result set
-    localH2H.forEach(ev => {
-      if (!seenIds.has(String(ev.id || ""))) {
-        seenIds.add(String(ev.id || ""));
-        h2hMatches.push(ev);
-      }
-    });
-
     if (typeof AFDB !== "undefined") {
       AFDB.log("H2H", "LOCAL_SCAN", 
         `Found ${h2hMatches.length} H2H candidates | idA=${idA} idB=${idB}`,
@@ -3921,8 +3832,8 @@ async function extractH2HFromPastedEvents() {
       const _h2hTag = document.getElementById("h2hAutoTag");
       if (_h2hTag) {
         _h2hTag.textContent = _h2hThin
-          ? "\u26a0\ufe0f Thin H2H \u2014 1 game only. Verify before checking."
-          : "\u2705 Auto-filled (2024+, OT stripped, expanded matchup history)";
+          ? "⚠️ Thin H2H — 1 game only. Verify before checking."
+          : "✅ Auto-filled (2024+, OT stripped, expanded matchup history)";
         _h2hTag.style.display = "inline";
         _h2hTag.style.color = _h2hThin ? "#d98a00" : "";
       }
@@ -3992,7 +3903,7 @@ async function fetchSofascoreStats() {
     if (!resolvedIdA) {
       setStatus("🔍 Searching for " + nameA + "...", "#d98a00");
       const searchDataA = await ssFetch("https://api.sofascore.com/api/v1/search/all?q=" + encodeURIComponent(nameA.split(",")[0].trim()));
-      const resultsA = (searchDataA.results || []).filter(r => r.type === "team");
+      const resultsA = (searchDataA.results || []).filter(r => r.type === "team" && r.entity?.sport?.slug === "basketball");
       if (resultsA.length) {
         resolvedIdA = String(resultsA[0].entity?.id || "");
         const idEl = document.getElementById("ssTeamAId");
@@ -4004,7 +3915,7 @@ async function fetchSofascoreStats() {
     if (!resolvedIdB) {
       setStatus("🔍 Searching for " + nameB + "...", "#d98a00");
       const searchDataB = await ssFetch("https://api.sofascore.com/api/v1/search/all?q=" + encodeURIComponent(nameB.split(",")[0].trim()));
-      const resultsB = (searchDataB.results || []).filter(r => r.type === "team");
+      const resultsB = (searchDataB.results || []).filter(r => r.type === "team" && r.entity?.sport?.slug === "basketball");
       if (resultsB.length) {
         resolvedIdB = String(resultsB[0].entity?.id || "");
         const idEl = document.getElementById("ssTeamBId");
@@ -15557,43 +15468,6 @@ function getTrackedInputSource(marketKey = "ft") {
 
 function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixtureMeta, league, diagnostics }) {
   const fixtureMeta = { ...originalFixtureMeta };
-  const exoticNoLineMarkets = ["player", "w_ou", "race", "high_q", "low_q", "htft", "margin_team", "margin_any", "high_q_ou", "low_q_ou", "other"];
-  const isExoticNoLine = pickRow && exoticNoLineMarkets.includes(pickRow.marketKey);
-
-  const isManualLeague = league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa";
-if (!fixtureMeta.eventId) {
-  // FIX: Removed isManualLeague gate — WNBA/NBA/NCAA with manually typed names and no
-  // fixture selection also need a fallback eventId. Previously only non-ESPN leagues got
-  // one here, so WNBA picks typed without a dropdown selection had no eventId, hit the
-  // !fixtureMeta?.eventId null-return guard, and were silently dropped from the tracker.
-  // Also pull names from Sofascore inputs if main inputs are still empty (manual league workflow)
-  let _homeForId = fixtureMeta.homeTeam || "";
-  let _awayForId = fixtureMeta.awayTeam || "";
-  if (!_homeForId || _homeForId === "—") {
-    const _ssA = document.getElementById("ssTeamAName");
-    if (_ssA && _ssA.value.trim()) _homeForId = _ssA.value.trim();
-  }
-  if (!_awayForId || _awayForId === "—") {
-    const _ssB = document.getElementById("ssTeamBName");
-    if (_ssB && _ssB.value.trim()) _awayForId = _ssB.value.trim();
-  }
-  if (_homeForId && _homeForId !== "—") fixtureMeta.homeTeam = _homeForId;
-  if (_awayForId && _awayForId !== "—") fixtureMeta.awayTeam = _awayForId;
-  const safeHome = (_homeForId || "home").replace(/[\s'"`<>&]/g, "");
-  const safeAway = (_awayForId || "away").replace(/[\s'"`<>&]/g, "");
-  fixtureMeta.eventId = `manual_${league}_${safeHome}_${safeAway}`;
-}
-if (!fixtureMeta.eventDate) {
-  fixtureMeta.eventDate = new Date().toISOString();
-}
-
-  // 🛡️ ADVISORY PARADOX FIX: Allow all legitimate picks to save regardless of warning notes, unless they are hard-blocked
-  const isSavablePick =
-    pickRow &&
-    pickRow.pick !== "NO PLAY" &&
-    !String(pickRow.note || "").startsWith("Massacre gate") &&
-    !String(pickRow.note || "").startsWith("Intel gate") &&
-    !String(pickRow.note || "").startsWith("Grade gate");
 
   // Final name sync: if homeTeam/awayTeam are still blank, pull from Sofascore name inputs
   if (!fixtureMeta.homeTeam || fixtureMeta.homeTeam === "—" || fixtureMeta.homeTeam === "A") {
@@ -15609,15 +15483,53 @@ if (!fixtureMeta.eventDate) {
     if (_nameB) fixtureMeta.awayTeam = _nameB;
   }
 
+  const exoticNoLineMarkets = ["player", "w_ou", "race", "high_q", "low_q", "htft", "margin_team", "margin_any", "high_q_ou", "low_q_ou", "other"];
+  const isExoticNoLine = pickRow && exoticNoLineMarkets.includes(pickRow.marketKey);
+
+  const isManualLeague = league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa";
+  if (!fixtureMeta.eventId) {
+    // FIX: Removed isManualLeague gate — WNBA/NBA/NCAA with manually typed names and no
+    // fixture selection also need a fallback eventId. Previously only non-ESPN leagues got
+    // one here, so WNBA picks typed without a dropdown selection had no eventId, hit the
+    // !fixtureMeta?.eventId null-return guard, and were silently dropped from the tracker.
+    // Also pull names from Sofascore inputs if main inputs are still empty (manual league workflow)
+    let _homeForId = fixtureMeta.homeTeam || "";
+    let _awayForId = fixtureMeta.awayTeam || "";
+    if (!_homeForId || _homeForId === "—") {
+      const _ssA = document.getElementById("ssTeamAName");
+      if (_ssA && _ssA.value.trim()) _homeForId = _ssA.value.trim();
+    }
+    if (!_awayForId || _awayForId === "—") {
+      const _ssB = document.getElementById("ssTeamBName");
+      if (_ssB && _ssB.value.trim()) _awayForId = _ssB.value.trim();
+    }
+    if (_homeForId && _homeForId !== "—") fixtureMeta.homeTeam = _homeForId;
+    if (_awayForId && _awayForId !== "—") fixtureMeta.awayTeam = _awayForId;
+    const safeHome = (_homeForId || "home").replace(/[\s'"`<>&]/g, "");
+    const safeAway = (_awayForId || "away").replace(/[\s'"`<>&]/g, "");
+    fixtureMeta.eventId = `manual_${league}_${safeHome}_${safeAway}`;
+  }
+  if (!fixtureMeta.eventDate) {
+    fixtureMeta.eventDate = new Date().toISOString();
+  }
+
+  // 🛡️ ADVISORY PARADOX FIX: Allow all legitimate picks to save regardless of warning notes, unless they are hard-blocked
+  const isSavablePick =
+    pickRow &&
+    pickRow.pick !== "NO PLAY" &&
+    !String(pickRow.note || "").startsWith("Massacre gate") &&
+    !String(pickRow.note || "").startsWith("Intel gate") &&
+    !String(pickRow.note || "").startsWith("Grade gate");
+
   if (
-  !pickRow ||
-  pickRow.pick === "NO PLAY" ||
-  ((pickRow.note && !isExoticNoLine) && !isSavablePick) ||
-  (!isFinite(pickRow.line) && !isExoticNoLine) ||
-  !fixtureMeta?.eventId
-) {
-  return null;
-}
+    !pickRow ||
+    pickRow.pick === "NO PLAY" ||
+    ((pickRow.note && !isExoticNoLine) && !isSavablePick) ||
+    (!isFinite(pickRow.line) && !isExoticNoLine) ||
+    !fixtureMeta?.eventId
+  ) {
+    return null;
+  }
 
         const marketKey = pickRow.marketKey;
       let side = getPickSideFromText(pickRow.pick);
