@@ -8536,36 +8536,11 @@ function archiveExpiredTrackedPicks() {
         const isSettled = ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase());
         
         const gameTs = safeParseDate(p.eventDate) || safeParseDate(p.createdAt) || 0;
-        // Use gameTs for the archive clock so late manual settlements don't keep games hostage in activePicks
         const refTs = gameTs > 0 ? gameTs : (safeParseDate(p.settledAt) || 0);
 
-        // LOCK: Picks with no timestamp (refTs === 0) are no longer instantly archived.
-        // Previously, refTs === 0 made isExpired unconditionally true — any pick saved without
-        // an eventDate or createdAt (common for manual leagues with no fixture selected) would
-        // vanish from the live tracker on the very next archive sweep, silently and permanently.
-        // FIX: Only settled picks with no timestamp are immediately archived. Pending picks with
-        // no timestamp are kept and will be caught by the 7-day ghost sweep instead.
-        // Do not restore the refTs === 0 → immediately expired behavior.
         const isExpired = refTs > 0 && (now - (refTs + (3 * 60 * 60 * 1000))) >= cutoffMs;
-        // [FIXED: TIMESTAMPLESS_SETTLED_EXPRESSION] — The prior expression contained
-        // `!isSettled === false && isSettled` which reduced to just `isSettled` by
-        // operator precedence (!x === false → x), making the middle clause dead weight.
-        // No wrong behavior but the redundancy was a maintenance trap — a future reader
-        // modifying it could inadvertently invert the logic. LOCK: Intent is strictly:
-        // archive settled picks that have no timestamp. Pending no-timestamp picks are
-        // intentionally kept here and caught by the isGhost sweep instead. Do not restore
-        // the triple-clause form or add additional conditions without proving a new case.
         const isTimestamplessSettled = refTs === 0 && isSettled;
-        // Fix H2: Prevent discarding older pending picks that need manual settlement
         const isGhost = gameTs > 0 && (now - gameTs) / (1000 * 60 * 60 * 24) > 7;
-
-        // DESIGN CHOICE [CLOSED — ISSUE 10]: The isGhost rule (archive picks whose game
-        // timestamp is >7 days old regardless of settlement status) is intentional.
-        // It prevents truly stale unsettled picks from clogging activePicks indefinitely.
-        // The 7-day window is deliberately generous — users who settle within a week are
-        // fully supported. Manual leagues with very delayed settlement should settle picks
-        // within 7 days of the game date. This behavior must not be changed without an
-        // explicit owner decision. DO NOT flag this as a bug in future audits.
         if ((isSettled && isExpired) || isTimestamplessSettled || isGhost) {
           moveToArchived.push(stripHeavyData(p));
           changed = true;
@@ -8621,7 +8596,6 @@ function makeTrackedSignature(pick) {
 function getTrackedPickTimeMs(pick) {
   if (!pick) return 0;
 
-  // Prioritize the actual game time for sorting, so chronological order is strictly maintained
   const candidates = [
     pick.eventDate,
     pick.createdAt,
@@ -8654,7 +8628,6 @@ function isTrackedPickVisibleOnPage(pick) {
   if (status === "pending") {
     return (now - gameTs) / (1000 * 60 * 60) < 48; 
   } else {
-    // Visible for 10 hours after the game ends (~13 hours after tipoff)
     return (now - gameTs) / (1000 * 60 * 60) < 13;
   }
 }
@@ -8731,12 +8704,6 @@ async function openTrackerModal() {
   const modal = document.getElementById("trackerModal");
   if (!modal) return;
   g_trackerModalView = "picks";
-  // ISSUE 17 FIX [CLOSED]: Reset the render limit on every modal open so pagination
-  // does not accumulate across sessions. Without this reset, clicking "Load More" 10
-  // times leaves the limit at 550, defeating the performance protection on every
-  // subsequent renderTrackedPicks() call for the rest of the session.
-  // DESIGN CHOICE: The limit deliberately resets to 50 on open — this is intentional
-  // and must not be removed. DO NOT flag the reset as a bug in future audits.
   window.__trackerRenderLimit = 50;
   lockPageBehindTracker();
   modal.classList.add("open");
@@ -10025,7 +9992,6 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
   const activation = phase2Activation || getPhase2ActivationState();
   const advisoryOnly = !!TRACKER_POLICY.advisoryOnly || (!activation?.trackerFeedbackLive && !activation?.teamMemoryLive);
 
-  // Issue 18: Graduated activation — mild effects (0.96–1.04) before minSettledFull (100)
   const mildMode = settled < Number(TRACKER_SOFT_EFFECTS.minSettledFull || 100);
 
   picks.forEach(p => {
@@ -10043,7 +10009,6 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
 
     const feedback = getTrackerFeedbackSignal(profile, p.marketKey, side, p.league);
     if (feedback) {
-      // Issue 18: In mild mode, clamp factor to ±4% until we have enough sample
       const rawFactor = feedback.factor;
       const effectiveFactor = mildMode ? clampNumber(rawFactor, 0.96, 1.04) : rawFactor;
       const adjustedEdge = p.edge * effectiveFactor;
@@ -10103,7 +10068,6 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
       }
     }
 
-    // FIX: Double-Penalty Shield (Don't downgrade if League Trust is already going to penalize)
     const trustMeta = getLeagueTrustMeta(p.league);
     if (trustMeta.mode !== "full" && confidenceShift < 0) {
       confidenceShift = 0; // Cancel the tracker penalty, trust gate will handle it
@@ -10869,31 +10833,7 @@ function addTrackedPicks(newPicks) {
   renderTrackedPicks();
 }
 
-/*
-  LOCKED ENGINE CALCULATION SECTION
 
-  This section contains the live model math and should not be edited unless a
-  current measurable regression is proven.
-
-  INCLUDED AS LOCKED BEHAVIOR
-  - H2H weighting, divergence suppression, and max-weight caps.
-  - Volatility adjustment, regression, pace blending, and home-edge application.
-  - FT / 1H / team projection formulas and venue blending rules.
-  - Anchor logic, trap filters, pick thresholds, NO PLAY gates, and suppression rules.
-  - Confidence grading, lock selection, correlated-period blocker, tracker feedback,
-    team-memory gating, and line-memory best-line protection.
-
-  AUDIT RULE
-  - Do NOT retune constants, formulas, thresholds, weights, filters, or gates
-    unless you can prove:
-      1) runtime break,
-      2) syntax error,
-      3) contradiction against the stated engine rules,
-      4) wrong calculation path in the current file,
-      5) measurable regression in outputs from the current build.
-
-  If output looks different, prove the exact broken path first before changing any constant.
-*/
     function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0, league = "unknown") {
   const minLen = Math.min(Number(lenA) || 0, Number(lenB) || 0);
   if (minLen < 2) return 0;
@@ -10909,7 +10849,6 @@ function addTrackedPicks(newPicks) {
 
   if (sampleTier === "thin") base *= 0.85;
 
-  // Issue 2: Scale divergence thresholds by league total-score baseline (NBA = 220 reference)
   if (isFinite(divergence)) {
     const leagueBase = LEAGUE_BASES[league] || 220;
     const divScale = leagueBase / 220;
@@ -10919,10 +10858,6 @@ function addTrackedPicks(newPicks) {
     else if (scaledDiff >= 8) base *= 0.80;
   }
 
-  // Issue 11: Reduce max cap for leagues where H2H games are rare (FIBA tournaments, etc.)
-  // [FIXED: WNBA_H2H_FREQ] — WNBA/WNBA_PRE now explicitly mapped at 0.90.
-  // Both leagues support full fetchH2HCore but previously fell through to the 0.75
-  // catch-all, systematically under-weighting H2H signal relative to available data.
   const freqMod =
     league === "nba" ? 1.0 :
     league === "wnba" || league === "wnba_pre" ? 0.90 :
@@ -10942,15 +10877,11 @@ function addTrackedPicks(newPicks) {
   return clampNumber(base, 0, maxCap);
 }
 
-    // ── FIX #1: Volatility no longer shrinks the projection value.
-// High variance lowers CONFIDENCE (grade), not the projected number.
-// getVolatilityRating() feeds into getConfidenceGrade() as-is.
-function applyVolatility(proj, std, limit) {
+    function applyVolatility(proj, std, limit) {
   return proj;
 }
 
 
-// ── FIX #2a: Volatility rating for confidence scoring ──
 function getVolatilityRating(std, limit) {
   if (!isFinite(std) || !isFinite(limit) || limit === 0) return "NORMAL";
   const ratio = std / limit;
@@ -10959,11 +10890,6 @@ function getVolatilityRating(std, limit) {
   return "HIGH";
 }
 
-// [FIXED: DEAD_CONTEXT_PARAMS] — All ctx properties (backToBack, sosHarder, sosEasier,
-// recencyBias) were never populated at any call site, making the previous body a no-op
-// that mutated nothing. Replaced with a clean identity stub that documents its reserved-hook
-// status and avoids executing dead branches on every projection call.
-// LOCK: Do not add logic here without also updating every call site to supply the ctx object.
 function applyContextAdjustments(baseProjection, _ctx) {
   // Reserved context-adjustment hook. Parameters are not yet wired at call sites.
   // When backToBack, sosHarder, sosEasier, or recencyBias are supplied in future,
@@ -11594,11 +11520,9 @@ function updateIntelligencePack(leagueOverride = "", linesOverride = null, parse
   if (bFormIntel) bFormIntel.value = pack.teamB.summary;
   if (aSpreadIntel) aSpreadIntel.value = pack.teamA.spreadSummary;
   if (bSpreadIntel) bSpreadIntel.value = pack.teamB.spreadSummary;
-  if (aHitIntel) aHitIntel.value = pack.teamA.hitProfile;
+    if (aHitIntel) aHitIntel.value = pack.teamA.hitProfile;
   if (bHitIntel) bHitIntel.value = pack.teamB.hitProfile;
 
-  // ISSUE 15 FIX [CLOSED]: intelAutoTag removed — no matching HTML element exists.
-  // See FIELD_GROUPS.autoTags comment for full explanation.
   return pack;
 }
 
@@ -11677,9 +11601,6 @@ const FIELD_GROUPS = {
 
   intelFields: ["aFormIntel", "bFormIntel", "aSpreadIntel", "bSpreadIntel", "aHitIntel", "bHitIntel"],
 
-  // ISSUE 15 FIX: "intelAutoTag" removed — no matching HTML element exists and adding
-  // one would require changes inside the locked UI section. The three real autofill
-  // indicators (aAutoTag, bAutoTag, h2hAutoTag) live on actual <span> elements.
   autoTags: ["aAutoTag", "bAutoTag", "h2hAutoTag"],
 
   periodInputs: [
@@ -11727,19 +11648,14 @@ function hideInjuryBox(side) {
     }
 
     function clearSideFields(side) {
-      const vsFieldsId = side === "A" ? "aVenueSplitFields" : "bVenueSplitFields";
-    const vsCbId = side === "A" ? "aVenueSplitEnabled" : "bVenueSplitEnabled";
-    const vsFields = document.getElementById(vsFieldsId);
-    const vsCb = document.getElementById(vsCbId);
-    if (vsFields) vsFields.style.display = "none";
-    if (vsCb) vsCb.checked = false;
+  const vsFieldsId = side === "A" ? "aVenueSplitFields" : "bVenueSplitFields";
+const vsCbId = side === "A" ? "aVenueSplitEnabled" : "bVenueSplitEnabled";
+const vsFields = document.getElementById(vsFieldsId);
+const vsCb = document.getElementById(vsCbId);
+if (vsFields) vsFields.style.display = "none";
+if (vsCb) vsCb.checked = false;
 
-  // [FIXED: STALE_ALLOWED_FIELDS] — aFTAllowed, a1HAllowed, a2HAllowed (and B equivalents)
-  // were absent from this list. fetchESPN calls clearSideFields before writing new data.
-  // If the new team's fetch returned no allowed data, the previous team's allowed values
-  // remained in the DOM and silently fed into computeFTProjection / compute1HProjection
-  // via getManualAllowedSeries, contaminating projections without any visible warning.
-    const ids = side === "A"
+const ids = side === "A"
     ? [
         "aFTScored", "aFTAllowed",
         "a1HScored", "a1HAllowed",
@@ -11809,8 +11725,7 @@ function clearH2HFields() {
 }
 
         function clearAutoFill(changedSide = null) {
-      // FIX: _fetchToken++ removed
-      unlockFetchBtn();
+  unlockFetchBtn();
       setStatusText("", "");
       setFetchAuditIssues([]);
       resetResultsTable();
@@ -11844,8 +11759,6 @@ function clearH2HFields() {
   const isNbaOrNcaa = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
 
   if (!league) {
-    // LOCK: "intelSection" removed — this element does not exist in the HTML.
-    // The dead DOM query ran on every league change returning null each time, wasting cycles.
     [
       "espnSection",
       "marketSection",
@@ -12525,9 +12438,8 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
               
               if (myBox && Array.isArray(myBox.statistics) && myBox.statistics.length > 0) {
                 myBox.statistics.forEach(s => { sMap[s.name] = s.displayValue; });
-              } else if (Array.isArray(boxscore.players)) {
-                // Rescue: Hunt down player stats if team stats are missing/corrupted
-                const safePlayers = boxscore.players || [];
+                    } else if (Array.isArray(boxscore.players)) {
+        const safePlayers = boxscore.players || [];
                 const myPlayers = safePlayers.find(p => matchesTeam(p, tId));
                 if (myPlayers && Array.isArray(myPlayers.statistics) && myPlayers.statistics[0] && Array.isArray(myPlayers.statistics[0].athletes)) {
                   let fga = 0, fta = 0, orb = 0, tov = 0;
@@ -13764,10 +13676,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
 
 
-            // HYBRID FIX: Wire in Context Adjustments (Capped at ±6%) & Anchor
-  const vl = getMarketVolLimit(league, "ft");
+            const vl = getMarketVolLimit(league, "ft");
 
-  // SOS: Dynamic opponent quality scaling (Issue 9: manual path now uses same 0.15 scale as L2)
   const baselineRating = 100;
   if (aORTG.length >= 2 && bORTG.length >= 2) {
     const avgOppDrtgA = avgOrNaN(bDRTG);
@@ -13781,7 +13691,6 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const halfBase = eb / 2;
     const oppQualityA = ((avgAllowedB - halfBase) / halfBase) * 100;
     const oppQualityB = ((avgAllowedA - halfBase) / halfBase) * 100;
-    // Scale down SOS for thin samples: 2 games→25%, 3→50%, 4→75%, 5+→100%
     const _sosSampleSize = Math.min(aFTS.length, bFTS.length);
     const _sosScale = Math.min(1.0, Math.max(0, (_sosSampleSize - 1) / 4));
     projAFT += oppQualityA * 0.15 * _sosScale;
@@ -13790,12 +13699,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   if (isFinite(projAFT)) {
     projAFT = applyVolatility(projAFT, aVol, vl);
-    projAFT = applyContextAdjustments(projAFT, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
+    projAFT = applyContextAdjustments(projAFT, { injuryImpact: 0 });
     projAFT = anchorProjection(projAFT, lines.aLine, league, "team");
   }
   if (isFinite(projBFT)) {
     projBFT = applyVolatility(projBFT, bVol, vl);
-    projBFT = applyContextAdjustments(projBFT, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
+    projBFT = applyContextAdjustments(projBFT, { injuryImpact: 0 });
     projBFT = anchorProjection(projBFT, lines.bLine, league, "team");
   }
 
@@ -14772,18 +14681,11 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
 
   const isManualLeague = league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa";
   if (isManualLeague && !fixtureMeta.eventId) {
-    // ISSUE 3 FIX [CLOSED]: Strip apostrophes and other injection-unsafe characters from
-    // manual event IDs. The original regex only removed whitespace, leaving apostrophes
-    // (e.g. O'Sullivan → O'Sullivan) intact inside the eventId string. These apostrophes
-    // then broke inline onclick attribute single-quote delimiters in renderTrackedPicks,
-    // silently preventing settlement buttons from appearing or functioning.
-    // The fix strips whitespace AND all shell/HTML/JS-unsafe characters in one pass.
     const safeHome = (fixtureMeta.homeTeam || "home").replace(/[\s'"`<>&]/g, "");
     const safeAway = (fixtureMeta.awayTeam || "away").replace(/[\s'"`<>&]/g, "");
     fixtureMeta.eventId = `manual_${league}_${safeHome}_${safeAway}`;
   }
 
-  // 🛡️ ADVISORY PARADOX FIX: Allow all legitimate picks to save regardless of warning notes, unless they are hard-blocked
   const isSavablePick =
     pickRow &&
     pickRow.pick !== "NO PLAY" &&
@@ -15088,9 +14990,7 @@ function resolveStoredLineBeforeDecision({
   return result;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// RETROSPECTIVE BACKTESTING SANDBOX — Spec Item 9
-// ═══════════════════════════════════════════════════════════════
+
 
 const g_lineMemorySnapshots = {};
 
@@ -15153,13 +15053,10 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
   
   finalPicks.forEach(p => {
     const isLock = p._idx === lockIdx && p.pick !== "NO PLAY" && p.pick !== "NaN";
-    const confText = (p.pick === "NO PLAY") ? "NaN" : (p.confidence === "—" ? "NaN" : (p.confidence || "D")); // [FIXED: DEAD_NAN_CHECK] — p.pick === "NaN" can never be true (picks are "NO PLAY", "OVER X.X", or "UNDER X.X"); removed dead branch.
+    const confText = (p.pick === "NO PLAY") ? "NaN" : (p.confidence === "—" ? "NaN" : (p.confidence || "D"));
     const shownLine = isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line;
     const shownEdge = isFinite(p.displayEdge) ? p.displayEdge : p.edge;
     
-    // LOCK: Badge HTML is separated from the text label and appended safely.
-    // Mixing engine-generated badge HTML with the name string via innerHTML is structurally
-    // fragile — if user-controlled data ever reaches p.name in a future refactor it becomes XSS.
     const row = table.insertRow();
 
     const tdPick = document.createElement("td");
@@ -15213,7 +15110,6 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     const pickWithCorrectKey = { ...p, marketKey: marketKeyFromLogic };
     const payload = buildTrackedPickPayload({ pickRow: pickWithCorrectKey, isLock, fixtureMeta, league, diagnostics });
     if (payload) tracked.push(payload);
-    // Spec Item 9: Record live calculation snapshot for retrospective backtesting
     if (p.pick !== "NO PLAY" && !p.note && isFinite(p.line) && p.line > 0 && fixtureMeta?.eventId) {
       const _snapSide = getPickSideFromText(p.pick);
       if (_snapSide) {
@@ -15306,7 +15202,6 @@ function getMassacreTeamContext(side, parsed) {
   };
 }
 
-/* ── FIX 2: Error Boundary ─────────────────────────────────── */
 function withErrorBoundary(fn, context) {
   return async function (...args) {
     try {
@@ -15330,7 +15225,6 @@ function withErrorBoundary(fn, context) {
   };
 }
 
-/* ── FIX 3: Clean Input Layer ───────────────────────────────── */
 function extractInputs(league) {
   const isNbaOrNcaa = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
   function readLine(id) {
