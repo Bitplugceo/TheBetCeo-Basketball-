@@ -3394,8 +3394,6 @@ function ssProcessTeamEvents(events, teamId, label) {
 function validateSofascoreSection() {
   const nameA = document.getElementById("ssTeamAName")?.value.trim() || "";
   const nameB = document.getElementById("ssTeamBName")?.value.trim() || "";
-  const btn = document.getElementById("ssFetchBtn");
-  if (btn) btn.disabled = !(nameA && nameB);
 
   // Sync to main names so the engine uses them and they save to the tracker with real names!
   const mainA = document.getElementById("teamAName");
@@ -3424,9 +3422,10 @@ function searchSofascorePlayer(side) {
   const searchName = rawName.split(",")[0].trim();
   const searchUrl = "https://api.sofascore.com/api/v1/search/all?q=" + encodeURIComponent(searchName);
   window.open(searchUrl, "_blank");
-  const st = document.getElementById("ssFetchStatus");
+  const st = document.getElementById("ssH2HStatus");
   if (st) {
     st.style.color = "#d98a00";
+    st.style.display = "block";
     st.textContent = "🔍 Search opened for " + side + " — find the team ID in the JSON and paste it above.";
   }
 }
@@ -6699,11 +6698,10 @@ function isIgnoredEngineWatchLine(line = "") {
     text.includes("timeout");
 }
 
-window.addEventListener("unhandledrejection", event => {
-  const _r = event.reason?.message || String(event.reason);
-  if (_r.toLowerCase().includes("fetch") || _r.toLowerCase().includes("load failed") || _r.toLowerCase().includes("networkerror")) return;
-  engineDebug("UNHANDLED REJECTION: " + _r, "engine");
-});
+// [CLOSED: UNHANDLED_REJECTION_DOUBLE_REGISTRATION] Second registration removed.
+// The Watchdog IIFE at the top already registers an unhandledrejection handler that
+// calls engineDebug and triggerGlobalEngineAlert. This duplicate fired both handlers
+// on every rejection, producing double log entries and potential double alert triggers.
 
 
 function maybeReadH2HEnabled(kind) {
@@ -7206,6 +7204,12 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
   // pace would be Infinity and propagate NaN through the entire Level 2 math pipeline.
   const safeMinutes = (isFinite(minutes) && minutes > 0) ? minutes : 48;
   const pace = (possessions / safeMinutes) * minutes;
+
+  // Guard: implausible ratings mean the stat block is corrupt — exclude this game entirely.
+  if (ortg < 50 || ortg > 175 || drtg < 50 || drtg > 175) {
+    console.warn("[BB Engine] calculateAdvancedMetrics: implausible ratings (" + ortg.toFixed(1) + "/" + drtg.toFixed(1) + ") — game excluded.");
+    return null;
+  }
 
   // Four Factors (Dean Oliver) — eFG%, TOV%, ORB%, FT rate
   // Stored alongside ORtg/DRtg/pace in Level 2 memory for downstream correlation.
@@ -9141,7 +9145,7 @@ function makeTrackedSignature(pick) {
         pick.marketKey || "",
         displayLine(pick.line),
         pick.side || ""
-      ].join("|");
+      ].join("|").replace(/[`<>]/g, "");
     }
 
 function getTrackedPickTimeMs(pick) {
@@ -9487,7 +9491,7 @@ function renderTrackedPicks() {
         <td style="font-weight:800;">${safeText(String(p.marketName || "—").split('<')[0].trim())}</td>
         <td>${isFinite(p.line) ? safeText(displayLine(p.line)) : "—"}</td>
         <td style="white-space: nowrap; font-size: 11px;">${safeText(p.predictionText || "—")}${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
-        <td class="conf-none">${safeText(grade)}</td>
+        <td class="${gradeClass}">${safeText(grade)}</td>
         <td>${safeText(edgeText)}</td>
         <td class="${statusClass}"><div class="tracker-status-stack">${statusHtml}</div></td>
       </tr>
@@ -11853,7 +11857,7 @@ function applyContextAdjustments(baseProjection, ctx) {
 function applyBucketGradeSignal(grade, league, marketKey, side) {
   if (!grade || grade === "NaN" || !league || !marketKey) return grade;
   try {
-    const derived = g_trackerState?.derivedState;
+    const derived = g_trackerDerivedState;
     if (!derived) return grade;
     const msk = [league, marketKey, String(side || "")].join("|");
     const bucket = derived.marketSides?.[msk];
@@ -14374,8 +14378,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     // Gap 4: Minimum 3-game sample guard — below that, fall back to simple blended average
     const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
     if (!hasSufficientSynthSample) {
-      projAFT = isFinite(aS) ? aS * injMultA : NaN;
-      projBFT = isFinite(bS) ? bS * injMultB : NaN;
+      const availBDefAvg = isFinite(avgOrNaN(parsed?.bFTAllowed)) ? avgOrNaN(parsed.bFTAllowed) : (eb / 2);
+      const availADefAvg = isFinite(avgOrNaN(parsed?.aFTAllowed)) ? avgOrNaN(parsed.aFTAllowed) : (eb / 2);
+      projAFT = isFinite(aS) ? (aS * 0.65 + availBDefAvg * 0.35) * injMultA : NaN;
+      projBFT = isFinite(bS) ? (bS * 0.65 + availADefAvg * 0.35) * injMultB : NaN;
     } else {
       projAFT = ((synOrtgA + synDrtgB) / 2 / 100) * estMatchPace * injMultA;
       projBFT = ((synOrtgB + synDrtgA) / 2 / 100) * estMatchPace * injMultB;
@@ -17037,7 +17043,9 @@ const markets = finalPicksForDisplay.map(p => ({
           existingDash = document.createElement('div');
           existingDash.id = 'syndicateDashboard';
           existingDash.style.cssText = "background: var(--panel); border: 1px solid var(--panel-border); margin: 10px 0; padding: 0; box-shadow: var(--shadow); font-family: sans-serif; min-height: 85px;";
-          table.parentNode.insertBefore(existingDash, table);
+          if (table.parentNode) {
+            table.parentNode.insertBefore(existingDash, table);
+          }
         }
         existingDash.innerHTML = dashHtml;
 
