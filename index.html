@@ -15224,28 +15224,16 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
   const isExoticNoLine = pickRow && exoticNoLineMarkets.includes(pickRow.marketKey);
 
   const isManualLeague = league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa";
-if (isManualLeague && !fixtureMeta.eventId) {
-  // ISSUE 3 FIX [CLOSED]: Strip apostrophes and other injection-unsafe characters from
-  // manual event IDs. The original regex only removed whitespace, leaving apostrophes
-  // (e.g. O'Sullivan → O'Sullivan) intact inside the eventId string. These apostrophes
-  // then broke inline onclick attribute single-quote delimiters in renderTrackedPicks,
-  // silently preventing settlement buttons from appearing or functioning.
-  // The fix strips whitespace AND all shell/HTML/JS-unsafe characters in one pass.
+if (!fixtureMeta.eventId) {
+  // FIX: Removed isManualLeague gate — WNBA/NBA/NCAA with manually typed names and no
+  // fixture selection also need a fallback eventId. Previously only non-ESPN leagues got
+  // one here, so WNBA picks typed without a dropdown selection had no eventId, hit the
+  // !fixtureMeta?.eventId null-return guard, and were silently dropped from the tracker.
   const safeHome = (fixtureMeta.homeTeam || "home").replace(/[\s'"`<>&]/g, "");
   const safeAway = (fixtureMeta.awayTeam || "away").replace(/[\s'"`<>&]/g, "");
   fixtureMeta.eventId = `manual_${league}_${safeHome}_${safeAway}`;
 }
-if (isManualLeague && !fixtureMeta.eventDate) {
-  fixtureMeta.eventDate = new Date().toISOString();
-}
-// Guarantee eventDate for manual picks — picks with no date have gameTs === 0
-// and fail every visibility check in isTrackedPickVisibleOnPage (invisible immediately).
-if (isManualLeague && !fixtureMeta.eventDate) {
-  fixtureMeta.eventDate = new Date().toISOString();
-}
-// Manual picks with no eventDate are invisible in the tracker — gameTs === 0 fails
-// every visibility and archival check. Guarantee a timestamp so picks surface immediately.
-if (isManualLeague && !fixtureMeta.eventDate) {
+if (!fixtureMeta.eventDate) {
   fixtureMeta.eventDate = new Date().toISOString();
 }
 
@@ -16963,52 +16951,51 @@ if (trackedToSave.length) {
     trackerStateAfterSave: getTrackerStateDebugScore(g_trackerState)
   });
 } else if (actionablePicks.length) {
-  const isSupportedForTracker = league === "nba" || league === "ncaa" || league === "wnba" || league === "wnba_pre";
-  if (isSupportedForTracker) {
-    setStatusText("⚠ Picks generated but not saved — select a fixture from the dropdown first.", "err");
-  } else {
-    try {
+  try {
       const _now   = new Date().toISOString();
       const _safeH = (fixtureMeta.homeTeam || "home").replace(/[\s'"`<>&]/g, "");
       const _safeA = (fixtureMeta.awayTeam || "away").replace(/[\s'"`<>&]/g, "");
       if (!fixtureMeta.eventId)   fixtureMeta.eventId   = `manual_${league}_${_safeH}_${_safeA}`;
       if (!fixtureMeta.eventDate) fixtureMeta.eventDate = _now;
       const _saveable = actionablePicks.filter(p => {
-            if (!p || !p.pick || p.pick.trim().toUpperCase() === "NO PLAY") return false;
-            const _l = +(p.displayLineUsed ?? p.line);
-            return isFinite(_l) && _l > 0;
-          });
-          const _saves = _saveable.map(p => {
-            const _pick = p.displayPick || p.pick;
-            const _l    = +(p.displayLineUsed ?? p.line);
-            const _side = getPickSideFromText(_pick);
-            return {
-              eventId:         fixtureMeta.eventId,
-              eventDate:       fixtureMeta.eventDate,
-              createdAt:       _now,
-              league,
-              homeTeam:        fixtureMeta.homeTeam || "",
-              awayTeam:        fixtureMeta.awayTeam || "",
-              marketKey:       p.marketKey || "",
-              line:            _l,
-              lineAtPick:      _l,
-              side:            _side,
-              pick:            _pick,
-              predictionText:  _pick,
-              confidence:      p.confidence || "—",
-              confidenceGrade: p.confidence || "—",
-              resultStatus:    "pending",
-              inputSource:     "manual"
-            };
-          });
-          if (_saves.length) {
-            addTrackedPicks(_saves);
-            scheduleTrackerSave();
-          } else {
-            setStatusText("⚠ No savable picks — verify lines are entered and picks are not NO PLAY.", "err");
-          }
-        }
-       }
+        if (!p || !p.pick || p.pick.trim().toUpperCase() === "NO PLAY") return false;
+        const _l = +(p.displayLineUsed ?? p.line);
+        return isFinite(_l) && _l > 0;
+      });
+      const _saves = _saveable.map(p => {
+        const _line = +(p.displayLineUsed ?? p.line);
+        const _pick = p.pick || "";
+        const _pu   = _pick.toUpperCase();
+        const _side = _pu.startsWith("OVER") ? "OVER" : _pu.startsWith("UNDER") ? "UNDER" : "";
+        return {
+          eventId:         fixtureMeta.eventId,
+          eventDate:       fixtureMeta.eventDate,
+          createdAt:       _now,
+          league,
+          homeTeam:        fixtureMeta.homeTeam || "",
+          awayTeam:        fixtureMeta.awayTeam || "",
+          marketKey:       p.marketKey || p.name || "",
+          line:            _line,
+          lineAtPick:      _line,
+          side:            _side,
+          pick:            _pick,
+          predictionText:  _pick,
+          confidence:      p.confidence || "—",
+          confidenceGrade: p.confidence || "—",
+          resultStatus:    "pending",
+          inputSource:     "manual"
+        };
+      });
+      if (_saves.length) {
+        addTrackedPicks(_saves);
+        scheduleTrackerSave();
+      } else {
+        setStatusText("⚠ No savable picks — verify lines are entered and picks are not NO PLAY.", "err");
+      }
+    } catch (_e) {
+      setStatusText("⚠ Manual save failed — check console for details.", "err");
+    }
+}
 
     engineDebug("run finished successfully", {
       trackerState: getTrackerStateDebugScore(g_trackerState),
