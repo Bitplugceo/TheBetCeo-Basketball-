@@ -2367,6 +2367,7 @@ body.dark-mode .tracker-analytics-section-head {
     <button class="theme-toggle" type="button" id="themeToggleBtn" title="Toggle dark/light mode">🏀</button>
     <button class="theme-toggle" type="button" id="trackerToggleBtn" title="Open tracked picks">📊</button>
     <button class="theme-toggle" type="button" id="afdbBtn" title="Auto-Fetch Debugger" onclick="AFDB.open()">🔬</button>
+    <button class="theme-toggle" type="button" id="snapDebugBtn" title="Snap &amp; Inspect — shows what JSON filled and what was saved to tracker" onclick="AFDB.snapAndLog && AFDB.snapAndLog()">🔍</button>
     PREDICTIONS
   </span>
 </header>
@@ -3573,6 +3574,18 @@ async function parseSofascoreIndividual(side) {
 
     if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " stats loaded from pasted JSON!"; }
     if (pasteEl) pasteEl.value = "";
+    // AFDB JSON fill audit log
+    if (typeof AFDB !== "undefined") {
+      const _fillSnap = {};
+      const _fillIds = ["aFTScored","aFTAllowed","bFTScored","bFTAllowed","a1HScored","a1HAllowed","b1HScored","b1HAllowed",
+        "aFTH2H","bFTH2H","a1HH2H","b1HH2H","aQ1Scored","bQ1Scored","aQ2Scored","bQ2Scored","aQ3Scored","bQ3Scored","aQ4Scored","bQ4Scored",
+        "aQ1H2H","bQ1H2H","teamAName","teamBName","leagueSelect"];
+      _fillIds.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) _fillSnap[id] = el.tagName === "SELECT" ? el.value : (el.value || "(empty)");
+      });
+      AFDB.log("FILL", "JSON_PASTE_" + side, "Team " + side + " JSON fill complete — inputs snapshot:", _fillSnap);
+    }
 
     // Propagate Sofascore team name into the main engine name input so the tracker
     // saves the real team name instead of a generic "A VS B" label.
@@ -3595,6 +3608,7 @@ async function parseSofascoreIndividual(side) {
     openSection("marketSection");
     openSection("teamASection");
     openSection("teamBSection");
+    openSection("h2hSection");
     invalidateFetchedAudit();
   } catch (err) {
     if (st) { st.style.color = "#d92d2a"; st.textContent = "❌ Parse failed: " + err.message; }
@@ -3618,8 +3632,8 @@ async function extractH2HFromPastedEvents() {
         const sType = ev.status?.type ?? "";
         return sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
       }).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
-      // Take up to 10 from API — we'll slice to 5 after scoring extraction
-      h2hMatches = _directFiltered.slice(0, 10);
+      // Take up to 15 from API — we'll slice to 5 after scoring extraction
+      h2hMatches = _directFiltered.slice(0, 15);
       engineDebug("Direct SS H2H fetch returned", { total: _directFiltered.length, using: h2hMatches.length });
     }
   } catch (eH2H) {
@@ -3663,15 +3677,22 @@ async function extractH2HFromPastedEvents() {
 
     engineDebug("After local merge, total H2H candidates", { count: h2hMatches.length });
 
-    // Re-sort after merge and cap at 10
+    // Re-sort after merge and cap at 15
     h2hMatches = h2hMatches
       .sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0))
-      .slice(0, 10);
+      .slice(0, 15);
   }
 
   // If still nothing, bail
   if (!h2hMatches.length) {
     engineDebug("extractH2HFromPastedEvents: no H2H matches found after all sources");
+    if (typeof AFDB !== "undefined") {
+      AFDB.log("WARN","JSON_H2H","No H2H games found between these two teams in pasted JSONs or API",{idA,idB,localEventsA:(window.__lastEventsA||[]).length,localEventsB:(window.__lastEventsB||[]).length});
+    }
+  } else if (h2hMatches.length < 2) {
+    if (typeof AFDB !== "undefined") {
+      AFDB.log("WARN","JSON_H2H","Only " + h2hMatches.length + " H2H game found — need min 2 to enable checkbox",{idA,idB});
+    }
   }
 
   // Build the uniqueEvents reference needed for the scheduled fixture scan below
@@ -3693,8 +3714,8 @@ async function extractH2HFromPastedEvents() {
       const isAHome = String(m.homeTeam?.id) === idA;
       const myScoreObj = isAHome ? m.homeScore : m.awayScore;
       const oppScoreObj = isAHome ? m.awayScore : m.homeScore;
-      const myFT = Number(myScoreObj?.normaltime ?? myScoreObj?.current ?? myScoreObj?.display ?? 0);
-      const oppFT = Number(oppScoreObj?.normaltime ?? oppScoreObj?.current ?? oppScoreObj?.display ?? 0);
+      const myFT = Number(myScoreObj?.normaltime ?? myScoreObj?.current ?? myScoreObj?.display ?? myScoreObj?.value ?? 0);
+      const oppFT = Number(oppScoreObj?.normaltime ?? oppScoreObj?.current ?? oppScoreObj?.display ?? oppScoreObj?.value ?? 0);
       if (myFT > 0 && h2hA.length < 5) {
         h2hA.push(myFT); h2hB.push(oppFT);
         const mQ1 = Number(myScoreObj?.period1 ?? 0);
@@ -3741,6 +3762,14 @@ async function extractH2HFromPastedEvents() {
       }
       syncAllH2HCheckboxes(false);
       engineDebug("Pasted JSON H2H auto-filled", { games: h2hA.length, q1Games: h2hAQ1.length });
+      if (typeof AFDB !== "undefined") {
+        AFDB.log("H2H", "JSON_H2H", "H2H auto-filled from pasted JSON", {
+          ftGames: h2hA.length, h1Games: h2hA1H.length, q1Games: h2hAQ1.length,
+          aFTH2H: h2hA.join(","), bFTH2H: h2hB.join(","),
+          a1HH2H: h2hA1H.join(","), b1HH2H: h2hB1H.join(","),
+          totalCandidates: h2hMatches.length, idA, idB
+        });
+      }
     }
   }
 
@@ -6617,7 +6646,14 @@ function isIgnoredEngineWatchLine(line = "") {
     text.includes("finished with no tracker changes") ||
     text.includes("no tracker changes") ||
     text.includes("confidence\":\"nan") ||
-    text.includes("\"no-play\"");
+    text.includes("\"no-play\"") ||
+    text.includes("parsesofascoreindividual failed") ||
+    text.includes("parsesofascoreindividual h2h extract failed") ||
+    text.includes("parse failed:") ||
+    text.includes("direct pasted ss h2h fetch failed") ||
+    text.includes("extracth2hfrompastedevents: no h2h") ||
+    text.includes("ssfetch proxy") ||
+    text.includes("ssfetch worker failed");
 }
 
 window.addEventListener("unhandledrejection", event => {
@@ -11339,14 +11375,30 @@ function addTrackedPicks(newPicks) {
 
     // 2. Skip if already in archive
     const archivedIdx = archived.findIndex(x => makeTrackerActiveMergeKey(x) === prisonKey);
-    if (archivedIdx !== -1) return;
+    if (archivedIdx !== -1) {
+      if (typeof AFDB !== "undefined") {
+        AFDB.log("WARN","TRACKER_SAVE","Pick SKIPPED — already in archive. Key: " + prisonKey, {
+          market: p.marketKey, pick: p.predictionText||p.pick, eventId: p.eventId
+        });
+      }
+      return;
+    }
 
     // 3. Brand new pick — add to top
     current.unshift(p);
     changed = true;
   });
 
-  if (changed) saveTrackedPicks(current);
+  if (changed) {
+    saveTrackedPicks(current);
+    if (typeof AFDB !== "undefined") {
+      AFDB.log("PICK","TRACKER_SAVE","Manual picks saved to tracker", {
+        newCount: newPicks.length,
+        totalActive: current.length,
+        picks: newPicks.map(p => ({ market: p.marketKey||p.name, pick: p.predictionText||p.pick, line: p.line, grade: p.confidenceGrade||p.confidence, edge: p.edgePct||p.edge }))
+      });
+    }
+  }
   renderTrackedPicks();
 }
 
@@ -18095,17 +18147,39 @@ const AFDB = (function() {
       'leagueSelect','teamAName','teamBName',
       'aFTScored','aFTAllowed','a1HScored','a1HAllowed',
       'bFTScored','bFTAllowed','b1HScored','b1HAllowed',
-      'aFTH2H','bFTH2H','a1HH2H','b1HH2H',
-      'ftMarket','h1Market','h2Market','teamAMarket','teamBMarket'
+      'aFTScoredHome','aFTAllowedHome','bFTScoredAway','bFTAllowedAway',
+      'aQ1Scored','aQ1Allowed','aQ2Scored','aQ2Allowed','aQ3Scored','aQ3Allowed','aQ4Scored','aQ4Allowed',
+      'bQ1Scored','bQ1Allowed','bQ2Scored','bQ2Allowed','bQ3Scored','bQ3Allowed','bQ4Scored','bQ4Allowed',
+      'aFTH2H','bFTH2H','a1HH2H','b1HH2H','aQ1H2H','bQ1H2H','aQ2H2H','bQ2H2H','aQ3H2H','bQ3H2H','aQ4H2H','bQ4H2H',
+      'ssTeamAId','ssTeamBId','ssTeamAName','ssTeamBName',
+      'ftMarket','h1Market','h2Market','teamAMarket','teamBMarket',
+      'q1Market','q2Market','q3Market','q4Market'
     ];
     const snap = {};
     ids.forEach(id => {
       const el = document.getElementById(id);
-      snap[id] = el ? (el.value||'(empty)') : '\u26d4 NOT FOUND';
+      if (el) {
+        const val = el.tagName === 'INPUT' && el.type === 'checkbox' ? (el.checked ? '✅ checked' : '⬜ unchecked') : (el.value||'(empty)');
+        if (val && val !== '(empty)') snap[id] = val; // only include non-empty
+      }
+    });
+    // H2H checkboxes
+    ['useFTH2H','use1HH2H','use2HH2H','useQ1H2H','useQ2H2H','useQ3H2H','useQ4H2H'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) snap[id] = el.checked ? '✅ ON' : '⬜ off';
     });
     if (typeof selectedTeamIds !== 'undefined') snap['_teamIds'] = JSON.stringify(selectedTeamIds);
     if (typeof uiState !== 'undefined') snap['_league'] = uiState.appliedLeagueSlug||'(none)';
+    // H2H meta
+    if (window.__manualFixtureMeta) snap['_fixtureMeta'] = JSON.stringify(window.__manualFixtureMeta);
     return snap;
+  }
+
+  // Expose snap for external call (e.g. from header debug btn)
+  function snapAndLog() {
+    const snap = snapDOM();
+    log('FILL','DOM_SNAP','Current input state snapshot — all filled fields:', snap);
+    if (!_isOpen) open();
   }
 
   function _render() {
@@ -18126,7 +18200,7 @@ const AFDB = (function() {
   return '<div style="padding:8px;border-bottom:1px solid #151515;"><div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;"><span style="color:#555;font-size:9px;min-width:65px;flex-shrink:0;">' + esc(e.ts) + '</span><span style="color:' + def.color + ';font-size:10px;font-weight:900;min-width:75px;flex-shrink:0;">' + icon + ' ' + esc(e.level) + '</span><span style="color:#777;font-size:9px;min-width:80px;flex-shrink:0;">[' + esc(e.section) + ']</span><span style="color:' + def.color + ';font-size:11px;font-weight:700;flex:1;white-space:pre-wrap;">' + esc(e.msg) + '</span></div>' + dataHtml + '</div>';
 }).join('');
 
-const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
+const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="(function(){const s=AFDB.snapDOM();AFDB.log('FILL','DOM_SNAP','Input snapshot:',s);})()" style="background:#111;border:1px solid #2aff9e;color:#2aff9e;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🔍 Snap</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
 
     const emptyMsg = _showOnlyErrors ? 'No suspects arrested. The code is clean.' : 'No log entries yet. Run a fetch.';
     const filterLabel = `\ud83c\udfaf LEVEL: ${_currentLogLevel}`;
@@ -18227,7 +18301,7 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
 
   }
 
-  return { log, clear, copy, toggleFilter, open, close, runTestFetch, get isOpen() { return _isOpen; }, get logs() { return _log; } };
+  return { log, clear, copy, toggleFilter, open, close, runTestFetch, snapAndLog, get isOpen() { return _isOpen; }, get logs() { return _log; } };
 })();
 
 window.openVisualReportFromDebug = function() {
