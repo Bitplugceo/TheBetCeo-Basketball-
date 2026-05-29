@@ -3395,6 +3395,12 @@ function validateSofascoreSection() {
   const nameB = document.getElementById("ssTeamBName")?.value.trim() || "";
   const btn = document.getElementById("ssFetchBtn");
   if (btn) btn.disabled = !(nameA && nameB);
+
+  // Sync to main names so the engine uses them and they save to the tracker with real names!
+  const mainA = document.getElementById("teamAName");
+  const mainB = document.getElementById("teamBName");
+  if (mainA) mainA.value = nameA;
+  if (mainB) mainB.value = nameB;
 }
 
 function updateSofascoreLinks(side) {
@@ -3563,17 +3569,16 @@ function parseSofascoreIndividual(side) {
     }
 
     // Try finding and auto-filling H2H inputs from current pasted context
-    extractH2HFromPastedEvents();
+    await extractH2HFromPastedEvents();
 
     if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " stats loaded from pasted JSON!"; }
     if (pasteEl) pasteEl.value = "";
 
     // Propagate Sofascore team name into the main engine name input so the tracker
     // saves the real team name instead of a generic "A VS B" label.
-    // Only copies when the main field is empty — never overwrites a manually typed name.
     const _ssNameSrc  = document.getElementById(side === "A" ? "ssTeamAName" : "ssTeamBName");
     const _mainNameEl = document.getElementById(side === "A" ? "teamAName" : "teamBName");
-    if (_ssNameSrc && _mainNameEl && _ssNameSrc.value.trim() && !_mainNameEl.value.trim()) {
+    if (_ssNameSrc && _mainNameEl && _ssNameSrc.value.trim()) {
       _mainNameEl.value = _ssNameSrc.value.trim();
     }
 
@@ -3588,39 +3593,56 @@ function parseSofascoreIndividual(side) {
 }
 
 // Extraction utility to parse Head-to-Head schedules from pasted schedules
-function extractH2HFromPastedEvents() {
+async function extractH2HFromPastedEvents() {
   const idA = document.getElementById("ssTeamAId")?.value.trim();
   const idB = document.getElementById("ssTeamBId")?.value.trim();
   if (!idA || !idB) return;
 
-  const allEvents = [
-    ...(window.__lastEventsA || []),
-    ...(window.__lastEventsB || [])
-  ];
-
-  if (!allEvents.length) return;
-
-  const uniqueEvents = [];
-  const seenIds = new Set();
-  allEvents.forEach(ev => {
-    if (ev.id && !seenIds.has(ev.id)) {
-      seenIds.add(ev.id);
-      uniqueEvents.push(ev);
+  let h2hMatches = [];
+  
+  // Try fetching direct H2H events to get full history (even from previous seasons)
+  try {
+    const directH2H = await ssFetch(`https://api.sofascore.com/api/v1/team/${idA}/team/${idB}/h2h/events`);
+    if (directH2H && Array.isArray(directH2H.events)) {
+      h2hMatches = directH2H.events.filter(ev => {
+        const sType = ev.status?.type ?? "";
+        return sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
+      }).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0)).slice(0, 5);
     }
-  });
+  } catch (eH2H) {
+    engineDebug("Direct pasted SS H2H fetch failed, falling back to local events", { error: eH2H.message });
+  }
 
-  const h2hMatches = uniqueEvents.filter(ev => {
-    const sType = ev.status?.type ?? "";
-    const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
-    if (!isTerminal) return false;
-    const hId = String(ev.homeTeam?.id ?? "");
-    const aId = String(ev.awayTeam?.id ?? "");
-    return (hId === idA && aId === idB) || (hId === idB && aId === idA);
-  }).sort((a, b) => {
-    const tA = a.startTimestamp || 0;
-    const tB = b.startTimestamp || 0;
-    return tB - tA; // Newest first
-  }).slice(0, 5);
+  // Fallback to local events if direct fetch failed or returned nothing
+  if (!h2hMatches.length) {
+    const allEvents = [
+      ...(window.__lastEventsA || []),
+      ...(window.__lastEventsB || [])
+    ];
+    if (!allEvents.length) return;
+
+    const uniqueEvents = [];
+    const seenIds = new Set();
+    allEvents.forEach(ev => {
+      if (ev.id && !seenIds.has(ev.id)) {
+        seenIds.add(ev.id);
+        uniqueEvents.push(ev);
+      }
+    });
+
+    h2hMatches = uniqueEvents.filter(ev => {
+      const sType = ev.status?.type ?? "";
+      const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
+      if (!isTerminal) return false;
+      const hId = String(ev.homeTeam?.id ?? "");
+      const aId = String(ev.awayTeam?.id ?? "");
+      return (hId === idA && aId === idB) || (hId === idB && aId === idA);
+    }).sort((a, b) => {
+      const tA = a.startTimestamp || 0;
+      const tB = b.startTimestamp || 0;
+      return tB - tA; // Newest first
+    }).slice(0, 5);
+  }
 
   if (h2hMatches.length >= 2) {
       const h2hA = [], h2hB = [];
@@ -3880,7 +3902,7 @@ async function fetchSofascoreStats() {
     // Auto-fill H2H if we can find games between these two
     try {
       setStatus("🔄 Checking H2H...", "#d98a00");
-      const h2hMatches = (histA.events || []).filter(ev => {
+      let h2hMatches = (histA.events || []).filter(ev => {
         const sType = ev.status?.type ?? "";
         const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
         if (!isTerminal) return false;
@@ -3891,7 +3913,22 @@ async function fetchSofascoreStats() {
         return (hId === rA && aId === rB) || (hId === rB && aId === rA);
       }).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0)).slice(0, 5);
 
-              if (h2hMatches.length >= 2) {
+      // Fallback to direct SofaScore H2H endpoint if last events yielded no matchups (previous seasons)
+      if (h2hMatches.length < 2) {
+        try {
+          const directH2H = await ssFetch(`https://api.sofascore.com/api/v1/team/${resolvedIdA}/team/${resolvedIdB}/h2h/events`);
+          if (directH2H && Array.isArray(directH2H.events)) {
+            h2hMatches = directH2H.events.filter(ev => {
+              const sType = ev.status?.type ?? "";
+              return sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
+            }).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0)).slice(0, 5);
+          }
+        } catch (eH2H) {
+          engineDebug("Direct SofaScore H2H endpoint failed", { error: eH2H.message });
+        }
+      }
+
+      if (h2hMatches.length >= 2) {
         const h2hA = [], h2hB = [];
         const h2hA1H = [], h2hB1H = [];
         const h2hAQ1 = [], h2hBQ1 = [], h2hAQ2 = [], h2hBQ2 = [];
