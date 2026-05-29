@@ -2557,7 +2557,7 @@ body.dark-mode .tracker-analytics-section-head {
     </div>
   </div>
 
-  <div style="margin-bottom:8px;display:none;">
+  <div style="margin-bottom:8px;display:block;">
     <button type="button" id="ssFetchBtn" onclick="fetchSofascoreStats()" style="background:#49a443;color:#fff;padding:6px 14px;font-size:12px;font-weight:700;border:none;cursor:pointer;margin:0 0 6px 0;">📡 Fetch Stats</button>
   </div>
   <div id="ssFetchStatus" style="font-size:10px;min-height:16px;"></div>
@@ -3479,8 +3479,8 @@ async function parseSofascoreIndividual(side) {
     if (side === "A") {
       if (display5S.length) document.getElementById("aFTScored").value = display5S.join(",");
       if (display5A.length) document.getElementById("aFTAllowed").value = display5A.join(",");
-      // Venue splits: Team A is HOME by convention in manual leagues
-      if (stats.homeScoredList.length >= 2) {
+      // Venue splits: Team A is HOME by convention in manual leagues (requires min 3 games for confidence)
+      if (stats.homeScoredList.length >= 3) {
         document.getElementById("aFTScoredHome").value = stats.homeScoredList.slice(0, 5).join(",");
         document.getElementById("aFTAllowedHome").value = stats.homeAllowedList.slice(0, 5).join(",");
         document.getElementById("aVenueSplitEnabled").checked = true;
@@ -3526,8 +3526,8 @@ async function parseSofascoreIndividual(side) {
     } else {
       if (display5S.length) document.getElementById("bFTScored").value = display5S.join(",");
       if (display5A.length) document.getElementById("bFTAllowed").value = display5A.join(",");
-      // Venue splits: Team B is AWAY by convention in manual leagues
-      if (stats.awayScoredList.length >= 2) {
+      // Venue splits: Team B is AWAY by convention in manual leagues (requires min 3 games for confidence)
+      if (stats.awayScoredList.length >= 3) {
         document.getElementById("bFTScoredAway").value = stats.awayScoredList.slice(0, 5).join(",");
         document.getElementById("bFTAllowedAway").value = stats.awayAllowedList.slice(0, 5).join(",");
         document.getElementById("bVenueSplitEnabled").checked = true;
@@ -3573,16 +3573,22 @@ async function parseSofascoreIndividual(side) {
     }
 
     // Try finding and auto-filling H2H inputs from current pasted context
-    try { await extractH2HFromPastedEvents(); } catch(e) { engineDebug("parseSofascoreIndividual H2H extract failed", e.message); }
+    let h2hCount = 0;
+    try { h2hCount = await extractH2HFromPastedEvents(); } catch(e) { engineDebug("parseSofascoreIndividual H2H extract failed", e.message); }
 
-    if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " stats loaded from pasted JSON!"; }
+    if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " stats loaded! H2H: " + (h2hCount || 0) + " games found."; }
     if (pasteEl) pasteEl.value = "";
     // AFDB JSON fill audit log
     if (typeof AFDB !== "undefined") {
       const _fillSnap = {};
-      const _fillIds = ["aFTScored","aFTAllowed","bFTScored","bFTAllowed","a1HScored","a1HAllowed","b1HScored","b1HAllowed",
-        "aFTH2H","bFTH2H","a1HH2H","b1HH2H","aQ1Scored","bQ1Scored","aQ2Scored","bQ2Scored","aQ3Scored","bQ3Scored","aQ4Scored","bQ4Scored",
-        "aQ1H2H","bQ1H2H","teamAName","teamBName","leagueSelect"];
+      const _fillIds = [
+        "aFTScored","aFTAllowed","bFTScored","bFTAllowed",
+        "a1HScored","a1HAllowed","b1HScored","b1HAllowed",
+        "aFTH2H","bFTH2H","a1HH2H","b1HH2H","a2HH2H","b2HH2H",
+        "aQ1Scored","bQ1Scored","aQ2Scored","bQ2Scored","aQ3Scored","bQ3Scored","aQ4Scored","bQ4Scored",
+        "aQ1H2H","bQ1H2H","aQ2H2H","bQ2H2H","aQ3H2H","bQ3H2H","aQ4H2H","bQ4H2H",
+        "teamAName","teamBName","leagueSelect"
+      ];
       _fillIds.forEach(id => {
         const el = document.getElementById(id);
         if (el) _fillSnap[id] = el.tagName === "SELECT" ? el.value : (el.value || "(empty)");
@@ -3623,7 +3629,12 @@ async function parseSofascoreIndividual(side) {
 async function extractH2HFromPastedEvents() {
   const idA = document.getElementById("ssTeamAId")?.value.trim();
   const idB = document.getElementById("ssTeamBId")?.value.trim();
-  if (!idA || !idB) return;
+  if (!idA || !idB) {
+    if (typeof AFDB !== "undefined") {
+      AFDB.log("WARN", "JSON_H2H", "H2H extraction skipped: Team ID missing on side " + (!idA ? "A" : "B") + ".");
+    }
+    return 0;
+  }
 
   let h2hMatches = [];
 
@@ -3655,8 +3666,9 @@ async function extractH2HFromPastedEvents() {
     const uniqueLocalEvents = [];
     const seenLocalIds = new Set();
     allLocalEvents.forEach(ev => {
-      if (ev.id && !seenLocalIds.has(ev.id)) {
-        seenLocalIds.add(ev.id);
+      const evIdStr = ev.id ? String(ev.id) : "";
+      if (evIdStr && !seenLocalIds.has(evIdStr)) {
+        seenLocalIds.add(evIdStr);
         uniqueLocalEvents.push(ev);
       }
     });
@@ -3677,6 +3689,13 @@ async function extractH2HFromPastedEvents() {
         h2hMatches.push(ev);
       }
     });
+
+    if (typeof AFDB !== "undefined") {
+      AFDB.log("H2H", "LOCAL_SCAN", 
+        `Found ${h2hMatches.length} H2H candidates | idA=${idA} idB=${idB}`,
+        { games: h2hMatches.map(m => ({ id: m.id, date: m.date, home: m.homeTeam?.id })) }
+      );
+    }
 
     engineDebug("After local merge, total H2H candidates", { count: h2hMatches.length });
 
@@ -3804,6 +3823,7 @@ async function extractH2HFromPastedEvents() {
     };
     engineDebug("Sofascore upcoming fixture confirmed", window.__manualFixtureMeta);
   }
+  return h2hMatches.length;
 }
 
 async function fetchSofascoreStats() {
@@ -3875,14 +3895,14 @@ async function fetchSofascoreStats() {
     document.getElementById("bFTScored").value = _ssB5S.join(",");
     document.getElementById("bFTAllowed").value = _ssB5A.join(",");
 
-    // Venue splits — Team A = Home, Team B = Away by convention
-    if (statsA.homeScoredList.length >= 2) {
+    // Venue splits — Team A = Home, Team B = Away by convention (requires min 3 games for confidence)
+    if (statsA.homeScoredList.length >= 3) {
       document.getElementById("aFTScoredHome").value = statsA.homeScoredList.slice(0, 5).join(",");
       document.getElementById("aFTAllowedHome").value = statsA.homeAllowedList.slice(0, 5).join(",");
       document.getElementById("aVenueSplitEnabled").checked = true;
       document.getElementById("aVenueSplitFields").style.display = "block";
     }
-    if (statsB.awayScoredList.length >= 2) {
+    if (statsB.awayScoredList.length >= 3) {
       document.getElementById("bFTScoredAway").value = statsB.awayScoredList.slice(0, 5).join(",");
       document.getElementById("bFTAllowedAway").value = statsB.awayAllowedList.slice(0, 5).join(",");
       document.getElementById("bVenueSplitEnabled").checked = true;
@@ -6645,7 +6665,10 @@ function isIgnoredEngineWatchLine(line = "") {
   // represent intentional engine states, not real crashes. Add patterns here instead of
   // weakening getDebugSeverity. Previously this function was defined but never called anywhere
   // — it was dead code whose entire protective purpose was silently inactive.
-  return text.includes("validation failed") ||
+  return text.includes("api error: http") ||
+    text.includes("critical network block") ||
+    text.includes("network/promise error") ||
+    text.includes("validation failed") ||
     text.includes("run blocked missing league") ||
     text.includes("run blocked duplicate teams") ||
     text.includes("finished with no tracker changes") ||
@@ -18129,6 +18152,14 @@ const AFDB = (function() {
     };
     _log.unshift(entry);
     if (_log.length > LOG_LIMIT) _log = _log.slice(0, LOG_LIMIT);
+
+    // Update live counter badge on the AFDB button
+    const errCount = _log.filter(e => e.level === 'ERROR').length;
+    const afdbBtn = document.getElementById("afdbBtn");
+    if (afdbBtn) {
+      afdbBtn.textContent = errCount > 0 ? "🔬" + errCount : "🔬";
+    }
+
     if (_isOpen) _render();
   }
 
