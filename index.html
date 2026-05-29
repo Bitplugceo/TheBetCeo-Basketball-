@@ -8176,11 +8176,14 @@ async function primeTrackerStateForRun() {
   const localState = await loadTrackerStateFromLocal();
 
   if (localState) {
-    normalizeTrackerState(localState);
+    // LOCK: Merge fresh in-memory state with local storage — never overwrite.
+    // addTrackedPicks writes to g_trackerState synchronously but IndexedDB write
+    // is async. If the user opens the tracker within ~400ms of a Run, the fresh
+    // pick exists in memory but not yet in local storage. A bare normalizeTrackerState
+    // call would silently drop it. Merging preserves it regardless of write timing.
+    const _primed = mergeTrackerStates(g_trackerState, localState);
+    normalizeTrackerState(_primed);
     backfillLineMemoryFromTrackedPicks();
-  } else {
-    g_trackerState = createEmptyTrackerState(); 
-    rebuildTrackerDerivedState();
   }
 
   renderTrackedPicks();
@@ -8451,7 +8454,11 @@ const hadLocalState =
 
 
     if (localState) {
-      normalizeTrackerState(localState);
+      // LOCK: Merge fresh in-memory picks with local state before normalizing.
+      // Same race guard as primeTrackerStateForRun — the IndexedDB write from
+      // addTrackedPicks may not have completed before hydrate reads local storage.
+      const _hydrateBase = mergeTrackerStates(g_trackerState, localState);
+      normalizeTrackerState(_hydrateBase);
       backfillLineMemoryFromTrackedPicks();
       trackerDebug("hydrate local state found", {
         active: getTrackerActivePickCount(localState),
@@ -8513,7 +8520,10 @@ if (!data?.state) {
         return g_trackerState;
       }
 
-      const mergedState = mergeTrackerStates(localState || {}, serverState);
+      // LOCK: Use g_trackerState (which now holds fresh in-memory picks from the
+      // merge above) as the local basis — not the raw localState from IndexedDB.
+      // localState is stale if the IndexedDB write hadn't completed when we read it.
+      const mergedState = mergeTrackerStates(g_trackerState, serverState);
       normalizeTrackerState(mergedState);
       backfillLineMemoryFromTrackedPicks();
       saveTrackerStateToLocal();
