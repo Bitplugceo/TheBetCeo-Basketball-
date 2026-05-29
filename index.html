@@ -5343,18 +5343,32 @@ function recordPickVariance(pick) {
   const actualSpread = actual - line;
   const variance     = Math.abs(projSpread - actualSpread);
 
+  // CLV: closing line value — positive = pick was on the correct side of line movement.
+  // closingLine must be stored on the pick at settlement time by the caller when available.
+  const closingLine = isFinite(Number(pick.closingLine)) ? Number(pick.closingLine) : null;
+  const side        = String(pick.side || "").toLowerCase();
+  const clv = (closingLine !== null && (side === "over" || side === "under"))
+    ? (side === "over" ? line - closingLine : closingLine - line)
+    : null;
+
   g_pickVarianceLog.push({
     ts:           new Date().toISOString(),
     league:       pick.league    || "unknown",
     marketKey:    pick.marketKey || "ft",
     proj, line, actual,
-    projSpread, actualSpread, variance
+    projSpread, actualSpread, variance,
+    ...(clv !== null ? { clv } : {})
   });
 
   savePickVarianceLog();
+
+  // Recalibrate edge floors after every new settled data point
+  if (typeof runEdgeCalibration === "function") runEdgeCalibration();
+
   engineDebug(
     "DRIFT TRACKER: var=" + variance.toFixed(2) +
     " | proj=" + proj.toFixed(1) + " act=" + actual +
+    (clv !== null ? " | clv=" + clv.toFixed(2) : "") +
     " | " + (pick.league || "") + " " + (pick.marketKey || "")
   );
 }
@@ -5370,6 +5384,47 @@ function getRollingMeanError(n, marketKey, league) {
   if (!entries.length) return NaN;
   const sum = entries.reduce(function(s, e) { return s + Number(e.variance || 0); }, 0);
   return sum / entries.length;
+}
+
+// ── AUTO-CALIBRATION: edge floor offsets derived from rolling variance log ──
+// Offsets are stored in localStorage and applied in getLeagueEdgeThresholds().
+// A positive offset raises the edge floor (tighter gate); negative loosens it.
+let g_calibratedEdgeOffsets = (() => {
+  try {
+    const raw = localStorage.getItem("bb_edge_calibration_v1");
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) { return {}; }
+})();
+
+function saveEdgeCalibration() {
+  try { localStorage.setItem("bb_edge_calibration_v1", JSON.stringify(g_calibratedEdgeOffsets)); } catch (e) {}
+}
+
+function runEdgeCalibration() {
+  const MARKETS      = ["ft", "h1", "h2", "team_a", "team_b"];
+  const LEAGUES      = ["nba", "ncaa", "wnba", "wnba_pre"];
+  const MIN_SAMPLES  = 20;
+  const BASELINE_MAE = 8.0; // expected mean absolute error in total-score points
+
+  for (const league of LEAGUES) {
+    for (const market of MARKETS) {
+      const entries = g_pickVarianceLog.filter(e => e.league === league && e.marketKey === market);
+      if (entries.length < MIN_SAMPLES) continue;
+      const recent = entries.slice(-MIN_SAMPLES);
+      const mae = recent.reduce((s, e) => s + (Number(e.variance) || 0), 0) / recent.length;
+      const key = `${league}:${market}`;
+
+      if (mae > BASELINE_MAE * 1.2) {
+        // Model noisier than baseline — tighten edge floor (cap at +1.8%)
+        g_calibratedEdgeOffsets[key] = Math.min((g_calibratedEdgeOffsets[key] || 0) + 0.003, 0.018);
+      } else if (mae < BASELINE_MAE * 0.8) {
+        // Model tighter than baseline — loosen floor slightly (floor at -1.0%)
+        g_calibratedEdgeOffsets[key] = Math.max((g_calibratedEdgeOffsets[key] || 0) - 0.002, -0.010);
+      }
+    }
+  }
+  saveEdgeCalibration();
+  engineDebug("edge calibration updated", g_calibratedEdgeOffsets);
 }
 
 function backfillLineMemoryFromTrackedPicks() {
@@ -6907,11 +6962,23 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
     return parseFloat(val) || 0;
   };
 
+  // getStatMade: extracts the made value from ESPN "made/attempted" strings
+  const getStatMade = (key) => {
+    const val = stats[key] || "0/0";
+    if (typeof val === "string" && val.includes("/")) return parseFloat(val.split("/")[0]) || 0;
+    return parseFloat(val) || 0;
+  };
+
     const fga = getStat("fieldGoals");
   const fta = getStat("freeThrows");
 
   const orb = getStat("offensiveRebounds");
   const tov = getStat("turnovers");
+
+  // Four Factors inputs — parsed from same box score using getStatMade
+  const fgm  = getStatMade("fieldGoals");
+  const fg3m = getStatMade("threePointFieldGoals");
+  const drb  = getStat("defensiveRebounds");
 
   // 🛡️ MATH FIX: True Hollinger requires opponent ORB to balance.
   // Since we only have 1 team's box score here, we dampen the ORB subtraction 
@@ -6940,11 +7007,27 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
   const safeMinutes = (isFinite(minutes) && minutes > 0) ? minutes : 48;
   const pace = (possessions / safeMinutes) * minutes;
 
+  // Four Factors (Dean Oliver) — eFG%, TOV%, ORB%, FT rate
+  // Stored alongside ORtg/DRtg/pace in Level 2 memory for downstream correlation.
+  // All four return null when prerequisite stats are zero/missing — callers must guard.
+  const eFGPct = fga > 0
+    ? parseFloat(((fgm + 0.5 * fg3m) / fga).toFixed(4)) : null;
+  const tovPct = (fga + 0.44 * fta + tov) > 0
+    ? parseFloat((tov / (fga + 0.44 * fta + tov)).toFixed(4)) : null;
+  const orbPct = (orb + drb) > 0
+    ? parseFloat((orb / (orb + drb)).toFixed(4)) : null;
+  const ftRate = fga > 0
+    ? parseFloat((fta / fga).toFixed(4)) : null;
+
   return {
     possessions: parseFloat(possessions.toFixed(2)),
-    ortg: parseFloat(ortg.toFixed(2)),
-    drtg: parseFloat(drtg.toFixed(2)),
-    pace: parseFloat(pace.toFixed(2))
+    ortg:        parseFloat(ortg.toFixed(2)),
+    drtg:        parseFloat(drtg.toFixed(2)),
+    pace:        parseFloat(pace.toFixed(2)),
+    ...(eFGPct !== null ? { eFGPct } : {}),
+    ...(tovPct !== null ? { tovPct } : {}),
+    ...(orbPct !== null ? { orbPct } : {}),
+    ...(ftRate !== null ? { ftRate } : {})
   };
 }
 
@@ -11224,16 +11307,34 @@ function getVolatilityRating(std, limit) {
   return "HIGH";
 }
 
-// [FIXED: DEAD_CONTEXT_PARAMS] — All ctx properties (backToBack, sosHarder, sosEasier,
-// recencyBias) were never populated at any call site, making the previous body a no-op
-// that mutated nothing. Replaced with a clean identity stub that documents its reserved-hook
-// status and avoids executing dead branches on every projection call.
-// LOCK: Do not add logic here without also updating every call site to supply the ctx object.
-function applyContextAdjustments(baseProjection, _ctx) {
-  // Reserved context-adjustment hook. Parameters are not yet wired at call sites.
-  // When backToBack, sosHarder, sosEasier, or recencyBias are supplied in future,
-  // restore the adjustment body here and remove the _ prefix from _ctx.
-  return isFinite(baseProjection) ? baseProjection : baseProjection;
+// Context adjustment hook — applies schedule/opponent signals to base projection.
+// Callers supply a ctx object with any known flags; absent flags are silently skipped.
+// Adjustments are additive and clamped to prevent outlier overcorrection.
+function applyContextAdjustments(baseProjection, ctx) {
+  if (!isFinite(baseProjection)) return baseProjection;
+  if (!ctx || typeof ctx !== "object") return baseProjection;
+
+  let adj = 0;
+
+  // Back-to-back fatigue: modest scoring depression for the B2B team
+  if (ctx.backToBack === true) adj -= 1.2;
+
+  // Rest advantage: 2+ days rest vs. opponent 0–1 days
+  if (typeof ctx.restDayAdvantage === "number" && isFinite(ctx.restDayAdvantage)) {
+    if (ctx.restDayAdvantage >= 2)       adj += 0.8;
+    else if (ctx.restDayAdvantage <= -2) adj -= 0.8;
+  }
+
+  // Strength of schedule modifier (recent opponent quality)
+  if (ctx.sosHarder === true)       adj -= 0.6;
+  else if (ctx.sosEasier === true)  adj += 0.6;
+
+  // Recency bias: sharp recent form divergence from season average (in points)
+  if (typeof ctx.recencyBias === "number" && isFinite(ctx.recencyBias)) {
+    adj += clampNumber(ctx.recencyBias * 0.4, -1.5, 1.5);
+  }
+
+  return baseProjection + adj;
 }
 
 
@@ -11245,6 +11346,7 @@ function applyContextAdjustments(baseProjection, _ctx) {
       const lens = arrays.map(a => Array.isArray(a) ? a.length : 0);
       const minLen = Math.min(...lens);
       if (minLen >= 5) return "full";
+      if (minLen === 4) return "medium";
       if (minLen >= 2) return "thin";
       return "insufficient";
     }
@@ -11278,12 +11380,27 @@ function applyContextAdjustments(baseProjection, _ctx) {
     // add a corresponding guard here. Do not remove the wnba/wnba_pre line without
     // updating both structures simultaneously.
     function getLeagueEdgeThresholds(league) {
-      if (league === "nba") return LEAGUE_EDGE_THRESHOLDS.nba;
-      if (league === "ncaa") return LEAGUE_EDGE_THRESHOLDS.ncaa;
-      if (league === "wnba" || league === "wnba_pre") return LEAGUE_EDGE_THRESHOLDS.wnba;
-      if (EUROPE_EDGE_LEAGUES.includes(league)) return LEAGUE_EDGE_THRESHOLDS.europe;
-      if (ASIA_EDGE_LEAGUES.includes(league)) return LEAGUE_EDGE_THRESHOLDS.asia;
-      return LEAGUE_EDGE_THRESHOLDS.default;
+      const base =
+        league === "nba"                              ? LEAGUE_EDGE_THRESHOLDS.nba     :
+        league === "ncaa"                             ? LEAGUE_EDGE_THRESHOLDS.ncaa    :
+        (league === "wnba" || league === "wnba_pre")  ? LEAGUE_EDGE_THRESHOLDS.wnba    :
+        EUROPE_EDGE_LEAGUES.includes(league)          ? LEAGUE_EDGE_THRESHOLDS.europe  :
+        ASIA_EDGE_LEAGUES.includes(league)            ? LEAGUE_EDGE_THRESHOLDS.asia    :
+        LEAGUE_EDGE_THRESHOLDS.default;
+
+      // Apply auto-calibration offsets derived from settled pick variance log.
+      // g_calibratedEdgeOffsets is initialised at startup from localStorage.
+      const offsets  = (typeof g_calibratedEdgeOffsets !== "undefined") ? g_calibratedEdgeOffsets : {};
+      const ftOffset = offsets[`${league}:ft`]  || 0;
+      const h1Offset = offsets[`${league}:h1`]  || 0;
+
+      if (!ftOffset && !h1Offset) return base;
+
+      return {
+        ...base,
+        ft: Math.max(0.020, (base.ft  || 0.065) + ftOffset),
+        h1: Math.max(0.020, (base.h1  || 0.067) + h1Offset)
+      };
     }
 
     function getLineSanityBands(league) {
@@ -11460,11 +11577,13 @@ function applyContextAdjustments(baseProjection, _ctx) {
       const isPeriodMarket = marketKey === "ft" || marketKey === "h1" || marketKey === "h2";
       const isH2 = marketKey === "h2";
 
-      if (fullModel && !projectionOnly && sampleTier === "full") score += 2;
-      else if (fullModel && !projectionOnly) score += 1;
-      else if (sampleTier === "full") score += 1;
-      else if (sampleTier === "thin") score -= isH2 ? 3 : 2;
-      else score -= 4;
+      if (fullModel && !projectionOnly && sampleTier === "full")   score += 2;
+      else if (fullModel && !projectionOnly && sampleTier === "medium") score += 1;
+      else if (fullModel && !projectionOnly)                        score += 0;
+      else if (sampleTier === "full")                               score += 1;
+      else if (sampleTier === "medium")                             score += 0;
+      else if (sampleTier === "thin")                               score -= isH2 ? 3 : 2;
+      else                                                          score -= 4;
 
       if (projectionOnly) score -= 3;
       if (edgePct >= 0.095) score += 2;
@@ -11494,6 +11613,24 @@ function applyContextAdjustments(baseProjection, _ctx) {
       if (score >= 1) return "C";
       return "D";
     }
+
+// Applies tracker-derived historical win-rate signal as a ±1 grade bump.
+// Uses existing bumpConfidenceGrade — safe no-op when derived state is absent
+// or the bucket has not yet reached actionable sample size.
+function applyBucketGradeSignal(grade, league, marketKey, side) {
+  if (!grade || grade === "NaN" || !league || !marketKey) return grade;
+  try {
+    const derived = g_trackerState?.derivedState;
+    if (!derived) return grade;
+    const msk = [league, marketKey, String(side || "")].join("|");
+    const bucket = derived.marketSides?.[msk];
+    if (!bucket || !bucket.isActionable) return grade;
+    const signal = Number(bucket.signalStrength || 0);
+    if (signal >= 3.5)  return bumpConfidenceGrade(grade,  1);
+    if (signal <= -3.5) return bumpConfidenceGrade(grade, -1);
+  } catch (_) {}
+  return grade;
+}
 
     // ── HYBRID FIX: Restored Market Anchoring (Vegas Safety Net) ──
 function anchorProjection(proj, line, league, marketType) {
@@ -11618,12 +11755,18 @@ function getIntelTeamBase(league, marketKey = "ft") {
 
 function buildLooseParsedState() {
   return {
-    aFTScored: readLooseSeries("aFTScored"),
-    bFTScored: readLooseSeries("bFTScored"),
-    a1HScored: readLooseSeries("a1HScored"),
-    b1HScored: readLooseSeries("b1HScored"),
-    a2HScored: readLooseSeries("a2HScored"),
-    b2HScored: readLooseSeries("b2HScored")
+    aFTScored:  readLooseSeries("aFTScored"),
+    bFTScored:  readLooseSeries("bFTScored"),
+    aFTAllowed: readLooseSeries("aFTAllowed"),
+    bFTAllowed: readLooseSeries("bFTAllowed"),
+    a1HScored:  readLooseSeries("a1HScored"),
+    b1HScored:  readLooseSeries("b1HScored"),
+    a1HAllowed: readLooseSeries("a1HAllowed"),
+    b1HAllowed: readLooseSeries("b1HAllowed"),
+    a2HScored:  readLooseSeries("a2HScored"),
+    b2HScored:  readLooseSeries("b2HScored"),
+    a2HAllowed: readLooseSeries("a2HAllowed"),
+    b2HAllowed: readLooseSeries("b2HAllowed")
   };
 }
 
@@ -11764,20 +11907,20 @@ function computeIntelligencePack(league, lines = {}, parsedInput = null) {
   const baseH1 = getIntelTeamBase(league, "h1");
   const baseH2 = getIntelTeamBase(league, "h2");
 
-  const aOverallFTSc = getIntelSeries("A", "overall", "ftScored10", parsed.aFTScored);
-  const aOverallFTAl = [];
-  const bOverallFTSc = getIntelSeries("B", "overall", "ftScored10", parsed.bFTScored);
-  const bOverallFTAl = [];
+  const aOverallFTSc = getIntelSeries("A", "overall", "ftScored10",  parsed.aFTScored);
+  const aOverallFTAl = getIntelSeries("A", "overall", "ftAllowed10", parsed.aFTAllowed);
+  const bOverallFTSc = getIntelSeries("B", "overall", "ftScored10",  parsed.bFTScored);
+  const bOverallFTAl = getIntelSeries("B", "overall", "ftAllowed10", parsed.bFTAllowed);
 
-  const aOverallH1Sc = getIntelSeries("A", "overall", "h1Scored10", parsed.a1HScored);
-  const aOverallH1Al = [];
-  const bOverallH1Sc = getIntelSeries("B", "overall", "h1Scored10", parsed.b1HScored);
-  const bOverallH1Al = [];
+  const aOverallH1Sc = getIntelSeries("A", "overall", "h1Scored10",  parsed.a1HScored);
+  const aOverallH1Al = getIntelSeries("A", "overall", "h1Allowed10", parsed.a1HAllowed);
+  const bOverallH1Sc = getIntelSeries("B", "overall", "h1Scored10",  parsed.b1HScored);
+  const bOverallH1Al = getIntelSeries("B", "overall", "h1Allowed10", parsed.b1HAllowed);
 
-  const aOverallH2Sc = getIntelSeries("A", "overall", "h2Scored10", parsed.a2HScored);
-  const aOverallH2Al = [];
-  const bOverallH2Sc = getIntelSeries("B", "overall", "h2Scored10", parsed.b2HScored);
-  const bOverallH2Al = [];
+  const aOverallH2Sc = getIntelSeries("A", "overall", "h2Scored10",  parsed.a2HScored);
+  const aOverallH2Al = getIntelSeries("A", "overall", "h2Allowed10", parsed.a2HAllowed);
+  const bOverallH2Sc = getIntelSeries("B", "overall", "h2Scored10",  parsed.b2HScored);
+  const bOverallH2Al = getIntelSeries("B", "overall", "h2Allowed10", parsed.b2HAllowed);
 
   const defaultTotalLine = isFinite(ftLine) && ftLine > 0 ? ftLine : (LEAGUE_BASES[league] || LEAGUE_BASES.unknown);
   const altHighLine = defaultTotalLine + (league === "nba" ? 12 : league === "ncaa" ? 8 : 10);
