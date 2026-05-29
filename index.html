@@ -1,3 +1,4 @@
+Q
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3397,13 +3398,17 @@ function validateSofascoreSection() {
   if (btn) btn.disabled = !(nameA && nameB);
 }
 
+window.__jsonPasteCountA = 0;
+window.__jsonPasteCountB = 0;
+
 function updateSofascoreLinks(side) {
   const idInput = document.getElementById(side === "A" ? "ssTeamAId" : "ssTeamBId");
   const linkEl = document.getElementById(side === "A" ? "ssTeamALink" : "ssTeamBLink");
   if (!idInput || !linkEl) return;
   const idVal = idInput.value.trim();
   if (idVal && /^\d+$/.test(idVal)) {
-    linkEl.href = "https://api.sofascore.com/api/v1/team/" + idVal + "/events/last/0";
+    const page = side === "A" ? window.__jsonPasteCountA : window.__jsonPasteCountB;
+    linkEl.href = "https://api.sofascore.com/api/v1/team/" + idVal + "/events/last/" + page;
     linkEl.style.display = "inline-block";
   } else {
     linkEl.style.display = "none";
@@ -3427,6 +3432,7 @@ function searchSofascorePlayer(side) {
 // Global event schedule storage for dynamic Head-To-Head auto-filling
 window.__lastEventsA = null;
 window.__lastEventsB = null;
+window.__h2hEntryCache = [];
 
 function parseSofascoreIndividual(side) {
   const pasteEl = document.getElementById(side === "A" ? "ssPasteA" : "ssPasteB");
@@ -3439,9 +3445,17 @@ function parseSofascoreIndividual(side) {
     const events = parsed.events || [];
     if (!events.length) throw new Error("No events found in pasted JSON.");
 
-    // Store schedule events globally
-    if (side === "A") window.__lastEventsA = events;
-    else window.__lastEventsB = events;
+    // Store schedule events globally (merge with existing, newest-first, dedup by id)
+    const prevEvents = side === "A" ? (window.__lastEventsA || []) : (window.__lastEventsB || []);
+    const mergedMap = new Map();
+    [...prevEvents, ...events].forEach(ev => { if (ev.id != null) mergedMap.set(ev.id, ev); });
+    const mergedEvents = Array.from(mergedMap.values()).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
+    if (side === "A") window.__lastEventsA = mergedEvents;
+    else window.__lastEventsB = mergedEvents;
+
+    // Advance the page counter so the link opens the next page on next click
+    if (side === "A") { window.__jsonPasteCountA = (window.__jsonPasteCountA || 0) + 1; }
+    else { window.__jsonPasteCountB = (window.__jsonPasteCountB || 0) + 1; }
 
     // Auto-detect team ID by frequency
     let idVal = (document.getElementById(side === "A" ? "ssTeamAId" : "ssTeamBId")?.value || "").trim();
@@ -3614,61 +3628,87 @@ function extractH2HFromPastedEvents() {
   }).slice(0, 5);
 
   if (h2hMatches.length >= 2) {
-      const h2hA = [], h2hB = [];
-  const h2hA1H = [], h2hB1H = [];
-  const h2hAQ1 = [], h2hBQ1 = [], h2hAQ2 = [], h2hBQ2 = [];
-  const h2hAQ3 = [], h2hBQ3 = [], h2hAQ4 = [], h2hBQ4 = [];
-  h2hMatches.forEach(m => {
-    const isAHome = String(m.homeTeam?.id) === idA;
-    const myScoreObj = isAHome ? m.homeScore : m.awayScore;
-    const oppScoreObj = isAHome ? m.awayScore : m.homeScore;
-    const myFT = Number(myScoreObj?.normaltime ?? myScoreObj?.current ?? myScoreObj?.display ?? 0);
-    const oppFT = Number(oppScoreObj?.normaltime ?? oppScoreObj?.current ?? oppScoreObj?.display ?? 0);
-    if (myFT > 0) {
-      h2hA.push(myFT); h2hB.push(oppFT);
-      const mQ1 = Number(myScoreObj?.period1 ?? 0);
-      const mQ2 = Number(myScoreObj?.period2 ?? 0);
-      const mQ3 = Number(myScoreObj?.period3 ?? 0);
-      const mQ4 = Number(myScoreObj?.period4 ?? 0);
-      const oQ1 = Number(oppScoreObj?.period1 ?? 0);
-      const oQ2 = Number(oppScoreObj?.period2 ?? 0);
-      const oQ3 = Number(oppScoreObj?.period3 ?? 0);
-      const oQ4 = Number(oppScoreObj?.period4 ?? 0);
-      if (mQ1 > 0 || mQ2 > 0) {
-        h2hA1H.push(mQ1 + mQ2); h2hB1H.push(oQ1 + oQ2);
-        h2hAQ1.push(mQ1); h2hBQ1.push(oQ1);
-        h2hAQ2.push(mQ2); h2hBQ2.push(oQ2);
-        h2hAQ3.push(mQ3); h2hBQ3.push(oQ3);
-        h2hAQ4.push(mQ4); h2hBQ4.push(oQ4);
+    // Build new scores WITH timestamps so we can merge with existing
+    const newEntries = [];
+    h2hMatches.forEach(m => {
+      const isAHome = String(m.homeTeam?.id) === idA;
+      const myScoreObj = isAHome ? m.homeScore : m.awayScore;
+      const oppScoreObj = isAHome ? m.awayScore : m.homeScore;
+      const myFT = Number(myScoreObj?.normaltime ?? myScoreObj?.current ?? myScoreObj?.display ?? 0);
+      const oppFT = Number(oppScoreObj?.normaltime ?? oppScoreObj?.current ?? oppScoreObj?.display ?? 0);
+      if (myFT > 0) {
+        const mQ1 = Number(myScoreObj?.period1 ?? 0);
+        const mQ2 = Number(myScoreObj?.period2 ?? 0);
+        const mQ3 = Number(myScoreObj?.period3 ?? 0);
+        const mQ4 = Number(myScoreObj?.period4 ?? 0);
+        const oQ1 = Number(oppScoreObj?.period1 ?? 0);
+        const oQ2 = Number(oppScoreObj?.period2 ?? 0);
+        const oQ3 = Number(oppScoreObj?.period3 ?? 0);
+        const oQ4 = Number(oppScoreObj?.period4 ?? 0);
+        newEntries.push({
+          id: m.id,
+          ts: m.startTimestamp || 0,
+          aFT: myFT, bFT: oppFT,
+          aH1: mQ1 + mQ2, bH1: oQ1 + oQ2,
+          aQ1: mQ1, bQ1: oQ1, aQ2: mQ2, bQ2: oQ2,
+          aQ3: mQ3, bQ3: oQ3, aQ4: mQ4, bQ4: oQ4,
+          hasQ: mQ1 > 0 || mQ2 > 0
+        });
       }
+    });
+
+    // Parse existing H2H field values back into entry-like objects using stored timestamps
+    if (!window.__h2hEntryCache) window.__h2hEntryCache = [];
+    const existingIds = new Set(window.__h2hEntryCache.map(e => e.id));
+
+    // Add only new entries that aren't already cached
+    newEntries.forEach(e => { if (!existingIds.has(e.id)) window.__h2hEntryCache.push(e); });
+
+    // Sort all cached entries newest-first, keep up to 5
+    window.__h2hEntryCache.sort((a, b) => b.ts - a.ts);
+    window.__h2hEntryCache = window.__h2hEntryCache.slice(0, 5);
+
+    const merged = window.__h2hEntryCache;
+    const h2hA = merged.map(e => e.aFT);
+    const h2hB = merged.map(e => e.bFT);
+    const h2hA1H = merged.filter(e => e.hasQ).map(e => e.aH1);
+    const h2hB1H = merged.filter(e => e.hasQ).map(e => e.bH1);
+    const h2hAQ1 = merged.filter(e => e.hasQ).map(e => e.aQ1);
+    const h2hBQ1 = merged.filter(e => e.hasQ).map(e => e.bQ1);
+    const h2hAQ2 = merged.filter(e => e.hasQ).map(e => e.aQ2);
+    const h2hBQ2 = merged.filter(e => e.hasQ).map(e => e.bQ2);
+    const h2hAQ3 = merged.filter(e => e.hasQ).map(e => e.aQ3);
+    const h2hBQ3 = merged.filter(e => e.hasQ).map(e => e.bQ3);
+    const h2hAQ4 = merged.filter(e => e.hasQ).map(e => e.aQ4);
+    const h2hBQ4 = merged.filter(e => e.hasQ).map(e => e.bQ4);
+
+    if (h2hA.length >= 2) {
+      document.getElementById("aFTH2H").value = h2hA.join(",");
+      document.getElementById("bFTH2H").value = h2hB.join(",");
+      const h2hCb = document.getElementById("useFTH2H");
+      if (h2hCb) h2hCb.checked = true;
+      if (h2hA1H.length >= 2) {
+        document.getElementById("a1HH2H").value = h2hA1H.join(",");
+        document.getElementById("b1HH2H").value = h2hB1H.join(",");
+        const h1Cb = document.getElementById("use1HH2H");
+        if (h1Cb) h1Cb.checked = true;
+      }
+      if (h2hAQ1.length >= 2) {
+        document.getElementById("aQ1H2H").value = h2hAQ1.join(",");
+        document.getElementById("bQ1H2H").value = h2hBQ1.join(",");
+        document.getElementById("aQ2H2H").value = h2hAQ2.join(",");
+        document.getElementById("bQ2H2H").value = h2hBQ2.join(",");
+        document.getElementById("aQ3H2H").value = h2hAQ3.join(",");
+        document.getElementById("bQ3H2H").value = h2hBQ3.join(",");
+        document.getElementById("aQ4H2H").value = h2hAQ4.join(",");
+        document.getElementById("bQ4H2H").value = h2hBQ4.join(",");
+        ["useQ1H2H","useQ2H2H","useQ3H2H","useQ4H2H"].forEach(id => {
+          const cb = document.getElementById(id); if (cb) cb.checked = true;
+        });
+      }
+      syncAllH2HCheckboxes(false);
+      engineDebug("Pasted JSON H2H auto-filled (merged)", { games: h2hA.length });
     }
-  });
-  if (h2hA.length >= 2) {
-    document.getElementById("aFTH2H").value = h2hA.join(",");
-    document.getElementById("bFTH2H").value = h2hB.join(",");
-    const h2hCb = document.getElementById("useFTH2H");
-    if (h2hCb) h2hCb.checked = true;
-    if (h2hA1H.length >= 2) {
-      document.getElementById("a1HH2H").value = h2hA1H.join(",");
-      document.getElementById("b1HH2H").value = h2hB1H.join(",");
-      const h1Cb = document.getElementById("use1HH2H");
-      if (h1Cb) h1Cb.checked = true;
-    }
-    if (h2hAQ1.length >= 2) {
-      document.getElementById("aQ1H2H").value = h2hAQ1.join(",");
-      document.getElementById("bQ1H2H").value = h2hBQ1.join(",");
-      document.getElementById("aQ2H2H").value = h2hAQ2.join(",");
-      document.getElementById("bQ2H2H").value = h2hBQ2.join(",");
-      document.getElementById("aQ3H2H").value = h2hAQ3.join(",");
-      document.getElementById("bQ3H2H").value = h2hBQ3.join(",");
-      document.getElementById("aQ4H2H").value = h2hAQ4.join(",");
-      document.getElementById("bQ4H2H").value = h2hBQ4.join(",");
-      ["useQ1H2H","useQ2H2H","useQ3H2H","useQ4H2H"].forEach(id => {
-        const cb = document.getElementById(id); if (cb) cb.checked = true;
-      });
-    }
-    syncAllH2HCheckboxes(false);
-    engineDebug("Pasted JSON H2H auto-filled", { games: h2hA.length });
   }
 }
 }
