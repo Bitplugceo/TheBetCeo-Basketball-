@@ -3569,7 +3569,7 @@ function parseSofascoreIndividual(side) {
     }
 
     // Try finding and auto-filling H2H inputs from current pasted context
-    await extractH2HFromPastedEvents();
+    try { await extractH2HFromPastedEvents(); } catch(e) { engineDebug("parseSofascoreIndividual H2H extract failed", e.message); }
 
     if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " stats loaded from pasted JSON!"; }
     if (pasteEl) pasteEl.value = "";
@@ -3581,6 +3581,16 @@ function parseSofascoreIndividual(side) {
     if (_ssNameSrc && _mainNameEl && _ssNameSrc.value.trim()) {
       _mainNameEl.value = _ssNameSrc.value.trim();
     }
+
+    // Also sync the other side's name if it's already filled, so getCurrentFixtureMeta has both
+    const _ssNameOther = document.getElementById(side === "A" ? "ssTeamBName" : "ssTeamAName");
+    const _mainNameOther = document.getElementById(side === "A" ? "teamBName" : "teamAName");
+    if (_ssNameOther && _mainNameOther && _ssNameOther.value.trim()) {
+      _mainNameOther.value = _ssNameOther.value.trim();
+    }
+
+    // Sync H2H checkboxes after paste so the engine sees them on next Run
+    syncAllH2HCheckboxes(false);
 
     openSection("marketSection");
     openSection("teamASection");
@@ -3599,107 +3609,139 @@ async function extractH2HFromPastedEvents() {
   if (!idA || !idB) return;
 
   let h2hMatches = [];
-  
+
   // Try fetching direct H2H events to get full history (even from previous seasons)
   try {
     const directH2H = await ssFetch(`https://api.sofascore.com/api/v1/team/${idA}/team/${idB}/h2h/events`);
     if (directH2H && Array.isArray(directH2H.events)) {
-      h2hMatches = directH2H.events.filter(ev => {
+      const _directFiltered = directH2H.events.filter(ev => {
         const sType = ev.status?.type ?? "";
         return sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
-      }).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0)).slice(0, 5);
+      }).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
+      // Take up to 10 from API — we'll slice to 5 after scoring extraction
+      h2hMatches = _directFiltered.slice(0, 10);
+      engineDebug("Direct SS H2H fetch returned", { total: _directFiltered.length, using: h2hMatches.length });
     }
   } catch (eH2H) {
     engineDebug("Direct pasted SS H2H fetch failed, falling back to local events", { error: eH2H.message });
   }
 
-  // Fallback to local events if direct fetch failed or returned nothing
-  if (!h2hMatches.length) {
-    const allEvents = [
-      ...(window.__lastEventsA || []),
-      ...(window.__lastEventsB || [])
-    ];
-    if (!allEvents.length) return;
+  // Always also scan ALL pasted local events to catch games the API may have missed
+  // Merge them with API results, deduplicate by event id, keep newest 10
+  const allLocalEvents = [
+    ...(window.__lastEventsA || []),
+    ...(window.__lastEventsB || [])
+  ];
 
-    const uniqueEvents = [];
-    const seenIds = new Set();
-    allEvents.forEach(ev => {
-      if (ev.id && !seenIds.has(ev.id)) {
-        seenIds.add(ev.id);
-        uniqueEvents.push(ev);
+  if (allLocalEvents.length) {
+    const seenIds = new Set(h2hMatches.map(m => String(m.id || "")));
+    const uniqueLocalEvents = [];
+    const seenLocalIds = new Set();
+    allLocalEvents.forEach(ev => {
+      if (ev.id && !seenLocalIds.has(ev.id)) {
+        seenLocalIds.add(ev.id);
+        uniqueLocalEvents.push(ev);
       }
     });
 
-    h2hMatches = uniqueEvents.filter(ev => {
+    const localH2H = uniqueLocalEvents.filter(ev => {
       const sType = ev.status?.type ?? "";
       const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
       if (!isTerminal) return false;
       const hId = String(ev.homeTeam?.id ?? "");
       const aId = String(ev.awayTeam?.id ?? "");
       return (hId === idA && aId === idB) || (hId === idB && aId === idA);
-    }).sort((a, b) => {
-      const tA = a.startTimestamp || 0;
-      const tB = b.startTimestamp || 0;
-      return tB - tA; // Newest first
-    }).slice(0, 5);
+    });
+
+    // Merge: add any local H2H games not already in the API result set
+    localH2H.forEach(ev => {
+      if (!seenIds.has(String(ev.id || ""))) {
+        seenIds.add(String(ev.id || ""));
+        h2hMatches.push(ev);
+      }
+    });
+
+    engineDebug("After local merge, total H2H candidates", { count: h2hMatches.length });
+
+    // Re-sort after merge and cap at 10
+    h2hMatches = h2hMatches
+      .sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0))
+      .slice(0, 10);
   }
 
-  if (h2hMatches.length >= 2) {
-      const h2hA = [], h2hB = [];
-  const h2hA1H = [], h2hB1H = [];
-  const h2hAQ1 = [], h2hBQ1 = [], h2hAQ2 = [], h2hBQ2 = [];
-  const h2hAQ3 = [], h2hBQ3 = [], h2hAQ4 = [], h2hBQ4 = [];
-  h2hMatches.forEach(m => {
-    const isAHome = String(m.homeTeam?.id) === idA;
-    const myScoreObj = isAHome ? m.homeScore : m.awayScore;
-    const oppScoreObj = isAHome ? m.awayScore : m.homeScore;
-    const myFT = Number(myScoreObj?.normaltime ?? myScoreObj?.current ?? myScoreObj?.display ?? 0);
-    const oppFT = Number(oppScoreObj?.normaltime ?? oppScoreObj?.current ?? oppScoreObj?.display ?? 0);
-    if (myFT > 0) {
-      h2hA.push(myFT); h2hB.push(oppFT);
-      const mQ1 = Number(myScoreObj?.period1 ?? 0);
-      const mQ2 = Number(myScoreObj?.period2 ?? 0);
-      const mQ3 = Number(myScoreObj?.period3 ?? 0);
-      const mQ4 = Number(myScoreObj?.period4 ?? 0);
-      const oQ1 = Number(oppScoreObj?.period1 ?? 0);
-      const oQ2 = Number(oppScoreObj?.period2 ?? 0);
-      const oQ3 = Number(oppScoreObj?.period3 ?? 0);
-      const oQ4 = Number(oppScoreObj?.period4 ?? 0);
-      if (mQ1 > 0 || mQ2 > 0) {
-        h2hA1H.push(mQ1 + mQ2); h2hB1H.push(oQ1 + oQ2);
-        h2hAQ1.push(mQ1); h2hBQ1.push(oQ1);
-        h2hAQ2.push(mQ2); h2hBQ2.push(oQ2);
-        h2hAQ3.push(mQ3); h2hBQ3.push(oQ3);
-        h2hAQ4.push(mQ4); h2hBQ4.push(oQ4);
-      }
-    }
+  // If still nothing, bail
+  if (!h2hMatches.length) {
+    engineDebug("extractH2HFromPastedEvents: no H2H matches found after all sources");
+  }
+
+  // Build the uniqueEvents reference needed for the scheduled fixture scan below
+  const _allLocalForScan = [];
+  const _scanSeenIds = new Set();
+  [...(window.__lastEventsA || []), ...(window.__lastEventsB || [])].forEach(ev => {
+    if (ev.id && !_scanSeenIds.has(ev.id)) { _scanSeenIds.add(ev.id); _allLocalForScan.push(ev); }
   });
-  if (h2hA.length >= 2) {
-    document.getElementById("aFTH2H").value = h2hA.join(",");
-    document.getElementById("bFTH2H").value = h2hB.join(",");
-    const h2hCb = document.getElementById("useFTH2H");
-    if (h2hCb) h2hCb.checked = true;
-    if (h2hA1H.length >= 2) {
-      document.getElementById("a1HH2H").value = h2hA1H.join(",");
-      document.getElementById("b1HH2H").value = h2hB1H.join(",");
-      const h1Cb = document.getElementById("use1HH2H");
-      if (h1Cb) h1Cb.checked = true;
+  const uniqueEvents = _allLocalForScan;
+
+  if (h2hMatches.length >= 2) {
+    const h2hA = [], h2hB = [];
+    const h2hA1H = [], h2hB1H = [];
+    const h2hAQ1 = [], h2hBQ1 = [], h2hAQ2 = [], h2hBQ2 = [];
+    const h2hAQ3 = [], h2hBQ3 = [], h2hAQ4 = [], h2hBQ4 = [];
+
+    // Use all found matches (up to 10) for extraction, then fill up to 5 valid scores
+    h2hMatches.forEach(m => {
+      const isAHome = String(m.homeTeam?.id) === idA;
+      const myScoreObj = isAHome ? m.homeScore : m.awayScore;
+      const oppScoreObj = isAHome ? m.awayScore : m.homeScore;
+      const myFT = Number(myScoreObj?.normaltime ?? myScoreObj?.current ?? myScoreObj?.display ?? 0);
+      const oppFT = Number(oppScoreObj?.normaltime ?? oppScoreObj?.current ?? oppScoreObj?.display ?? 0);
+      if (myFT > 0 && h2hA.length < 5) {
+        h2hA.push(myFT); h2hB.push(oppFT);
+        const mQ1 = Number(myScoreObj?.period1 ?? 0);
+        const mQ2 = Number(myScoreObj?.period2 ?? 0);
+        const mQ3 = Number(myScoreObj?.period3 ?? 0);
+        const mQ4 = Number(myScoreObj?.period4 ?? 0);
+        const oQ1 = Number(oppScoreObj?.period1 ?? 0);
+        const oQ2 = Number(oppScoreObj?.period2 ?? 0);
+        const oQ3 = Number(oppScoreObj?.period3 ?? 0);
+        const oQ4 = Number(oppScoreObj?.period4 ?? 0);
+        if (mQ1 > 0 || mQ2 > 0) {
+          h2hA1H.push(mQ1 + mQ2); h2hB1H.push(oQ1 + oQ2);
+          h2hAQ1.push(mQ1); h2hBQ1.push(oQ1);
+          h2hAQ2.push(mQ2); h2hBQ2.push(oQ2);
+          h2hAQ3.push(mQ3); h2hBQ3.push(oQ3);
+          h2hAQ4.push(mQ4); h2hBQ4.push(oQ4);
+        }
+      }
+    });
+
+    if (h2hA.length >= 2) {
+      document.getElementById("aFTH2H").value = h2hA.join(",");
+      document.getElementById("bFTH2H").value = h2hB.join(",");
+      const h2hCb = document.getElementById("useFTH2H");
+      if (h2hCb) h2hCb.checked = true;
+      if (h2hA1H.length >= 2) {
+        document.getElementById("a1HH2H").value = h2hA1H.join(",");
+        document.getElementById("b1HH2H").value = h2hB1H.join(",");
+        const h1Cb = document.getElementById("use1HH2H");
+        if (h1Cb) h1Cb.checked = true;
+      }
+      if (h2hAQ1.length >= 2) {
+        document.getElementById("aQ1H2H").value = h2hAQ1.join(",");
+        document.getElementById("bQ1H2H").value = h2hBQ1.join(",");
+        document.getElementById("aQ2H2H").value = h2hAQ2.join(",");
+        document.getElementById("bQ2H2H").value = h2hBQ2.join(",");
+        document.getElementById("aQ3H2H").value = h2hAQ3.join(",");
+        document.getElementById("bQ3H2H").value = h2hBQ3.join(",");
+        document.getElementById("aQ4H2H").value = h2hAQ4.join(",");
+        document.getElementById("bQ4H2H").value = h2hBQ4.join(",");
+        ["useQ1H2H","useQ2H2H","useQ3H2H","useQ4H2H"].forEach(id => {
+          const cb = document.getElementById(id); if (cb) cb.checked = true;
+        });
+      }
+      syncAllH2HCheckboxes(false);
+      engineDebug("Pasted JSON H2H auto-filled", { games: h2hA.length, q1Games: h2hAQ1.length });
     }
-    if (h2hAQ1.length >= 2) {
-      document.getElementById("aQ1H2H").value = h2hAQ1.join(",");
-      document.getElementById("bQ1H2H").value = h2hBQ1.join(",");
-      document.getElementById("aQ2H2H").value = h2hAQ2.join(",");
-      document.getElementById("bQ2H2H").value = h2hBQ2.join(",");
-      document.getElementById("aQ3H2H").value = h2hAQ3.join(",");
-      document.getElementById("bQ3H2H").value = h2hBQ3.join(",");
-      document.getElementById("aQ4H2H").value = h2hAQ4.join(",");
-      document.getElementById("bQ4H2H").value = h2hBQ4.join(",");
-      ["useQ1H2H","useQ2H2H","useQ3H2H","useQ4H2H"].forEach(id => {
-        const cb = document.getElementById(id); if (cb) cb.checked = true;
-      });
-    }
-          syncAllH2HCheckboxes(false);
-      engineDebug("Pasted JSON H2H auto-filled", { games: h2hA.length });
   }
 
   // Scan pasted events for the upcoming scheduled fixture between the two teams.
@@ -3730,7 +3772,6 @@ async function extractH2HFromPastedEvents() {
     };
     engineDebug("Sofascore upcoming fixture confirmed", window.__manualFixtureMeta);
   }
-}
 }
 
 async function fetchSofascoreStats() {
@@ -15266,8 +15307,21 @@ if (!fixtureMeta.eventId) {
   // fixture selection also need a fallback eventId. Previously only non-ESPN leagues got
   // one here, so WNBA picks typed without a dropdown selection had no eventId, hit the
   // !fixtureMeta?.eventId null-return guard, and were silently dropped from the tracker.
-  const safeHome = (fixtureMeta.homeTeam || "home").replace(/[\s'"`<>&]/g, "");
-  const safeAway = (fixtureMeta.awayTeam || "away").replace(/[\s'"`<>&]/g, "");
+  // Also pull names from Sofascore inputs if main inputs are still empty (manual league workflow)
+  let _homeForId = fixtureMeta.homeTeam || "";
+  let _awayForId = fixtureMeta.awayTeam || "";
+  if (!_homeForId || _homeForId === "—") {
+    const _ssA = document.getElementById("ssTeamAName");
+    if (_ssA && _ssA.value.trim()) _homeForId = _ssA.value.trim();
+  }
+  if (!_awayForId || _awayForId === "—") {
+    const _ssB = document.getElementById("ssTeamBName");
+    if (_ssB && _ssB.value.trim()) _awayForId = _ssB.value.trim();
+  }
+  if (_homeForId && _homeForId !== "—") fixtureMeta.homeTeam = _homeForId;
+  if (_awayForId && _awayForId !== "—") fixtureMeta.awayTeam = _awayForId;
+  const safeHome = (_homeForId || "home").replace(/[\s'"`<>&]/g, "");
+  const safeAway = (_awayForId || "away").replace(/[\s'"`<>&]/g, "");
   fixtureMeta.eventId = `manual_${league}_${safeHome}_${safeAway}`;
 }
 if (!fixtureMeta.eventDate) {
@@ -15281,6 +15335,20 @@ if (!fixtureMeta.eventDate) {
     !String(pickRow.note || "").startsWith("Massacre gate") &&
     !String(pickRow.note || "").startsWith("Intel gate") &&
     !String(pickRow.note || "").startsWith("Grade gate");
+
+  // Final name sync: if homeTeam/awayTeam are still blank, pull from Sofascore name inputs
+  if (!fixtureMeta.homeTeam || fixtureMeta.homeTeam === "—" || fixtureMeta.homeTeam === "A") {
+    const _ssAN = document.getElementById("ssTeamAName");
+    const _mainAN = document.getElementById("teamAName");
+    const _nameA = (_ssAN && _ssAN.value.trim()) || (_mainAN && _mainAN.value.trim()) || "";
+    if (_nameA) fixtureMeta.homeTeam = _nameA;
+  }
+  if (!fixtureMeta.awayTeam || fixtureMeta.awayTeam === "—" || fixtureMeta.awayTeam === "B") {
+    const _ssBN = document.getElementById("ssTeamBName");
+    const _mainBN = document.getElementById("teamBName");
+    const _nameB = (_ssBN && _ssBN.value.trim()) || (_mainBN && _mainBN.value.trim()) || "";
+    if (_nameB) fixtureMeta.awayTeam = _nameB;
+  }
 
   if (
   !pickRow ||
