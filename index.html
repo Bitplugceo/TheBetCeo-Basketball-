@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3572,11 +3573,14 @@ async function parseSofascoreIndividual(side) {
       }
     }
 
-    // Try finding and auto-filling H2H inputs from current pasted context
+    // H2H extraction: only run when BOTH team JSONs are loaded — avoids false zero on first paste
     let h2hCount = 0;
-    try { h2hCount = await extractH2HFromPastedEvents(); } catch(e) { engineDebug("parseSofascoreIndividual H2H extract failed", e.message); }
-
-    if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " stats loaded! H2H: " + (h2hCount || 0) + " games found."; }
+    if (window.__lastEventsA && window.__lastEventsB) {
+      try { h2hCount = await extractH2HFromPastedEvents(); } catch(e) { engineDebug("parseSofascoreIndividual H2H extract failed", e.message); }
+      if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " stats loaded! H2H: " + (h2hCount || 0) + " game" + (h2hCount === 1 ? "" : "s") + " found."; }
+    } else {
+      if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " stats loaded — paste the other team's JSON to unlock H2H."; }
+    }
     if (pasteEl) pasteEl.value = "";
     // AFDB JSON fill audit log
     if (typeof AFDB !== "undefined") {
@@ -3639,16 +3643,19 @@ async function extractH2HFromPastedEvents() {
   let h2hMatches = [];
 
   // Try fetching direct H2H events to get full history (even from previous seasons)
+  // SofaScore H2H API may return events under different keys — check all known variants
   try {
     const directH2H = await ssFetch(`https://api.sofascore.com/api/v1/team/${idA}/team/${idB}/h2h/events`);
-    if (directH2H && Array.isArray(directH2H.events)) {
-      const _directFiltered = directH2H.events.filter(ev => {
+    const _h2hRaw = directH2H?.events || directH2H?.previousEvents || directH2H?.teamDuel?.events || [];
+    if (Array.isArray(_h2hRaw) && _h2hRaw.length) {
+      const _directFiltered = _h2hRaw.filter(ev => {
         const sType = ev.status?.type ?? "";
         return sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
       }).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
       // Take up to 15 from API — we'll slice to 5 after scoring extraction
       h2hMatches = _directFiltered.slice(0, 15);
-      engineDebug("Direct SS H2H fetch returned", { total: _directFiltered.length, using: h2hMatches.length });
+      const _h2hSrc = directH2H?.events ? "events" : directH2H?.previousEvents ? "previousEvents" : "teamDuel.events";
+      engineDebug("Direct SS H2H fetch returned", { total: _directFiltered.length, using: h2hMatches.length, src: _h2hSrc });
     }
   } catch (eH2H) {
     engineDebug("Direct pasted SS H2H fetch failed, falling back to local events", { error: eH2H.message });
@@ -3725,7 +3732,8 @@ async function extractH2HFromPastedEvents() {
   });
   const uniqueEvents = _allLocalForScan;
 
-  if (h2hMatches.length >= 2) {
+  if (h2hMatches.length >= 1) {
+    const _h2hThin = h2hMatches.length < 2;
     const h2hA = [], h2hB = [];
     const h2hA1H = [], h2hB1H = [];
     const h2hAQ1 = [], h2hBQ1 = [], h2hAQ2 = [], h2hBQ2 = [];
@@ -3758,18 +3766,18 @@ async function extractH2HFromPastedEvents() {
       }
     });
 
-    if (h2hA.length >= 2) {
+    if (h2hA.length >= 1) {
       document.getElementById("aFTH2H").value = h2hA.join(",");
       document.getElementById("bFTH2H").value = h2hB.join(",");
       const h2hCb = document.getElementById("useFTH2H");
-      if (h2hCb) h2hCb.checked = true;
-      if (h2hA1H.length >= 2) {
+      if (h2hCb) h2hCb.checked = !_h2hThin;
+      if (h2hA1H.length >= 1) {
         document.getElementById("a1HH2H").value = h2hA1H.join(",");
         document.getElementById("b1HH2H").value = h2hB1H.join(",");
         const h1Cb = document.getElementById("use1HH2H");
-        if (h1Cb) h1Cb.checked = true;
+        if (h1Cb) h1Cb.checked = !_h2hThin;
       }
-      if (h2hAQ1.length >= 2) {
+      if (h2hAQ1.length >= 1) {
         document.getElementById("aQ1H2H").value = h2hAQ1.join(",");
         document.getElementById("bQ1H2H").value = h2hBQ1.join(",");
         document.getElementById("aQ2H2H").value = h2hAQ2.join(",");
@@ -3778,18 +3786,28 @@ async function extractH2HFromPastedEvents() {
         document.getElementById("bQ3H2H").value = h2hBQ3.join(",");
         document.getElementById("aQ4H2H").value = h2hAQ4.join(",");
         document.getElementById("bQ4H2H").value = h2hBQ4.join(",");
-        ["useQ1H2H","useQ2H2H","useQ3H2H","useQ4H2H"].forEach(id => {
-          const cb = document.getElementById(id); if (cb) cb.checked = true;
-        });
+        if (!_h2hThin) {
+          ["useQ1H2H","useQ2H2H","useQ3H2H","useQ4H2H"].forEach(id => {
+            const cb = document.getElementById(id); if (cb) cb.checked = true;
+          });
+        }
+      }
+      const _h2hTag = document.getElementById("h2hAutoTag");
+      if (_h2hTag) {
+        _h2hTag.textContent = _h2hThin
+          ? "\u26a0\ufe0f Thin H2H \u2014 1 game only. Verify before checking."
+          : "\u2705 Auto-filled (2024+, OT stripped, expanded matchup history)";
+        _h2hTag.style.display = "inline";
+        _h2hTag.style.color = _h2hThin ? "#d98a00" : "";
       }
       syncAllH2HCheckboxes(false);
-      engineDebug("Pasted JSON H2H auto-filled", { games: h2hA.length, q1Games: h2hAQ1.length });
+      engineDebug("Pasted JSON H2H auto-filled", { games: h2hA.length, q1Games: h2hAQ1.length, thin: _h2hThin });
       if (typeof AFDB !== "undefined") {
         AFDB.log("H2H", "JSON_H2H", "H2H auto-filled from pasted JSON", {
           ftGames: h2hA.length, h1Games: h2hA1H.length, q1Games: h2hAQ1.length,
           aFTH2H: h2hA.join(","), bFTH2H: h2hB.join(","),
           a1HH2H: h2hA1H.join(","), b1HH2H: h2hB1H.join(","),
-          totalCandidates: h2hMatches.length, idA, idB
+          totalCandidates: h2hMatches.length, idA, idB, thin: _h2hThin
         });
       }
     }
@@ -4010,8 +4028,9 @@ async function fetchSofascoreStats() {
       if (h2hMatches.length < 2) {
         try {
           const directH2H = await ssFetch(`https://api.sofascore.com/api/v1/team/${resolvedIdA}/team/${resolvedIdB}/h2h/events`);
-          if (directH2H && Array.isArray(directH2H.events)) {
-            h2hMatches = directH2H.events.filter(ev => {
+          const _h2hRaw2 = directH2H?.events || directH2H?.previousEvents || directH2H?.teamDuel?.events || [];
+          if (Array.isArray(_h2hRaw2) && _h2hRaw2.length) {
+            h2hMatches = _h2hRaw2.filter(ev => {
               const sType = ev.status?.type ?? "";
               return sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
             }).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0)).slice(0, 5);
