@@ -3412,7 +3412,7 @@ function extractH2HFromPastedEvents() {
   }).sort((a, b) => {
     const tA = a.startTimestamp || 0;
     const tB = b.startTimestamp || 0;
-    return tB - tA; // Newest first
+    return tB - tA;
   }).slice(0, 5);
 
   if (h2hMatches.length >= 2) {
@@ -7713,11 +7713,9 @@ function _tickLiveClocks() {
     const origSecs = parseClockToSeconds(info.clock);
     if (origSecs === null) return;
 
-    // Cap elapsed to origSecs — phone sleep/wake can never jump the clock past 0 or backward
     const elapsedSecs = Math.min((Date.now() - capturedAt) / 1000, origSecs);
     const currentSecs = Math.max(0, origSecs - elapsedSecs);
 
-    // Timeout / challenge / replay review — ESPN clock hasn't moved between polls
     if (info.clockFrozen) {
       const _regP = LEAGUE_FETCH_RULES[info.league || ""]?.regulationPeriods ?? 4;
       const _p = Number(info.period || 0);
@@ -7730,21 +7728,19 @@ function _tickLiveClocks() {
       return;
     }
 
-    if (currentSecs <= 0) {
-      const _regP = LEAGUE_FETCH_RULES[info.league || ""]?.regulationPeriods ?? 4;
-      const _p = Number(info.period || 0);
-      if (_p > 0 && _p < _regP) {
-        // End of a non-final regulation period — quarter/half break, game still going
-        el.textContent = `Q${_p} Break`;
-      } else {
-        // End of final regulation period, OT period, or unknown (period=0) — trigger settlement
-        el.textContent = "Settling";
-        if (!info._expiredAt) {
-          info._expiredAt = Date.now();
-          expiredEventIds.push(eid);
+          if (currentSecs <= 0) {
+        const _regP = LEAGUE_FETCH_RULES[info.league || ""]?.regulationPeriods ?? 4;
+        const _p = Number(info.period || 0);
+        if (_p > 0 && _p < _regP) {
+          el.textContent = `Q${_p} Break`;
+        } else {
+          el.textContent = "Settling";
+          if (!info._expiredAt) {
+            info._expiredAt = Date.now();
+            expiredEventIds.push(eid);
+          }
         }
-      }
-    } else {
+      } else {
       const _regP = LEAGUE_FETCH_RULES[info.league || ""]?.regulationPeriods ?? 4;
       const _p = Number(info.period || 0);
       if (_p === 0) {
@@ -7821,8 +7817,6 @@ async function pollLiveGameClocks() {
         if (isLive) {
           const existing = g_liveGameStatus.get(eid);
           const newClock = isHalf ? "HALF" : clock;
-          // Dead-game guard: if the ticker already showed ENDED for 5+ minutes and ESPN
-          // is still returning "live" (stale API), force-kill it — do not resurrect
           if (existing?._expiredAt && (Date.now() - existing._expiredAt) > 5 * 60 * 1000) {
             g_liveGameStatus.delete(eid);
             didChange = true;
@@ -8236,7 +8230,6 @@ function choosePreferredBucketPick(existingPick, incomingPick) {
   const current = ensureTrackedPickKeys(existingPick || {});
   const incoming = ensureTrackedPickKeys(incomingPick || {});
 
-  // HUMAN OVERRIDE: The most recent manual button click defeats all other rules
   const currManual = safeParseDate(current.manualSettledAt);
   const incManual = safeParseDate(incoming.manualSettledAt);
   if (currManual || incManual) {
@@ -8247,7 +8240,6 @@ function choosePreferredBucketPick(existingPick, incomingPick) {
   const currentWeight = getPickStateWeight(current.resultStatus);
   const incomingWeight = getPickStateWeight(incoming.resultStatus);
 
-  // Settled always beats pending. No timestamps allowed.
   if (incomingWeight > currentWeight) return incoming;
   if (currentWeight >= incomingWeight) return current;
 
@@ -10108,8 +10100,6 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
     line: touchedPick?.line
   });
   
-  // Phase 2 Simulator Hook for Manual Leagues
-  // [FIXED: PHASE2_SIMULATOR_THROW] — unguarded call propagated QuotaExceededError from localStorage on full-storage devices, skipping renderTrackedPicks() and scheduleTrackerSave() below and leaving the tracker UI stale after every manual settlement on a non-ESPN league.
   if (touchedPick && touchedPick.league && touchedPick.league !== "nba" && touchedPick.league !== "wnba" && touchedPick.league !== "wnba_pre" && touchedPick.league !== "ncaa") {
     try {
       if (typeof window.runPhase2Simulator === "function") {
@@ -10120,12 +10110,6 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
     }
   }
 
-  // Phase 2 Retrospective Simulation Ignition: Re-run the backtest immediately after any
-  // manual settlement so the learning engine processes the new result without waiting
-  // for the next Run cycle. Requires a prior Run to have stored the context globals.
-  // LOCK: Both league AND eventId must match the last Run before firing the retrospective.
-  // Previously only league was checked — settling any NBA pick triggered a backtest using
-  // a completely different game's parsed data, producing meaningless comparison results.
   const _isManualLeagueSettle = !["nba","ncaa","wnba","wnba_pre"].includes(touchedPick?.league || "");
   const _retroEventIdMatch = _isManualLeagueSettle
     ? window.__lastRunLeague === touchedPick?.league
@@ -10698,7 +10682,6 @@ function addTrackedPicks(newPicks) {
 
   if (sampleTier === "thin") base *= 0.85;
 
-  // Issue 2: Scale divergence thresholds by league total-score baseline (NBA = 220 reference)
   if (isFinite(divergence)) {
     const leagueBase = LEAGUE_BASES[league] || 220;
     const divScale = leagueBase / 220;
@@ -10708,10 +10691,6 @@ function addTrackedPicks(newPicks) {
     else if (scaledDiff >= 8) base *= 0.80;
   }
 
-  // Issue 11: Reduce max cap for leagues where H2H games are rare (FIBA tournaments, etc.)
-  // [FIXED: WNBA_H2H_FREQ] — WNBA/WNBA_PRE now explicitly mapped at 0.90.
-  // Both leagues support full fetchH2HCore but previously fell through to the 0.75
-  // catch-all, systematically under-weighting H2H signal relative to available data.
   const freqMod =
     league === "nba" ? 1.0 :
     league === "wnba" || league === "wnba_pre" ? 0.90 :
@@ -10731,15 +10710,11 @@ function addTrackedPicks(newPicks) {
   return clampNumber(base, 0, maxCap);
 }
 
-    // ── FIX #1: Volatility no longer shrinks the projection value.
-// High variance lowers CONFIDENCE (grade), not the projected number.
-// getVolatilityRating() feeds into getConfidenceGrade() as-is.
 function applyVolatility(proj, std, limit) {
   return proj;
 }
 
 
-// ── FIX #2a: Volatility rating for confidence scoring ──
 function getVolatilityRating(std, limit) {
   if (!isFinite(std) || !isFinite(limit) || limit === 0) return "NORMAL";
   const ratio = std / limit;
@@ -10868,14 +10843,6 @@ function applyContextAdjustments(baseProjection, _ctx) {
   if (edge > 0 && pct < overMin) return "NO PLAY";
   if (edge < 0 && pct < underMin) return "NO PLAY";
 
-  // #14 dead guard removed — h2 always returns NaN edge, isNaN check above already short-circuits
-
-  // [FIXED: PICK_RULES_TEAM_DEAD_BRANCH] — `marketType === "team"` was never passed by
-  // any call site; all team markets enter getPick as "ft" or "h1". The dead branch was
-  // present in both the OT shield and the under-block below. LOCK: Do not add "team"
-  // back to either guard. If team markets ever need a distinct marketType, wire it at
-  // every call site first and add a matching PICK_RULES entry simultaneously. The OT
-  // shield and under-block must stay in sync — both check "ft" only.
   if (edge < 0 && marketType === "ft" && context.blowoutGap !== undefined) {
     if (context.blowoutGap <= 1.0) {
        return "NO PLAY"; 
@@ -10900,7 +10867,6 @@ function applyContextAdjustments(baseProjection, _ctx) {
     }
 
     function detectTrap(edge, line, pick, league, marketType, vol) {
-      // Spec Item 6: Manual leagues bypass trap detection — volatility arrays are empty, causing false alarms
       const _isAutomatedLeague = league === "nba" || league === "ncaa" || league === "wnba" || league === "wnba_pre";
       if (!_isAutomatedLeague) return false;
       if (!line || isNaN(edge) || line <= 0 || !pick || pick === "NO PLAY") return false;
@@ -10934,12 +10900,10 @@ function applyContextAdjustments(baseProjection, _ctx) {
   };
 
   const best = [...valid].sort((a, b) => {
-    // 1. Grade is still absolute king (A always beats B)
     const aGrade = getConfidenceRank(a.confidenceGrade || a.confidence || "");
     const bGrade = getConfidenceRank(b.confidenceGrade || b.confidence || "");
     if (bGrade !== aGrade) return bGrade - aGrade;
 
-    // 2. Add Tier Hierarchy so Core Markets take the lock over Exotics
     const aTierBonus = getMarketTierBonus(a.marketKey);
     const bTierBonus = getMarketTierBonus(b.marketKey);
 
@@ -10952,7 +10916,6 @@ function applyContextAdjustments(baseProjection, _ctx) {
     const aMassacreBonus = isFinite(Number(a.lockStrength)) ? Number(a.lockStrength) : 0;
     const bMassacreBonus = isFinite(Number(b.lockStrength)) ? Number(b.lockStrength) : 0;
 
-    // 3. Final Lock Score calculation includes the Tier Bonus
     const aLockScore = aEdgePct + aFullModelBonus + aMassacreBonus + aTierBonus;
     const bLockScore = bEdgePct + bFullModelBonus + bMassacreBonus + bTierBonus;
 
@@ -11053,7 +11016,6 @@ function readLooseSeries(id) {
   const raw = el?.value?.trim() || "";
   if (!raw) return [];
 
-  // Split, trim, and remove completely empty strings
   const parts = raw.split(",").map(x => x.trim()).filter(Boolean);
   if (!parts.length) return [];
 
@@ -11061,7 +11023,6 @@ function readLooseSeries(id) {
   for (const part of parts) {
     const value = Number(part);
     
-    // Instead of nuking the whole array, just skip the corrupted entry
     if (!isFinite(value) || value <= 0 || value > 300) {
       engineDebug(`readLooseSeries skipped invalid input in #${id}:`, part);
       continue; 
@@ -11069,7 +11030,6 @@ function readLooseSeries(id) {
     
     out.push(value);
     
-    // Enforce the 5-game maximum limit safely
     if (out.length === 5) break;
   }
 
@@ -11429,8 +11389,6 @@ function applyIntelligenceLayerToPicks(picks, intelligencePack, league) {
       return;
     }
 
-    // 🛡️ MATH FIX: Removed p.edge mutation (p.edge = adjustedEdge) to prevent double-penalizing downstream lock formulas
-
     if (hypotheticalPick && hypotheticalPick !== "NO PLAY" && getPickSideFromText(hypotheticalPick) === side) {
       p.pick = hypotheticalPick;
     }
@@ -11466,9 +11424,6 @@ const FIELD_GROUPS = {
 
   intelFields: ["aFormIntel", "bFormIntel", "aSpreadIntel", "bSpreadIntel", "aHitIntel", "bHitIntel"],
 
-  // ISSUE 15 FIX: "intelAutoTag" removed — no matching HTML element exists and adding
-  // one would require changes inside the locked UI section. The three real autofill
-  // indicators (aAutoTag, bAutoTag, h2hAutoTag) live on actual <span> elements.
   autoTags: ["aAutoTag", "bAutoTag", "h2hAutoTag"],
 
   periodInputs: [
@@ -11523,11 +11478,6 @@ function hideInjuryBox(side) {
     if (vsFields) vsFields.style.display = "none";
     if (vsCb) vsCb.checked = false;
 
-  // [FIXED: STALE_ALLOWED_FIELDS] — aFTAllowed, a1HAllowed, a2HAllowed (and B equivalents)
-  // were absent from this list. fetchESPN calls clearSideFields before writing new data.
-  // If the new team's fetch returned no allowed data, the previous team's allowed values
-  // remained in the DOM and silently fed into computeFTProjection / compute1HProjection
-  // via getManualAllowedSeries, contaminating projections without any visible warning.
     const ids = side === "A"
     ? [
         "aFTScored", "aFTAllowed",
@@ -12452,8 +12402,6 @@ async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
   const tB = String(teamBId);
   const currentSeason = getCurrentSeasonYear(leagueKey);
 
-  // FIX 4: Rolling Window Logic
-  // We look back 2 seasons from the current one to keep data fresh and fetches fast.
   const lookbackYears = 2; 
   const minSeason = currentSeason - lookbackYears;
   // Generate timestamp for Jan 1st of the earliest lookback year
@@ -15207,7 +15155,6 @@ async function runEngine() {
   const runBtn = document.getElementById("runBtn");
   const table = document.getElementById("results");
 
-    // Load Phase 2 Verified Overrides — FT silo first, then combined, then league defaults
   const leagueSelectEl = document.getElementById("leagueSelect");
   const currentLeagueForRun = leagueSelectEl ? leagueSelectEl.value : "";
   try {
@@ -15235,10 +15182,6 @@ async function runEngine() {
     window.__phase2H1RecencyWeights = null;
   }
 
-  // LOCK: Debug log is never wiped on Run — a boundary marker is inserted instead.
-  // Wiping destroyed pre-run error evidence (fetch failures, tracker sync issues) that
-  // occurred before the user pressed Run, making the root cause permanently untraceable.
-  // Do not restore the wipe. Add a separator instead so prior context is always visible.
   g_engineDebugLog.unshift(`[${new Date().toLocaleTimeString([], {hour12:false})}] ══ NEW RUN ══`);
   if (g_engineDebugLog.length > ENGINE_DEBUG_LIMIT) {
     g_engineDebugLog = g_engineDebugLog.slice(0, ENGINE_DEBUG_LIMIT);
@@ -15286,7 +15229,6 @@ if (_localState) {
     const teamANameNorm = normalizeTeamName(document.getElementById("teamAName")?.value || "");
     const teamBNameNorm = normalizeTeamName(document.getElementById("teamBName")?.value || "");
 
-        // FIX 15: Simplified duplicate team check for raw execution speed
     const isDuplicate = (teamAId && teamAId === teamBId) || 
                        (teamANameNorm && teamANameNorm === teamBNameNorm);
 
@@ -15320,8 +15262,6 @@ const fixtureMeta = getCurrentFixtureMeta();
       parsed: summarizeParsedForDebug(parsed)
     });
 
-// 🛡️ ARCHITECTURE FIX: Deterministic Execution
-// Freezing the base state prevents intermediate functions from mutating the input lines
 const baseLines = Object.freeze({
   ftLine: lines.ftLine,
   h1Line: lines.h1Line,
@@ -15330,7 +15270,6 @@ const baseLines = Object.freeze({
   bLine: lines.bLine
 });
 
-// PASS 1: Base calculation to establish preliminary projections for memory lookup
 MODEL_TUNING.recencyWeights = window.__phase2FTRecencyWeights || getLeagueRecencyDefaults(currentLeagueForRun);
 const baseFtCalc = computeFTProjection({
   league,
@@ -15383,7 +15322,6 @@ const finalLines = Object.freeze({
   raceRange: lines.raceRange
 });
 
-// Issue 4/6: h2 stripped — resH2 never exists; removing it prevents ReferenceError crash
 const memoryFlags = {
   ft: resFT.usedMemory,
   h1: resH1.usedMemory,
@@ -15391,7 +15329,6 @@ const memoryFlags = {
   team_b: resB.usedMemory
 };
 
-// PASS 2: Final deterministic calculation locked strictly to the resolved memory lines
 MODEL_TUNING.recencyWeights = window.__phase2FTRecencyWeights || getLeagueRecencyDefaults(currentLeagueForRun);
 const ftCalc = computeFTProjection({
   league,
@@ -15428,12 +15365,8 @@ const h1Calc = compute1HProjection({
         let aPick = getPick(ftCalc.aEdge, aLine, league, "team", { teamSc: ftCalc.aS, blowoutGap: ftCalc.blowoutGap });
         let bPick = getPick(ftCalc.bEdge, bLine, league, "team", { teamSc: ftCalc.bS, blowoutGap: ftCalc.blowoutGap });
 
-        // --- NEW LEVEL 2 SHIELD ---
         const hasLevel2 = (g_massacreFetchContext.A.ortg10?.length >= 1) && 
                           (g_massacreFetchContext.B.ortg10?.length >= 1);
-        // FIX: Shield no longer kills valid manual 1H data.
-        // Previously any NBA/WNBA game without ESPN box-score data lost ALL 1H/2H picks,
-        // even when the user had manually typed in 1H scored/allowed numbers.
         const hasManual1H = (safeArr(parsed.a1HScored)?.length >= 2) && (safeArr(parsed.b1HScored)?.length >= 2);
 
         if ((league === "nba" || league === "wnba" || league === "wnba_pre") && !hasLevel2 && !hasManual1H) {
@@ -15452,7 +15385,6 @@ const h1Calc = compute1HProjection({
       aPick = "NO PLAY";
       bPick = "NO PLAY";
       
-      // Wipe out phantom projections if there is zero game data entered
       h1Calc.h1Proj = NaN;
       h1Calc.h1Edge = NaN;
       ftCalc.ftProj = NaN;
@@ -15462,7 +15394,6 @@ const h1Calc = compute1HProjection({
       ftCalc.projBFT = NaN;
       ftCalc.bEdge = NaN;
 
-      // 🛡️ PHANTOM QUARTER FIX
       if (q1) { q1.proj = NaN; q1.edge = NaN; q1.pick = "NO PLAY"; }
       if (q2) { q2.proj = NaN; q2.edge = NaN; q2.pick = "NO PLAY"; }
       if (q3) { q3.proj = NaN; q3.edge = NaN; q3.pick = "NO PLAY"; }
@@ -15621,10 +15552,6 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const bBadge = getMicroStreakBadge(ctxB.ftScored10, null, null, null, bLine, true);
 
           function computeQ(qKey, lineVal) {
-        // LOCK [FIX 9]: Redundant second league guard removed. The first guard at line 1
-        // already returns null for non-automated leagues — the `const supported` block
-        // immediately below it was dead code that could never execute. One guard is correct.
-        // Spec Item 4: Halt immediately if no line value — prevents division errors
         if (!lineVal) return null;
 
         const aS = getManualSeries("A", qKey, parsed);
@@ -15649,10 +15576,6 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
           projB = isFinite(h1Calc.projB1H) ? h1Calc.projB1H / 2 : (isFinite(ftCalc.projBFT) ? ftCalc.projBFT / 4 : eb / 4);
         }
 
-        // LOCK [FIX 7]: Q3 structural suppression — basketball Q3 is the lowest-scoring
-        // quarter by design (teams play starters conservatively after halftime adjustments).
-        // Q3 OVER record was 1W-5L. A 3.5% downward correction accounts for the structural
-        // scoring dip without eliminating valid Q3 plays. Do not remove or increase this factor.
         if (qKey === "q3") { projA *= 0.9825; projB *= 0.9825; }
 
         const vCtxA = g_massacreFetchContext.A.venue;
@@ -16104,12 +16027,10 @@ await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtur
 
 
 
-// Fix H1: Attach the memory icons (🧠)
 finalPicksForDisplay.forEach(p => {
   if (memoryFlags[p.marketKey]) p.usedMemory = true;
 });
 
-    // --- STRICT A/B GATE — Grade C, D, NaN all blocked ---
 finalPicksForDisplay.forEach(p => {
   if (p.pick !== "NO PLAY") {
     const grade = String(p.confidence || "").replace(/[^ABCD]/g, '').charAt(0);
@@ -16229,10 +16150,6 @@ if (Object.keys(g_lineMemorySnapshots).length > 0) {
   }, 600);
 }
 
-// LOCK: Audit snapshot stores summaries only — not full calc objects.
-// Storing ftCalc/h1Calc/h2Calc in their entirety caused significant memory pressure on mobile
-// because the old reference and the new one coexist during GC, and these objects can be 50-100KB each.
-// Do not re-add full calc objects to this snapshot.
 window.__LAST_AUDIT_STATE = {
   timestamp: new Date().toLocaleTimeString(),
   league,
@@ -16432,7 +16349,6 @@ if (trackedToSave.length) {
   const ssSection = document.getElementById("sofascoreManualSection");
   if (ssSection) ssSection.style.display = (!leagueVal || isEspnLeague) ? "none" : "block";
 
-        // --- NUKES ALL INPUTS AND DASHBOARD ON LEAGUE CHANGE ---
       document.querySelectorAll(".wrapper input").forEach(i => {
         if (i.type !== "checkbox") i.value = "";
         else i.checked = false;
@@ -16441,12 +16357,10 @@ if (trackedToSave.length) {
       
       const dash = document.getElementById("syndicateDashboard");
       if (dash) dash.remove();
-      // -------------------------------------------------------
 
       const league = leagueVal;
       const isQs = league === "nba" || league === "wnba" || league === "wnba_pre";
 
-      // --- FIX: ALWAYS clear period/quarter inputs when switching leagues! ---
       setFieldValues(FIELD_GROUPS.periodInputs);
 
             const teamMarketSection = document.getElementById("teamMarketSection");
@@ -16467,7 +16381,6 @@ if (trackedToSave.length) {
       document.getElementById("aQSection").style.display = isQs || !isNbaOrNcaa ? "block" : "none";
       document.getElementById("bQSection").style.display = isQs || !isNbaOrNcaa ? "block" : "none";
 
-      // Hide all 1H/2H sections for manual leagues; 2H stat inputs removed from all leagues
       ["a1HSection", "b1HSection", "h2h1HSection"].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.style.display = leagueVal ? "block" : "none";
@@ -16479,28 +16392,21 @@ if (trackedToSave.length) {
       const h2hQ = document.getElementById("h2hQSection");
       if (h2hQ) h2hQ.style.display = (isQs && isNbaOrNcaa) || !isNbaOrNcaa ? "block" : "none";
       
-            // Handle Market Lines — 2H market removed from all leagues
-      // 1H Total market: shown for all leagues (manual leagues can now enter 1H data)
       const h1MarketEl = document.getElementById("h1MarketSection");
       if (h1MarketEl) h1MarketEl.style.display = leagueVal ? "block" : "none";
-      // 1H Team A/B market: NBA/NCAA only (requires ESPN linescore data)
       const h1TeamEl = document.getElementById("h1TeamMarketSection");
       if (h1TeamEl) h1TeamEl.style.display = (isNbaOrNcaa && !isWnba) ? "grid" : "none";
 
-      // Show 1H market input for all leagues when a league is selected
       const h1MarketElManual = document.getElementById("h1MarketSection");
       if (h1MarketElManual) h1MarketElManual.style.display = leagueVal ? "block" : "none";
 
-      // Quarter totals — shown for all leagues when a league is selected
       ["q1q2MarketSection", "q3q4MarketSection"].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.style.display = leagueVal ? "grid" : "none";
       });
-      // Highest/Lowest Q — ESPN leagues only (requires linescore data)
       const highLowQEl = document.getElementById("highLowQMarketSection");
       if (highLowQEl) highLowQEl.style.display = isNbaOrNcaa ? "grid" : "none";
 
-      // Permanently retired for all leagues
       ["h2MarketSection", "q1TeamMarketSection", "exoticMarketSection"].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.style.display = "none";
@@ -16676,8 +16582,6 @@ if (trackerCopyDataBtn) trackerCopyDataBtn.addEventListener("click", copyTracker
       const fetchBtn = document.getElementById("fetchBtn");
 if (fetchBtn) fetchBtn.addEventListener("click", withErrorBoundary(fetchESPN, "fetchESPN"));
 
-// UI is basketball-only by static HTML design. No runtime sport-mode switching implemented.
-
       const runBtn = document.getElementById("runBtn");
       if (runBtn) runBtn.addEventListener("click", withErrorBoundary(runEngine, "runEngine"));
 
@@ -16830,13 +16734,6 @@ window.addEventListener("online", () => refreshTrackerInBackground(true));
         const el = document.getElementById(id);
         if (el) el.addEventListener("input", () => { invalidateFetchedAudit(); updateSectionLocks(); updateIntelligencePack(); });
       });
-
-      // NOTE: aFTScored/bFTScored/etc. already have input listeners attached above via bucketMap.
-      // Second duplicate attachment removed to prevent double updateSectionLocks calls.
-
-    // NOTE: H2H input/change listeners are already attached above in the h2h input sync block.
-    // The duplicate attachment below was removed to prevent double-firing updateSectionLocks
-    // and updateIntelligencePack on every keystroke.
 
 setFetchInputErrors([]);
 setFetchAuditIssues([]);
