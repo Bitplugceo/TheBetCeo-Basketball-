@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2500,9 +2501,6 @@ body.dark-mode .tracker-analytics-section-head {
     </div>
   </div>
 
-  <div style="margin-bottom:8px;display:none;">
-    <button type="button" id="ssFetchBtn" onclick="fetchSofascoreStats()" style="background:#49a443;color:#fff;padding:6px 14px;font-size:12px;font-weight:700;border:none;cursor:pointer;margin:0 0 6px 0;">📡 Fetch Stats</button>
-  </div>
   <div id="ssFetchStatus" style="font-size:10px;min-height:16px;"></div>
 </div>
 
@@ -3009,10 +3007,6 @@ const SS_PROXY_FALLBACKS = [
   "https://thingproxy.freeboard.io/fetch/"
 ];
 
-async function ssFetch(url) {
-  return null;
-}
-
 function ssProcessTeamEvents(events, teamId, label) {
   const scoredList = [], allowedList = [];
   const homeScoredList = [], homeAllowedList = [];
@@ -3413,9 +3407,6 @@ function extractH2HFromPastedEvents() {
   }
 }
 
-async function fetchSofascoreStats() {
-  return null;
-}
 const WORKER_BASE_URL = String(WORKER_URL || "").replace(/\/+$/, "");
 const DEBUG = false;
 const CACHE_MAX = 120;
@@ -4425,7 +4416,11 @@ function saveEngineLineMemory() {
       });
       sorted.slice(0, keys.length - MAX_ENTRIES).forEach(k => delete g_engineLineMemory[k]);
     }
-    localStorage.setItem(ENGINE_LINE_MEMORY_STORAGE, JSON.stringify(g_engineLineMemory));
+    try {
+      localStorage.setItem(ENGINE_LINE_MEMORY_STORAGE, JSON.stringify(g_engineLineMemory));
+    } catch (quotaErr) {
+      engineDebug("saveEngineLineMemory: localStorage full", { error: quotaErr.name });
+    }
   } catch (err) {
     console.error("[BB Engine] saveEngineLineMemory failed", err);
   }
@@ -4821,9 +4816,7 @@ function getTrackerUserKey() {
             if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
               key = crypto.randomUUID();
             } else if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
-              key = "trk_" + Date.now() + "_" + ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c => 
-                (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
-              );
+              key = "trk_" + Date.now() + "_" + Math.random().toString(36).slice(2, 11) + Math.random().toString(36).slice(2, 11);
             } else {
               key = "trk_legacy_" + Date.now() + "_" + Date.now().toString(36);
             }
@@ -6149,7 +6142,7 @@ function safeText(str) {
     function normalizeTeamName(name) {
       return String(name || "")
         .toLowerCase()
-        .replace(/[.''()]/g, "")
+        .replace(/[.''()<>&"]/g, "")
         .replace(/\bsaint\b/g, "st")
         .replace(/\ba&m\b/g, "a and m")
         .replace(/&/g, " and ")
@@ -6835,7 +6828,9 @@ function buildBestPickOnlyShadowExperiment(items = []) {
   const bestOnly = [];
   grouped.forEach(rows => {
     const winner = rows.slice().sort((a, b) => {
-      const scoreDiff = getBestPickShadowSortScore(b) - getBestPickShadowSortScore(a);
+      const aScore = getBestPickShadowSortScore(a) || 0;
+      const bScore = getBestPickShadowSortScore(b) || 0;
+      const scoreDiff = bScore - aScore;
       if (scoreDiff !== 0) return scoreDiff;
       return Number(getTrackedPickEdgeAbsPct(b) || 0) - Number(getTrackedPickEdgeAbsPct(a) || 0);
     })[0];
@@ -6999,6 +6994,7 @@ async function pushTrackerStateToServer(state, isExit = false) {
 async function flushTrackerSave() {
   if (isTrackerStateMeaningfullyEmpty(g_trackerState)) return;
   try {
+    await saveTrackerStateToLocal(); // Always persist locally first
     const snapshot = JSON.parse(JSON.stringify(g_trackerState));
     const pushed = await pushTrackerStateToServer(g_trackerState);
     if (pushed && pushed.state) {
@@ -7007,7 +7003,7 @@ async function flushTrackerSave() {
       await saveTrackerStateToLocal();
     }
   } catch (err) {
-    trackerDebug("flush save failed", { error: String(err) });
+    trackerDebug("flush save failed — local copy preserved", { error: String(err) });
   }
 }
 
@@ -7149,6 +7145,12 @@ async function refreshTrackerInBackground(forceHydrate = false) {
   try {
     await hydrateTrackedPicks(forceHydrate);
     await refreshTrackedPickResults();
+    const _activeEids = new Set(
+      (g_trackerState.activePicks || [])
+        .filter(p => String(p?.resultStatus || "pending").toLowerCase() === "pending" && p?.eventId)
+        .map(p => p.eventId)
+    );
+    [...g_liveGameStatus.keys()].forEach(eid => { if (!_activeEids.has(eid)) g_liveGameStatus.delete(eid); });
     await forceTrackerSaveNow();
     engineDebug("Watchdog: Settle/Sync cycle complete.", "engine");
     scheduleLiveClockPoll();
@@ -7833,7 +7835,10 @@ function archiveExpiredTrackedPicks() {
     g_trackerState.activePicks = keepActive;
 
     g_trackerState.archivedPicks = archived
-      .filter(p => (now - (safeParseDate(p.eventDate || p.createdAt) || now)) < pruneCutoffMs)
+      .filter(p => {
+        const ts = safeParseDate(p.eventDate || p.createdAt);
+        return ts === 0 || (now - ts) < pruneCutoffMs;
+      })
       .slice(0, TRACKER_ARCHIVED_LIMIT);
 
     rebuildTrackerStats();
@@ -8117,7 +8122,7 @@ function renderTrackedPicks() {
     let statusHtml = "";
     if (status === 'pending') {
             const pId = ((p.eventId || '') + p.signature).replace(/[^a-z0-9]/gi, '');
-        const escapedSig = p.signature.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/'/g, "\\'").replace(/\)/g, '\\x29');
+        const escapedSig = escapeHtml(p.signature.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/'/g, "\\'").replace(/\)/g, '\\x29'));
       const gameTs = safeParseDate(p.eventDate || p.createdAt);
       const isZombie = gameTs > 0 && (Date.now() - gameTs) > (36 * 60 * 60 * 1000);
       const _liveClockLabel = _liveInfo
@@ -8149,7 +8154,7 @@ function renderTrackedPicks() {
                 _qRowsHtml += `<div style="font-size:7px;font-weight:900;line-height:1.25;color:var(--text);white-space:nowrap;letter-spacing:0;">Q${_qi+1}<span style="display:inline-block;min-width:13px;text-align:right;">${Math.round(_qHv)}</span>:<span style="display:inline-block;min-width:13px;">${Math.round(_qAv)}</span></div>`;
               }
             }
-            return `<div style="color:var(--muted);font-size:8px;font-weight:900;line-height:1.0;letter-spacing:0.3px;margin-bottom:1px;">LIVE</div><div style="font-size:6px;font-weight:800;line-height:1.1;margin-bottom:1px;color:var(--muted);white-space:nowrap;"><span style="font-size:5px;">⏰</span><span data-live-clk="${p.eventId}"> ${_clockOnly}</span></div>${_qRowsHtml}`;
+            return `<div style="color:var(--muted);font-size:8px;font-weight:900;line-height:1.0;letter-spacing:0.3px;margin-bottom:1px;">LIVE</div><div style="font-size:6px;font-weight:800;line-height:1.1;margin-bottom:1px;color:var(--muted);white-space:nowrap;"><span style="font-size:5px;">⏰</span><span data-live-clk="${escapeHtml(p.eventId)}"> ${_clockOnly}</span></div>${_qRowsHtml}`;
           })()
         : '';
       statusHtml = `
@@ -8162,7 +8167,7 @@ function renderTrackedPicks() {
           <div style="font-size:8px; text-decoration:underline; cursor:pointer; margin-top:2px; font-weight:800; opacity:0.7;" onclick="settleTrackedPickManualFull('${escapedSig}')">CUSTOM</div>
         </div>`;
     } else {
-      const escapedSig = p.signature.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\)/g, '\\x29');
+      const escapedSig = escapeHtml(p.signature.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\)/g, '\\x29'));
       statusHtml = `<div onclick="settleTrackedPickManualFull('${escapedSig}')" style="cursor:pointer;" title="Click to edit or revert">${status.toUpperCase()}</div>`;
       if (p.engineResultStatus && p.engineResultStatus !== status) {
          statusHtml += `<div style="font-size:8px; color:var(--tracker-subtext); margin-top:2px; font-weight:800;">MID: ${p.engineResultStatus.toUpperCase()}</div>`;
@@ -10104,9 +10109,7 @@ function getVolatilityRating(std, limit) {
   return "HIGH";
 }
 
-function applyContextAdjustments(baseProjection, _ctx) {
-  return isFinite(baseProjection) ? baseProjection : baseProjection;
-}
+
 
 
     function getSampleTier(...arrays) {
@@ -10770,8 +10773,6 @@ const FIELD_GROUPS = {
   teamBOverall: ["bFTScored", "b1HScored", "b2HScored"],
 
   h2h: ["aFTH2H", "bFTH2H", "a1HH2H", "b1HH2H", "a2HH2H", "b2HH2H", "aQ1H2H", "bQ1H2H", "aQ2H2H", "bQ2H2H", "aQ3H2H", "bQ3H2H", "aQ4H2H", "bQ4H2H"],
-
-  intelFields: ["aFormIntel", "bFormIntel", "aSpreadIntel", "bSpreadIntel", "aHitIntel", "bHitIntel"],
 
   autoTags: ["aAutoTag", "bAutoTag", "h2hAutoTag"],
 
@@ -12822,12 +12823,10 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
 
   if (isFinite(projAFT)) {
     projAFT = applyVolatility(projAFT, aVol, vl);
-    projAFT = applyContextAdjustments(projAFT, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
     projAFT = anchorProjection(projAFT, lines.aLine, league, "team");
   }
   if (isFinite(projBFT)) {
     projBFT = applyVolatility(projBFT, bVol, vl);
-    projBFT = applyContextAdjustments(projBFT, { injuryImpact: 0 }); // 🛡️ MATH FIX: Removed duplicate injury penalty
     projBFT = anchorProjection(projBFT, lines.bLine, league, "team");
   }
 
@@ -12910,6 +12909,19 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projB1H = (projB1H * (1 - hw1)) + (avgOrNaN(bH2H1) * hw1);
   }
 
+  // Opponent quality (SoS) signal — mirrors FT model at 0.12 scale
+  const _avgA1HAllowedOpp = avgOrNaN(b1HA);
+  const _avgB1HAllowedOpp = avgOrNaN(a1HA);
+  const _baseTeam1H = eb / 4;
+  if (isFinite(_avgA1HAllowedOpp) && isFinite(projA1H)) {
+    const oppFactorA = ((_avgA1HAllowedOpp - _baseTeam1H) / Math.max(1, _baseTeam1H)) * 0.12;
+    projA1H += projA1H * oppFactorA;
+  }
+  if (isFinite(_avgB1HAllowedOpp) && isFinite(projB1H)) {
+    const oppFactorB = ((_avgB1HAllowedOpp - _baseTeam1H) / Math.max(1, _baseTeam1H)) * 0.12;
+    projB1H += projB1H * oppFactorB;
+  }
+
   const roleA = getFixtureSideRole("A");
   const homeEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5) / 2;
   const hasVenueData = g_massacreFetchContext.A.venue?.h1Scored10?.length >= 5;
@@ -12921,11 +12933,9 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const h1Vl = getMarketVolLimit(league, "h1");
   if (isFinite(projA1H)) {
     projA1H = applyVolatility(projA1H, aVol1, h1Vl);
-    projA1H = applyContextAdjustments(projA1H, { injuryImpact: 0 });
   }
   if (isFinite(projB1H)) {
     projB1H = applyVolatility(projB1H, bVol1, h1Vl);
-    projB1H = applyContextAdjustments(projB1H, { injuryImpact: 0 });
   }
 
   let h1Proj = projA1H + projB1H;
@@ -12954,49 +12964,15 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
 
 
-function deriveSecondHalfSeries(ftSeries, firstHalfSeries) {
-  const ft = Array.isArray(ftSeries) ? ftSeries : [];
-  const h1 = Array.isArray(firstHalfSeries) ? firstHalfSeries : [];
-  
-  if (ft.length === 0 || h1.length === 0 || ft.length !== h1.length) {
-    const avgFT = avgOrNaN(ft);
-    const avgH1 = avgOrNaN(h1);
-    if (isFinite(avgFT) && isFinite(avgH1) && avgFT > avgH1) {
-      return [Math.round((avgFT - avgH1) * 10) / 10];
-    }
-    return [];
-  }
-
-  const out = [];
-  for (let i = 0; i < ft.length; i++) {
-    const v = Number(ft[i]) - Number(h1[i]);
-    if (isFinite(v) && v > 0) out.push(Math.round(v * 10) / 10);
-  }
-
-  return out;
-}
-
 function getExactFetchedSecondHalfSeries(side, bucket, kind, parsed) {
+  // 2H predictions removed — return exact fetched series only, no derivation fallback
   const ctx = g_massacreFetchContext?.[side] || {};
   const scope = bucket === "venue" ? (ctx.venue || {}) : (ctx.overall || {});
   const key = kind === "scored" ? "h2Scored10" : "h2Allowed10";
   const exact = Array.isArray(scope?.[key])
     ? scope[key].map(Number).filter(v => isFinite(v) && v > 0)
     : [];
-
-  if (exact.length) {
-    return exact.slice(0, 5);
-  }
-
-  const ft = kind === "allowed"
-    ? (side === "A" ? safeArr(parsed.aFTAllowed) : safeArr(parsed.bFTAllowed))
-    : (side === "A" ? safeArr(parsed.aFTScored) : safeArr(parsed.bFTScored));
-
-  const h1 = kind === "allowed"
-    ? (side === "A" ? safeArr(parsed.a1HAllowed) : safeArr(parsed.b1HAllowed))
-    : (side === "A" ? safeArr(parsed.a1HScored) : safeArr(parsed.b1HScored));
-
-  return deriveSecondHalfSeries(ft, h1);
+  return exact.length ? exact.slice(0, 5) : [];
 }
 
 
@@ -13188,14 +13164,6 @@ function projectMassacreTeam(side, aSc, aAll, bSc, bAll) {
 function meanFromList(values) {
   const clean = (values || []).map(Number).filter(v => isFinite(v));
   return clean.length ? clean.reduce((s, v) => s + v, 0) / clean.length : NaN;
-}
-
-function getMassacreNormalRandom() {
-  let u = 0;
-  let v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
 async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
@@ -14658,8 +14626,9 @@ const h1Calc = compute1HProjection({
       let projB = (avgOrNaN(bS) * 0.55 + avgOrNaN(aA) * 0.45);
 
       if (!isNbaOrNcaa && (!isFinite(projA) || !isFinite(projB))) {
-        projA = isFinite(h1Calc.projA1H) ? h1Calc.projA1H / 2 : (isFinite(ftCalc.projAFT) ? ftCalc.projAFT / 4 : eb / 4);
-        projB = isFinite(h1Calc.projB1H) ? h1Calc.projB1H / 2 : (isFinite(ftCalc.projBFT) ? ftCalc.projBFT / 4 : eb / 4);
+        const _eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160;
+        projA = isFinite(h1Calc.projA1H) ? h1Calc.projA1H / 2 : (isFinite(ftCalc.projAFT) ? ftCalc.projAFT / 4 : _eb / 4);
+        projB = isFinite(h1Calc.projB1H) ? h1Calc.projB1H / 2 : (isFinite(ftCalc.projBFT) ? ftCalc.projBFT / 4 : _eb / 4);
       }
 
       if (qKey === "q3") { projA *= 0.9825; projB *= 0.9825; }
