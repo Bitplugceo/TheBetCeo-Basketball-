@@ -1,4 +1,4 @@
-M
+Z
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3004,6 +3004,45 @@ const SS_PROXY_FALLBACKS = [
   "https://thingproxy.freeboard.io/fetch/"
 ];
 
+// LOCK: BASKETBALL_SPORT_IDS — SofaScore sport IDs that correspond to basketball variants.
+// sport.id=2 is standard basketball. Do NOT add football (1), tennis (5), etc.
+// This set is checked in ssProcessTeamEvents to hard-block non-basketball events
+// from ever entering the projection pipeline regardless of team name matches.
+const SS_BASKETBALL_SPORT_IDS = new Set([2, 128, 129, 155, 156, 157, 158]);
+
+function ssIsBasketballEvent(ev) {
+  // Primary check: tournament/category sport slug
+  const sportSlug = String(
+    ev?.tournament?.category?.sport?.slug ||
+    ev?.sport?.slug ||
+    ev?.category?.sport?.slug ||
+    ""
+  ).toLowerCase();
+  if (sportSlug && sportSlug !== "basketball") return false;
+
+  // Secondary check: sport id
+  const sportId = Number(
+    ev?.tournament?.category?.sport?.id ??
+    ev?.sport?.id ??
+    ev?.category?.sport?.id ??
+    -1
+  );
+  if (sportId !== -1 && !SS_BASKETBALL_SPORT_IDS.has(sportId)) return false;
+
+  // Tertiary check: score shape — basketball scores are integers typically 1–200.
+  // Football scores are 0–20 range. If both scores are ≤ 5 and sport is ambiguous,
+  // treat as non-basketball to avoid football contamination.
+  if (sportSlug === "" && sportId === -1) {
+    const hScore = Number(ev?.homeScore?.current ?? ev?.homeScore?.normaltime ?? -1);
+    const aScore = Number(ev?.awayScore?.current ?? ev?.awayScore?.normaltime ?? -1);
+    if (isFinite(hScore) && isFinite(aScore) && hScore >= 0 && aScore >= 0) {
+      if (hScore <= 9 && aScore <= 9) return false; // Almost certainly football
+    }
+  }
+
+  return true;
+}
+
 function ssProcessTeamEvents(events, teamId, label) {
   const scoredList = [], allowedList = [];
   const homeScoredList = [], homeAllowedList = [];
@@ -3012,7 +3051,16 @@ function ssProcessTeamEvents(events, teamId, label) {
   const q1ScoredList = [], q2ScoredList = [], q3ScoredList = [], q4ScoredList = [];
   const q1AllowedList = [], q2AllowedList = [], q3AllowedList = [], q4AllowedList = [];
 
-  const completedAll = events.filter(e => {
+  // LOCK: Filter to basketball events ONLY before any processing.
+  // ssIsBasketballEvent checks sport slug, sport id, and score shape.
+  // This prevents football/soccer results from contaminating basketball projections.
+  const basketballEvents = events.filter(ev => ssIsBasketballEvent(ev));
+  const blockedCount = events.length - basketballEvents.length;
+  if (blockedCount > 0) {
+    engineDebug("ssProcessTeamEvents: blocked " + blockedCount + " non-basketball events", { label, total: events.length, kept: basketballEvents.length });
+  }
+
+  const completedAll = basketballEvents.filter(e => {
     const _sType = e.status?.type ?? "";
     const _isDone = _sType === "finished" || _sType === "afterExtraTime" || _sType === "afterPenalties" || e.status?.finished === true;
     if (!_isDone) return false;
@@ -3115,17 +3163,19 @@ function updateSofascoreLinks(side) {
   }
 }
 
-function searchSofascorePlayer(side) {
+  function searchSofascorePlayer(side) {
   const nameEl = document.getElementById(side === "A" ? "ssTeamAName" : "ssTeamBName");
   const rawName = (nameEl?.value || "").trim();
   if (!rawName) { alert("Enter a player/team name first."); return; }
   const searchName = rawName.split(",")[0].trim();
-  const searchUrl = "https://api.sofascore.com/api/v1/search/all?q=" + encodeURIComponent(searchName);
+  // LOCK: sport=2 restricts SofaScore search to basketball ONLY.
+  // Do NOT change to /search/all — that returns football, tennis, etc.
+  const searchUrl = "https://api.sofascore.com/api/v1/search/teams?q=" + encodeURIComponent(searchName) + "&sport=basketball";
   window.open(searchUrl, "_blank");
   const st = document.getElementById("ssFetchStatus");
   if (st) {
     st.style.color = "#d98a00";
-    st.textContent = "🔍 Search opened for " + side + " — find the team ID in the JSON and paste it above.";
+    st.textContent = "🔍 Basketball-only search opened for " + side + " — find the team ID in the JSON and paste it above.";
   }
 }
 
@@ -3312,7 +3362,10 @@ function extractH2HFromPastedEvents() {
     }
   });
 
+  // LOCK: H2H must also be basketball-only. ssIsBasketballEvent blocks football/soccer
+  // events that share team IDs with basketball teams on SofaScore.
   const h2hMatches = uniqueEvents.filter(ev => {
+    if (!ssIsBasketballEvent(ev)) return false;
     const sType = ev.status?.type ?? "";
     const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
     if (!isTerminal) return false;
@@ -4368,7 +4421,7 @@ const TRACKER_SAVE_DEBOUNCE_MS = 400;
 const TRACKER_SAVE_RETRY_BASE_MS = 1500;
 const TRACKER_SAVE_RETRY_MAX_MS = 15000;
 const TRACKER_NETWORK_TIMEOUT_MS = BB_CONFIG.timeouts.fetch;
-const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_XX";
+const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_X";
 const ENGINE_MODEL_VERSION = "engine_v2_final";
 const TRACKER_LEARNING_ENABLED = true;
 
