@@ -1,3 +1,4 @@
+G
 O
 <!DOCTYPE html>
 <html lang="en">
@@ -12903,6 +12904,105 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
     aS, bS,
     aScores: aFTS,
     bScores: bFTS
+  };
+}
+
+function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
+  const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
+  const h1Baseline   = eb / 2;
+  const teamH1Base   = eb / 4;
+  const basePace     = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default;
+  const h1Vl         = getMarketVolLimit(league, "h1");
+  const cl           = getEffectivePaceClamp(league);
+
+  const aS1  = getManualSeries("A", "h1", parsed);
+  const bS1  = getManualSeries("B", "h1", parsed);
+  const aA1  = getAllowedSeries("A", "overall", "h1", parsed);
+  const bA1  = getAllowedSeries("B", "overall", "h1", parsed);
+  const h1SampleTier = getSampleTier(aS1, bS1);
+
+  const aVol1 = (aS1.length >= 2 && aA1.length >= 2) ? stdDev(totalSeries(aS1, aA1)) : 0;
+  const bVol1 = (bS1.length >= 2 && bA1.length >= 2) ? stdDev(totalSeries(bS1, bA1)) : 0;
+
+  if (h1SampleTier === "insufficient") {
+    return {
+      h1Proj: NaN, h1Edge: NaN, projA1H: NaN, projB1H: NaN,
+      h1SampleTier, h1HasH2H: false, h1ProjectionOnly: true,
+      h1FullModel: false, paceGapRisk: false, defensiveFloorFlag: false,
+      aVol1: 0, bVol1: 0, aS1: NaN, bS1: NaN
+    };
+  }
+
+  let projA1H = (avgOrNaN(aS1) * 0.55 + avgOrNaN(bA1) * 0.45);
+  let projB1H = (avgOrNaN(bS1) * 0.55 + avgOrNaN(aA1) * 0.45);
+
+  if (isFinite(projA1H)) projA1H *= injMultA;
+  if (isFinite(projB1H)) projB1H *= injMultB;
+
+  const aH2H      = getH2HSeries("A", "h1", parsed);
+  const bH2H      = getH2HSeries("B", "h1", parsed);
+  const h1HasH2H  = maybeReadH2HEnabled("h1") && aH2H.length >= 2 && bH2H.length >= 2;
+
+  if (h1HasH2H) {
+    const avgAH2H     = avgOrNaN(aH2H);
+    const h1Divergence = isFinite(avgAH2H) && isFinite(projA1H) ? (avgAH2H - projA1H) : 0;
+    const hw = getH2HWeight(aH2H.length, bH2H.length, "h1", h1SampleTier, h1Divergence, league);
+    projA1H = (projA1H * (1 - hw)) + (avgAH2H * hw);
+    projB1H = (projB1H * (1 - hw)) + (avgOrNaN(bH2H) * hw);
+  }
+
+  const roleA    = getFixtureSideRole("A");
+  const homeEdge = Number(LEAGUE_HOME_EDGE[league] || 1.5);
+  const hasVenueA = (g_massacreFetchContext.A.venue?.h1Scored10?.length || 0) >= 2;
+  const hasVenueB = (g_massacreFetchContext.B.venue?.h1Scored10?.length || 0) >= 2;
+  if (!hasVenueA && roleA === "home") projA1H += (homeEdge / 4);
+  if (!hasVenueB && roleA === "away") projB1H += (homeEdge / 4);
+
+  // LOCK: pass teamH1Base (eb/4) as baseline so applyVolatility never produces NaN
+  if (isFinite(projA1H)) {
+    projA1H = applyVolatility(projA1H, aVol1, h1Vl, teamH1Base);
+    projA1H = anchorProjection(projA1H, lines.h1aLine, league, "team");
+  }
+  if (isFinite(projB1H)) {
+    projB1H = applyVolatility(projB1H, bVol1, h1Vl, teamH1Base);
+    projB1H = anchorProjection(projB1H, lines.h1bLine, league, "team");
+  }
+
+  let h1Proj = projA1H + projB1H;
+  // LOCK: pass h1Baseline (eb/2) as baseline for combined 1H total
+  if (isFinite(h1Proj)) {
+    h1Proj = applyVolatility(h1Proj, Math.max(aVol1, bVol1), h1Vl, h1Baseline);
+    h1Proj = anchorProjection(h1Proj, lines.h1Line, league, "h1");
+  }
+
+  const aFTS = getManualSeries("A", "ft", parsed);
+  const bFTS = getManualSeries("B", "ft", parsed);
+  const aFTA = getAllowedSeries("A", "overall", "ft", parsed);
+  const bFTA = getAllowedSeries("B", "overall", "ft", parsed);
+  const pfA   = 1 + ((avgOrNaN(aFTS) + avgOrNaN(aFTA)) / eb - 1) * 0.4;
+  const pfB   = 1 + ((avgOrNaN(bFTS) + avgOrNaN(bFTA)) / eb - 1) * 0.4;
+  const estPace = clampNumber(basePace * ((pfA + pfB) / 2), basePace * cl.min, basePace * cl.max);
+  const paceGapRisk = estPace > (basePace * 1.08) || estPace < (basePace * 0.92);
+  const aAllAvg = avgOrNaN(aA1);
+  const bAllAvg = avgOrNaN(bA1);
+  const defensiveFloorFlag = (isFinite(aAllAvg) && aAllAvg > teamH1Base * 1.05) ||
+                             (isFinite(bAllAvg) && bAllAvg > teamH1Base * 1.05);
+
+  return {
+    h1Proj,
+    h1Edge:          lines.h1Line ? h1Proj - lines.h1Line : NaN,
+    projA1H,
+    projB1H,
+    h1SampleTier,
+    h1HasH2H,
+    h1ProjectionOnly: !h1HasH2H && h1SampleTier === "thin",
+    h1FullModel:      h1SampleTier === "full",
+    paceGapRisk,
+    defensiveFloorFlag,
+    aVol1,
+    bVol1,
+    aS1: avgOrNaN(aS1),
+    bS1: avgOrNaN(bS1)
   };
 }
 
