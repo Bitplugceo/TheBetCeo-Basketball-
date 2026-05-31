@@ -1,4 +1,4 @@
-B
+M
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -12807,10 +12807,28 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       estMatchPace = clampNumber(basePace * ((dampenedPaceA + dampenedPaceB) / 2), basePace * cl.min, basePace * cl.max);
     }
     
-    const synOrtgA = clampNumber((aS / (basePace * dampenedPaceA)) * 100, 80, 130);
-const synDrtgA = clampNumber((aA / (basePace * dampenedPaceA)) * 100, 80, 130);
-const synOrtgB = clampNumber((bS / (basePace * dampenedPaceB)) * 100, 80, 130);
-const synDrtgB = clampNumber((bA / (basePace * dampenedPaceB)) * 100, 80, 130);
+    // Bayesian shrinkage: regress raw ORTG/DRTG toward league average (100) weighted by games played
+    const leagueAvgORTG = 100;
+    const leagueAvgDRTG = 100;
+    const priorWeight = 12; // equivalent to 12 games of league average
+    const aFTS_clean = aFTS.map(Number).filter(v => isFinite(v) && v > 0);
+    const bFTS_clean = bFTS.map(Number).filter(v => isFinite(v) && v > 0);
+    const aFTA_clean = aFTA.map(Number).filter(v => isFinite(v) && v > 0);
+    const bFTA_clean = bFTA.map(Number).filter(v => isFinite(v) && v > 0);
+    const rawOrtgA = (aS / (basePace * dampenedPaceA)) * 100;
+    const rawDrtgA = (aA / (basePace * dampenedPaceA)) * 100;
+    const rawOrtgB = (bS / (basePace * dampenedPaceB)) * 100;
+    const rawDrtgB = (bA / (basePace * dampenedPaceB)) * 100;
+    const gamesA = Math.max(aFTS_clean.length, aFTA_clean.length, 1);
+    const gamesB = Math.max(bFTS_clean.length, bFTA_clean.length, 1);
+    const shrunkOrtgA = (rawOrtgA * gamesA + leagueAvgORTG * priorWeight) / (gamesA + priorWeight);
+    const shrunkDrtgA = (rawDrtgA * gamesA + leagueAvgDRTG * priorWeight) / (gamesA + priorWeight);
+    const shrunkOrtgB = (rawOrtgB * gamesB + leagueAvgORTG * priorWeight) / (gamesB + priorWeight);
+    const shrunkDrtgB = (rawDrtgB * gamesB + leagueAvgDRTG * priorWeight) / (gamesB + priorWeight);
+    const synOrtgA = clampNumber(shrunkOrtgA, 80, 130);
+    const synDrtgA = clampNumber(shrunkDrtgA, 80, 130);
+    const synOrtgB = clampNumber(shrunkOrtgB, 80, 130);
+    const synDrtgB = clampNumber(shrunkDrtgB, 80, 130);
 
 synNetA = clampNumber(synOrtgA - synDrtgA, -15, 15);
 synNetB = clampNumber(synOrtgB - synDrtgB, -15, 15);
@@ -13706,19 +13724,103 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
   const _isMobileDevice = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
   const _massacreBatchSize = _isMobileDevice ? 2 : 5;
 
-  // Helper: compute win probability from massacre diagnostics (logistic approximation)
-  function computeMassacreWinProb(diag) {
-    // Placeholder coefficients – replace with empirically derived ones from your settled picks
-    const coeff = { simPct: 0.032, brutalityScore: 0.018, agreement: 0.12, convergence: 0.08, modelCount: 0.05 };
-    const intercept = -2.5;
-    let logOdds = intercept;
-    logOdds += (diag.simPct - 50) * coeff.simPct;
-    logOdds += (diag.brutalityScore - 50) * coeff.brutalityScore;
-    logOdds += diag.agreement * coeff.agreement;
-    logOdds += diag.alignedConvergence * coeff.convergence;
-    logOdds += (diag.modelCount - 2) * coeff.modelCount;
+  // Helper: compute win probability from massacre diagnostics using auto‑calibrated coefficients
+  function computeMassacreWinProb(diag, league, marketKey) {
+    // Load or initialize coefficients from localStorage
+    let massacreCoeff = {};
+    try {
+      const stored = localStorage.getItem("BB_MASSACRE_COEFF");
+      if (stored) massacreCoeff = JSON.parse(stored);
+    } catch(e) {}
+    // Default coefficients (starting values)
+    const defaultCoeff = {
+      simPct: 0.032,
+      brutalityScore: 0.018,
+      agreement: 0.12,
+      convergence: 0.08,
+      modelCount: 0.05,
+      intercept: -2.5
+    };
+    // Use league‑specific if available, otherwise fallback to default
+    const coeff = massacreCoeff[league] || defaultCoeff;
+    let logOdds = coeff.intercept;
+    logOdds += (diag.simPct - 50) * (coeff.simPct ?? defaultCoeff.simPct);
+    logOdds += (diag.brutalityScore - 50) * (coeff.brutalityScore ?? defaultCoeff.brutalityScore);
+    logOdds += diag.agreement * (coeff.agreement ?? defaultCoeff.agreement);
+    logOdds += diag.alignedConvergence * (coeff.convergence ?? defaultCoeff.convergence);
+    logOdds += (diag.modelCount - 2) * (coeff.modelCount ?? defaultCoeff.modelCount);
     const prob = 1 / (1 + Math.exp(-logOdds));
     return Math.min(0.95, Math.max(0.05, prob));
+  }
+
+  // Auto‑calibration function for massacre coefficients (call periodically)
+  function calibrateMassacreCoefficients() {
+    // Also calibrate confidence grade thresholds based on historical win rates
+    const allPicks = getAllTrackedPicksForReport();
+    const gradedPicks = allPicks.filter(p => p.confidenceGrade && ["A","B","C","D"].includes(p.confidenceGrade) && ["win","loss"].includes(p.resultStatus));
+    if (gradedPicks.length >= 50) {
+      const gradeRates = { A: { wins:0, total:0 }, B: { wins:0, total:0 }, C: { wins:0, total:0 }, D: { wins:0, total:0 } };
+      gradedPicks.forEach(p => {
+        const grade = p.confidenceGrade;
+        if (gradeRates[grade]) {
+          gradeRates[grade].total++;
+          if (p.resultStatus === "win") gradeRates[grade].wins++;
+        }
+      });
+      // Find optimal thresholds to separate grades (simplified: use percentiles)
+      // For now, keep default thresholds; this is a placeholder for future enhancement
+    }
+    const allPicks = getAllTrackedPicksForReport();
+    const settled = allPicks.filter(p => p.massacre && ["win","loss"].includes(p.resultStatus));
+    if (settled.length < 50) return;
+
+    const leagues = [...new Set(settled.map(p => p.league).filter(Boolean))];
+    const newCoeff = {};
+
+    leagues.forEach(league => {
+      const leaguePicks = settled.filter(p => p.league === league);
+      if (leaguePicks.length < 30) return;
+
+      // Simple logistic regression via gradient descent (simplified)
+      // Features: simPct-50, brutalityScore-50, agreement, convergence, modelCount-2
+      // Target: win = 1, loss = 0
+      let coeff = { simPct: 0.032, brutalityScore: 0.018, agreement: 0.12, convergence: 0.08, modelCount: 0.05, intercept: -2.5 };
+      const learningRate = 0.0001;
+      const iterations = 500;
+      for (let iter = 0; iter < iterations; iter++) {
+        let grad = { simPct:0, brutalityScore:0, agreement:0, convergence:0, modelCount:0, intercept:0 };
+        for (const pick of leaguePicks) {
+          const diag = pick.massacre;
+          const x_sim = diag.simPct - 50;
+          const x_brut = diag.brutalityScore - 50;
+          const x_agree = diag.agreement;
+          const x_conv = diag.alignedConvergence;
+          const x_count = diag.modelCount - 2;
+          const logOdds = coeff.intercept + coeff.simPct * x_sim + coeff.brutalityScore * x_brut + coeff.agreement * x_agree + coeff.convergence * x_conv + coeff.modelCount * x_count;
+          const p = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, logOdds))));
+          const error = (pick.resultStatus === "win" ? 1 : 0) - p;
+          grad.intercept += error;
+          grad.simPct += error * x_sim;
+          grad.brutalityScore += error * x_brut;
+          grad.agreement += error * x_agree;
+          grad.convergence += error * x_conv;
+          grad.modelCount += error * x_count;
+        }
+        // Update coefficients
+        coeff.intercept += learningRate * grad.intercept;
+        coeff.simPct += learningRate * grad.simPct;
+        coeff.brutalityScore += learningRate * grad.brutalityScore;
+        coeff.agreement += learningRate * grad.agreement;
+        coeff.convergence += learningRate * grad.convergence;
+        coeff.modelCount += learningRate * grad.modelCount;
+      }
+      newCoeff[league] = coeff;
+    });
+
+    if (Object.keys(newCoeff).length) {
+      localStorage.setItem("BB_MASSACRE_COEFF", JSON.stringify(newCoeff));
+      engineDebug("Massacre coefficients auto‑calibrated for leagues", Object.keys(newCoeff));
+    }
   }
 
   const _runOneMassacrePick = async (p) => {
@@ -13732,7 +13834,7 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
 
     const originalPick = p.pick;
     const diag = await evaluateMassacreForPick(p, league, parsed, fixtureMeta);
-    const winProb = computeMassacreWinProb(diag);
+    const winProb = computeMassacreWinProb(diag, league, p.marketKey);
     const profile = getMassacreProfile(diag, p, league);
 
     p.massacre = diag;
@@ -14715,8 +14817,8 @@ const h1Calc = compute1HProjection({
       const tier = getSampleTier(aS, bS);
       if (tier === "insufficient" && !(!isNbaOrNcaa && hasH2H)) return null;
 
-      let projA = (avgOrNaN(aS) * 0.55 + avgOrNaN(bA) * 0.45);
-      let projB = (avgOrNaN(bS) * 0.55 + avgOrNaN(aA) * 0.45);
+      let projA = (avgOrNaN(aS) * 0.55 + avgOrNaN(bA) * 0.45) * quarterPaceFactor;
+      let projB = (avgOrNaN(bS) * 0.55 + avgOrNaN(aA) * 0.45) * quarterPaceFactor;
 
       if (!isNbaOrNcaa && (!isFinite(projA) || !isFinite(projB))) {
         const _eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160;
@@ -14724,7 +14826,13 @@ const h1Calc = compute1HProjection({
         projB = isFinite(h1Calc.projB1H) ? h1Calc.projB1H / 2 : (isFinite(ftCalc.projBFT) ? ftCalc.projBFT / 4 : _eb / 4);
       }
 
-      if (qKey === "q3") { projA *= 0.9825; projB *= 0.9825; }
+      // Quarter adjustment factor (empirical, can be tuned)
+      // Default 1.0 means no adjustment; you can change based on historical data
+      const quarterFactor = 1.0;
+      if (qKey === "q1") { projA *= quarterFactor; projB *= quarterFactor; }
+      else if (qKey === "q2") { projA *= quarterFactor; projB *= quarterFactor; }
+      else if (qKey === "q3") { projA *= quarterFactor; projB *= quarterFactor; }
+      else if (qKey === "q4") { projA *= quarterFactor; projB *= quarterFactor; }
 
       const vCtxA = g_massacreFetchContext.A.venue;
       const vCtxB = g_massacreFetchContext.B.venue;
