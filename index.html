@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9130,121 +9131,25 @@ function buildTrackerFeedbackProfile() {
   return { totalSettled: all.length, buckets };
 }
 
+// Bayesian version: returns posterior win probability for (league, market, side)
+function getTrackerPosteriorWinProb(league, marketKey, side, priorGames = 12, priorWinRate = 50) {
+  const all = getLearningTrackedPicks();
+  const matches = all.filter(p => 
+    p.league === league && 
+    p.marketKey === marketKey && 
+    p.side === side &&
+    (p.resultStatus === "win" || p.resultStatus === "loss")
+  );
+  const wins = matches.filter(p => p.resultStatus === "win").length;
+  const total = matches.length;
+  const priorWins = priorGames * (priorWinRate / 100);
+  const posteriorWinRate = (wins + priorWins) / (total + priorGames);
+  return posteriorWinRate;
+}
+
+// Legacy function kept for compatibility but returns null (no longer used)
 function getTrackerFeedbackSignal(profile, marketKey, side, league) {
-  if (!profile || !profile.buckets || !marketKey || !side) return null;
-
-  const minSample = getTrackerFeedbackMinSample(marketKey);
-    const leagueKey = String(league || "unknown");
-  const marketSide = profile.buckets.get(`leagueMarketSide:${leagueKey}:${marketKey}:${side}`);
-  const marketOnly = profile.buckets.get(`leagueMarket:${leagueKey}:${marketKey}`);
-  const sideOnly = profile.buckets.get(`side:${side}`);
-
-  let factor = 1;
-  let reasons = [];
-  let signalCount = 0;
-  let severeNegative = false;
-
-  const applyTier = (stat, mode) => {
-    if (!stat) return;
-    // Gap 2 Bayesian: blend raw win rate toward a 50% prior (12-game weight)
-    // With 5 picks: prior dominates → mild signal. With 20+ picks: data dominates → strong signal.
-    const _priorWins = 12 * 0.50;
-    const score = (stat.wins + (stat.pushes || 0) * 0.5 + _priorWins) / (stat.settled + 12);
-    if (!isFinite(score)) return;
-
-    if (mode === "marketSide") {
-      if (score <= 0.37 && stat.settled >= minSample + 4) {
-        factor *= 0.82;
-        reasons.push("market/side crash");
-        signalCount++;
-        severeNegative = true;
-        return;
-      }
-      if (score <= 0.44) {
-        factor *= 0.88;
-        reasons.push("market/side weak");
-        signalCount++;
-        return;
-      }
-      if (score <= 0.50) {
-        factor *= 0.94;
-        reasons.push("market/side soft");
-        signalCount++;
-        return;
-      }
-      if (score >= 0.62) {
-        factor *= 1.06;
-        reasons.push("market/side hot");
-        signalCount++;
-        return;
-      }
-      if (score >= 0.57) {
-        factor *= 1.03;
-        reasons.push("market/side positive");
-        signalCount++;
-      }
-      return;
-    }
-
-    if (mode === "marketOnly") {
-      if (score <= 0.43) {
-        factor *= 0.92;
-        reasons.push("market weak");
-        signalCount++;
-        return;
-      }
-      if (score <= 0.48) {
-        factor *= 0.96;
-        reasons.push("market soft");
-        signalCount++;
-        return;
-      }
-      if (score >= 0.60) {
-        factor *= 1.03;
-        reasons.push("market hot");
-        signalCount++;
-        return;
-      }
-      if (score >= 0.55) {
-        factor *= 1.01;
-        reasons.push("market positive");
-        signalCount++;
-      }
-      return;
-    }
-
-    if (mode === "sideOnly") {
-      if (score <= 0.44) {
-        factor *= 0.96;
-        reasons.push("global side weak");
-        signalCount++;
-        return;
-      }
-      if (score >= 0.58) {
-        factor *= 1.02;
-        reasons.push("global side positive");
-        signalCount++;
-      }
-    }
-  };
-
-  if (marketSide && marketSide.settled >= minSample) applyTier(marketSide, "marketSide");
-  if (marketOnly && marketOnly.settled >= minSample + 4) applyTier(marketOnly, "marketOnly");
-  if (sideOnly && sideOnly.settled >= 20) applyTier(sideOnly, "sideOnly");
-
-  if (!signalCount) return null;
-
-  factor = clampNumber(factor, 0.80, 1.10);
-
-  return {
-    factor,
-    shouldBlock: severeNegative && factor <= 0.84,
-    confidenceShift: factor <= 0.90 ? -1 : factor >= 1.05 ? 1 : 0,
-    reasons,
-    marketSideSample: marketSide?.settled || 0,
-    marketSample: marketOnly?.settled || 0,
-    sideSample: sideOnly?.settled || 0
-  };
+  return null;
 }
 
 
@@ -10314,7 +10219,15 @@ function applyVolatility(proj, std, limit) {
       return validateLines(league, lines.ftLine, lines.h1Line, lines.h2Line, lines.aLine, lines.bLine);
     }
 
-        function getPick(edge, line, league, marketType, context = {}) {
+// Helper: probability that a team's recent scores exceed a threshold
+function probTeamOverThreshold(teamScores, threshold) {
+  const scores = normalizeIntelSeries(teamScores);
+  if (scores.length < 3) return 0.5;
+  const overCount = scores.filter(s => s > threshold).length;
+  return overCount / scores.length;
+}
+
+function getPick(edge, line, league, marketType, context = {}) {
   if (!line || isNaN(edge) || isNaN(line) || line <= 0) return "NO PLAY";
   const periodThresholds = getLeagueEdgeThresholds(league || "unknown");
   const rules = PICK_RULES[marketType] || PICK_RULES.default;
@@ -10341,15 +10254,19 @@ function applyVolatility(proj, std, limit) {
 
   if (edge < 0 && marketType === "ft" && context.blowoutGap !== undefined) {
     if (context.blowoutGap <= 1.0) {
-       return "NO PLAY"; 
+       return "NO PLAY";
     }
   }
 
-  if (edge < 0) {
-    if (marketType === "ft" && isFinite(context.aSc) && isFinite(context.bSc)) {
-      if (context.aSc >= line * underBlockRatio || context.bSc >= line * underBlockRatio) {
-        return "NO PLAY";
-      }
+  // Probabilistic under block replacement
+  if (edge < 0 && marketType === "ft") {
+    const lineNum = Number(line);
+    const probA = probTeamOverThreshold(context.aScScores || [], lineNum);
+    const probB = probTeamOverThreshold(context.bScScores || [], lineNum);
+    const anyTeamOverProb = 1 - (1 - probA) * (1 - probB);
+    if (anyTeamOverProb > 0.6) return "NO PLAY";
+    if (anyTeamOverProb < 0.3 && pct >= underMin * 0.8) {
+      return "UNDER " + displayLine(line);
     }
   }
 
@@ -12983,6 +12900,7 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
 
 function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
+  const basePace = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default;
 
   const a1HS = getManualSeries("A", "h1", parsed);
   const b1HS = getManualSeries("B", "h1", parsed);
@@ -13044,6 +12962,20 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
   if (isFinite(projB1H)) {
     projB1H = applyVolatility(projB1H, bVol1, h1Vl);
+  }
+
+  // Pace adjustment for 1H
+  let estMatchPace = basePace;
+  const ftLine = lines.ftLine;
+  if (isFinite(ftLine) && ftLine > 0) {
+    const ftPaceEstimate = ftLine / (LEAGUE_BASES[league] || basePace);
+    estMatchPace = Math.min(basePace * 1.2, Math.max(basePace * 0.8, ftPaceEstimate * basePace));
+  }
+  const paceFactor = estMatchPace / basePace;
+  if (isFinite(paceFactor) && paceFactor !== 1) {
+    const halfPaceFactor = 0.5 + paceFactor * 0.5;
+    projA1H = projA1H * halfPaceFactor;
+    projB1H = projB1H * halfPaceFactor;
   }
 
   let h1Proj = projA1H + projB1H;
@@ -13128,8 +13060,8 @@ function getMassacreModelRangeLimit(marketKey) {
 }
 
 function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
-  const games = Array.isArray(g_massacreFetchContext?.h2hGames) ? g_massacreFetchContext.h2hGames : [];
-  if (!games || !games.length) {
+  let games = Array.isArray(g_massacreFetchContext?.h2hGames) ? [...g_massacreFetchContext.h2hGames] : [];
+  if (!games.length) {
     if (marketKey === "ft") {
       return { 
         A: (parsed && parsed.aFTH2H) ? safeArr(parsed.aFTH2H) : [], 
@@ -13151,11 +13083,15 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
     return { A: [], B: [] };
   }
 
+  // Sort games descending by date (most recent first)
+  games.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+  const weights = MODEL_TUNING.recencyWeights; // [1.35, 1.20, 1.00, 0.85, 0.70]
   const fixtureHomeId = String(fixtureMeta?.homeId || "");
   const A = [];
   const B = [];
 
-  games.slice(0, 10).forEach(g => {
+  games.slice(0, weights.length).forEach((g, idx) => {
+    const w = weights[idx] || 1;
     const teamAIsHome = fixtureHomeId && String(g.teamAId || "") === fixtureHomeId;
     
     const valueA =
@@ -13176,8 +13112,11 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
       marketKey === "q3" ? (teamAIsHome ? g.q3B : g.q3A) :
       marketKey === "q4" ? (teamAIsHome ? g.q4B : g.q4A) : 0;
 
-    if (isFinite(Number(valueA)) && Number(valueA) > 0) A.push(Number(valueA));
-    if (isFinite(Number(valueB)) && Number(valueB) > 0) B.push(Number(valueB));
+    // Repeat value w times to simulate weight
+    for (let i = 0; i < w; i++) {
+      if (isFinite(Number(valueA)) && Number(valueA) > 0) A.push(Number(valueA));
+      if (isFinite(Number(valueB)) && Number(valueB) > 0) B.push(Number(valueB));
+    }
   });
 
   return { A, B };
@@ -13372,6 +13311,18 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
 }
 
 
+// Helper: historical std dev for Monte Carlo
+function getHistoricalStdDev(league, marketKey) {
+  const entries = g_pickVarianceLog.filter(e => 
+    e.league === league && e.marketKey === marketKey
+  );
+  if (entries.length < 10) return null;
+  const errors = entries.map(e => e.proj - e.actual);
+  const meanErr = errors.reduce((a,b) => a+b,0) / errors.length;
+  const sqSum = errors.reduce((a,b) => a + Math.pow(b-meanErr,2), 0);
+  return Math.sqrt(sqSum / errors.length);
+}
+
 async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
 
 
@@ -13520,7 +13471,18 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
     : Math.max(0, 100 - (modelRange / getMassacreModelRangeLimit(marketKey)) * 100);
 
   const marketStdDev = (() => {
-    // Spec Item 5: For manual leagues with thin or fresh history, inject robust fallback stdDev
+    // Use historical error standard deviation if available, else fallback to heuristic
+    let histStdDev = getHistoricalStdDev(league, marketKey);
+    if (histStdDev !== null && isFinite(histStdDev) && histStdDev > 0) {
+      // Blend historical with current team volatility
+      const actualTeamVol = Math.max(Number(pickRow.context?.aVol || 0), Number(pickRow.context?.bVol || 0));
+      if (actualTeamVol > 0 && isFinite(actualTeamVol)) {
+        return (histStdDev * 0.7) + (actualTeamVol * 0.3);
+      }
+      return histStdDev;
+    }
+
+    // Fallback: original heuristic
     const _isManualLeagueForMC = league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre";
     const actualTeamVol = Math.max(Number(pickRow.context?.aVol || 0), Number(pickRow.context?.bVol || 0));
     if (_isManualLeagueForMC && (!isFinite(actualTeamVol) || actualTeamVol < 2)) return 11.5;
@@ -13532,7 +13494,6 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
       8.0;
 
     const blendedBase = actualTeamVol > 0 ? (actualTeamVol * 0.6) + (base * 0.4) : base;
-
     const rangeAdj = isFinite(modelRange) ? modelRange * 0.18 : 0;
     const instabilityAdj = stabilityScore < 55 ? 1.2 : stabilityScore < 70 ? 0.6 : 0;
     return blendedBase + rangeAdj + instabilityAdj;
@@ -13737,12 +13698,23 @@ function rescueBestMassacreLean(picks) {
 async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta) {
   if (!Array.isArray(picks)) return;
 
-  // LOCK: Batched execution — do NOT revert to Promise.all(picks.map(...)).
-  // The original code spawned 10-12 simultaneous Web Workers on every run (one per pick).
-  // On a mobile phone at low battery this causes thermal throttling, UI jank, and tab crashes.
-  // Desktop: 5 concurrent workers max. Mobile: 2 concurrent workers max.
   const _isMobileDevice = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
   const _massacreBatchSize = _isMobileDevice ? 2 : 5;
+
+  // Helper: compute win probability from massacre diagnostics (logistic approximation)
+  function computeMassacreWinProb(diag) {
+    // Placeholder coefficients – replace with empirically derived ones from your settled picks
+    const coeff = { simPct: 0.032, brutalityScore: 0.018, agreement: 0.12, convergence: 0.08, modelCount: 0.05 };
+    const intercept = -2.5;
+    let logOdds = intercept;
+    logOdds += (diag.simPct - 50) * coeff.simPct;
+    logOdds += (diag.brutalityScore - 50) * coeff.brutalityScore;
+    logOdds += diag.agreement * coeff.agreement;
+    logOdds += diag.alignedConvergence * coeff.convergence;
+    logOdds += (diag.modelCount - 2) * coeff.modelCount;
+    const prob = 1 / (1 + Math.exp(-logOdds));
+    return Math.min(0.95, Math.max(0.05, prob));
+  }
 
   const _runOneMassacrePick = async (p) => {
     if (!p || p.note || p.pick === "NO PLAY") return;
@@ -13755,39 +13727,39 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
 
     const originalPick = p.pick;
     const diag = await evaluateMassacreForPick(p, league, parsed, fixtureMeta);
+    const winProb = computeMassacreWinProb(diag);
     const profile = getMassacreProfile(diag, p, league);
 
     p.massacre = diag;
+    p.massacreWinProb = winProb;
     p.massacreProfile = profile;
     p.massacreOriginalPick = originalPick;
     p.lockStrength = diag.lockStrength;
     p.recommendationTier = p.recommendationTier || "play";
 
-    if (profile.hardBlock) {
+    if (winProb < 0.40) {
       p.pick = "NO PLAY";
       p.displayPick = "NO PLAY";
       p.confidence = "—";
-      p.note = "Massacre gate: " + [...profile.reasons.severe, ...profile.cautionReasons].slice(0, 3).join(" • ");
+      p.note = "Massacre gate: win probability " + (winProb*100).toFixed(0) + "%";
       p.massacreDecision = "blocked";
       return;
     }
 
-    if (profile.leanOnly) {
+    if (winProb < 0.55) {
       p.pick = originalPick;
       p.recommendationTier = "lean";
       p.confidence = "—";
-      p.note = "Lean only: " + [...profile.reasons.severe, ...profile.cautionReasons].slice(0, 3).join(" • ");
+      p.note = "Lean only: " + (winProb*100).toFixed(0) + "% win prob";
       p.massacreDecision = "lean";
       return;
     }
 
-    p.massacreDecision = profile.cautionOnly ? "caution" : "pass";
+    p.massacreDecision = winProb >= 0.7 ? "pass" : "caution";
 
     if (diag.brutalityScore >= 78 && diag.simPct >= (profile.thresholds.sim + 4) && diag.agreement >= Math.max(2, profile.thresholds.agreement)) {
       p.confidence = bumpConfidenceGrade(p.confidence, 1);
-    } else if (profile.cautionOnly) {
-      p.confidence = bumpConfidenceGrade(p.confidence, -1);
-    } else if (diag.brutalityScore < (profile.thresholds.brutality - 4) || diag.simPct < (profile.thresholds.sim - 2)) {
+    } else if (winProb < 0.65) {
       p.confidence = bumpConfidenceGrade(p.confidence, -1);
     }
   };
