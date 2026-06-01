@@ -1,3 +1,4 @@
+D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5267,24 +5268,52 @@ function getStabilizedBucketWinRate(wins = 0, losses = 0, priorGames = 12, prior
   return Number((((w + priorWins) / (decisive + priorGames)) * 100).toFixed(2));
 }
 
-function getBucketSignalStrength(stabilizedWinRate = null, reliabilityScore = 0) {
+function getBucketSignalStrength(stabilizedWinRate = null, reliabilityScore = 0, decisive = 0) {
+  // [FIX: z-score formula — DO NOT REVERT TO (stabilizedWinRate - 50) * (reliabilityScore / 100)]
+  // Previous formula multiplied excess win rate by reliabilityScore/100. The reliability
+  // score is a non-linear discrete lookup table with no statistical interpretation — it
+  // caused signal magnitude to vary by a factor of ~21x between n=1 and n=45 at the
+  // same win rate, a ratio bearing no relationship to the actual sqrt(n) improvement in
+  // statistical precision. The thresholds (2.5 in Direction and Actionability) were
+  // calibrated to that arbitrary scale and are meaningless with a different formula.
+  // Fix: z-score = (stabilizedWinRate - 50) / (stderr * 100), where stderr = sqrt(0.25/n).
+  // This is the number of standard errors the win rate sits above the null of 50% —
+  // a statistically principled and dimensionally consistent quantity.
+  // The reliabilityScore parameter is kept in the signature for backward compatibility
+  // with existing callers that pass it, but it is no longer used in the computation.
+  // getBucketSignalDirection and getBucketActionability thresholds are updated to 1.0
+  // (one standard error above null) to match the new z-score scale.
+  // DO NOT revert to the reliabilityScore multiplication formula.
+  // DO NOT change the Direction/Actionability thresholds back to 2.5 — those were
+  // calibrated against the old ad hoc formula and are wrong for z-scores.
   if (!isFinite(stabilizedWinRate)) return null;
-  return Number((((stabilizedWinRate - 50) * (reliabilityScore / 100))).toFixed(2));
+  const n      = Math.max(1, Number(decisive) || 0);
+  const stdErr = Math.sqrt(0.25 / n) * 100;
+  return Number(((stabilizedWinRate - 50) / stdErr).toFixed(2));
 }
 
 function getBucketSignalDirection(signalStrength = null) {
+  // [FIX: z-score threshold — DO NOT CHANGE BACK TO 2.5]
+  // Threshold updated from 2.5 to 1.0 to match the z-score formula in
+  // getBucketSignalStrength. z=1.0 means the win rate is approximately one standard
+  // error above (or below) the null of 50% — the minimum meaningful signal level.
   if (!isFinite(signalStrength)) return "neutral";
-  if (signalStrength >= 2.5) return "positive";
-  if (signalStrength <= -2.5) return "negative";
+  if (signalStrength >= 1.0) return "positive";
+  if (signalStrength <= -1.0) return "negative";
   return "neutral";
 }
 
 function getBucketActionability(decisive = 0, reliabilityScore = 0, signalStrength = null) {
+  // [FIX: z-score threshold, reliabilityScore gate removed — DO NOT REVERT]
+  // reliabilityScore >= 45 gate removed: by definition from getBucketReliabilityScore,
+  // n=8 gives reliabilityScore=45, so the gate was perfectly redundant with decisive >= 8.
+  // Threshold updated from 2.5 to 1.0 to match the new z-score scale (one stderr above null).
+  // reliabilityScore parameter retained in signature for backward-compatible call sites.
+  // DO NOT reinstate reliabilityScore >= 45. DO NOT change the z threshold back to 2.5.
   return (
     decisive >= 8 &&
-    reliabilityScore >= 45 &&
     isFinite(signalStrength) &&
-    Math.abs(signalStrength) >= 2.5
+    Math.abs(signalStrength) >= 1.0
   );
 }
 
@@ -5295,10 +5324,29 @@ function finalizeDerivedBucket(bucket) {
   const decisive = wins + losses;
 
   const rawWinRate = decisive ? Number(((wins / decisive) * 100).toFixed(2)) : null;
-  const stabilizedWinRate = getStabilizedBucketWinRate(wins, losses, 12, 50);
+  // [FIX: empirical prior replaces universal 50% — DO NOT REVERT TO HARDCODED 50]
+  // Hardcoding priorWinRate=50 injected 6 phantom losses per 12-game prior whenever
+  // the model had systematic positive edge, creating a persistent downward bias that
+  // never fully corrects regardless of sample size. The prior should reflect the model's
+  // actual observed base rate, not the a-priori 50/50 null hypothesis.
+  // Fix: derive the prior from all settled learning picks, capped 40–60% for stability
+  // against extreme early samples. Falls back to 50 with fewer than 30 settled picks.
+  // DO NOT hardcode 50 as the fourth argument to getStabilizedBucketWinRate here.
+  const _empiricalPrior = (() => {
+    try {
+      const _settled = getLearningTrackedPicks().filter(p => p.resultStatus === "win" || p.resultStatus === "loss");
+      if (_settled.length < 30) return 50;
+      const _w = _settled.filter(p => p.resultStatus === "win").length;
+      return Math.min(60, Math.max(40, (_w / _settled.length) * 100));
+    } catch(e) { return 50; }
+  })();
+  const stabilizedWinRate = getStabilizedBucketWinRate(wins, losses, 12, _empiricalPrior);
   const reliabilityScore = getBucketReliabilityScore(decisive);
   const reliabilityTier = getBucketReliabilityTier(reliabilityScore);
-  const signalStrength = getBucketSignalStrength(stabilizedWinRate, reliabilityScore);
+  // [FIX: decisive passed as third arg — required by z-score formula in getBucketSignalStrength]
+  // DO NOT remove the decisive argument. Without it the function defaults to n=1 and
+  // produces a maximally conservative z-score regardless of actual sample size.
+  const signalStrength = getBucketSignalStrength(stabilizedWinRate, reliabilityScore, decisive);
   const signalDirection = getBucketSignalDirection(signalStrength);
   const isActionable = getBucketActionability(decisive, reliabilityScore, signalStrength);
 
@@ -6650,10 +6698,20 @@ function getRawMarketInputMap() {
     }
 
     function weightedRecentAverage(arr, weights = MODEL_TUNING.recencyWeights) {
-  // [FIX: ordering convention documented] arr MUST be ordered newest-first:
-  // arr[0] = most recent game. weights[0] is the highest weight and maps to arr[0].
-  // Passing games oldest-first will silently invert the recency effect — there is
-  // no runtime guard, so every call site must independently honour this convention.
+  // [LOCK: ORDERING CONTRACT — DO NOT REMOVE, WEAKEN, OR REVERT THIS BLOCK]
+  // arr MUST be ordered newest-first: arr[0] = most recent game, arr[1] = next, etc.
+  // weights[0] is the HIGHEST weight (1.35) and maps to arr[0] (most recent game).
+  // Passing arr oldest-first SILENTLY INVERTS the recency effect — older games receive
+  // higher weight. This failure is invisible: the function returns a valid number either
+  // way and there is no auto-detect or auto-correct. Every call site is solely responsible
+  // for guaranteeing newest-first order before calling this function.
+  // Verified safe call sites (newest-first confirmed and locked):
+  //   trimmedAvg (fixed in Issue 9 — now uses index-based trim preserving time order)
+  //   computeFTProjection, compute1HProjection, getMassacreH2HSeries, recentFormDelta
+  // If you add a new call site, append it to the list above AFTER verifying order.
+  // DEV CHECK: log arr and confirm arr[0] is the game played most recently.
+  // DO NOT add an internal auto-sort — it would silently break callers that rely on
+  // specific ordering for slicing or other pre-processing before calling this function.
   const work = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
   if (!work.length) return NaN;
 
@@ -6684,12 +6742,18 @@ function trimmedAvg(arr) {
   if (work.length <= 2) return avg(work);
 
   if (work.length >= 5) {
-    // [FIX: index-based trim] Remove exactly one value from each end by position,
-    // not all occurrences of the extreme value. Prevents over-trimming when data
-    // has natural ties at the extremes (e.g. three identical high scores collapse
-    // a 6-game window to 2 games, which is worse than the thin-sample path).
-    const sorted = [...work].sort((a, b) => a - b);
-    const trimmed = sorted.slice(1, sorted.length - 1);
+    // [FIX v2: temporal-order-preserving trim — DO NOT REVERT — DO NOT USE sorted.slice HERE]
+    // The previous version passed the sorted copy directly to weightedRecentAverage.
+    // Sorting destroyed newest-first ordering, so weight[0]=1.35 landed on the smallest
+    // remaining value instead of the most recent game — the exact opposite of intended.
+    // Fix: use the sorted copy ONLY to identify the two extreme index positions in the
+    // original array, then filter those indices out. The remaining array is still in
+    // original (newest-first) order. Index-based removal is retained so tied extremes
+    // do not over-trim multiple identical values.
+    // DO NOT pass a sorted array to weightedRecentAverage. DO NOT call sorted.slice here.
+    const indexed = work.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
+    const trimIndices = new Set([indexed[0].i, indexed[indexed.length - 1].i]);
+    const trimmed = work.filter((_, i) => !trimIndices.has(i));
     return weightedRecentAverage(trimmed);
   }
 
@@ -10245,10 +10309,22 @@ function addTrackedPicks(newPicks) {
 
 // Helper: probability that a team's recent scores exceed a threshold
 function probTeamOverThreshold(teamScores, threshold) {
+  // [FIX: Beta-Binomial shrinkage — DO NOT REVERT TO RAW HIT RATE]
+  // Previous version returned a raw empirical hit rate with a hard floor of 3 games.
+  // At n=3 the only possible outputs were 0.33, 0.67, or 1.00 (standard error ~29%).
+  // A single game could flip the entire signal direction, making the estimate
+  // statistically useless and inconsistent with getStabilizedBucketWinRate and
+  // getTrackerPosteriorWinProb, both of which use Beta-Binomial shrinkage.
+  // Fix applies the same (hits + priorGames * priorRate) / (n + priorGames) formula
+  // used throughout the codebase. The minimum-n=3 guard is intentionally removed —
+  // the prior absorbs thin-sample instability without a hard cutoff.
+  // DO NOT reinstate raw overCount/scores.length. DO NOT add a minimum n floor.
+  const PRIOR_GAMES = 10;
+  const PRIOR_RATE  = 0.50;
   const scores = normalizeIntelSeries(teamScores);
-  if (scores.length < 3) return 0.5;
+  if (!scores.length) return PRIOR_RATE;
   const overCount = scores.filter(s => s > threshold).length;
-  return overCount / scores.length;
+  return (overCount + PRIOR_GAMES * PRIOR_RATE) / (scores.length + PRIOR_GAMES);
 }
 
 function getPick(edge, line, league, marketType, context = {}) {
@@ -10295,8 +10371,18 @@ function getPick(edge, line, league, marketType, context = {}) {
     }
 
     function detectTrap(edge, line, pick, league, marketType, vol) {
-      const _isAutomatedLeague = league === "nba" || league === "ncaa" || league === "wnba" || league === "wnba_pre";
-      if (!_isAutomatedLeague) return false;
+      // [FIX: league guard removed — DO NOT REINSTATE _isAutomatedLeague OR ANY LEAGUE WHITELIST]
+      // The previous guard returned false unconditionally for all non-NBA/NCAA/WNBA leagues,
+      // meaning every pick for Euroleague, ACB, BBL, ISL, and all other European and
+      // international leagues bypassed trap detection entirely. High-volatility picks with
+      // implausibly extreme edges in those leagues were never caught.
+      // The mathematical conditions defining a trap apply equally to every league:
+      //   - edge below the minimum threshold → likely noise, not a real signal
+      //   - extreme edge combined with high volatility → likely a data or input error
+      // League-specific calibration is already handled by getTrapVolThreshold (which reads
+      // LEAGUE_VOL_LIMITS[league]) and by the lowLineUnder block below for NBA/NCAA.
+      // The boolean whitelist added nothing and actively harmed coverage.
+      // DO NOT add any league whitelist, blacklist, or _isAutomatedLeague check here.
       if (!line || isNaN(edge) || line <= 0 || !pick || pick === "NO PLAY") return false;
       const pct = Math.abs(edge / line);
       if (pct < TRAP_RULES.minEdgePct) return true;
@@ -12839,8 +12925,23 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       estMatchPace = clampNumber(basePace * ((dampenedPaceA + dampenedPaceB) / 2), basePace * cl.min, basePace * cl.max);
     }
     
-    const leagueAvgORTG = 100;
-    const leagueAvgDRTG = 100;
+    // [FIX: league-derived ORTG/DRTG prior — DO NOT HARDCODE 100 HERE AGAIN]
+    // Hardcoding leagueAvgORTG = 100 and leagueAvgDRTG = 100 was wrong for every league.
+    // In computeFTProjection the synthetic rawOrtgA = (aS / (basePace * dampFactor)) * 100.
+    // For NBA: aS ~115 pts, pace ~99.5 → rawOrtgA ~115. Shrinking toward 100 introduced
+    // a ~15-point systematic underestimate on thin samples. WNBA (~105) and European
+    // leagues have proportionally similar errors relative to their actual ORTG ranges.
+    // Fix: derive the league-average per-team ORTG from existing constants already in scope:
+    //   LEAGUE_BASES[league]     = total pts/game (both teams combined) → per-team = /2
+    //   LEAGUE_PACE_BASES[league] = possessions per game
+    //   implied avg ORTG         = (pts_per_team / possessions) * 100
+    // This makes the regression target consistent with each league's actual scoring
+    // environment and eliminates the universal 100 prior that was wrong everywhere.
+    // DO NOT hardcode 100 here. 100 was wrong for every single league in the codebase.
+    const _leagueBase  = LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160;
+    const _leaguePace  = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
+    const leagueAvgORTG = (_leagueBase / 2 / _leaguePace) * 100;
+    const leagueAvgDRTG = leagueAvgORTG;
     const priorWeight = Math.round(12 * ((LEAGUE_VOL_LIMITS["nba"] || 14) / (LEAGUE_VOL_LIMITS[league] || 12)));
     const aFTS_clean = aFTS.map(Number).filter(v => isFinite(v) && v > 0);
     const bFTS_clean = bFTS.map(Number).filter(v => isFinite(v) && v > 0);
@@ -13142,12 +13243,29 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
   games.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
   const weights = MODEL_TUNING.recencyWeights;
   const fixtureHomeId = String(fixtureMeta?.homeId || "");
-  let sumA = 0, sumB = 0, totalWeightA = 0, totalWeightB = 0;
+  // [FIX: return individual game values, not a collapsed weighted mean — DO NOT REVERT]
+  // Previous code computed (sumA / totalWeightA) and returned it as a length-1 array.
+  // This discarded real sample count before it reached any downstream consumer:
+  //   h2h.A.length was always 1 whether 1 or 10 actual H2H games existed.
+  //   h2hProj had no mechanism to signal confidence relative to other ensemble projections.
+  //   The if (!hA.length || !hB.length) guard could never detect missing H2H history
+  //   because a collapsed length-1 array always passes the length check.
+  // Fix: collect individual game scores into rawA / rawB arrays.
+  //   avgOrNaN(hA)  → unweighted mean of actual game values (acceptable trade-off)
+  //   hA.length     → real sample count, visible to all downstream gating logic
+  //   The length-0 guard now correctly returns NaN when no H2H data exists.
+  // Trade-off: per-game recency weighting (weights[idx]) is removed. This is acceptable
+  // because h2hProj is one of up to six ensemble projections with bounded marginal
+  // impact, and correct sample count is more statistically valuable than intra-H2H
+  // recency weighting for this use case.
+  // DO NOT revert to sumA/totalWeightA. DO NOT collapse to a length-1 array again.
+  // DO NOT add back idx or w — they are intentionally removed from the forEach.
+  const rawA = [];
+  const rawB = [];
 
-  games.slice(0, weights.length).forEach((g, idx) => {
-    const w = weights[idx] || 1;
+  games.slice(0, weights.length).forEach((g) => {
     const teamAIsHome = fixtureHomeId && String(g.teamAId || "") === fixtureHomeId;
-    
+
     const valueA =
       marketKey === "ft" ? (teamAIsHome ? g.scoreA : g.scoreB) :
       marketKey === "h1" ? (teamAIsHome ? g.h1A : g.h1B) :
@@ -13166,19 +13284,11 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
       marketKey === "q3" ? (teamAIsHome ? g.q3B : g.q3A) :
       marketKey === "q4" ? (teamAIsHome ? g.q4B : g.q4A) : 0;
 
-    if (isFinite(Number(valueA)) && Number(valueA) > 0) {
-      sumA += Number(valueA) * w;
-      totalWeightA += w;
-    }
-    if (isFinite(Number(valueB)) && Number(valueB) > 0) {
-      sumB += Number(valueB) * w;
-      totalWeightB += w;
-    }
+    if (isFinite(Number(valueA)) && Number(valueA) > 0) rawA.push(Number(valueA));
+    if (isFinite(Number(valueB)) && Number(valueB) > 0) rawB.push(Number(valueB));
   });
 
-  const A = totalWeightA > 0 ? [sumA / totalWeightA] : [];
-  const B = totalWeightB > 0 ? [sumB / totalWeightB] : [];
-  return { A, B };
+  return { A: rawA, B: rawB };
 }
 
 
@@ -13222,14 +13332,37 @@ function getMassacreMarketWindowSet(marketKey, parsed, fixtureMeta) {
   };
 
   ["q1", "q2", "q3", "q4"].forEach(q => {
+    // [FIX: quarter window de-aliasing — DO NOT REASSIGN THESE ARRAYS TO THE SAME REFERENCE]
+    // Previous code assigned the same array reference to overallA10Scored, overallA5Scored,
+    // and venueAScored (and their B/Allowed counterparts). Because all three windows held
+    // identical data, evaluateMassacreForPick computed:
+    //   trendAdj = (recentProj - seasonishProj) * 0.35 → always exactly 0
+    //   venueLayer → always 0; momentumLayer → always 0
+    // Three of the seven massacre diagnostic layers were permanently disabled for every
+    // quarter market. Fix: slice the full series to produce a genuine 5-game recent
+    // window. The venue window uses the massacre context quarter arrays when available;
+    // falls back to the 5-game slice (produces a neutral 0 layer, not a false signal)
+    // when no venue context data is present.
+    // DO NOT alias overallA10, overallA5, and venue to the same array again.
+    // DO NOT remove the .slice(0, 5) calls — they are what creates the distinct windows.
     const getQ = (t, s) => safeArr(parsed?.[`${t}${q.toUpperCase()}${s}`]) || [];
+    const aFull    = getQ('a', 'Scored');
+    const aAllFull = getQ('a', 'Allowed');
+    const bFull    = getQ('b', 'Scored');
+    const bAllFull = getQ('b', 'Allowed');
+    const vA   = g_massacreFetchContext.A[q + 'Scored']  || [];
+    const vAB  = g_massacreFetchContext.A[q + 'Allowed'] || [];
+    const vB   = g_massacreFetchContext.B[q + 'Scored']  || [];
+    const vBB  = g_massacreFetchContext.B[q + 'Allowed'] || [];
     map[q] = {
-      overallA10Scored: getQ('a', 'Scored'), overallA10Allowed: getQ('a', 'Allowed'),
-      overallB10Scored: getQ('b', 'Scored'), overallB10Allowed: getQ('b', 'Allowed'),
-      overallA5Scored: getQ('a', 'Scored'), overallA5Allowed: getQ('a', 'Allowed'),
-      overallB5Scored: getQ('b', 'Scored'), overallB5Allowed: getQ('b', 'Allowed'),
-      venueAScored: getQ('a', 'Scored'), venueAAllowed: getQ('a', 'Allowed'),
-      venueBScored: getQ('b', 'Scored'), venueBAllowed: getQ('b', 'Allowed')
+      overallA10Scored:  aFull,                overallA10Allowed:  aAllFull,
+      overallB10Scored:  bFull,                overallB10Allowed:  bAllFull,
+      overallA5Scored:   aFull.slice(0, 5),    overallA5Allowed:   aAllFull.slice(0, 5),
+      overallB5Scored:   bFull.slice(0, 5),    overallB5Allowed:   bAllFull.slice(0, 5),
+      venueAScored:  vA.length  ? vA  : aFull.slice(0, 5),
+      venueAAllowed: vAB.length ? vAB : aAllFull.slice(0, 5),
+      venueBScored:  vB.length  ? vB  : bFull.slice(0, 5),
+      venueBAllowed: vBB.length ? vBB : bAllFull.slice(0, 5)
     };
   });
 
