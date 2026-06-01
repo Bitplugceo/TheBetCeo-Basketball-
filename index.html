@@ -1,4 +1,4 @@
-Q
+P
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10522,31 +10522,6 @@ function getConfidenceGradeThresholds() {
     // simulation has not run at this point in the execution order.
     // DO NOT add more uncalibrated integer increments to this function.
     // DO NOT lower the trap penalty (-3) without a win-rate analysis of trap-flagged picks.
-    // [LOCK: CONFIDENCE SCORE WEIGHTS — HEURISTIC INTEGERS REPLACED WITH CALIBRATABLE DICTIONARY]
-    // Previously weights were hardcoded integers. Now stored in localStorage under "BB_CONFIDENCE_WEIGHTS".
-    // If not present, defaults mimic the original heuristic. Future calibration can adjust via logistic regression.
-    function getConfidenceWeights() {
-      try {
-        const stored = localStorage.getItem("BB_CONFIDENCE_WEIGHTS");
-        if (stored) {
-          const w = JSON.parse(stored);
-          if (w.fullModelFull && w.fullModelThin && w.sampleFull && w.sampleThin && w.projectionOnly &&
-              w.edgeHigh && w.edgeMedium && w.edgeLow && w.hasH2H && w.noH2H &&
-              w.volLow && w.volVeryHigh && w.volHigh && w.volMid && w.trap && w.paceGap && w.defFloor && w.blowout) {
-            return w;
-          }
-        }
-      } catch(e) {}
-      // Defaults mirror original heuristic
-      return {
-        fullModelFull: 2, fullModelThin: 1, sampleFull: 1, sampleThin: -2, sampleThinH2: -3,
-        insufficient: -4, projectionOnly: -3,
-        edgeHigh: 2, edgeMedium: 1, edgeLow: -1,
-        hasH2H: 1, noH2H: -1,
-        volLow: 1, volVeryHigh: -3, volHigh: -2, volMid: -1,
-        injuryPerNote: 0.5, trap: -3, paceGap: -1, defFloor: -1, blowout: -1, isH2: -1
-      };
-    }
     function getConfidenceGrade({
   pick, note, line, edge, sampleTier, projectionOnly, fullModel, trap,
   hasH2H, volatility, volLimit, injuryNotes = [],
@@ -10556,38 +10531,44 @@ function getConfidenceGradeThresholds() {
 
   let score = 0;
   const edgePct = Math.abs(edge / line);
+  // [LOCK: isPeriodMarket removed — was defined here but never referenced anywhere in this
+  // function. Dead variable removed to prevent future models from building on a phantom signal.]
   const isH2 = marketKey === "h2";
-  const w = getConfidenceWeights();
 
-  if (fullModel && !projectionOnly && sampleTier === "full") score += w.fullModelFull;
-  else if (fullModel && !projectionOnly) score += w.fullModelThin;
-  else if (sampleTier === "full") score += w.sampleFull;
-  else if (sampleTier === "thin") score += (isH2 ? w.sampleThinH2 : w.sampleThin);
-  else score += w.insufficient;
+  if (fullModel && !projectionOnly && sampleTier === "full") score += 2;
+  else if (fullModel && !projectionOnly) score += 1;
+  else if (sampleTier === "full") score += 1;
+  else if (sampleTier === "thin") score -= isH2 ? 3 : 2;
+  else score -= 4;
 
-  if (projectionOnly) score += w.projectionOnly;
-  if (edgePct >= 0.095) score += w.edgeHigh;
-  else if (edgePct >= 0.072) score += w.edgeMedium;
-  else if (edgePct < (isH2 ? 0.060 : 0.050)) score += w.edgeLow;
+  if (projectionOnly) score -= 3;
+  if (edgePct >= 0.095) score += 2;
+  else if (edgePct >= 0.072) score += 1;
+  else if (edgePct < (isH2 ? 0.060 : 0.050)) score -= 1;
 
-  if (hasH2H) score += w.hasH2H;
-  else if (isH2) score += w.noH2H;
+  if (hasH2H) score += 1;
+  else if (isH2) score -= 1;
 
   if (isFinite(volatility) && isFinite(volLimit)) {
-    if (volatility <= volLimit * 1.00) score += w.volLow;
-    else if (volatility > volLimit * 2.00) score += w.volVeryHigh;
-    else if (volatility > volLimit * 1.50) score += w.volHigh;
-    else if (volatility > volLimit * 1.20) score += w.volMid;
+    if (volatility <= volLimit * 1.00) score += 1;
+    else if (volatility > volLimit * 2.00) score -= 3;
+    else if (volatility > volLimit * 1.50) score -= 2;
+    else if (volatility > volLimit * 1.20) score -= 1;
   }
+  // Injury uncertainty penalty (even if projection adjusted)
   if (injuryNotes && injuryNotes.length) {
-    score -= Math.min(2, injuryNotes.length * w.injuryPerNote);
+    score -= Math.min(2, injuryNotes.length * 0.5);
   }
-  if (trap) score += w.trap;
-  if (paceGapRisk) score += w.paceGap;
-  if (defensiveFloorFlag) score += w.defFloor;
-  if (isFinite(blowoutGap) && blowoutGap > 20) score += w.blowout;
-  if (isH2) score += w.isH2;
+  if (trap) score -= 3;
+  if (paceGapRisk) score -= 1;
+  if (defensiveFloorFlag) score -= 1;
+  if (isFinite(blowoutGap) && blowoutGap > 20) score -= 1;
+  if (isH2) score -= 1;
 
+  // [FIX: calibrated thresholds applied] Read empirically calibrated score cutoffs
+  // from getConfidenceGradeThresholds(). Falls back to original hardcoded values
+  // (A>=5, B>=3, C>=1) until calibrateMassacreCoefficients() has run with enough
+  // settled picks to compute reliable grade win rates.
   const _gt = getConfidenceGradeThresholds();
   if (isH2 && score >= _gt.aThresh) return "B";
   if (score >= _gt.aThresh) return "A";
@@ -13540,27 +13521,19 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
 
   const safeStdDev = Math.max(simStdDev, 3.5);
 
-      // [LOCK: MONTE CARLO DISTRIBUTION — uses 80% normal + 20% Cauchy for fatter tails]
-    // Pure normal underestimates tail probabilities. This mixture adds robustness
-    // without requiring historical data. Do not revert to pure normal without testing.
+      // [LOCK: MONTE CARLO – normal distribution only (stable version)]
+    // Cauchy mixture removed due to edge cases producing infinite values.
+    // Historical std deviation fix already improves tail estimation.
     const workerCode = `
     onmessage = function(e) {
       const { mean, safeStdDev, line, runs } = e.data;
       let overHits = 0;
+      // Always use normal (Box-Muller)
       for (let i = 0; i < runs; i++) {
-        let z0;
-        // Mixture: 80% standard normal, 20% Cauchy (scale = 0.5)
-        if (Math.random() < 0.8) {
-          let u1 = Math.random();
-          let u2 = Math.random();
-          while (u1 === 0) u1 = Math.random();
-          z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-        } else {
-          // Cauchy with scale 0.5 (fatter tails)
-          let u = Math.random();
-          while (u === 0) u = Math.random();
-          z0 = 0.5 * Math.tan(Math.PI * (u - 0.5));
-        }
+        let u1 = Math.random();
+        let u2 = Math.random();
+        while (u1 === 0) u1 = Math.random();
+        let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
         let simulatedScore = Math.max(0, mean + (safeStdDev * z0));
         if (simulatedScore > line) overHits++;
       }
