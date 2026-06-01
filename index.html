@@ -9084,7 +9084,9 @@ function bumpConfidenceGrade(grade, shift = 0) {
   const ladder = ["D", "C", "B", "A"];
   const idx = ladder.indexOf(String(grade || "").toUpperCase());
   if (idx === -1) return grade || "—";
-  return ladder[clampNumber(idx + shift, 0, ladder.length - 1)];
+  const newIdx = idx + shift;
+  if (newIdx < 0) return "F";
+  return ladder[clampNumber(newIdx, 0, ladder.length - 1)];
 }
 
 // [DELETED] settledTrackerScore – unused function
@@ -9134,17 +9136,28 @@ function buildTrackerFeedbackProfile() {
 }
 
 // Bayesian version: returns posterior win probability for (league, market, side)
+function getEmpiricalPriorWinRate(side, broadPicks) {
+  const relevant = broadPicks.filter(p =>
+    String(p.side || "").toLowerCase() === side &&
+    (p.resultStatus === "win" || p.resultStatus === "loss")
+  );
+  if (relevant.length < 30) return 50;
+  const wins = relevant.filter(p => p.resultStatus === "win").length;
+  return Math.min(60, Math.max(40, (wins / relevant.length) * 100));
+}
+
 function getTrackerPosteriorWinProb(league, marketKey, side, priorGames = 12, priorWinRate = 50) {
   const all = getLearningTrackedPicks();
-  const matches = all.filter(p => 
-    p.league === league && 
-    p.marketKey === marketKey && 
+  const empiricalPrior = getEmpiricalPriorWinRate(side, all);
+  const matches = all.filter(p =>
+    p.league === league &&
+    p.marketKey === marketKey &&
     p.side === side &&
     (p.resultStatus === "win" || p.resultStatus === "loss")
   );
   const wins = matches.filter(p => p.resultStatus === "win").length;
   const total = matches.length;
-  const priorWins = priorGames * (priorWinRate / 100);
+  const priorWins = priorGames * (empiricalPrior / 100);
   const posteriorWinRate = (wins + priorWins) / (total + priorGames);
   return posteriorWinRate;
 }
@@ -10107,11 +10120,14 @@ function addTrackedPicks(newPicks) {
   if (sampleTier === "thin") base *= 0.85;
 
   if (isFinite(divergence)) {
-    // Use raw point difference, not scaled by league baseline
-    const rawDiv = Math.abs(divergence);
-    if (rawDiv >= 18) base *= 0.45;
-    else if (rawDiv >= 12) base *= 0.62;
-    else if (rawDiv >= 8) base *= 0.80;
+    const leagueBase = LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160;
+    const rawDiv   = Math.abs(divergence);
+    const highGate = leagueBase * 0.078;
+    const medGate  = leagueBase * 0.052;
+    const lowGate  = leagueBase * 0.035;
+    if (rawDiv >= highGate) base *= 0.45;
+    else if (rawDiv >= medGate) base *= 0.62;
+    else if (rawDiv >= lowGate) base *= 0.80;
   }
 
   const freqMod =
@@ -12825,7 +12841,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     
     const leagueAvgORTG = 100;
     const leagueAvgDRTG = 100;
-    const priorWeight = 12;
+    const priorWeight = Math.round(12 * ((LEAGUE_VOL_LIMITS["nba"] || 14) / (LEAGUE_VOL_LIMITS[league] || 12)));
     const aFTS_clean = aFTS.map(Number).filter(v => isFinite(v) && v > 0);
     const bFTS_clean = bFTS.map(Number).filter(v => isFinite(v) && v > 0);
     const aFTA_clean = aFTA.map(Number).filter(v => isFinite(v) && v > 0);
@@ -12993,20 +13009,18 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   if (!hasVenueA && roleA === "home") projA1H += (homeEdge / 4);
   if (!hasVenueB && roleA === "away") projB1H += (homeEdge / 4);
 
-  // LOCK: pass teamH1Base (eb/4) as baseline so applyVolatility never produces NaN
   if (isFinite(projA1H)) {
-    projA1H = applyVolatility(projA1H, aVol1, h1Vl, teamH1Base);
     projA1H = anchorProjection(projA1H, lines.h1aLine, league, "team");
   }
   if (isFinite(projB1H)) {
-    projB1H = applyVolatility(projB1H, bVol1, h1Vl, teamH1Base);
     projB1H = anchorProjection(projB1H, lines.h1bLine, league, "team");
   }
 
   let h1Proj = projA1H + projB1H;
-  // LOCK: pass h1Baseline (eb/2) as baseline for combined 1H total
+  // FIX: single volatility dampening at combined level using quadrature combined vol
   if (isFinite(h1Proj)) {
-    h1Proj = applyVolatility(h1Proj, Math.max(aVol1, bVol1), h1Vl, h1Baseline);
+    const h1CombinedVol = Math.sqrt(aVol1 * aVol1 + bVol1 * bVol1);
+    h1Proj = applyVolatility(h1Proj, h1CombinedVol, h1Vl, h1Baseline);
     h1Proj = anchorProjection(h1Proj, lines.h1Line, league, "h1");
   }
 
@@ -13086,7 +13100,14 @@ function getMassacreRuns(league) {
   return MASSACRE_TUNING.monteCarloRuns.other;
 }
 
-function getMassacreModelRangeLimit(marketKey) {
+function getMassacreModelRangeLimit(marketKey, line) {
+  const _line = isFinite(Number(line)) && Number(line) > 0 ? Number(line) : null;
+  if (_line) {
+    if (marketKey === "ft")                                    return Math.max(8, Math.round(_line * 0.115));
+    if (marketKey === "h1" || marketKey === "h2")             return Math.max(6, Math.round(_line * 0.120));
+    if (marketKey.startsWith("q") && marketKey.length === 2) return Math.max(4, Math.round(_line * 0.120));
+    return Math.max(5, Math.round(_line * 0.115));
+  }
   if (marketKey === "ft") return MASSACRE_TUNING.maxModelRange.ft;
   if (marketKey === "h1") return MASSACRE_TUNING.maxModelRange.h1;
   if (marketKey === "h2") return MASSACRE_TUNING.maxModelRange.h2;
@@ -13224,25 +13245,38 @@ function getMassacreMarketWindowSet(marketKey, parsed, fixtureMeta) {
   return windows;
 }
 
+function _getMassacreBlendWeight(aSc, bAll) {
+  const minLen = Math.min(
+    Array.isArray(aSc)  ? aSc.length  : 0,
+    Array.isArray(bAll) ? bAll.length : 0
+  );
+  return 0.50 + 0.05 * Math.min(minLen, 5) / 5;
+}
+
 function projectMassacreTotal(aSc, aAll, bSc, bAll) {
   if (!Array.isArray(aSc) || !Array.isArray(aAll) || !Array.isArray(bSc) || !Array.isArray(bAll)) return NaN;
-  const ASc = avgOrNaN(aSc);
+  const ASc  = avgOrNaN(aSc);
   const AAll = avgOrNaN(aAll);
-  const BSc = avgOrNaN(bSc);
+  const BSc  = avgOrNaN(bSc);
   const BAll = avgOrNaN(bAll);
   if (![ASc, AAll, BSc, BAll].every(v => isFinite(v))) return NaN;
-  return (0.55 * ASc + 0.45 * BAll) + (0.55 * BSc + 0.45 * AAll);
+  const wA = _getMassacreBlendWeight(aSc, bAll);
+  const wB = _getMassacreBlendWeight(bSc, aAll);
+  return (wA * ASc + (1 - wA) * BAll) + (wB * BSc + (1 - wB) * AAll);
 }
 
 function projectMassacreTeam(side, aSc, aAll, bSc, bAll) {
-  const ASc = avgOrNaN(aSc);
+  const ASc  = avgOrNaN(aSc);
   const AAll = avgOrNaN(aAll);
-  const BSc = avgOrNaN(bSc);
+  const BSc  = avgOrNaN(bSc);
   const BAll = avgOrNaN(bAll);
   if (![ASc, AAll, BSc, BAll].every(v => isFinite(v))) return NaN;
-  return side === "A"
-    ? (0.55 * ASc + 0.45 * BAll)
-    : (0.55 * BSc + 0.45 * AAll);
+  if (side === "A") {
+    const w = _getMassacreBlendWeight(aSc, bAll);
+    return w * ASc + (1 - w) * BAll;
+  }
+  const w = _getMassacreBlendWeight(bSc, aAll);
+  return w * BSc + (1 - w) * AAll;
 }
 
 function meanFromList(values) {
@@ -13419,11 +13453,13 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
   const ensembleMean = meanFromList(trimmedModels);
   const modelRange = sortedModels.length ? (sortedModels[sortedModels.length - 1] - sortedModels[0]) : NaN;
 
-  const buffer =
-    marketKey === "ft" ? 1.75 :
-    marketKey === "h1" || marketKey === "h2" ? 1.25 :
-    marketKey.startsWith("q") ? 0.75 :
-    1.0;
+  const _bufLine = isFinite(Number(pickRow?.line)) && Number(pickRow.line) > 0
+    ? Number(pickRow.line)
+    : (LEAGUE_BASES[league] || 160);
+  const buffer = Math.max(
+    marketKey.startsWith("q") ? 0.60 : 1.0,
+    _bufLine * 0.008
+  );
 
   let agreement = 0;
   let disagreement = 0;
@@ -13451,6 +13487,13 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
       : projectMassacreTotal(windows.overallA5Scored, windows.overallA5Allowed, windows.overallB5Scored, windows.overallB5Allowed);
 
   const paceMetric = (() => {
+    const pA = g_massacreFetchContext?.A?.pace10;
+    const pB = g_massacreFetchContext?.B?.pace10;
+    if (Array.isArray(pA) && pA.length >= 2 && Array.isArray(pB) && pB.length >= 2) {
+      const avgPA = avgOrNaN(pA);
+      const avgPB = avgOrNaN(pB);
+      if (isFinite(avgPA) && isFinite(avgPB)) return (avgPA + avgPB) / 2;
+    }
     const a = avgOrNaN(windows.overallA10Scored) + avgOrNaN(windows.overallA10Allowed);
     const b = avgOrNaN(windows.overallB10Scored) + avgOrNaN(windows.overallB10Allowed);
     if (!isFinite(a) || !isFinite(b)) return NaN;
@@ -13573,7 +13616,7 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
   if (simPct < thresholds.sim) failedReasons.push(`sim ${simPct.toFixed(1)}%`);
   if (alignedConvergence < thresholds.convergence) failedReasons.push(`convergence ${alignedConvergence}`);
   if (brutalityScore < thresholds.brutality) failedReasons.push(`score ${brutalityScore.toFixed(0)}`);
-  if (isFinite(modelRange) && modelRange > getMassacreModelRangeLimit(marketKey)) failedReasons.push(`range ${modelRange.toFixed(1)}`);
+  if (isFinite(modelRange) && modelRange > getMassacreModelRangeLimit(marketKey, pickRow?.line)) failedReasons.push(`range ${modelRange.toFixed(1)}`);
 
   return {
     marketKey,
@@ -13605,7 +13648,7 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
 function getMassacreProfile(diag, pickRow, league) {
   const marketKey = diag?.marketKey || getMarketKeyFromName(pickRow?.name);
   const thresholds = getMassacreThresholdBucket(league, marketKey);
-  const rangeLimit = getMassacreModelRangeLimit(marketKey);
+  const rangeLimit = getMassacreModelRangeLimit(marketKey, pickRow?.line);
   const edgePct = isFinite(Number(pickRow?.edge)) && isFinite(Number(pickRow?.line)) && Number(pickRow.line) > 0
     ? Math.abs((Number(pickRow.edge) / Number(pickRow.line)) * 100)
     : 0;
@@ -13843,14 +13886,49 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
       const leaguePicks = settled.filter(p => p.league === league);
       if (leaguePicks.length < 50) return; // [FIX: raised from 30] 30 samples is insufficient for stable 6-param logistic regression
 
+      // [FIX: feature normalization + dynamic learning rate]
+      // Normalise each feature to zero mean and unit variance so all coefficients
+      // operate on a comparable scale and gradient steps are well-conditioned.
+      // Learning rate scales up for small samples to ensure convergence.
+      const _fKeys = ["simPct", "brutalityScore", "agreement", "convergence", "modelCount"];
+      const _rawF  = leaguePicks.map(pick => {
+        const diag = pick.massacre;
+        return {
+          simPct:         diag.simPct - 50,
+          brutalityScore: diag.brutalityScore - 50,
+          agreement:      diag.agreement,
+          convergence:    diag.alignedConvergence,
+          modelCount:     diag.modelCount - 2
+        };
+      });
+      const _fMean = {};
+      const _fStd  = {};
+      _fKeys.forEach(k => {
+        const vals     = _rawF.map(f => f[k]);
+        const m        = vals.reduce((s, v) => s + v, 0) / vals.length;
+        const variance = vals.reduce((s, v) => s + Math.pow(v - m, 2), 0) / Math.max(1, vals.length - 1);
+        _fMean[k] = m;
+        _fStd[k]  = Math.sqrt(variance) || 1;
+      });
+      const _normP = leaguePicks.map((pick, i) => ({
+        pick,
+        x: {
+          simPct:         (_rawF[i].simPct         - _fMean.simPct)         / _fStd.simPct,
+          brutalityScore: (_rawF[i].brutalityScore  - _fMean.brutalityScore) / _fStd.brutalityScore,
+          agreement:      (_rawF[i].agreement       - _fMean.agreement)      / _fStd.agreement,
+          convergence:    (_rawF[i].convergence     - _fMean.convergence)    / _fStd.convergence,
+          modelCount:     (_rawF[i].modelCount      - _fMean.modelCount)     / _fStd.modelCount
+        }
+      }));
+
       // [FIX: L2 regularization + early stopping] Gradient descent with L2 penalty
       // prevents coefficient blow-up on small samples. Early stopping halts training
       // when per-window log-likelihood gain falls below tolerance, avoiding wasted
       // iterations and additional overfitting. Intercept is not L2-penalised.
-      // Features: simPct-50, brutalityScore-50, agreement, convergence, modelCount-2
+      // Features: normalised simPct, brutalityScore, agreement, convergence, modelCount
       // Target: win = 1, loss = 0
       let coeff = { simPct: 0.032, brutalityScore: 0.018, agreement: 0.12, convergence: 0.08, modelCount: 0.05, intercept: -2.5 };
-      const learningRate = 0.0001;
+      const learningRate = leaguePicks.length < 200 ? 0.001 : 0.0001;
       const lambda = 0.01;
       const iterations = 500;
       const earlyStopWindow = 50;
@@ -13859,24 +13937,18 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
       for (let iter = 0; iter < iterations; iter++) {
         let grad = { simPct:0, brutalityScore:0, agreement:0, convergence:0, modelCount:0, intercept:0 };
         let logLik = 0;
-        for (const pick of leaguePicks) {
-          const diag = pick.massacre;
-          const x_sim = diag.simPct - 50;
-          const x_brut = diag.brutalityScore - 50;
-          const x_agree = diag.agreement;
-          const x_conv = diag.alignedConvergence;
-          const x_count = diag.modelCount - 2;
-          const logOdds = coeff.intercept + coeff.simPct * x_sim + coeff.brutalityScore * x_brut + coeff.agreement * x_agree + coeff.convergence * x_conv + coeff.modelCount * x_count;
+        for (const { pick, x } of _normP) {
+          const logOdds = coeff.intercept + coeff.simPct * x.simPct + coeff.brutalityScore * x.brutalityScore + coeff.agreement * x.agreement + coeff.convergence * x.convergence + coeff.modelCount * x.modelCount;
           const p = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, logOdds))));
           const y = pick.resultStatus === "win" ? 1 : 0;
           const error = y - p;
           logLik += y === 1 ? Math.log(Math.max(1e-9, p)) : Math.log(Math.max(1e-9, 1 - p));
           grad.intercept += error;
-          grad.simPct += error * x_sim;
-          grad.brutalityScore += error * x_brut;
-          grad.agreement += error * x_agree;
-          grad.convergence += error * x_conv;
-          grad.modelCount += error * x_count;
+          grad.simPct += error * x.simPct;
+          grad.brutalityScore += error * x.brutalityScore;
+          grad.agreement += error * x.agreement;
+          grad.convergence += error * x.convergence;
+          grad.modelCount += error * x.modelCount;
         }
         // Update with L2 regularization (intercept exempt)
         coeff.intercept += learningRate * grad.intercept;
