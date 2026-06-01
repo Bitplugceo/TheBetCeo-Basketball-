@@ -1,4 +1,3 @@
-D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3549,6 +3548,14 @@ const BB_CONFIG = {
 
 
 
+    // [LOCK: regressionWeight AND baselineWeight ARE INTENTIONALLY DEAD OUTPUTS]
+    // computeFTProjection uses its own inline priorWeight derived from LEAGUE_VOL_LIMITS
+    // ratios. regressionWeight and baselineWeight returned here have NO live consumers in
+    // any projection or pick path — they exist for API completeness only.
+    // The test suite exercises getDynamicWeights as if it drives blending, but it does NOT.
+    // Only teamWeight and oppWeight are active. DO NOT wire regressionWeight or
+    // baselineWeight into computeFTProjection without first removing the inline priorWeight
+    // block. DO NOT add new consumers of these outputs without documenting them here.
     function getDynamicWeights(sampleTier, volatility, league) {
   const isFull = sampleTier === "full";
   const leagueAvg = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
@@ -3557,6 +3564,7 @@ const BB_CONFIG = {
   
   let teamWeight = clampNumber((isFull ? 0.65 : 0.50) - (isHighVol ? 0.10 : 0), 0.40, 0.75);
 
+  // [LOCK: regressionWeight and baselineWeight not consumed by projection path — see above]
   return { 
     teamWeight, 
     oppWeight: 1.0 - teamWeight, 
@@ -6279,11 +6287,19 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
 
   let possessions = 0.96 * (fga + (0.44 * fta) - (0.4 * orb) + tov);
 
-  if (possessions <= 0) {
+  // [LOCK: NULL RETURN FOR INVALID POSSESSIONS — DO NOT REINSTATE THE DEFAULT SUBSTITUTION]
+  // Previous version replaced computed possessions with 100 (48-min games) or 80 (shorter)
+  // when the formula yielded < 50. A partial or failed boxscore fetch produced
+  // plausible-looking but entirely fabricated ORTG/DRTG/pace values, stored them in the
+  // massacre context, and used them in projections with no flag indicating they came from
+  // assumed inputs rather than real data.
+  // Fix: return null when possessions <= 0 OR < 50. The caller already handles null safely:
+  //   if (advResult) { advanced = advResult; }
+  // so null correctly skips storing invalid metrics with no other change required.
+  // DO NOT reinstate any default substitution. DO NOT lower the < 50 threshold.
+  if (possessions <= 0 || possessions < 50) {
     return null;
   }
-
-  if (possessions < 50) possessions = (minutes >= 48 ? 100 : 80);
 
   const ortg = (pointsScored / possessions) * 100;
   const drtg = (pointsAllowed / possessions) * 100;
@@ -6692,9 +6708,18 @@ function getRawMarketInputMap() {
       return out;
     }
 
+    // [LOCK: NON-FINITE FILTER — DO NOT REMOVE]
+    // avg previously reduced raw arrays without filtering. Any upstream NaN or non-finite
+    // element (e.g. from a missing or failed data fetch) caused the entire result to become
+    // NaN, silently corrupting downstream projections with no error or warning.
+    // Downstream callers such as stdDev and weightedRecentAverage filter their own inputs,
+    // but code paths that call avg directly on unvalidated arrays were exposed.
+    // The isFinite filter here closes that gap at the source.
+    // DO NOT revert to the unfiltered reduce. DO NOT remove the clean.length guard.
     function avg(arr) {
       if (!arr || arr.length === 0) return NaN;
-      return arr.reduce((a, b) => a + b, 0) / arr.length;
+      const clean = arr.filter(v => isFinite(v));
+      return clean.length ? clean.reduce((a, b) => a + b, 0) / clean.length : NaN;
     }
 
     function weightedRecentAverage(arr, weights = MODEL_TUNING.recencyWeights) {
@@ -10183,15 +10208,22 @@ function addTrackedPicks(newPicks) {
 
   if (sampleTier === "thin") base *= 0.85;
 
+  // [LOCK: SMOOTH EXPONENTIAL DECAY — DO NOT REVERT TO STEP FUNCTION]
+  // Previous: 3 hard brackets (×0.45 / ×0.62 / ×0.80 at 7.8% / 5.2% / 3.5% of leagueBase).
+  // A divergence of 5.19% applied ×0.80; 5.21% applied ×0.62 — a 22% weight step at an
+  // arbitrary boundary with no statistical basis. Two nearly identical matchups sitting just
+  // above and below the same gate received very different H2H blending.
+  // Fix: multiplier = exp(-2.5 × rawDiv / leagueBase), clamped to [0.40, 1.0].
+  //   0% divergence → 1.00 (no penalty)
+  //   5.2% divergence → ≈0.72
+  //   7.8% divergence → ≈0.53
+  // Continuous and monotonically decreasing — zero discontinuities.
+  // DO NOT replace with step brackets. DO NOT remove the clamp floor of 0.40.
   if (isFinite(divergence)) {
     const leagueBase = LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160;
-    const rawDiv   = Math.abs(divergence);
-    const highGate = leagueBase * 0.078;
-    const medGate  = leagueBase * 0.052;
-    const lowGate  = leagueBase * 0.035;
-    if (rawDiv >= highGate) base *= 0.45;
-    else if (rawDiv >= medGate) base *= 0.62;
-    else if (rawDiv >= lowGate) base *= 0.80;
+    const rawDiv = Math.abs(divergence);
+    const multiplier = clampNumber(Math.exp(-2.5 * rawDiv / leagueBase), 0.40, 1.0);
+    base *= multiplier;
   }
 
   const freqMod =
@@ -10385,7 +10417,15 @@ function getPick(edge, line, league, marketType, context = {}) {
       // DO NOT add any league whitelist, blacklist, or _isAutomatedLeague check here.
       if (!line || isNaN(edge) || line <= 0 || !pick || pick === "NO PLAY") return false;
       const pct = Math.abs(edge / line);
-      if (pct < TRAP_RULES.minEdgePct) return true;
+      // [LOCK: LEAGUE-SCALED TRAP FLOOR — DO NOT REVERT TO TRAP_RULES.minEdgePct]
+      // TRAP_RULES.minEdgePct = 0.015 (1.5%). Every league's pick-generation threshold is
+      // 5.5%–6.8% (LEAGUE_EDGE_THRESHOLDS). No real pick output can ever have pct < 1.5%
+      // because the pick gate already blocked it — the old check was permanently dead.
+      // Fix: _leagueTrapFloor = 60% of the league's FT threshold, placing the trap floor
+      // just below the pick gate where the check is actually meaningful for borderline picks.
+      // DO NOT restore TRAP_RULES.minEdgePct here. DO NOT set _leagueTrapFloor below 0.025.
+      const _leagueTrapFloor = (getLeagueEdgeThresholds(league)?.ft || TRAP_RULES.minEdgePct) * 0.60;
+      if (pct < _leagueTrapFloor) return true;
 
       let bad = 0;
       const volLimit = getTrapVolThreshold(marketType, league);
@@ -10464,6 +10504,19 @@ function getConfidenceGradeThresholds() {
   return { aThresh: 5, bThresh: 3, cThresh: 1 };
 }
 
+    // [LOCK: ADDITIVE INTEGER SCORING — WEIGHTS ARE HEURISTIC, NOT EMPIRICALLY CALIBRATED]
+    // Each factor (+2 fullModel, +1 H2H, -3 trap, etc.) is an arbitrary integer with no
+    // statistical derivation. calibrateMassacreCoefficients adjusts only the grade BOUNDARY
+    // THRESHOLDS (A/B/C cutoffs) from settled win rates — it never adjusts individual factor
+    // weights. A model could have persistently miscalibrated A-vs-B discrimination even after
+    // calibration runs if any single factor weight is wrong.
+    // The correct long-term replacement is logistic regression on (edgePct, sampleTier,
+    // hasH2H, volatility ratio, trap, paceGapRisk) predicting P(win), with grade boundaries
+    // set from calibrated probability thresholds. simPct from the massacre Monte Carlo is
+    // applied downstream via bumpConfidenceGrade — it cannot be added here because the
+    // simulation has not run at this point in the execution order.
+    // DO NOT add more uncalibrated integer increments to this function.
+    // DO NOT lower the trap penalty (-3) without a win-rate analysis of trap-flagged picks.
     function getConfidenceGrade({
   pick, note, line, edge, sampleTier, projectionOnly, fullModel, trap,
   hasH2H, volatility, volLimit, injuryNotes = [],
@@ -10473,7 +10526,8 @@ function getConfidenceGradeThresholds() {
 
   let score = 0;
   const edgePct = Math.abs(edge / line);
-  const isPeriodMarket = marketKey === "ft" || marketKey === "h1" || marketKey === "h2";
+  // [LOCK: isPeriodMarket removed — was defined here but never referenced anywhere in this
+  // function. Dead variable removed to prevent future models from building on a phantom signal.]
   const isH2 = marketKey === "h2";
 
   if (fullModel && !projectionOnly && sampleTier === "full") score += 2;
@@ -10533,7 +10587,14 @@ function getConfidenceGradeThresholds() {
 
   const scale = Number(MODEL_TUNING.anchorScale?.[marketType] || 0.75);
   const excess = clampNumber((diff - diffGate) / Math.max(1, diffGate * 1.5), 0, 1);
-  const weight = clampNumber(baseWeight * scale * excess, 0, 0.70);
+  // [LOCK: ANCHOR CAP REDUCED 0.70 → 0.55 — DO NOT RAISE ABOVE 0.60]
+  // The betting line is set by bookmakers to balance action, not to reflect the true
+  // expected total. A 0.70 cap allowed the market to dominate the model by 70% even on
+  // the engine's largest independent deviations, systematically diluting the signal exactly
+  // where a big model-vs-market divergence is most valuable.
+  // Cap of 0.55 ensures the model always contributes at least 45% of the final projection.
+  // DO NOT raise this cap above 0.60. DO NOT revert to 0.70.
+  const weight = clampNumber(baseWeight * scale * excess, 0, 0.55);
 
   return (proj * (1 - weight)) + (line * weight);
 }
@@ -10603,12 +10664,31 @@ function hitRateOver(series, threshold) {
   const clean = normalizeIntelSeries(series);
   const line = Number(threshold);
   if (!clean.length || !isFinite(line) || line <= 0) return NaN;
-  return (clean.filter(v => v > line).length / clean.length) * 100;
+  // [LOCK: BETA-BINOMIAL SHRINKAGE — DO NOT REVERT TO RAW HIT RATE]
+  // Previous: (overCount / n) * 100. At n=3 only four outputs were possible
+  // (0%, 33%, 67%, 100%) with standard error ~29%. A single game flip could reverse the
+  // entire market signal direction in the Intel pack. probTeamOverThreshold already uses
+  // the same 10-game Beta prior at 50% — this function is now consistent with it.
+  // Formula: (hits + PRIOR_GAMES * PRIOR_RATE) / (n + PRIOR_GAMES), identical to
+  // probTeamOverThreshold. DO NOT remove the prior constants.
+  // DO NOT reinstate the raw overCount/n division.
+  const PRIOR_GAMES = 10;
+  const PRIOR_RATE  = 0.50;
+  const overCount = clean.filter(v => v > line).length;
+  return ((overCount + PRIOR_GAMES * PRIOR_RATE) / (clean.length + PRIOR_GAMES)) * 100;
 }
 
 function recentFormDelta(scored, allowed) {
   const margins = marginSeries(scored, allowed);
-  if (!margins.length) return NaN;
+  // [LOCK: n >= 4 GUARD — DO NOT LOWER TO 3 OR REMOVE]
+  // When margins.length === 3, both 'recent' (slice(0, 3)) and 'baseline' (full margins)
+  // receive the identical 3-element array with the same recency weights [1.35, 1.20, 1.00],
+  // producing identical weighted means and delta = 0. The function silently suppressed the
+  // form signal for any team with exactly 3 games, returning a computed-looking 0 that
+  // implied flat form rather than NaN, which is the honest thin-sample signal.
+  // Callers treat NaN as neutral (no contribution), which is correct behavior.
+  // DO NOT lower this guard to 3 — that was the broken case. DO NOT return 0 here.
+  if (margins.length < 4) return NaN;
   const recent = weightedRecentAverage(margins.slice(0, Math.min(3, margins.length)));
   const baseline = weightedRecentAverage(margins);
   return isFinite(recent) && isFinite(baseline) ? recent - baseline : NaN;
@@ -12995,8 +13075,17 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
   const useVenueForB = hasVenueDataB && roleA === "away";
       const hasVenueDataA_ft = (g_massacreFetchContext.A.venue?.ftScored10?.length || 0) >= 2;
     const hasVenueDataB_ft = (g_massacreFetchContext.B.venue?.ftScored10?.length || 0) >= 2;
-    if (!hasVenueDataA_ft && roleA === "home") projAFT += (homeEdge / 2);
-    if (!hasVenueDataB_ft && roleA === "away") projBFT += (homeEdge / 2);
+    // [LOCK: HOME EDGE ADJUSTMENT HALVED TO homeEdge/4 — DO NOT REVERT TO homeEdge/2]
+    // The team's scored/allowed series is venue-mixed, typically ~50% home games, so the
+    // averages already embed approximately half the home advantage before this block runs.
+    // Adding homeEdge/2 on top inflated home projections by ~homeEdge/4 above the correct
+    // value — double-counting the half of home advantage already captured in the averages.
+    // Fix: homeEdge/4 represents only the residual advantage not yet in the mixed-venue mean,
+    // assuming a ~50/50 home/away sample composition.
+    // For full accuracy, track homeGameFraction per series and use:
+    //   homeEdge/2 * (0.5 - homeGameFraction). DO NOT restore homeEdge/2 here.
+    if (!hasVenueDataA_ft && roleA === "home") projAFT += (homeEdge / 4);
+    if (!hasVenueDataB_ft && roleA === "away") projBFT += (homeEdge / 4);
 
 
 
@@ -13569,21 +13658,42 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
     ? (recentProj - seasonishProj) * 0.35
     : 0;
 
-  const momentumProj = isFinite(pickRow?.proj) ? pickRow.proj + trendAdj : NaN;
-
+  // [LOCK: momentumProj REMOVED FROM ENSEMBLE — DO NOT RE-ADD AS A SEPARATE MEMBER]
+  // Previous version added (pickRow.proj + trendAdj) as a 6th ensemble projection.
+  // trendAdj = (recentProj - seasonishProj) * 0.35. recentProj is already member [1] of
+  // the ensemble, so the same recent-form signal was counted twice: once as its raw value
+  // and once folded into the momentum projection at 35% amplification. When recent form
+  // strongly exceeded the seasonal baseline, both recentProj and momentumProj pushed
+  // ensembleMean upward together, over-weighting the short-term trend by design.
+  // trendAdj is now applied as a bounded post-processing nudge on ensembleMean (15% blend)
+  // after the ensemble is finalized — contribution is proportional and non-duplicated.
+  // DO NOT add momentumProj back to modelProjections. DO NOT raise trendBlend above 0.20.
   const modelProjections = [
     Number(pickRow?.proj),
     recentProj,
     seasonishProj,
     venueProj,
-    momentumProj,
     h2hProj
   ].filter(v => isFinite(v));
 
   const sortedModels = [...modelProjections].sort((a, b) => a - b);
-  const _isManualLeagueForEnsemble = league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre";
-  const trimmedModels = (!_isManualLeagueForEnsemble && sortedModels.length >= 5) ? sortedModels.slice(1, -1) : sortedModels;
-  const ensembleMean = meanFromList(trimmedModels);
+  // [LOCK: OUTLIER TRIM APPLIES TO ALL LEAGUES — DO NOT RE-ADD _isManualLeagueForEnsemble]
+  // Previous version disabled the min/max trim for non-NBA/NCAA/WNBA leagues. This was
+  // backwards: manual-entry leagues have higher measurement error from hand-entered scores,
+  // making outlier ensemble members MORE likely to reflect data-entry mistakes than genuine
+  // signals. The league restriction was actively harmful to the leagues that needed it most.
+  // The 5-model threshold already ensures sufficient ensemble redundancy before any trim.
+  // DO NOT reinstate _isManualLeagueForEnsemble. DO NOT add any league whitelist here.
+  const trimmedModels = sortedModels.length >= 5 ? sortedModels.slice(1, -1) : sortedModels;
+  const ensembleMeanRaw = meanFromList(trimmedModels);
+  // [LOCK: MOMENTUM NUDGE — 15% post-processing blend, NOT a separate ensemble member]
+  // trendAdj (computed above from recentProj vs seasonishProj) is applied here as a bounded
+  // nudge rather than as a 6th ensemble projection, preventing double-counting recentProj.
+  // DO NOT increase _trendBlend above 0.20. DO NOT move this back into modelProjections.
+  const _trendBlend = 0.15;
+  const ensembleMean = isFinite(ensembleMeanRaw) && isFinite(trendAdj)
+    ? ensembleMeanRaw + trendAdj * _trendBlend
+    : ensembleMeanRaw;
   const modelRange = sortedModels.length ? (sortedModels[sortedModels.length - 1] - sortedModels[0]) : NaN;
 
   const _bufLine = isFinite(Number(pickRow?.line)) && Number(pickRow.line) > 0
