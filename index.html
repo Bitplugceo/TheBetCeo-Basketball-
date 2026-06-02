@@ -1,4 +1,4 @@
-Z
+D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2492,8 +2492,6 @@ body.dark-mode .tracker-analytics-section-head {
       <option value="united_league">United League (Intl)</option>
       <option value="uruguay_lub">Uruguay - LUB</option>
       <option value="uruguay_lfb_w">Uruguay - LFB Women</option>
-      <option value="wnba">USA - WNBA</option>
-      <option value="wnba_pre">USA - WNBA Preseason</option>
     </optgroup>
     <optgroup label="── V ──────────────────">
       <option value="venezuela_sl">Venezuela - SuperLiga</option>
@@ -2538,7 +2536,7 @@ body.dark-mode .tracker-analytics-section-head {
 </div>
 
 <div class="section" id="espnSection">
-  <h3>⚡ ESPN Auto-Fetch <span style="font-size:11px;color:#aaa;">(NBA &amp; NCAA only)</span></h3>
+  <h3>⚡ ESPN Auto-Fetch <span style="font-size:11px;color:#aaa;">(NBA, WNBA, NCAA, G League &amp; NCAA Women)</span></h3>
 
   <div id="fixtureToolbar" class="fixture-toolbar">
     <button type="button" class="fixture-day active" id="fixturesTodayBtn">Today</button>
@@ -4582,7 +4580,8 @@ const TRACKER_LEARNING_ENABLED = true;
 const TRACKER_LEGACY_BUILD_KEYS = ["tracker_cleanup_v11_soft_live", "tracker_cleanup_v10_advisory", "tracker_cleanup_v9", "tracker_cleanup_v8", "tracker_cleanup_v7", "tracker_cleanup_v6", "tracker_cleanup_v5", "tracker_cleanup_v4"];
 
 const ENGINE_LINE_MEMORY_STORAGE = "bb_engine_line_memory_v1";
-let g_engineLineMemory = loadEngineLineMemory();
+let g_engineLineMemory =   loadEngineLineMemory();
+  loadRefereeTendencies();
 
 function loadEngineLineMemory() {
   try {
@@ -9607,6 +9606,47 @@ function getTrackedLeagueBase(league) {
   return "";
 }
 
+// [FIX #20] Fetch standings for a given league (silent background load)
+async function fetchStandings(league) {
+  const base = getTrackedLeagueBase(league);
+  if (!base) return null;
+  try {
+    const url = `${base}/standings?season=${getCurrentSeasonYear(league)}&limit=50`;
+    const data = await proxyFetch(url, 6000);
+    if (!data || !data.standings || !data.standings.entries) return null;
+    const standings = {};
+    data.standings.entries.forEach(entry => {
+      const teamId = entry.team?.id || entry.id;
+      const teamName = entry.team?.displayName || entry.displayName || "";
+      const stats = entry.stats || [];
+      const findStat = (name) => {
+        const stat = stats.find(s => s.name === name || s.abbreviation === name);
+        return stat ? parseFloat(stat.value) : NaN;
+      };
+      standings[teamId] = {
+        name: teamName,
+        wins: findStat("wins"),
+        losses: findStat("losses"),
+        winPct: findStat("winPercent"),
+        homeWins: findStat("homeWins"),
+        homeLosses: findStat("homeLosses"),
+        awayWins: findStat("awayWins"),
+        awayLosses: findStat("awayLosses"),
+        last10Wins: findStat("last10Wins"),
+        last10Losses: findStat("last10Losses"),
+        streak: findStat("streak"),
+        gamesBehind: findStat("gamesBehind"),
+        clinched: entry.clinched || false
+      };
+    });
+    engineDebug("Standings fetched", { league, teams: Object.keys(standings).length });
+    return standings;
+  } catch (err) {
+    engineDebug("Standings fetch failed", { league, error: err.message });
+    return null;
+  }
+}
+
 function isTrackerSupportedLeague(league) {
   return !!getTrackedLeagueBase(String(league || "").toLowerCase());
 }
@@ -12241,6 +12281,103 @@ async function fetchNcaaSchedule(base, teamId, requiredVenue, allowFallback = tr
   return fetchScheduleCore(base, teamId, "ncaa", requiredVenue, allowFallback);
 }
 
+// [FIX #11] Referee data extraction and tendency storage
+const REFEREE_STORAGE_KEY = "bb_referee_tendencies_v1";
+let g_refereeTendencies = {};
+
+function loadRefereeTendencies() {
+  try {
+    const stored = localStorage.getItem(REFEREE_STORAGE_KEY);
+    if (stored) {
+      g_refereeTendencies = JSON.parse(stored);
+    } else {
+      g_refereeTendencies = {};
+    }
+  } catch(e) { g_refereeTendencies = {}; }
+}
+
+function saveRefereeTendencies() {
+  try {
+    const toStore = {};
+    Object.entries(g_refereeTendencies).forEach(([name, data]) => {
+      toStore[name] = {
+        games: data.games,
+        total: data.total,
+        overCount: data.overCount,
+        underCount: data.underCount,
+        avgTotal: data.avgTotal,
+        avgSpread: data.avgSpread
+      };
+    });
+    localStorage.setItem(REFEREE_STORAGE_KEY, JSON.stringify(toStore));
+  } catch(e) { engineDebug("saveRefereeTendencies failed", e.message); }
+}
+
+function updateRefereeTendencies(refereeName, homeScore, awayScore, totalLine, spreadLine) {
+  if (!refereeName) return;
+  const total = homeScore + awayScore;
+  const spread = homeScore - awayScore;
+  if (!g_refereeTendencies[refereeName]) {
+    g_refereeTendencies[refereeName] = {
+      games: 0,
+      total: 0,
+      overCount: 0,
+      underCount: 0,
+      avgTotal: 0,
+      avgSpread: 0,
+      lastUpdated: Date.now()
+    };
+  }
+  const r = g_refereeTendencies[refereeName];
+  r.games++;
+  r.total += total;
+  if (isFinite(totalLine)) {
+    if (total > totalLine) r.overCount++;
+    else if (total < totalLine) r.underCount++;
+  }
+  r.avgTotal = r.total / r.games;
+  r.avgSpread = ((r.avgSpread * (r.games - 1)) + spread) / r.games;
+  saveRefereeTendencies();
+}
+
+function getRefereeSignal(refereeName, totalLine) {
+  if (!refereeName || !g_refereeTendencies[refereeName]) return null;
+  const r = g_refereeTendencies[refereeName];
+  if (r.games < 3) return null;
+  const overPct = r.overCount / r.games;
+  const underPct = r.underCount / r.games;
+  if (overPct > 0.65) return { direction: "over", strength: overPct, note: `Ref ${refereeName} calls high totals (${(overPct*100).toFixed(0)}% over in ${r.games} games)` };
+  if (underPct > 0.65) return { direction: "under", strength: underPct, note: `Ref ${refereeName} calls low totals (${(underPct*100).toFixed(0)}% under in ${r.games} games)` };
+  return null;
+}
+
+// Call this inside fetchESPN after getting boxscore data
+async function extractRefereesFromBoxscore(eventId, league) {
+  const base = getTrackedLeagueBase(league);
+  if (!base) return [];
+  try {
+    const url = `${base}/summary?event=${eventId}`;
+    const data = await proxyFetch(url, 5000);
+    const competition = data?.header?.competitions?.[0];
+    const officials = competition?.officials || competition?.officialsList || [];
+    const refereeNames = [];
+    officials.forEach(off => {
+      const name = off.displayName || off.name || off.firstName + " " + off.lastName;
+      if (name && !refereeNames.includes(name)) refereeNames.push(name);
+    });
+    if (refereeNames.length) {
+      engineDebug("Referees found", { eventId, referees: refereeNames });
+      // Store for later use in predictions (e.g., add to massacre context)
+      if (!g_massacreFetchContext.referees) g_massacreFetchContext.referees = [];
+      g_massacreFetchContext.referees = refereeNames;
+    }
+    return refereeNames;
+  } catch (err) {
+    engineDebug("extractRefereesFromBoxscore failed", err.message);
+    return [];
+  }
+}
+
 async function fetchNcaaH2H(base, teamAId, teamBId) {
   return fetchH2HCore(base, teamAId, teamBId, "ncaa");
 }
@@ -12267,7 +12404,7 @@ const cls =
       const sel = document.getElementById("fixtureSelect");
       if (!toolbar || !sel) return;
 
-      const supported = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
+      const supported = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa" || league === "nba-g-league" || league === "womens-college-basketball";
       if (!supported) {
         toolbar.style.display = "none";
         sel.style.display = "none";
@@ -12401,8 +12538,8 @@ async function fetchESPN() {
     setStatusText("❌ Enter both team names first.", "err");
     return;
   }
-  if (league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa") {
-    setStatusText("❌ ESPN auto-fetch is NBA, WNBA & NCAA only.", "err");
+  if (league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa" && league !== "nba-g-league" && league !== "womens-college-basketball") {
+    setStatusText("❌ ESPN auto-fetch is NBA, WNBA, NCAA, G League & NCAA Women only.", "err");
     return;
   }
   
@@ -13076,8 +13213,27 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       rawPace = rawPace * (1 - seasonBlend) + sPace * seasonBlend;
     }
     estMatchPace = clampNumber(rawPace, cl.min * basePace, cl.max * basePace);
-    projAFT = (expEffA / 100) * estMatchPace * injMultA;
-    projBFT = (expEffB / 100) * estMatchPace * injMultB;
+    // [FIX #18] Pace‑adjusted total – use actual pace if available, otherwise blended
+    const aPaceAvg = aPace.length >= 2 ? avgOrNaN(aPace) : null;
+    const bPaceAvg = bPace.length >= 2 ? avgOrNaN(bPace) : null;
+    let paceAdjust = 1.0;
+    if (isFinite(aPaceAvg) && isFinite(bPaceAvg)) {
+      const avgPace = (aPaceAvg + bPaceAvg) / 2;
+      paceAdjust = avgPace / basePace;
+      paceAdjust = clampNumber(paceAdjust, 0.85, 1.15);
+    } else if (isFinite(aPaceAvg)) {
+      paceAdjust = aPaceAvg / basePace;
+      paceAdjust = clampNumber(paceAdjust, 0.85, 1.15);
+    } else if (isFinite(bPaceAvg)) {
+      paceAdjust = bPaceAvg / basePace;
+      paceAdjust = clampNumber(paceAdjust, 0.85, 1.15);
+    }
+    const adjustedPace = estMatchPace * paceAdjust;
+    projAFT = (expEffA / 100) * adjustedPace * injMultA;
+    projBFT = (expEffB / 100) * adjustedPace * injMultB;
+    if (paceAdjust !== 1.0) {
+      engineDebug("Pace adjustment applied", { rawPace: estMatchPace, paceAdjust, adjustedPace });
+    }
   } else if (hasSeasonBaselines) {
     const expEffA = (aSeason.ortg + bSeason.drtg) / 2;
     const expEffB = (bSeason.ortg + aSeason.drtg) / 2;
@@ -13220,6 +13376,26 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
     if (isFinite(ftProj)) {
       ftProj = applyVolatility(ftProj, ftCombinedVol, vl, eb);
       ftProj = anchorProjection(ftProj, lines.ftLine, league, "ft");
+    }
+    
+    // [FIX #12] B2B (back‑to‑back) adjustment – reduces projection if either team is on 0 or 1 rest days
+    const restA = g_massacreFetchContext.A.restDays;
+    const restB = g_massacreFetchContext.B.restDays;
+    let b2bFactor = 1.0;
+    let b2bNote = "";
+    if (isFinite(restA) && restA <= 1) {
+      b2bFactor *= 0.97;
+      b2bNote += `${teamAName || "Team A"} on ${restA} rest days; `;
+    }
+    if (isFinite(restB) && restB <= 1) {
+      b2bFactor *= 0.97;
+      b2bNote += `${teamBName || "Team B"} on ${restB} rest days; `;
+    }
+    if (b2bFactor < 1.0) {
+      const originalFtProj = ftProj;
+      ftProj = ftProj * b2bFactor;
+      ftNote = (ftNote || "") + (ftNote ? " " : "") + b2bNote.trim().replace(/;$/, "") + ` (pace adjusted from ${originalFtProj.toFixed(1)} to ${ftProj.toFixed(1)})`;
+      engineDebug("B2B adjustment applied", { restA, restB, factor: b2bFactor, original: originalFtProj, adjusted: ftProj });
     }
 
 
@@ -13607,12 +13783,23 @@ function meanFromList(values) {
   return clean.length ? clean.reduce((s, v) => s + v, 0) / clean.length : NaN;
 }
 
+// Session cache for Monte Carlo results
+const g_mcCache = new Map();
+function makeMcCacheKey(mean, safeStdDev, line, runs) {
+  return `${mean}|${safeStdDev}|${line}|${runs}`;
+}
+
 async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
   if (!isFinite(mean) || !isFinite(simStdDev) || !isFinite(line) || simStdDev <= 0) {
     return { overPct: 50, underPct: 50 };
   }
 
   const safeStdDev = Math.max(simStdDev, 3.5);
+  const cacheKey = makeMcCacheKey(mean, safeStdDev, line, runs);
+  if (g_mcCache.has(cacheKey)) {
+    engineDebug("Monte Carlo cache hit", { mean, safeStdDev, line, runs });
+    return g_mcCache.get(cacheKey);
+  }
 
       // [LOCK: MONTE CARLO – normal distribution only (stable version)]
     // Cauchy mixture removed due to edge cases producing infinite values.
@@ -13693,7 +13880,14 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
     }, 3000);
   });
 
-  return Promise.race([workerPromise, timeoutPromise]);
+  const result = await Promise.race([workerPromise, timeoutPromise]);
+  g_mcCache.set(cacheKey, result);
+  // Limit cache size to 100 entries
+  if (g_mcCache.size > 100) {
+    const firstKey = g_mcCache.keys().next().value;
+    g_mcCache.delete(firstKey);
+  }
+  return result;
 }
 
 
@@ -16056,8 +16250,8 @@ if (trackedToSave.length) {
   resetResultsTable();
 
   const leagueVal = document.getElementById("leagueSelect")?.value || "";
-  const isEspnLeague = leagueVal === "nba" || leagueVal === "ncaa" || leagueVal === "wnba" || leagueVal === "wnba_pre";
-  const isNbaOrNcaa = leagueVal === "nba" || leagueVal === "wnba" || leagueVal === "wnba_pre" || leagueVal === "ncaa";
+  const isEspnLeague = leagueVal === "nba" || leagueVal === "ncaa" || leagueVal === "wnba" || leagueVal === "wnba_pre" || leagueVal === "nba-g-league" || leagueVal === "womens-college-basketball";
+  const isNbaOrNcaa = leagueVal === "nba" || leagueVal === "wnba" || leagueVal === "wnba_pre" || leagueVal === "ncaa" || leagueVal === "nba-g-league" || leagueVal === "womens-college-basketball";
   const isWnba = leagueVal === "wnba" || leagueVal === "wnba_pre";
   const ssSection = document.getElementById("sofascoreManualSection");
   if (ssSection) ssSection.style.display = (!leagueVal || isEspnLeague) ? "none" : "block";
