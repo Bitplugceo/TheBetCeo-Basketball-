@@ -1,4 +1,4 @@
-A
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2779,7 +2779,7 @@ body.dark-mode .tracker-analytics-section-head {
 </div>
 
 <div class="section" id="h2hSection">
-  <h3>H2H TEST <span class="autofill-indicator" id="h2hAutoTag">✅ Auto-filled (2024+, OT stripped, expanded matchup history)</span></h3>
+  <h3>H2H TEST <span class="autofill-indicator" id="h2hAutoTag">✅ Auto-filled (2022+, decay-weighted, OT stripped)</span></h3>
 
   <label id="useFTH2HLabel"><input type="checkbox" id="useFTH2H" /> Use FT H2H (min 2 games)</label>
   <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;">
@@ -4248,6 +4248,24 @@ const LEAGUE_FETCH_RULES = {
     scheduleTypes: ["2", "3"],
     h2hScheduleTypes: ["2", "3"],
     regulationPeriods: 2
+  },
+  // [CLOSED: ESPN+ EXPANSION — LEAGUE_FETCH_RULES ENTRIES]
+  // ncaaw and nba_gl were missing entirely — fetchScheduleCore and fetchH2HCore returned
+  // null for both leagues, silently blocking all stats and H2H fetch.
+  // ncaaw uses halftime-style (2 regulation periods) like NCAA Men's.
+  // nba_gl uses 4 quarters like NBA. Season types mirror their parent leagues.
+  // DO NOT remove — without these, schedule/H2H fetch returns null for both leagues.
+  ncaaw: {
+    recentSeasons: 3,
+    scheduleTypes: ["2", "3"],
+    h2hScheduleTypes: ["2", "3"],
+    regulationPeriods: 2
+  },
+  nba_gl: {
+    recentSeasons: 2,
+    scheduleTypes: ["1", "2", "3"],
+    h2hScheduleTypes: ["1", "2", "3"],
+    regulationPeriods: 4
   }
 };
 
@@ -12363,10 +12381,16 @@ validateFetchSection();
   const cacheKey = "fixtures:" + league + ":" + dateStr;
   if (_fixtureCache.has(cacheKey)) return _fixtureCache.get(cacheKey);
 
-  const p = proxyFetch(base + "/scoreboard?dates=" + dateStr + "&limit=200").catch(err => {
-    _fixtureCache.delete(cacheKey);
-    throw err;
-  });
+            const p = proxyFetch(base + "/scoreboard?dates=" + dateStr + "&limit=200").catch(err => {
+  _fixtureCache.delete(cacheKey);
+  // [CLOSED: G-LEAGUE OFF-SEASON] HTTP 400 on scoreboard = off-season or unsupported endpoint.
+  // Treat as empty schedule instead of triggering proxy fallback chain and error spam.
+  // Matches behaviour of NCAA/WNBA which return 200+empty during their off-season.
+  // DO NOT remove — without this, G League (and any future league) spams 400 errors
+  // through all 3 fallback proxies and shows "Unable to load matches" instead of "No upcoming matches".
+  if (String(err?.message || "").includes("HTTP 400")) return { events: [] };
+  throw err;
+});
 
   cacheSet(_fixtureCache, cacheKey, p);
   return p;
@@ -12492,9 +12516,18 @@ async function fetchESPN() {
 
   try {
     const isNcaa = league === "ncaa";
+    const isNcaaW = league === "ncaaw";
     const isWnba = league === "wnba" || league === "wnba_pre";
     const isNba = league === "nba";
-    const leagueSlug = isNcaa ? "mens-college-basketball" : (isWnba ? "wnba" : "nba");
+    const isGLeague = league === "nba_gl";
+    // [CLOSED: ESPN+ EXPANSION — FETCH BASE FIX] ncaaw and nba_gl were falling through to
+    // "nba" slug, fetching wrong stats. Now correctly routed to their ESPN endpoints.
+    // Must always match getLeagueBase(). DO NOT add new leagues without updating both.
+    const leagueSlug = isNcaa ? "mens-college-basketball"
+      : isNcaaW ? "womens-college-basketball"
+      : isGLeague ? "nba-g-league"
+      : isWnba ? "wnba"
+      : "nba";
     const espnBase = `https://site.api.espn.com/apis/site/v2/sports/basketball/${leagueSlug}`;
 
     let teamAId = selectedTeamIds.A || lookupTeamId(teamAName, league);
@@ -12524,11 +12557,14 @@ async function fetchESPN() {
       selectedFixture && String(selectedFixture.dataset.awayId || "") === String(teamBId) ? "away" :
       null;
 
+                        // [CLOSED: ESPN+ EXPANSION] ncaaw uses 2-period schedule fetch like NCAA Men's.
+                        // nba_gl uses standard 4-period fetchScheduleCore path like NBA.
+                        const _useNcaaPath = isNcaa || isNcaaW;
                         const [aStats, bStats, aVenueStats, bVenueStats] = await Promise.all([
-                      isNcaa ? fetchNcaaSchedule(espnBase, teamAId, null) : fetchScheduleCore(espnBase, teamAId, league, null, true),
-                      isNcaa ? fetchNcaaSchedule(espnBase, teamBId, null) : fetchScheduleCore(espnBase, teamBId, league, null, true),
-                      teamAVenue ? (isNcaa ? fetchNcaaSchedule(espnBase, teamAId, teamAVenue, true) : fetchScheduleCore(espnBase, teamAId, league, teamAVenue, true)) : Promise.resolve(null),
-                      teamBVenue ? (isNcaa ? fetchNcaaSchedule(espnBase, teamBId, teamBVenue, true) : fetchScheduleCore(espnBase, teamBId, league, teamBVenue, true)) : Promise.resolve(null)
+                      _useNcaaPath ? fetchNcaaSchedule(espnBase, teamAId, null) : fetchScheduleCore(espnBase, teamAId, league, null, true),
+                      _useNcaaPath ? fetchNcaaSchedule(espnBase, teamBId, null) : fetchScheduleCore(espnBase, teamBId, league, null, true),
+                      teamAVenue ? (_useNcaaPath ? fetchNcaaSchedule(espnBase, teamAId, teamAVenue, true) : fetchScheduleCore(espnBase, teamAId, league, teamAVenue, true)) : Promise.resolve(null),
+                      teamBVenue ? (_useNcaaPath ? fetchNcaaSchedule(espnBase, teamBId, teamBVenue, true) : fetchScheduleCore(espnBase, teamBId, league, teamBVenue, true)) : Promise.resolve(null)
                     ]);
 
                     if (!aStats && !bStats) throw new Error("No recent schedule data found from ESPN.");
@@ -12646,7 +12682,10 @@ async function fetchESPN() {
 
     let h2hGames = [];
     try {
-      h2hGames = isNcaa ? await fetchNcaaH2H(espnBase, teamAId, teamBId) : await fetchH2HCore(espnBase, teamAId, teamBId, league);
+      // [CLOSED: ESPN+ EXPANSION] ncaaw uses NCAA H2H path (2-period summaries).
+      // nba_gl uses standard fetchH2HCore. DO NOT merge these without verifying period counts.
+      const _useNcaaH2HPath = isNcaa || isNcaaW;
+      h2hGames = _useNcaaH2HPath ? await fetchNcaaH2H(espnBase, teamAId, teamBId) : await fetchH2HCore(espnBase, teamAId, teamBId, league);
     } catch (e) {
       logDebug("H2H fetch failed", e);
     }
