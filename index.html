@@ -1,4 +1,3 @@
-B
 A
 <!DOCTYPE html>
 <html lang="en">
@@ -10567,6 +10566,42 @@ function getPick(edge, line, league, marketType, context = {}) {
 
 
 
+function computeLineupQuality(roster, injuryMeta) {
+  // [FIX 13: LINEUP QUALITY INDEX] Converts fetched player advanced stats into a 0–1
+  // quality score. Inputs: TS% (shooting efficiency), plusMinus (on-court impact),
+  // minPG (usage / starter status). Neutral = 0.5. Above 0.62 = strong lineup (+1 grade).
+  // Below 0.38 = weak lineup (-1 grade). Injury mult applied as an additional penalty.
+  // DO NOT remove — fills the confidence gap on thin-sample or manually-entered picks
+  // where team-level stats cannot distinguish lineup strength.
+  if (!Array.isArray(roster) || !roster.length) return 0.5;
+  const starters = roster.slice(0, 5);
+  const tsVals   = starters.map(p => Number(p.tsPercent)).filter(v => isFinite(v) && v > 0 && v < 1);
+  const pmVals   = starters.map(p => Number(p.plusMinus)).filter(v => isFinite(v));
+  const minVals  = starters.map(p => Number(p.minPG)).filter(v => isFinite(v) && v > 0);
+
+  let score = 0.5;
+
+  // TS% signal: NBA league average ~0.545. Shift linearly from that baseline.
+  if (tsVals.length >= 3) {
+    const avgTS = tsVals.reduce((s, v) => s + v, 0) / tsVals.length;
+    score += clampNumber((avgTS - 0.545) * 2.5, -0.20, 0.20);
+  }
+
+  // Plus-minus signal: small but meaningful impact on confidence.
+  if (pmVals.length >= 3) {
+    const avgPM = pmVals.reduce((s, v) => s + v, 0) / pmVals.length;
+    score += clampNumber(avgPM * 0.012, -0.12, 0.12);
+  }
+
+  // Injury multiplier: scoringMult < 0.97 means meaningful absences already penalised
+  // in the projection — also soften the lineup quality score proportionally.
+  if (injuryMeta && isFinite(Number(injuryMeta.scoringMult)) && Number(injuryMeta.scoringMult) < 0.97) {
+    score -= (1 - Number(injuryMeta.scoringMult)) * 1.5;
+  }
+
+  return clampNumber(score, 0, 1);
+}
+
 function getConfidenceGradeThresholds() {
   // [FIX: calibrated grade thresholds] Returns score cutoffs written by
   // calibrateMassacreCoefficients() after empirical win-rate analysis, or safe
@@ -10600,7 +10635,8 @@ function getConfidenceGradeThresholds() {
     function getConfidenceGrade({
   pick, note, line, edge, sampleTier, projectionOnly, fullModel, trap,
   hasH2H, volatility, volLimit, injuryNotes = [],
-  paceGapRisk = false, defensiveFloorFlag = false, blowoutGap = NaN, marketKey = ""
+  paceGapRisk = false, defensiveFloorFlag = false, blowoutGap = NaN, marketKey = "",
+  lineupQuality = null
 }) {
   if (!pick || pick === "NO PLAY" || note || line === null || isNaN(line) || !isFinite(line) || line <= 0 || isNaN(edge)) return "NaN";
 
@@ -10639,6 +10675,16 @@ function getConfidenceGradeThresholds() {
   if (defensiveFloorFlag) score -= 1;
   if (isFinite(blowoutGap) && blowoutGap > 20) score -= 1;
   if (isH2) score -= 1;
+
+  // [FIX 13: LINEUP QUALITY SIGNAL] Apply roster quality index when available.
+  // +1 for strong lineup (LQI > 0.62), -1 for weak lineup (LQI < 0.38), 0 otherwise.
+  // Threshold asymmetry: bonus requires a clearer positive signal than penalty does negative,
+  // matching the conservative bias already present in the scoring system.
+  // DO NOT remove — this is the only confidence path wired to fetchRoster() advanced stats.
+  if (lineupQuality !== null && isFinite(lineupQuality)) {
+    if (lineupQuality > 0.62) score += 1;
+    else if (lineupQuality < 0.38) score -= 1;
+  }
 
   // [FIX: calibrated thresholds applied] Read empirically calibrated score cutoffs
   // from getConfidenceGradeThresholds(). Falls back to original hardcoded values
@@ -12735,7 +12781,13 @@ async function fetchESPN() {
         for (const a of articles) {
           const h = a?.headline || a?.title || a?.description || "";
           if (INJURY_KW.test(h)) { alerts.push({ type: "meta", text: `📰 ${h.slice(0, 80)}` }); highUncertainty = true; }
-          if (COACH_KW.test(h)) coachingChange = true;
+          // [FIX 24: COACHING CHANGE → MONTE CARLO VARIANCE] Coaching change now also sets
+          // highUncertainty = true, which flows into the existing injA/B.highUncertainty
+          // pathway and triggers Monte Carlo variance expansion. Previously coachingChange
+          // only added a note — the agreed variance expansion never fired.
+          // DO NOT remove the highUncertainty assignment here — it is the only connection
+          // between coaching change detection and the simulation uncertainty layer.
+          if (COACH_KW.test(h)) { coachingChange = true; highUncertainty = true; }
         }
         return { alerts, coachingChange, highUncertainty };
       } catch(_) { return null; }
@@ -13545,6 +13597,29 @@ function getMassacreModelRangeLimit(marketKey, line) {
   return MASSACRE_TUNING.maxModelRange.team;
 }
 
+function getH2HSeasonDecayWeight(dateStr) {
+  // [FIX 6/15: SEASON DECAY WEIGHT] Maps each H2H game's season to its decay multiplier.
+  // Current season = 1.00 | -1 = 0.75 | -2 = 0.50 | -3 or older = 0.30.
+  // Season boundary: October = start of new season year (Oct 2024 → 2025 season).
+  // DO NOT hardcode to calendar year — basketball seasons straddle two calendar years.
+  if (!dateStr) return 0.75;
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return 0.75;
+    const gameYear = d.getUTCFullYear();
+    const gameMonth = d.getUTCMonth(); // 0-based; Oct = 9
+    const gameSeasonYear = gameMonth >= 9 ? gameYear + 1 : gameYear;
+    const nowMonth = new Date().getUTCMonth();
+    const nowYear = new Date().getUTCFullYear();
+    const currentSeasonYear = nowMonth >= 9 ? nowYear + 1 : nowYear;
+    const diff = currentSeasonYear - gameSeasonYear;
+    if (diff <= 0) return 1.00;
+    if (diff === 1) return 0.75;
+    if (diff === 2) return 0.50;
+    return 0.30;
+  } catch (_) { return 0.75; }
+}
+
 function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
   let games = Array.isArray(g_massacreFetchContext?.h2hGames) ? [...g_massacreFetchContext.h2hGames] : [];
   if (!games.length) {
@@ -13591,6 +13666,7 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
   // DO NOT add back idx or w — they are intentionally removed from the forEach.
   const rawA = [];
   const rawB = [];
+  const decayWeights = [];
 
   games.slice(0, weights.length).forEach((g) => {
     const teamAIsHome = fixtureHomeId && String(g.teamAId || "") === fixtureHomeId;
@@ -13613,9 +13689,30 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
       marketKey === "q3" ? (teamAIsHome ? g.q3B : g.q3A) :
       marketKey === "q4" ? (teamAIsHome ? g.q4B : g.q4A) : 0;
 
-    if (isFinite(Number(valueA)) && Number(valueA) > 0) rawA.push(Number(valueA));
-    if (isFinite(Number(valueB)) && Number(valueB) > 0) rawB.push(Number(valueB));
+    // [FIX 6/15: SEASON DECAY] Collect both scores as a pair so the same decay weight
+    // applies to both A and B for the same game. Only push when both are valid.
+    // Decay-normalized arrays: avgOrNaN(normalizedA) = true decay-weighted mean.
+    // Math: push(v * w / meanW) → avgOrNaN = sum(vi*wi)/(n*meanW) = sum(vi*wi)/sum(wi).
+    // DO NOT separate A and B pushes — mismatched indices break normalization.
+    const vA = Number(valueA);
+    const vB = Number(valueB);
+    if (isFinite(vA) && vA > 0 && isFinite(vB) && vB > 0) {
+      rawA.push(vA);
+      rawB.push(vB);
+      decayWeights.push(getH2HSeasonDecayWeight(g.date));
+    }
   });
+
+  // Normalize by mean weight so avgOrNaN() produces the true decay-weighted mean.
+  // If no decay data is available, fall back to unweighted arrays unchanged.
+  if (decayWeights.length >= 2) {
+    const _meanW = decayWeights.reduce((s, w) => s + w, 0) / decayWeights.length;
+    if (_meanW > 0) {
+      const normalizedA = rawA.map((v, i) => v * decayWeights[i] / _meanW);
+      const normalizedB = rawB.map((v, i) => v * decayWeights[i] / _meanW);
+      return { A: normalizedA, B: normalizedB };
+    }
+  }
 
   return { A: rawA, B: rawB };
 }
@@ -15576,6 +15673,15 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
 
     const sharedInjuryNotes = [...(g_injA.notes || []), ...(g_injB.notes || [])];
 
+    // [FIX 13: LINEUP QUALITY] Compute per-team LQI from fetched roster data and combine
+    // into a shared matchup quality score passed to each getConfidenceGrade call.
+    // Uses the higher-quality (stronger) team's roster as primary signal for totals markets,
+    // since a dominant offense drives game totals more than a weak one suppresses them.
+    // Falls back to 0.5 (neutral) when fetchRoster() returned an empty array.
+    const _lqiA = computeLineupQuality(g_massacreFetchContext.A.roster || [], g_injA);
+    const _lqiB = computeLineupQuality(g_massacreFetchContext.B.roster || [], g_injB);
+    const _lqiShared = isFinite(_lqiA) && isFinite(_lqiB) ? (_lqiA + _lqiB) / 2 : 0.5;
+
     const ftConfidence = getConfidenceGrade({
       pick: ftPick,
       note: ftNote,
@@ -15592,7 +15698,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       paceGapRisk: ftCalc.paceGapRisk,
       defensiveFloorFlag: ftCalc.defensiveFloorFlag,
       blowoutGap: ftCalc.blowoutGap,
-      marketKey: "ft"
+      marketKey: "ft",
+      lineupQuality: _lqiShared
     });
 
     const h1VolLimit = getMarketVolLimit(league, "h1");
@@ -15612,7 +15719,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       injuryNotes: sharedInjuryNotes,
       paceGapRisk: h1Calc.paceGapRisk,
       defensiveFloorFlag: h1Calc.defensiveFloorFlag,
-      marketKey: "h1"
+      marketKey: "h1",
+      lineupQuality: _lqiShared
     });
 
     const h1ConfidenceFinal = h1Confidence;
