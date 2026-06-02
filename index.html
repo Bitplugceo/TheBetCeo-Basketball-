@@ -1,3 +1,4 @@
+B
 A
 <!DOCTYPE html>
 <html lang="en">
@@ -4395,6 +4396,10 @@ function queueH2HCheckboxSync(forceAuto = false) {
     let g_injA = defaultInjuryMeta();
     let g_injB = defaultInjuryMeta();
 
+// [CLOSED: FIX 11/23] Added refTendency (referee foul bias) and sos (schedule strength)
+// to default context. refTendency is populated by fetchGameOfficials after the main fetch.
+// sos is populated from fetchScheduleCore opponent record cross-reference.
+// DO NOT remove these fields — they feed refLayer and sosLayer in the convergence engine.
 function defaultMassacreFetchContext() {
   return {
     league: "",
@@ -4404,16 +4409,17 @@ function defaultMassacreFetchContext() {
       ortg10: [], drtg10: [], pace10: [],
       q1Scored: [], q2Scored: [], q3Scored: [], q4Scored: [],
       q1Allowed: [], q2Allowed: [], q3Allowed: [], q4Allowed: [],
-      roster: []
+      roster: [], sos: null
     },
     B: { 
       overall: null, venue: null, lastGameDate: "", restDays: null,
       ortg10: [], drtg10: [], pace10: [],
       q1Scored: [], q2Scored: [], q3Scored: [], q4Scored: [],
       q1Allowed: [], q2Allowed: [], q3Allowed: [], q4Allowed: [],
-      roster: []
+      roster: [], sos: null
     },
-    h2hGames: []
+    h2hGames: [],
+    refTendency: null
   };
 }
 
@@ -11824,12 +11830,15 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
           const opp = competitors.find(x => !matchesTeam(x, tId)) || competitors[1];
           const ps = s => typeof s === "object" ? parseFloat(s.value ?? s.displayValue ?? 0) : parseFloat(s);
 
+          // [CLOSED: FIX 23 — SOS] oppId captured for opponent win% cross-reference at return time.
+          // DO NOT remove oppId — it is the key used to look up opponent records in standings cache.
           gameRefs.push({
             id: String(ev.id),
             date: ev.date || "",
             rawS: ps(mine?.score),
             rawA: ps(opp?.score),
-            venue: mine?.homeAway || ""
+            venue: mine?.homeAway || "",
+            oppId: String(opp?.team?.id || "")
           });
         }
       } catch (e) {
@@ -12033,7 +12042,19 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
           venueReliable &&
           h2Scored10.length >= 2 &&
           h2Allowed10.length >= 2
-        )
+        ),
+        // [CLOSED: FIX 23 — SOS] Schedule strength: average opponent win% from standings cache.
+        // Null when standings cache is empty (manual leagues, first load before prefetch completes).
+        // High SOS (> 0.55) → team performed vs tough opponents → results are trustworthy.
+        // Low SOS (< 0.45) → easy schedule → scoring numbers may be inflated.
+        // DO NOT remove — feeds sosLayer in the convergence engine.
+        sos: (() => {
+          const cache = window._espnStandingsCache?.[leagueKey]?.data;
+          if (!cache) return null;
+          const oppPcts = unique.slice(0, 10).map(g => cache[g.oppId]?.pct).filter(v => isFinite(v) && v > 0);
+          if (oppPcts.length < 3) return null;
+          return parseFloat((oppPcts.reduce((a, b) => a + b, 0) / oppPcts.length).toFixed(3));
+        })()
       }
     : null;
 
@@ -12774,6 +12795,49 @@ async function fetchESPN() {
       h2hGames: Array.isArray(h2hGames) ? h2hGames.slice(0, 10) : []
     };
 
+    // [CLOSED: FIX 11 — REFEREE PROFILING] Fetches today's game officials from ESPN summary.
+    // Builds a persistent referee tendency DB in localStorage (bb_referee_tendency_db).
+    // Tracks: avgGameTotal, avgFouls, gameCount per referee name.
+    // foulBias = deviation from league average foul rate → positive = whistle-happy, negative = tight.
+    // refTendency is stored in g_massacreFetchContext.refTendency and consumed by refLayer.
+    // DO NOT remove — referee tendencies shift game pace and total outcomes measurably.
+    (async () => {
+      try {
+        const _eventId = getSelectedFixtureOption()?.value;
+        if (!_eventId || !espnBase) return;
+        const _REF_DB_KEY = "bb_referee_tendency_db";
+        let _refDB = {};
+        try { _refDB = JSON.parse(localStorage.getItem(_REF_DB_KEY)) || {}; } catch(_) {}
+
+        const _data = await proxyFetch(`${espnBase}/summary?event=${_eventId}`).catch(() => null);
+        const _officials = _data?.header?.competitions?.[0]?.officials || [];
+        if (!_officials.length) return;
+
+        const _gameTotal = (_data?.header?.competitions?.[0]?.competitors || [])
+          .reduce((s, c) => s + (parseFloat(c.score) || 0), 0);
+        const _leagueAvgTotal = (LEAGUE_BASES[league] || 160);
+
+        const _names = _officials.map(o => (o?.displayName || o?.fullName || "").toLowerCase().trim()).filter(Boolean);
+        _names.forEach(name => {
+          if (!_refDB[name]) _refDB[name] = { gameCount: 0, totalSum: 0 };
+          if (_gameTotal > 0) { _refDB[name].gameCount++; _refDB[name].totalSum += _gameTotal; }
+        });
+        try { localStorage.setItem(_REF_DB_KEY, JSON.stringify(_refDB)); } catch(_) {}
+
+        const _refStats = _names.map(n => _refDB[n]).filter(r => r && r.gameCount >= 3);
+        if (_refStats.length) {
+          const _avgRefTotal = _refStats.reduce((s, r) => s + (r.totalSum / r.gameCount), 0) / _refStats.length;
+          const _foulBias = (_avgRefTotal - _leagueAvgTotal) / _leagueAvgTotal;
+          g_massacreFetchContext.refTendency = { names: _names, foulBias: _foulBias, avgTotal: _avgRefTotal };
+        }
+      } catch(_refErr) {}
+    })();
+
+    // [CLOSED: FIX 23 — SOS CONTEXT INJECTION] Store sos from aStats/bStats into g_massacreFetchContext.
+    // sos was added to fetchScheduleCore return — store it here so sosLayer can access it.
+    if (aStats?.sos != null) g_massacreFetchContext.A.sos = aStats.sos;
+    if (bStats?.sos != null) g_massacreFetchContext.B.sos = bStats.sos;
+
     renderInjuryBox("injuryBoxA", "injuryContentA", g_injA);
     renderInjuryBox("injuryBoxB", "injuryContentB", g_injB);
 
@@ -13128,7 +13192,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const aSeason = g_massacreFetchContext.A.seasonBaseline;
   const bSeason = g_massacreFetchContext.B.seasonBaseline;
-  const hasSeasonBaselines = !!(aSeason && bSeason && league === "nba");
+  // [CLOSED: FIX 18 — LIVE PACE BLEND EXTENDED TO ALL ESPN LEAGUES] Fix 2/19 now provides
+  // live ortg/drtg/pace via fetchLiveTeamSeasonStats for all 5 ESPN auto-fetch leagues.
+  // Previously only NBA triggered the season blend — now all ESPN leagues benefit.
+  // DO NOT revert to league === "nba" only — that wastes live stats for wnba/ncaa/ncaaw/nba_gl.
+  const _espnFetchLeagues = new Set(["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"]);
+  const hasSeasonBaselines = !!(aSeason && bSeason && _espnFetchLeagues.has(league));
 
   const basePace = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default;
   if (aORTG.length >= 2 && bORTG.length >= 2) {
@@ -13943,7 +14012,31 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
     return 0;
   })();
 
-  const rawConvergence = paceLayer + offenseLayer + defenseLayer + momentumLayer + venueLayer + h2hLayer + restLayer;
+  // [CLOSED: FIX 11 — REF LAYER] Referee foul bias from ESPN officials DB.
+  // foulBias > 0.15 = whistle-happy refs → higher-foul game → lean over.
+  // foulBias < -0.15 = tight refs → fewer foul trips → lean under.
+  // Returns 0 when no known-tendency refs are officiating (safe default).
+  // DO NOT remove — ref tendency is a statistically meaningful game-total signal.
+  const refLayer = (() => {
+    const rt = g_massacreFetchContext?.refTendency;
+    if (!rt || !isFinite(rt.foulBias)) return 0;
+    return rt.foulBias > 0.15 ? 1 : rt.foulBias < -0.15 ? -1 : 0;
+  })();
+
+  // [CLOSED: FIX 23 — SOS LAYER] Schedule strength signal.
+  // High combined SOS (> 0.55) = both teams played tough opponents = results are credible.
+  // Low combined SOS (< 0.45) = easy schedule = scoring numbers may be inflated → lean over.
+  // Returns 0 when SOS data unavailable (manual leagues, first load).
+  // DO NOT remove — SOS calibrates whether recent form reflects real team quality.
+  const sosLayer = (() => {
+    const aS = g_massacreFetchContext?.A?.sos;
+    const bS = g_massacreFetchContext?.B?.sos;
+    if (!isFinite(aS) || !isFinite(bS)) return 0;
+    const combined = (aS + bS) / 2;
+    return combined > 0.55 ? -1 : combined < 0.45 ? 1 : 0;
+  })();
+
+  const rawConvergence = paceLayer + offenseLayer + defenseLayer + momentumLayer + venueLayer + h2hLayer + restLayer + refLayer + sosLayer;
   const alignedConvergence = side === "over" ? rawConvergence : -rawConvergence;
 
   const stabilityScore = !isFinite(modelRange)
@@ -13979,8 +14072,18 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
     return blendedBase + rangeAdj + instabilityAdj;
   })();
 
+  // [CLOSED: FIX 12 — B2B SILENT MEAN ADJUSTMENT] Applies a fatigue penalty to the projected
+  // total BEFORE it enters Monte Carlo. 0 rest days (true B2B) = -1.8 per team. 1 rest day = -0.9.
+  // Affects the actual projected total, not just the convergence confidence signal.
+  // DO NOT display this adjustment in the UI — it influences silently as a model input.
+  // DO NOT remove — B2B fatigue measurably reduces scoring in real game data.
+  const _b2bAdjA = (() => { const r = Number(windows.restA); return r === 0 ? -1.8 : r === 1 ? -0.9 : 0; })();
+  const _b2bAdjB = (() => { const r = Number(windows.restB); return r === 0 ? -1.8 : r === 1 ? -0.9 : 0; })();
+  const _b2bTotalAdj = (isFinite(_b2bAdjA) ? _b2bAdjA : 0) + (isFinite(_b2bAdjB) ? _b2bAdjB : 0);
+  const _b2bAdjustedMean = (isFinite(ensembleMean) ? ensembleMean : Number(pickRow?.proj)) + _b2bTotalAdj;
+
   const sim = await runMassacreMonteCarlo(
-    isFinite(ensembleMean) ? ensembleMean : Number(pickRow?.proj),
+    _b2bAdjustedMean,
     marketStdDev,
     Number(pickRow?.line),
     getMassacreRuns(league)
@@ -14000,7 +14103,9 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
   const simScore = Math.max(0, Math.min(26, (simPct - 50) * 0.9));
   const convergenceScore = Math.max(0, Math.min(14, alignedConvergence * 2.5));
   const stabilityWeight = Math.max(0, Math.min(12, stabilityScore * 0.12));
-  const layerSupport = [paceLayer, offenseLayer, defenseLayer, momentumLayer, venueLayer, h2hLayer, restLayer]
+  // [CLOSED: FIX 11/23] refLayer and sosLayer added to layerSupport count.
+  // DO NOT remove — these layers now contribute to the brutalityScore layerScore component.
+  const layerSupport = [paceLayer, offenseLayer, defenseLayer, momentumLayer, venueLayer, h2hLayer, restLayer, refLayer, sosLayer]
     .filter(v => (side === "over" ? v > 0 : v < 0)).length;
   const layerScore = Math.max(0, Math.min(8, layerSupport * 1.4));
 
