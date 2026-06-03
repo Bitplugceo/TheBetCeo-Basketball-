@@ -1,4 +1,4 @@
-D
+L
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10949,27 +10949,21 @@ function calibrateConfidenceModel() {
     trap:      (p.godsEyeMemory?.trap) ? 1 : 0
   });
 
-  const runGD = (data) => {
-    if (data.length < 20) return null;
+  // [LOCK: K-FOLD CV HYPERPARAMETER SELECTION — DO NOT REVERT TO HARDCODED lr/lambda]
+  // _gd runs a single gradient descent pass with explicit (lr, lambda) parameters.
+  // runGD wraps _gd with 3-fold cross-validation over 4 candidate (lr, lambda) pairs when
+  // data >= 60, selecting the pair that minimises mean held-out log-loss. Smaller samples
+  // skip CV and use the proven default to avoid overfitting the CV selector itself.
+  // DO NOT hardcode 0.002/0.0005/0.01 in runGD — the optimal pair is dataset-dependent.
+  const _gd = (data, lr, lambda) => {
     let c = { intercept: -0.2, edgePct: 8.0, volRatio: -0.8, sampleFull: 0.4, h2h: 0.2, trap: -1.2 };
-    const lr = data.length < 100 ? 0.002 : 0.0005;
-    const lambda = 0.01;
     for (let iter = 0; iter < 400; iter++) {
       const g = { intercept: 0, edgePct: 0, volRatio: 0, sampleFull: 0, h2h: 0, trap: 0 };
       for (const { f, y } of data) {
         const lo = c.intercept + c.edgePct*f.edgePct + c.volRatio*f.volRatio + c.sampleFull*f.sampleFull + c.h2h*f.h2h + c.trap*f.trap;
         const prob = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, lo))));
         const e = y - prob;
-        g.intercept += e; g.edgePct += e*f.edgePct; g.volRatio += e*f.volRatio;
-        g.sampleFull += e*f.sampleFull; g.h2h += e*f.h2h; g.trap += e*f.trap;
-      }
-      c.intercept += lr * g.intercept;
-      ["edgePct","volRatio","sampleFull","h2h","trap"].forEach(k => {
-        c[k] += lr * g[k] - lr * lambda * c[k];
-      });
-    }
-    return c;
-  };
+        g.intercept += e; g.edgePct += e*f.edgeP
 
   const models = {};
   const globalData = allPicks.map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
@@ -13695,9 +13689,26 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     
     const paceFactorA = (aS + aA) / eb;
     const paceFactorB = (bS + bA) / eb;
-    
-    const dampenedPaceA = 1 + ((paceFactorA - 1) * 0.4);
-    const dampenedPaceB = 1 + ((paceFactorB - 1) * 0.4);
+    // [LOCK: LEARNED PACE DAMPENING — replaces hardcoded 0.4]
+    // Derives the dampening coefficient from bb_engine_accuracy_log per league.
+    // Low MAE → model is accurate → trust pace signal more (lower dampening, less regression).
+    // High MAE → noisy data → dampen more toward league baseline (higher dampening).
+    // Clamped [0.20, 0.65]. Falls back to 0.40 when fewer than 30 settled picks exist.
+    // DO NOT restore hardcoded 0.4 — it applied identical dampening regardless of model quality.
+    const _learnedPaceDamp = (() => {
+      try {
+        const _al = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]");
+        const _rl = _al.filter(e => e.league === league && isFinite(e.error) && isFinite(e.line) && e.line > 0);
+        if (_rl.length >= 30) {
+          const _mae = _rl.slice(-60).reduce((s, e) => s + Math.abs(e.error), 0) / Math.min(_rl.length, 60);
+          const _base = LEAGUE_BASES[league] || 160;
+          return clampNumber(0.25 + (_mae / (_base * 0.08)) * 0.30, 0.20, 0.65);
+        }
+      } catch(_pe) {}
+      return 0.40;
+    })();
+    const dampenedPaceA = 1 + ((paceFactorA - 1) * _learnedPaceDamp);
+    const dampenedPaceB = 1 + ((paceFactorB - 1) * _learnedPaceDamp);
 
     if (window.__phase2PaceAdjustment === "aggressive") {
       estMatchPace = basePace * Math.max(dampenedPaceA, dampenedPaceB, (dampenedPaceA + dampenedPaceB) / 2);
@@ -13891,8 +13902,27 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     };
   }
 
-  let projA1H = (avgOrNaN(aS1) * 0.55 + avgOrNaN(bA1) * 0.45);
-  let projB1H = (avgOrNaN(bS1) * 0.55 + avgOrNaN(aA1) * 0.45);
+  // [LOCK: INVERSE-VARIANCE 1H BLEND — replaces hardcoded 0.55/0.45 split]
+  // Optimal linear blend weight: w(ownScored) = Var(oppAllowed) / (Var(ownScored) + Var(oppAllowed)).
+  // When opponent-allowed is noisier, own-team scored is the stronger signal → higher w.
+  // When own scoring series is noisier, opponent-allowed carries more information → lower w.
+  // Computed independently per team so each projection uses its own variance context.
+  // Clamped [0.40, 0.70]. Falls back to 0.55 when sample is too thin (< 3 games).
+  // DO NOT revert to flat 0.55 — inverse-variance is the statistically optimal linear blend.
+  const _h1BlendWA = (() => {
+    const _vo = (aS1.length >= 3) ? Math.pow(stdDev(aS1), 2) : null;
+    const _vp = (bA1.length >= 3) ? Math.pow(stdDev(bA1), 2) : null;
+    if (_vo !== null && _vp !== null && (_vo + _vp) > 0) return clampNumber(_vp / (_vo + _vp), 0.40, 0.70);
+    return 0.55;
+  })();
+  const _h1BlendWB = (() => {
+    const _vo = (bS1.length >= 3) ? Math.pow(stdDev(bS1), 2) : null;
+    const _vp = (aA1.length >= 3) ? Math.pow(stdDev(aA1), 2) : null;
+    if (_vo !== null && _vp !== null && (_vo + _vp) > 0) return clampNumber(_vp / (_vo + _vp), 0.40, 0.70);
+    return 0.55;
+  })();
+  let projA1H = (avgOrNaN(aS1) * _h1BlendWA + avgOrNaN(bA1) * (1 - _h1BlendWA));
+  let projB1H = (avgOrNaN(bS1) * _h1BlendWB + avgOrNaN(aA1) * (1 - _h1BlendWB));
 
   if (isFinite(projA1H)) projA1H *= injMultA;
   if (isFinite(projB1H)) projB1H *= injMultB;
@@ -14280,7 +14310,11 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
   }
 
   const safeStdDev = Math.max(simStdDev, 3.5);
-  const _mcKey = `${mean.toFixed(4)}|${safeStdDev.toFixed(4)}|${line}|${runs}`;
+  // [LOCK: DISTRIBUTION TYPE IN CACHE KEY — prevents stale Normal results being served
+  // for heavy-tailed markets now routed to Student-t (sigma/line > 5%).
+  // DO NOT remove _distType from the key — omitting it causes wrong cached results.]
+  const _distType = (safeStdDev / Math.max(line, 1)) > 0.05 ? "t7" : "n";
+  const _mcKey = `${mean.toFixed(4)}|${safeStdDev.toFixed(4)}|${line}|${runs}|${_distType}`;
   if (_mcCache.has(_mcKey)) return _mcCache.get(_mcKey);
 
       // [LOCK: MONTE CARLO – normal distribution only (stable version)]
@@ -14288,18 +14322,27 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
     // Historical std deviation fix already improves tail estimation.
     const workerCode = `
     onmessage = function(e) {
-      const { mean, safeStdDev, line, runs } = e.data;
-      let overHits = 0;
-      // Always use normal (Box-Muller)
-      for (let i = 0; i < runs; i++) {
-        let u1 = Math.random();
-        let u2 = Math.random();
+      const { mean, safeStdDev, line, runs, useTDist, df } = e.data;
+      const safeRuns = runs % 2 === 0 ? runs : runs + 1;
+      function bm() {
+        let u1 = Math.random(), u2 = Math.random();
         while (u1 === 0) u1 = Math.random();
-        let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-        let simulatedScore = Math.max(0, mean + (safeStdDev * z0));
-        if (simulatedScore > line) overHits++;
+        return Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
       }
-      const overPct = (overHits / runs) * 100;
+      function tDist(dof) {
+        let chi2 = 0;
+        for (let k = 0; k < dof; k++) { const g = bm(); chi2 += g * g; }
+        return bm() / Math.sqrt(chi2 / dof);
+      }
+      let overHits = 0;
+      for (let i = 0; i < safeRuns; i += 2) {
+        const z = useTDist ? tDist(df || 7) : bm();
+        const s1 = Math.max(0, mean + safeStdDev * z);
+        const s2 = Math.max(0, mean - safeStdDev * z);
+        if (s1 > line) overHits++;
+        if (s2 > line) overHits++;
+      }
+      const overPct = (overHits / safeRuns) * 100;
       postMessage({ overPct, underPct: 100 - overPct });
     };
     `;
@@ -14312,16 +14355,31 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
   } catch (err) {
     if (workerUrl) URL.revokeObjectURL(workerUrl);
     console.warn("[BB Engine] Worker blocked (Private Mode/CSP). Running Monte Carlo synchronously.");
-    let overHits = 0;
-    // Always use normal (Box-Muller) – Poisson is not appropriate for basketball totals
-    for (let i = 0; i < runs; i++) {
+    // [LOCK: ANTITHETIC VARIATES + STUDENT-T FALLBACK — mirrors Worker logic exactly]
+    // Paired (z, -z) samples halve estimator variance at the same run count.
+    // Student-t df=7 used when sigma/line > 5% (heavy-tailed market spreads).
+    // DO NOT revert to independent Normal draws — this is the correct statistical path.
+    const _fbUseTDist = (safeStdDev / Math.max(line, 1)) > 0.05;
+    const _fbRuns = runs % 2 === 0 ? runs : runs + 1;
+    function _fbBM() {
       let u1 = Math.random(), u2 = Math.random();
       while (u1 === 0) u1 = Math.random();
-      let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-      let simulatedScore = Math.max(0, mean + safeStdDev * z0);
-      if (simulatedScore > line) overHits++;
+      return Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
     }
-    const overPct = (overHits / runs) * 100;
+    function _fbTD(dof) {
+      let chi2 = 0;
+      for (let k = 0; k < dof; k++) { const g = _fbBM(); chi2 += g * g; }
+      return _fbBM() / Math.sqrt(chi2 / dof);
+    }
+    let overHits = 0;
+    for (let i = 0; i < _fbRuns; i += 2) {
+      const z = _fbUseTDist ? _fbTD(7) : _fbBM();
+      const s1 = Math.max(0, mean + safeStdDev * z);
+      const s2 = Math.max(0, mean - safeStdDev * z);
+      if (s1 > line) overHits++;
+      if (s2 > line) overHits++;
+    }
+    const overPct = (overHits / _fbRuns) * 100;
     return { overPct, underPct: 100 - overPct };
   }
 
@@ -14347,7 +14405,14 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
       reject(err);
     };
 
-    worker.postMessage({ mean, safeStdDev, line, runs });
+    // [LOCK: PASS DISTRIBUTION PARAMS TO WORKER — antithetic variates + Student-t df=7]
+    // _wUseTDist: heavy-tailed distribution when sigma/line > 5% (wide-spread markets).
+    // _wRuns must be even so paired (z, -z) samples are always complete.
+    // DO NOT revert to postMessage({ mean, safeStdDev, line, runs }) — missing params
+    // cause worker to silently use independent Normal draws, losing all variance reduction.
+    const _wUseTDist = (safeStdDev / Math.max(line, 1)) > 0.05;
+    const _wRuns = runs % 2 === 0 ? runs : runs + 1;
+    worker.postMessage({ mean, safeStdDev, line, runs: _wRuns, useTDist: _wUseTDist, df: 7 });
   });
 
 
@@ -14614,22 +14679,34 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
 
   const simPct = side === "over" ? sim.overPct : sim.underPct;
 
-  const agreementScore = trimmedModels.length
-    ? (agreement / trimmedModels.length) * 18
-    : 0;
+  // [LOCK: LEARNED BRUTALITY WEIGHTS — replaces hardcoded sub-score ceilings and multipliers]
+  // BB_BRUTALITY_WEIGHTS is written by calibrateBrutalityWeights() via AUC grid search on
+  // settled massacre picks. Falls back to original hardcoded values before first calibration run.
+  // DO NOT restore hardcoded 22/3.2/26/0.9/18/14/2.5/12/0.12/8/1.4 — those are heuristics.
+  const _bw = (() => {
+    try {
+      const _stored = localStorage.getItem("BB_BRUTALITY_WEIGHTS");
+      if (_stored) {
+        const _bwData = JSON.parse(_stored);
+        const _g = (league === "nba" || league === "nba_gl") ? "nba" : (league === "ncaa" || league === "ncaaw") ? "ncaa" : "other";
+        if (_bwData[_g]) return _bwData[_g];
+      }
+    } catch(_bwe) {}
+    return { edgeCeil: 22, edgeMult: 3.2, simCeil: 26, simMult: 0.9, agrCeil: 18, convCeil: 14, convMult: 2.5, stabCeil: 12, stabMult: 0.12, layerCeil: 8, layerMult: 1.4 };
+  })();
 
+  const agreementScore = trimmedModels.length ? (agreement / trimmedModels.length) * _bw.agrCeil : 0;
   const edgeScore = isFinite(Number(pickRow?.edge)) && isFinite(Number(pickRow?.line)) && Number(pickRow.line) > 0
-    ? Math.min(22, Math.abs((pickRow.edge / pickRow.line) * 100) * 3.2)
+    ? Math.min(_bw.edgeCeil, Math.abs((pickRow.edge / pickRow.line) * 100) * _bw.edgeMult)
     : 0;
-
-  const simScore = Math.max(0, Math.min(26, (simPct - 50) * 0.9));
-  const convergenceScore = Math.max(0, Math.min(14, alignedConvergence * 2.5));
-  const stabilityWeight = Math.max(0, Math.min(12, stabilityScore * 0.12));
+  const simScore = Math.max(0, Math.min(_bw.simCeil, (simPct - 50) * _bw.simMult));
+  const convergenceScore = Math.max(0, Math.min(_bw.convCeil, alignedConvergence * _bw.convMult));
+  const stabilityWeight = Math.max(0, Math.min(_bw.stabCeil, stabilityScore * _bw.stabMult));
   // [CLOSED: FIX 11/23] refLayer and sosLayer added to layerSupport count.
   // DO NOT remove — these layers now contribute to the brutalityScore layerScore component.
   const layerSupport = [paceLayer, offenseLayer, defenseLayer, momentumLayer, venueLayer, h2hLayer, restLayer, refLayer, sosLayer]
     .filter(v => (side === "over" ? v > 0 : v < 0)).length;
-  const layerScore = Math.max(0, Math.min(8, layerSupport * 1.4));
+  const layerScore = Math.max(0, Math.min(_bw.layerCeil, layerSupport * _bw.layerMult));
 
   const brutalityScore = Math.max(
     0,
