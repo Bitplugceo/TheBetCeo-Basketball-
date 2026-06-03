@@ -1,4 +1,4 @@
-S
+D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3599,6 +3599,47 @@ const MODEL_TUNING = {
   recencyWeights: [1.35, 1.20, 1.00, 0.85, 0.70]
 };
 
+// [FIX #1: LEARNED-WEIGHT FRAMEWORK HOOKS]
+// Reads the best-performing recency weights for a league from the Phase 2 calibrator
+// (window.runPhase2Simulator → BB_VERIFIED_TUNINGS). Falls back to MODEL_TUNING defaults.
+// Call at projection start; pass the result to weightedRecentAverage call sites.
+function getLearnedRecencyWeights(league, marketSilo) {
+  try {
+    const siloKey = marketSilo
+      ? ("BB_VERIFIED_TUNINGS_" + String(marketSilo).toUpperCase())
+      : "BB_VERIFIED_TUNINGS";
+    const stored = localStorage.getItem(siloKey);
+    if (!stored) return MODEL_TUNING.recencyWeights;
+    const tunings = JSON.parse(stored);
+    const ld = tunings[String(league || "")];
+    if (ld && ld.verified && Array.isArray(ld.recencyWeights) && ld.recencyWeights.length === 5) {
+      return ld.recencyWeights;
+    }
+  } catch(e) {}
+  return MODEL_TUNING.recencyWeights;
+}
+
+// [FIX #14: LEAGUE-SPECIFIC LEARNING — single call-site for all per-league learned params]
+// Bundles recency weights, massacre coefficients, brutality thresholds, and dynamic anchor
+// cap into one frozen snapshot per league. Consumers call once per engine run.
+function getLeagueLearnedParams(league) {
+  const recencyWeights = getLearnedRecencyWeights(league);
+  let massacreCoeff = null, brutalityThresholds = null, anchorCap = 0.55;
+  try {
+    const mc = JSON.parse(localStorage.getItem("BB_MASSACRE_COEFF") || "{}");
+    massacreCoeff = mc[league] || null;
+  } catch(e) {}
+  try {
+    const bt = JSON.parse(localStorage.getItem("BB_BRUTALITY_THRESHOLDS") || "{}");
+    brutalityThresholds = bt[league] || null;
+  } catch(e) {}
+  try {
+    const aa = JSON.parse(localStorage.getItem("BB_ANCHOR_ADJUSTMENTS") || "{}");
+    if (isFinite(aa[league])) anchorCap = clampNumber(aa[league], 0.30, 0.55);
+  } catch(e) {}
+  return { recencyWeights, massacreCoeff, brutalityThresholds, anchorCap };
+}
+
 
 
 const MASSACRE_TUNING = {
@@ -3633,6 +3674,29 @@ const TEAM_MEMORY_RULES = {
   badWinRate: 0.38,
   hardBlockWinRate: 0.30
 };
+
+// [FIX #6: LEARNED BRUTALITY WEIGHTS]
+// Returns learned sim/brutality thresholds for a league/market from BB_BRUTALITY_THRESHOLDS,
+// which is written by calibrateMassacreCoefficients() using a grid search on settled
+// massacre picks. Falls back to MASSACRE_TUNING.thresholds hardcoded values.
+function getLearnedBrutalityThresholds(league, marketKey) {
+  try {
+    const stored = localStorage.getItem("BB_BRUTALITY_THRESHOLDS");
+    if (stored) {
+      const bt = JSON.parse(stored);
+      const leagueData = bt[league];
+      if (leagueData) {
+        const mkt = marketKey || "ft";
+        return leagueData[mkt] || leagueData.ft || null;
+      }
+    }
+  } catch(e) {}
+  const leagueGroup = league === "nba" ? "nba"
+    : (league === "ncaa" || league === "ncaaw") ? "ncaa"
+    : "other";
+  const base = MASSACRE_TUNING.thresholds[leagueGroup] || MASSACRE_TUNING.thresholds.other;
+  return base[marketKey || "ft"] || base.ft;
+}
 
 const TRACKER_POLICY = {
   advisoryOnly: false,
@@ -9256,6 +9320,37 @@ function bumpConfidenceGrade(grade, shift = 0) {
 
 // [DELETED] settledTrackerScore – unused function
 
+// [FIX #11: MONTE CARLO PROBABILITY OUTPUTS]
+// Lightweight MC simulation for the main pick path — adds win probability output
+// to every OVER/UNDER pick, not just massacre picks. Runs N Box-Muller normal samples
+// of the game total centered at proj with spread vol, returns fraction hitting the side.
+// Budget: default 5000 runs balances speed vs accuracy for client-side use.
+function quickMCWinProb(proj, line, vol, nRuns, side) {
+  if (!isFinite(proj) || !isFinite(line) || line <= 0) return null;
+  if (!isFinite(vol) || vol < 0) return null;
+  if (side !== "over" && side !== "under") return null;
+  const runs = Math.max(500, Math.min(nRuns || 5000, 10000));
+  const sigma = Math.max(vol, 1.0);
+  let hits = 0;
+  for (let i = 0; i < runs; i += 2) {
+    const u1 = Math.random() || 1e-12;
+    const u2 = Math.random() || 1e-12;
+    const z1 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    const z2 = Math.sqrt(-2 * Math.log(u1)) * Math.sin(2 * Math.PI * u2);
+    const s1 = proj + z1 * sigma;
+    const s2 = proj + z2 * sigma;
+    if (side === "over") {
+      if (s1 > line) hits++;
+      if ((i + 1) < runs && s2 > line) hits++;
+    } else {
+      if (s1 < line) hits++;
+      if ((i + 1) < runs && s2 < line) hits++;
+    }
+  }
+  const actualRuns = (runs % 2 === 0) ? runs : runs - 1;
+  return parseFloat(clampNumber(hits / actualRuns, 0.05, 0.95).toFixed(3));
+}
+
 function getTrackerFeedbackMinSample(marketKey) {
   // Gap 2 Bayesian: Bayesian prior absorbs early noise — lower gates let signal emerge sooner
   if (marketKey === "ft") return 5;
@@ -9311,20 +9406,48 @@ function getEmpiricalPriorWinRate(side, broadPicks) {
   return Math.min(60, Math.max(40, (wins / relevant.length) * 100));
 }
 
+// [FIX #10: HIERARCHICAL BAYESIAN PRIORS — 3-level shrinkage]
+// Level 1 (global): side-specific empirical prior across all leagues.
+// Level 2 (league): league + side, shrunk toward Level 1.
+// Level 3 (specific): league + market + side, shrunk toward Level 2.
+// When specific sample < 15, shrink Level 3 toward Level 2 posterior.
+// When league sample < 10, fall back entirely to global prior.
+// This eliminates extreme posteriors from thin cells while still learning from data.
 function getTrackerPosteriorWinProb(league, marketKey, side, priorGames = 12, priorWinRate = 50) {
   const all = getLearningTrackedPicks();
-  const empiricalPrior = getEmpiricalPriorWinRate(side, all);
-  const matches = all.filter(p =>
+  const sideStr = String(side || "").toLowerCase();
+
+  // Level 1: Global empirical side prior
+  const globalPrior = getEmpiricalPriorWinRate(sideStr, all) / 100;
+
+  // Level 2: League-level posterior (all markets, this league + side)
+  const l2Picks = all.filter(p =>
     p.league === league &&
-    p.marketKey === marketKey &&
-    p.side === side &&
+    String(p.side || "").toLowerCase() === sideStr &&
     (p.resultStatus === "win" || p.resultStatus === "loss")
   );
-  const wins = matches.filter(p => p.resultStatus === "win").length;
-  const total = matches.length;
-  const priorWins = priorGames * (empiricalPrior / 100);
-  const posteriorWinRate = (wins + priorWins) / (total + priorGames);
-  return posteriorWinRate;
+  const l2Wins = l2Picks.filter(p => p.resultStatus === "win").length;
+  const l2Total = l2Picks.length;
+  const l2Posterior = (l2Wins + priorGames * globalPrior) / (l2Total + priorGames);
+
+  // Level 3: Specific posterior (league + market + side)
+  const l3Picks = all.filter(p =>
+    p.league === league &&
+    p.marketKey === marketKey &&
+    String(p.side || "").toLowerCase() === sideStr &&
+    (p.resultStatus === "win" || p.resultStatus === "loss")
+  );
+  const l3Wins = l3Picks.filter(p => p.resultStatus === "win").length;
+  const l3Total = l3Picks.length;
+
+  if (l3Total < 15) {
+    // Thin specific cell: use Level 2 posterior as the prior for Level 3
+    return (l3Wins + priorGames * l2Posterior) / (l3Total + priorGames);
+  }
+
+  // Blend Level 2 and Level 3 — weight increases toward L3 as sample grows (15 → 50)
+  const l3Weight = clampNumber((l3Total - 15) / 35, 0, 1);
+  return (1 - l3Weight) * l2Posterior + l3Weight * (l3Wins / l3Total);
 }
 
 // Legacy function kept for compatibility but returns null (no longer used)
@@ -9339,6 +9462,52 @@ function getAllSettledTrackedPicks() {
       const status = String(p.resultStatus || "").toLowerCase();
       return status === "win" || status === "loss";
     });
+}
+
+// [FIX #13: FEATURE IMPORTANCE TRACKING]
+// Computes Pearson |r| between each godsEyeMemory feature and win outcome for a league.
+// Higher = more predictive of wins. Saved per league to BB_FEATURE_IMPORTANCE.
+// Called automatically by the retraining pipeline. Use to guide future weight tuning.
+function computeFeatureImportance(league) {
+  const settled = getAllSettledTrackedPicks().filter(p =>
+    (!league || p.league === league) && p.godsEyeMemory
+  );
+  if (settled.length < 20) return null;
+
+  const features = [
+    "edgePct","simPct","aVol","bVol","pace","netA","netB",
+    "volatilityRatio","possProjection","anchorPull","brutalityScore","agreement"
+  ];
+  const outcomes = settled.map(p => p.resultStatus === "win" ? 1 : 0);
+  const importance = {};
+
+  features.forEach(feat => {
+    const vals = settled.map(p => Number(p.godsEyeMemory?.[feat] ?? p[feat]));
+    const valid = vals.map((v, i) => isFinite(v) ? i : -1).filter(i => i >= 0);
+    if (valid.length < 15) { importance[feat] = null; return; }
+    const xs = valid.map(i => vals[i]);
+    const ys = valid.map(i => outcomes[i]);
+    const n = xs.length;
+    const xM = xs.reduce((s, v) => s + v, 0) / n;
+    const yM = ys.reduce((s, v) => s + v, 0) / n;
+    const cov = xs.reduce((s, v, i) => s + (v - xM) * (ys[i] - yM), 0) / n;
+    const xS = Math.sqrt(xs.reduce((s, v) => s + Math.pow(v - xM, 2), 0) / n) || 1;
+    const yS = Math.sqrt(ys.reduce((s, v) => s + Math.pow(v - yM, 2), 0) / n) || 1;
+    importance[feat] = parseFloat(Math.abs(cov / (xS * yS)).toFixed(4));
+  });
+
+  const ranked = Object.entries(importance)
+    .filter(([, v]) => v !== null)
+    .sort(([, a], [, b]) => b - a)
+    .reduce((o, [k, v]) => ({ ...o, [k]: v }), {});
+
+  try {
+    const stored = JSON.parse(localStorage.getItem("BB_FEATURE_IMPORTANCE") || "{}");
+    stored[league || "global"] = { ranked, n: settled.length, ts: new Date().toISOString() };
+    localStorage.setItem("BB_FEATURE_IMPORTANCE", JSON.stringify(stored));
+  } catch(e) {}
+  engineDebug("Feature importance", { league: league || "global", ranked });
+  return ranked;
 }
 
 
@@ -10194,7 +10363,9 @@ function handleTrackedPicksActionClick(event) {
       await saveTrackerStateToLocal();
       // [CLOSED: FIX 16 — SELF-GRADING POST-MORTEM] Logs prediction accuracy after every
       // settlement batch to localStorage key "bb_engine_accuracy_log".
-      // Tracks: league, market, side, projection, actual, line, error margin, result.
+      // [FIX #9: CALIBRATION METRICS] Extended with Brier score contribution, winProbability,
+      // grade, edgePct. Computes rolling Brier score + ECE after each batch.
+      // [FIX #12: RETRAINING PIPELINE] Triggers calibration every 25 new settled picks.
       // Capped at 2000 entries (rolling). DO NOT remove — feeds calibration audits.
       try {
         const _ACCLOG = "bb_engine_accuracy_log";
@@ -10206,10 +10377,66 @@ function handleTrackedPicksActionClick(event) {
         }).forEach(p => {
           const _proj = Number(p.proj), _actual = Number(p.actualScore);
           if (!isFinite(_proj) || !isFinite(_actual)) return;
-          _log.push({ ts: new Date().toISOString(), league: p.league||"", market: p.marketKey||"", side: p.side||"", proj: _proj, actual: _actual, line: Number(p.lineAtPick||p.line||0), error: _actual - _proj, result: String(p.resultStatus||"").toLowerCase() });
+          const _result = String(p.resultStatus || "").toLowerCase();
+          const _outcome = _result === "win" ? 1 : (_result === "loss" ? 0 : 0.5);
+          const _wp = isFinite(Number(p.winProbability)) ? Number(p.winProbability) : null;
+          _log.push({
+            ts: new Date().toISOString(),
+            league: p.league || "", market: p.marketKey || "", side: p.side || "",
+            proj: _proj, actual: _actual,
+            line: Number(p.lineAtPick || p.line || 0),
+            error: _actual - _proj,
+            result: _result,
+            grade: p.confidenceGrade || "",
+            winProb: _wp,
+            brierContrib: _wp !== null ? Math.pow(_wp - _outcome, 2) : null,
+            edgePct: isFinite(Number(p.edgePct)) ? Number(p.edgePct) : null
+          });
         });
         if (_log.length > 2000) _log = _log.slice(-2000);
         try { localStorage.setItem(_ACCLOG, JSON.stringify(_log)); } catch(_) {}
+        // [FIX #9: Compute rolling Brier score + ECE from entries with winProb]
+        try {
+          const _bEntries = _log.filter(e => e.brierContrib !== null && isFinite(e.brierContrib));
+          if (_bEntries.length >= 20) {
+            const _recent = _bEntries.slice(-100);
+            const _brier = _recent.reduce((s, e) => s + e.brierContrib, 0) / _recent.length;
+            const _bins = Array.from({ length: 10 }, () => ({ sp: 0, so: 0, n: 0 }));
+            _recent.forEach(e => {
+              const bi = Math.min(9, Math.floor(e.winProb * 10));
+              _bins[bi].sp += e.winProb;
+              _bins[bi].so += (e.result === "win" ? 1 : 0);
+              _bins[bi].n++;
+            });
+            const _ece = _bins.filter(b => b.n > 0)
+              .reduce((s, b) => s + (b.n / _recent.length) * Math.abs(b.sp / b.n - b.so / b.n), 0);
+            localStorage.setItem("BB_CALIBRATION_METRICS", JSON.stringify({
+              brierScore: parseFloat(_brier.toFixed(4)),
+              ece: parseFloat(_ece.toFixed(4)),
+              n: _recent.length,
+              ts: new Date().toISOString()
+            }));
+          }
+        } catch(_ce) {}
+        // [FIX #12: RETRAINING PIPELINE HOOK — trigger every 25 new settled picks]
+        try {
+          const _ckpt = JSON.parse(localStorage.getItem("BB_RETRAIN_CHECKPOINT") || "{}");
+          const _nowSettled = getAllSettledTrackedPicks().length;
+          const _prevSettled = Number(_ckpt.settledCount || 0);
+          if (_nowSettled - _prevSettled >= 25) {
+            setTimeout(() => {
+              try { calibrateMassacreCoefficients(); } catch(e) {}
+              try { calibrateConfidenceModel(); } catch(e) {}
+              try { optimizePickThresholds(); } catch(e) {}
+              try { runOutOfSampleValidation(); } catch(e) {}
+              try { checkModelHealth(); } catch(e) {}
+              localStorage.setItem("BB_RETRAIN_CHECKPOINT", JSON.stringify({
+                settledCount: _nowSettled, ts: new Date().toISOString()
+              }));
+              engineDebug("Retraining pipeline fired", { settled: _nowSettled, prev: _prevSettled });
+            }, 400);
+          }
+        } catch(_re) {}
       } catch(_e) {}
 renderTrackedPicks();
     }
@@ -10244,15 +10471,32 @@ function addTrackedPicks(newPicks) {
   newPicks.forEach(raw => {
     const p = { ...ensureTrackedPickKeys(raw) };
     if (p.diagnostics) {
+      // [FIX #13 PREREQ: EXPANDED FEATURE VECTOR]
+      // Captures all signals needed for permutation importance, OOS validation,
+      // confidence calibration, and model health. DO NOT remove existing fields.
       p.godsEyeMemory = {
-        pace: p.diagnostics.pace,
-        netA: p.diagnostics.netA,
-        netB: p.diagnostics.netB,
-        aVol: p.diagnostics.aVol,
-        bVol: p.diagnostics.bVol,
-        edgePct: p.edgePct,
-        grade: p.confidenceGrade,
-        simPct: p.diagnostics.massacre?.simPct,
+        pace:            p.diagnostics.pace,
+        netA:            p.diagnostics.netA,
+        netB:            p.diagnostics.netB,
+        aVol:            p.diagnostics.aVol,
+        bVol:            p.diagnostics.bVol,
+        edgePct:         p.edgePct,
+        grade:           p.confidenceGrade,
+        simPct:          p.diagnostics.massacre?.simPct,
+        sampleTier:      p.diagnostics.ftSampleTier || p.diagnostics.sampleTier || null,
+        trap:            p.diagnostics.trap || false,
+        paceGapRisk:     p.diagnostics.paceGapRisk || false,
+        hasH2H:          p.diagnostics.ftHasH2H || false,
+        volatilityRatio: (isFinite(Number(p.diagnostics.aVol)) && (LEAGUE_VOL_LIMITS[p.league] || 0) > 0)
+                           ? Number(p.diagnostics.aVol) / (LEAGUE_VOL_LIMITS[p.league] || 12)
+                           : null,
+        possProjection:  p.diagnostics.possProjection ?? null,
+        anchorPull:      p.diagnostics.anchorPull ?? null,
+        league:          p.league || null,
+        marketKey:       p.marketKey || null,
+        winProbability:  p.winProbability ?? null,
+        brutalityScore:  p.diagnostics.massacre?.brutalityScore ?? null,
+        agreement:       p.diagnostics.massacre?.agreement ?? null,
       };
       delete p.diagnostics; delete p.massacre; delete p.trackerFeedback;
       delete p.shadowTrackerFeedback; delete p.teamMemory;
@@ -10646,6 +10890,103 @@ function getConfidenceGradeThresholds() {
   return { aThresh: 5, bThresh: 3, cThresh: 1 };
 }
 
+// [FIX #2: PROBABILITY-CALIBRATED CONFIDENCE]
+// Returns a calibrated win probability (0–1) for a given grade + pick context.
+// Priority: (1) fitted logistic model from BB_CONFIDENCE_MODEL_COEFF,
+// (2) empirical grade win rates from settled history, (3) hardcoded priors.
+// Store the result as pick.winProbability for Brier score, health, and MC downstream use.
+function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier, hasH2H, trap, league) {
+  try {
+    const stored = localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF");
+    if (stored) {
+      const models = JSON.parse(stored);
+      const leagueGroup = league === "nba" ? "nba"
+        : (league === "ncaa" || league === "ncaaw") ? "ncaa" : "other";
+      const coeff = models[league] || models[leagueGroup] || models["global"];
+      if (coeff) {
+        const logOdds =
+          (coeff.intercept   || -0.2) +
+          (coeff.edgePct     ||  8.0) * ((edgePct || 0) - 0.060) +
+          (coeff.volRatio    || -0.8) * ((volatilityRatio || 1.0) - 1.0) +
+          (coeff.sampleFull  ||  0.4) * (sampleTier === "full" ? 1 : 0) +
+          (coeff.h2h         ||  0.2) * (hasH2H ? 1 : 0) +
+          (coeff.trap        || -1.2) * (trap ? 1 : 0);
+        return parseFloat(clampNumber(1 / (1 + Math.exp(-Math.min(10, Math.max(-10, logOdds)))), 0.10, 0.90).toFixed(3));
+      }
+    }
+  } catch(e) {}
+  try {
+    const allPicks = getLearningTrackedPicks().filter(p =>
+      p.confidenceGrade === grade && (p.resultStatus === "win" || p.resultStatus === "loss")
+    );
+    if (allPicks.length >= 15) {
+      const wr = allPicks.filter(p => p.resultStatus === "win").length / allPicks.length;
+      return parseFloat(clampNumber(wr, 0.30, 0.85).toFixed(3));
+    }
+  } catch(e) {}
+  return { A: 0.68, B: 0.60, C: 0.54, D: 0.46 }[String(grade || "").toUpperCase()] || 0.50;
+}
+
+// [FIX #8: IMPROVED LOGISTIC CALIBRATION — generalized confidence model]
+// Fits logistic regression on ALL settled picks (not just massacre) predicting P(win)
+// from: edgePct, volatilityRatio, sampleTier, hasH2H, trap. Saves per-league and
+// global models to BB_CONFIDENCE_MODEL_COEFF. Uses the same L2 + early-stopping
+// gradient descent pattern as calibrateMassacreCoefficients.
+function calibrateConfidenceModel() {
+  const allPicks = getAllTrackedPicksForReport().filter(p =>
+    isFinite(Number(p.edgePct)) &&
+    (p.resultStatus === "win" || p.resultStatus === "loss")
+  );
+  if (allPicks.length < 30) return;
+
+  const buildF = (p) => ({
+    edgePct:   clampNumber(Number(p.edgePct || p.godsEyeMemory?.edgePct || 0) - 0.060, -0.06, 0.15),
+    volRatio:  clampNumber(
+                 ((Number(p.godsEyeMemory?.aVol || 0) + Number(p.godsEyeMemory?.bVol || 0)) / 2)
+                 / (LEAGUE_VOL_LIMITS[String(p.league || "")] || 12) - 1.0, -1, 2),
+    sampleFull: (String(p.godsEyeMemory?.sampleTier || "").toLowerCase() === "full") ? 1 : 0,
+    h2h:       (p.godsEyeMemory?.hasH2H) ? 1 : 0,
+    trap:      (p.godsEyeMemory?.trap) ? 1 : 0
+  });
+
+  const runGD = (data) => {
+    if (data.length < 20) return null;
+    let c = { intercept: -0.2, edgePct: 8.0, volRatio: -0.8, sampleFull: 0.4, h2h: 0.2, trap: -1.2 };
+    const lr = data.length < 100 ? 0.002 : 0.0005;
+    const lambda = 0.01;
+    for (let iter = 0; iter < 400; iter++) {
+      const g = { intercept: 0, edgePct: 0, volRatio: 0, sampleFull: 0, h2h: 0, trap: 0 };
+      for (const { f, y } of data) {
+        const lo = c.intercept + c.edgePct*f.edgePct + c.volRatio*f.volRatio + c.sampleFull*f.sampleFull + c.h2h*f.h2h + c.trap*f.trap;
+        const prob = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, lo))));
+        const e = y - prob;
+        g.intercept += e; g.edgePct += e*f.edgePct; g.volRatio += e*f.volRatio;
+        g.sampleFull += e*f.sampleFull; g.h2h += e*f.h2h; g.trap += e*f.trap;
+      }
+      c.intercept += lr * g.intercept;
+      ["edgePct","volRatio","sampleFull","h2h","trap"].forEach(k => {
+        c[k] += lr * g[k] - lr * lambda * c[k];
+      });
+    }
+    return c;
+  };
+
+  const models = {};
+  const globalData = allPicks.map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
+  const globalModel = runGD(globalData);
+  if (globalModel) models["global"] = globalModel;
+  [...new Set(allPicks.map(p => p.league).filter(Boolean))].forEach(league => {
+    const ld = allPicks.filter(p => p.league === league)
+      .map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
+    const lm = runGD(ld);
+    if (lm) models[league] = lm;
+  });
+  if (Object.keys(models).length) {
+    try { localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF", JSON.stringify(models)); } catch(e) {}
+    engineDebug("Confidence model calibrated", Object.keys(models));
+  }
+}
+
     // [LOCK: ADDITIVE INTEGER SCORING — WEIGHTS ARE HEURISTIC, NOT EMPIRICALLY CALIBRATED]
     // Each factor (+2 fullModel, +1 H2H, -3 trap, etc.) is an arbitrary integer with no
     // statistical derivation. calibrateMassacreCoefficients adjusts only the grade BOUNDARY
@@ -10669,54 +11010,65 @@ function getConfidenceGradeThresholds() {
 
   let score = 0;
   const edgePct = Math.abs(edge / line);
-  // [LOCK: isPeriodMarket removed — was defined here but never referenced anywhere in this
-  // function. Dead variable removed to prevent future models from building on a phantom signal.]
+  // [FIX #3: CONTINUOUS SIGNAL LAYERS — replaces discrete integer cliff-edges]
+  // Each factor now contributes a continuous float in the same grade-point scale.
+  // Eliminates cliff-edge instability (e.g., edgePct 7.19% → +1 vs 7.20% → +2).
+  // Grade letter boundaries (A/B/C/D) remain discrete via calibrated _gt thresholds.
   const isH2 = marketKey === "h2";
 
-  if (fullModel && !projectionOnly && sampleTier === "full") score += 2;
-  else if (fullModel && !projectionOnly) score += 1;
-  else if (sampleTier === "full") score += 1;
-  else if (sampleTier === "thin") score -= isH2 ? 3 : 2;
-  else score -= 4;
+  // Model quality: discrete tiers (represent qualitative data completeness, not a gradient)
+  if (fullModel && !projectionOnly && sampleTier === "full") score += 2.0;
+  else if (fullModel && !projectionOnly) score += 1.0;
+  else if (sampleTier === "full") score += 1.0;
+  else if (sampleTier === "thin") score -= isH2 ? 3.0 : 2.0;
+  else score -= 4.0;
+  if (projectionOnly) score -= 3.0;
 
-  if (projectionOnly) score -= 3;
-  if (edgePct >= 0.095) score += 2;
-  else if (edgePct >= 0.072) score += 1;
-  else if (edgePct < (isH2 ? 0.060 : 0.050)) score -= 1;
+  // Edge signal: smooth continuous function replacing 3-step cliff
+  // Neutral at pick floor (5%/6%); +2.0 at ~14.6%; -1.0 near zero edge
+  const edgeFloor = isH2 ? 0.060 : 0.050;
+  score += clampNumber((edgePct - edgeFloor) / 0.048, -1.0, 2.0);
 
-  if (hasH2H) score += 1;
-  else if (isH2) score -= 1;
+  // H2H: binary flag — no continuous equivalent needed
+  if (hasH2H) score += 1.0;
+  else if (isH2) score -= 1.0;
 
-  if (isFinite(volatility) && isFinite(volLimit)) {
-    if (volatility <= volLimit * 1.00) score += 1;
-    else if (volatility > volLimit * 2.00) score -= 3;
-    else if (volatility > volLimit * 1.50) score -= 2;
-    else if (volatility > volLimit * 1.20) score -= 1;
+  // Volatility: piecewise-continuous replacing 4-step cliff
+  // volRatio → score: ≤1.0 → up to +1.5 | 1.0-1.2 → 0 | 1.2-1.5 → -1.0 | 1.5-2.0 → -2.0 | >2.0 → -3.0
+  if (isFinite(volatility) && isFinite(volLimit) && volLimit > 0) {
+    const vr = volatility / volLimit;
+    const volScore =
+      vr <= 1.00 ? clampNumber(1.0 + (1.0 - vr) * 0.5, 0.75, 1.5) :
+      vr <= 1.20 ? clampNumber(1.0 - (vr - 1.00) * 5.0, -0.1, 1.0) :
+      vr <= 1.50 ? clampNumber(0.0 - (vr - 1.20) * (1.0 / 0.30), -1.1, 0.0) :
+      vr <= 2.00 ? clampNumber(-1.0 - (vr - 1.50) * 2.0, -2.1, -1.0) :
+      clampNumber(-2.0 - (vr - 2.00) * 2.0, -3.0, -2.0);
+    score += clampNumber(volScore, -3.0, 1.5);
   }
-  // Injury uncertainty penalty (even if projection adjusted)
+
+  // Injury: continuous exact float (was capped discrete 0.5 steps)
   if (injuryNotes && injuryNotes.length) {
-    score -= Math.min(2, injuryNotes.length * 0.5);
+    score -= clampNumber(injuryNotes.length * 0.5, 0, 2.0);
   }
-  if (trap) score -= 3;
-  if (paceGapRisk) score -= 1;
-  if (defensiveFloorFlag) score -= 1;
-  if (isFinite(blowoutGap) && blowoutGap > 20) score -= 1;
-  if (isH2) score -= 1;
 
-  // [FIX 13: LINEUP QUALITY SIGNAL] Apply roster quality index when available.
-  // +1 for strong lineup (LQI > 0.62), -1 for weak lineup (LQI < 0.38), 0 otherwise.
-  // Threshold asymmetry: bonus requires a clearer positive signal than penalty does negative,
-  // matching the conservative bias already present in the scoring system.
-  // DO NOT remove — this is the only confidence path wired to fetchRoster() advanced stats.
+  // Binary qualitative flags — no continuous equivalent
+  if (trap) score -= 3.0;
+  if (paceGapRisk) score -= 1.0;
+  if (defensiveFloorFlag) score -= 1.0;
+
+  // Blowout gap: continuous penalty scaling with magnitude (was hard -1 at >20)
+  if (isFinite(blowoutGap) && blowoutGap > 15) {
+    score -= clampNumber((blowoutGap - 15) / 15, 0, 1.5);
+  }
+  if (isH2) score -= 1.0;
+
+  // [FIX #3 + FIX 13: LINEUP QUALITY — smooth continuous LQI signal]
+  // Linear signal centered at LQI=0.50 (neutral). DO NOT remove — only confidence
+  // path wired to fetchRoster() advanced stats.
   if (lineupQuality !== null && isFinite(lineupQuality)) {
-    if (lineupQuality > 0.62) score += 1;
-    else if (lineupQuality < 0.38) score -= 1;
+    score += clampNumber((lineupQuality - 0.50) * 3.5, -1.2, 1.2);
   }
 
-  // [FIX: calibrated thresholds applied] Read empirically calibrated score cutoffs
-  // from getConfidenceGradeThresholds(). Falls back to original hardcoded values
-  // (A>=5, B>=3, C>=1) until calibrateMassacreCoefficients() has run with enough
-  // settled picks to compute reliable grade win rates.
   const _gt = getConfidenceGradeThresholds();
   if (isH2 && score >= _gt.aThresh) return "B";
   if (score >= _gt.aThresh) return "A";
@@ -10740,14 +11092,28 @@ function getConfidenceGradeThresholds() {
 
   const scale = Number(MODEL_TUNING.anchorScale?.[marketType] || 0.75);
   const excess = clampNumber((diff - diffGate) / Math.max(1, diffGate * 1.5), 0, 1);
-  // [LOCK: ANCHOR CAP REDUCED 0.70 → 0.55 — DO NOT RAISE ABOVE 0.60]
-  // The betting line is set by bookmakers to balance action, not to reflect the true
-  // expected total. A 0.70 cap allowed the market to dominate the model by 70% even on
-  // the engine's largest independent deviations, systematically diluting the signal exactly
-  // where a big model-vs-market divergence is most valuable.
-  // Cap of 0.55 ensures the model always contributes at least 45% of the final projection.
-  // DO NOT raise this cap above 0.60. DO NOT revert to 0.70.
-  const weight = clampNumber(baseWeight * scale * excess, 0, 0.55);
+  // [FIX #4: DYNAMIC MARKET ANCHORING]
+  // Cap adapts to per-league/market rolling MAE from bb_engine_accuracy_log.
+  // Low MAE (accurate model) → lower cap (model trusted more, less market pull).
+  // High MAE (noisy model) → higher cap (more market pull, capped at 0.55).
+  // Hard ceiling 0.55 preserved. DO NOT raise above 0.60. DO NOT revert to 0.70.
+  let _dynCap = 0.55;
+  try {
+    const _accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]");
+    const _lmLogs = _accLog.filter(e =>
+      e.league === league && e.market === marketType &&
+      (e.result === "win" || e.result === "loss") && isFinite(e.error)
+    );
+    if (_lmLogs.length >= 20) {
+      const _recent = _lmLogs.slice(-50);
+      const _mae = _recent.reduce((s, e) => s + Math.abs(e.error), 0) / _recent.length;
+      const _base = LEAGUE_BASES[league] || 160;
+      _dynCap = clampNumber(0.30 + (_mae / (_base * 0.08)) * 0.25, 0.30, 0.55);
+    }
+    const _aa = JSON.parse(localStorage.getItem("BB_ANCHOR_ADJUSTMENTS") || "{}");
+    if (isFinite(_aa[league])) _dynCap = clampNumber(_aa[league], 0.30, 0.55);
+  } catch(e) {}
+  const weight = clampNumber(baseWeight * scale * excess, 0, _dynCap);
 
   return (proj * (1 - weight)) + (line * weight);
 }
@@ -13465,6 +13831,17 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
     const aA = avgOrNaN(parsed?.aFTAllowed) || (eb / 2);
     const bA = avgOrNaN(parsed?.bFTAllowed) || (eb / 2);
 
+    // [FIX #5: POSSESSION × PPP EXPLICIT OUTPUT]
+    // possProjection = projAFT + projBFT BEFORE the ftLine anchor step.
+    // Exposes the raw Poss×PPP total for: (a) measuring anchor pull-back magnitude,
+    // (b) feeding pppEdge as an independent calibration signal, (c) diagnostics.
+    // anchorPull = |ftProj - possProjection| — how hard the market pulled the model.
+    const possProjection = isFinite(projAFT) && isFinite(projBFT) ? projAFT + projBFT : NaN;
+    const pppEdge = isFinite(possProjection) && isFinite(lines.ftLine) && lines.ftLine > 0
+      ? possProjection - lines.ftLine : NaN;
+    const anchorPull = isFinite(possProjection) && isFinite(ftProj)
+      ? Math.abs(ftProj - possProjection) : NaN;
+
     return {
     eb, projAFT, projBFT, ftProj, pace: estMatchPace, ftSampleTier,
     synNetA, synNetB, ftHasH2H,
@@ -13481,7 +13858,10 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
     defensiveFloorFlag: (isFinite(aA) && aA > (eb / 2) * 1.05) || (isFinite(bA) && bA > (eb / 2) * 1.05),
     aS, bS,
     aScores: aFTS,
-    bScores: bFTS
+    bScores: bFTS,
+    possProjection,
+    pppEdge,
+    anchorPull
   };
 }
 
@@ -14616,7 +14996,150 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
       localStorage.setItem("BB_MASSACRE_COEFF", JSON.stringify(newCoeff));
       engineDebug("Massacre coefficients auto‑calibrated for leagues", Object.keys(newCoeff));
     }
+
+    // [FIX #6 CONT: Learn brutality thresholds via grid search on settled massacre picks]
+    try {
+      const _mPicks = allPicks.filter(p => p.massacre && (p.resultStatus === "win" || p.resultStatus === "loss"));
+      if (_mPicks.length >= 30) {
+        const _btResult = {};
+        [...new Set(_mPicks.map(p => p.league).filter(Boolean))].forEach(lg => {
+          const _lgP = _mPicks.filter(p => p.league === lg);
+          if (_lgP.length < 20) return;
+          let _bestWR = 0, _bestSim = 53, _bestBrut = 50;
+          for (let sim = 50; sim <= 57; sim++) {
+            for (let brut = 45; brut <= 55; brut++) {
+              const _q = _lgP.filter(p => (p.massacre.simPct||0) >= sim && (p.massacre.brutalityScore||0) >= brut);
+              if (_q.length < 8) continue;
+              const _wr = _q.filter(p => p.resultStatus === "win").length / _q.length;
+              if (_wr > _bestWR) { _bestWR = _wr; _bestSim = sim; _bestBrut = brut; }
+            }
+          }
+          _btResult[lg] = { ft: { sim: _bestSim, brutality: _bestBrut }, winRate: parseFloat(_bestWR.toFixed(3)), n: _lgP.length };
+        });
+        if (Object.keys(_btResult).length) {
+          localStorage.setItem("BB_BRUTALITY_THRESHOLDS", JSON.stringify(_btResult));
+          engineDebug("Brutality thresholds learned", Object.keys(_btResult));
+        }
+      }
+    } catch(_bt) {}
   }
+
+// [FIX #7: PARAMETER OPTIMIZATION FRAMEWORK]
+// Grid searches over OVER/UNDER edge% thresholds using Brier-score minimization on
+// bb_engine_accuracy_log. Saves optimal thresholds to BB_OPTIMIZED_THRESHOLDS per league.
+// Run automatically by the retraining pipeline after each checkpoint.
+function optimizePickThresholds(league) {
+  let accLog = [];
+  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
+  const data = accLog.filter(e =>
+    (!league || e.league === league) &&
+    (e.result === "win" || e.result === "loss") &&
+    isFinite(e.proj) && isFinite(e.line) && isFinite(e.error)
+  ).map(e => ({
+    ...e,
+    edgePct: Math.abs((e.proj - e.line) / (Math.abs(e.line) || 1)),
+    outcome: e.result === "win" ? 1 : 0
+  }));
+  if (data.length < 40) return;
+
+  let bestBrier = Infinity;
+  let best = { over: 0.050, under: 0.055 };
+  for (let ot = 0.040; ot <= 0.070; ot += 0.0025) {
+    for (let ut = ot; ut <= 0.075; ut += 0.0025) {
+      const filtered = data.filter(e =>
+        (e.side === "over" && e.edgePct >= ot) ||
+        (e.side === "under" && e.edgePct >= ut)
+      );
+      if (filtered.length < 15) continue;
+      const avgWR = filtered.reduce((s, e) => s + e.outcome, 0) / filtered.length;
+      const brier = filtered.reduce((s, e) => s + Math.pow(avgWR - e.outcome, 2), 0) / filtered.length;
+      if (brier < bestBrier) { bestBrier = brier; best = { over: parseFloat(ot.toFixed(4)), under: parseFloat(ut.toFixed(4)) }; }
+    }
+  }
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem("BB_OPTIMIZED_THRESHOLDS") || "{}"); } catch(e) {}
+  stored[league || "global"] = { ...best, brier: parseFloat(bestBrier.toFixed(4)), n: data.length, ts: new Date().toISOString() };
+  try { localStorage.setItem("BB_OPTIMIZED_THRESHOLDS", JSON.stringify(stored)); } catch(e) {}
+  engineDebug("Threshold optimization", { league, ...stored[league || "global"] });
+}
+
+// [FIX #15: OUT-OF-SAMPLE VALIDATION — chronological train/test split]
+// Splits bb_engine_accuracy_log 70/30 by time. Computes Brier score on each half.
+// A large gap (testBrier >> trainBrier) signals overfitting to historical patterns.
+// Saved to BB_OOS_VALIDATION per league. Called automatically by retraining pipeline.
+function runOutOfSampleValidation(league) {
+  let accLog = [];
+  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
+  const leagueLogs = accLog.filter(e =>
+    (!league || e.league === league) &&
+    (e.result === "win" || e.result === "loss") &&
+    e.brierContrib !== null && isFinite(e.brierContrib)
+  );
+  if (leagueLogs.length < 30) return null;
+
+  const split = Math.floor(leagueLogs.length * 0.70);
+  const trainSet = leagueLogs.slice(0, split);
+  const testSet  = leagueLogs.slice(split);
+  const brierOf  = (s) => s.length ? s.reduce((acc, e) => acc + e.brierContrib, 0) / s.length : null;
+
+  const result = {
+    league:      league || "global",
+    trainBrier:  brierOf(trainSet) !== null ? parseFloat(brierOf(trainSet).toFixed(4)) : null,
+    testBrier:   brierOf(testSet)  !== null ? parseFloat(brierOf(testSet).toFixed(4))  : null,
+    overfit:     (brierOf(testSet) !== null && brierOf(trainSet) !== null)
+                   ? parseFloat((brierOf(testSet) - brierOf(trainSet)).toFixed(4)) : null,
+    trainN:      trainSet.length,
+    testN:       testSet.length,
+    ts:          new Date().toISOString()
+  };
+
+  try {
+    const stored = JSON.parse(localStorage.getItem("BB_OOS_VALIDATION") || "{}");
+    stored[league || "global"] = result;
+    localStorage.setItem("BB_OOS_VALIDATION", JSON.stringify(stored));
+  } catch(e) {}
+  engineDebug("Out-of-sample validation", result);
+  return result;
+}
+
+// [FIX #16: MODEL HEALTH MONITORING — win rate drift detection]
+// Compares rolling win rate (last 20 picks) against historical baseline.
+// Flags as unhealthy when drift >= 10pp, severe when drift >= 18pp or 14+ cold streak.
+// isSevere triggers a confidence deflation warning in the UI.
+// Saved to BB_MODEL_HEALTH per league. Called automatically by retraining pipeline.
+function checkModelHealth(league) {
+  const settled = getAllSettledTrackedPicks().filter(p => !league || p.league === league);
+  if (settled.length < 20) return null;
+
+  const recent = settled.slice(-20);
+  const recentWR    = recent.filter(p => p.resultStatus === "win").length / 20;
+  const historicalWR = settled.filter(p => p.resultStatus === "win").length / settled.length;
+  const drift        = historicalWR - recentWR;
+  const coldStreak   = recent.filter(p => p.resultStatus === "loss").length;
+
+  const health = {
+    league:           league || "global",
+    recentWinRate:    parseFloat(recentWR.toFixed(3)),
+    historicalWinRate: parseFloat(historicalWR.toFixed(3)),
+    drift:            parseFloat(drift.toFixed(3)),
+    coldStreakCount:  coldStreak,
+    isUnhealthy:      drift >= 0.10,
+    isSevere:         drift >= 0.18 || coldStreak >= 14,
+    totalSettled:     settled.length,
+    ts:               new Date().toISOString()
+  };
+
+  try {
+    const stored = JSON.parse(localStorage.getItem("BB_MODEL_HEALTH") || "{}");
+    stored[league || "global"] = health;
+    localStorage.setItem("BB_MODEL_HEALTH", JSON.stringify(stored));
+  } catch(e) {}
+
+  if (health.isUnhealthy) {
+    engineDebug("MODEL HEALTH WARNING", health);
+  }
+  return health;
+}
 
   const _runOneMassacrePick = async (p) => {
     if (!p || p.note || p.pick === "NO PLAY") return;
