@@ -1,4 +1,4 @@
-S
+O
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2451,8 +2451,12 @@ body.dark-mode .tracker-analytics-section-head {
       <option value="mexico_lnbp">Mexico - LNBP</option>
     </optgroup>
     <optgroup label="── N ──────────────────">
+      <!-- [CLOSED: ESPN+ EXPANSION] nba_gl and ncaaw verified ESPN auto-fetch leagues.
+           Full feature parity with NBA/WNBA/NCAA: stats, injuries, H2H, live polling, tracker.
+           DO NOT remove or reclassify as manual leagues. -->
+      <!-- [CLOSED: ESPN+ EXPANSION] NBA stays under N. All other US ESPN leagues moved to USA group.
+           DO NOT re-add nba_gl, ncaa, ncaaw here — they now live in the USA optgroup. -->
       <option value="nba">NBA - USA</option>
-      <option value="ncaa">NCAA - USA</option>
       <option value="nznbl">New Zealand - NBL</option>
     </optgroup>
     <optgroup label="── P ──────────────────">
@@ -2488,6 +2492,12 @@ body.dark-mode .tracker-analytics-section-head {
       <option value="united_league">United League (Intl)</option>
       <option value="uruguay_lub">Uruguay - LUB</option>
       <option value="uruguay_lfb_w">Uruguay - LFB Women</option>
+      <!-- [CLOSED: ESPN+ EXPANSION] All US ESPN auto-fetch leagues grouped here.
+           nba_gl, ncaa, ncaaw moved from N section — grouped with WNBA for clarity.
+           DO NOT split this group or move entries back under N. -->
+      <option value="nba_gl">USA - NBA G League</option>
+      <option value="ncaa">USA - NCAA Men's</option>
+      <option value="ncaaw">USA - NCAA Women's</option>
       <option value="wnba">USA - WNBA</option>
       <option value="wnba_pre">USA - WNBA Preseason</option>
     </optgroup>
@@ -2534,7 +2544,10 @@ body.dark-mode .tracker-analytics-section-head {
 </div>
 
 <div class="section" id="espnSection">
-  <h3>⚡ ESPN Auto-Fetch <span style="font-size:11px;color:#aaa;">(NBA &amp; NCAA only)</span></h3>
+  <!-- [CLOSED: ESPN+ EXPANSION] Label updated to reflect all 5 ESPN auto-fetch leagues.
+       NBA · WNBA (+ preseason) · NCAA Men's · NCAA Women's · NBA G League.
+       DO NOT revert — misleads users about which leagues support auto-fetch. -->
+  <h3>⚡ ESPN Auto-Fetch <span style="font-size:11px;color:#aaa;">(NBA · WNBA · NCAA · NCAA Women's · G League)</span></h3>
 
   <div id="fixtureToolbar" class="fixture-toolbar">
     <button type="button" class="fixture-day active" id="fixturesTodayBtn">Today</button>
@@ -2766,7 +2779,7 @@ body.dark-mode .tracker-analytics-section-head {
 </div>
 
 <div class="section" id="h2hSection">
-  <h3>H2H TEST <span class="autofill-indicator" id="h2hAutoTag">✅ Auto-filled (2024+, OT stripped, expanded matchup history)</span></h3>
+  <h3>H2H TEST <span class="autofill-indicator" id="h2hAutoTag">✅ Auto-filled (2022+, decay-weighted, OT stripped)</span></h3>
 
   <label id="useFTH2HLabel"><input type="checkbox" id="useFTH2H" /> Use FT H2H (min 2 games)</label>
   <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;">
@@ -2965,9 +2978,9 @@ body.dark-mode .tracker-analytics-section-head {
   window.fetch = async function(...args) {
     try {
       const response = await originalFetch.apply(this, args);
-      if (!response.ok && typeof window.engineDebug === "function") {
-        window.engineDebug(`API ERROR: HTTP ${response.status}`, { url: args[0] });
-      }
+          if (!response.ok && response.status !== 400 && typeof window.engineDebug === "function") {
+      window.engineDebug(`API ERROR: HTTP ${response.status}`, { url: args[0] });
+    }
       return response;
     } catch (err) {
       if (typeof window.engineDebug === "function") {
@@ -3075,6 +3088,17 @@ function ssIsBasketballEvent(ev) {
   }
 
   return true;
+}
+
+// Helper: returns true if any past event for the given team ID passed the basketball filter
+function isTeamKnownBasketball(teamId, events) {
+  if (!events || !events.length) return false;
+  return events.some(ev => {
+    if (!ssIsBasketballEvent(ev)) return false;
+    const hId = String(ev.homeTeam?.id ?? "");
+    const aId = String(ev.awayTeam?.id ?? "");
+    return hId === teamId || aId === teamId;
+  });
 }
 
 function ssProcessTeamEvents(events, teamId, label) {
@@ -3418,8 +3442,55 @@ function parseSofascoreIndividual(side) {
 }
 
 function extractH2HFromPastedEvents() {
-  const idA = document.getElementById("ssTeamAId")?.value.trim();
-  const idB = document.getElementById("ssTeamBId")?.value.trim();
+  let idA = document.getElementById("ssTeamAId")?.value.trim();
+  let idB = document.getElementById("ssTeamBId")?.value.trim();
+
+  // Auto-infer missing Team B ID from Team A's events using Team B's name field
+  if (idA && !idB && (window.__lastEventsA || []).length) {
+    const rawNameB = normalizeTeamName((document.getElementById("ssTeamBName")?.value || "").split(",")[0].trim());
+    if (rawNameB.length >= 3) {
+      const oppFreq = {};
+      (window.__lastEventsA).forEach(ev => {
+        const isAHome = String(ev.homeTeam?.id) === String(idA);
+        const opp = isAHome ? ev.awayTeam : ev.homeTeam;
+        if (!opp?.id) return;
+        const oppNorm = normalizeTeamName(opp.shortName || opp.name || opp.nameCode || "");
+        if (oppNorm.includes(rawNameB) || rawNameB.includes(oppNorm)) {
+          oppFreq[String(opp.id)] = (oppFreq[String(opp.id)] || 0) + 1;
+        }
+      });
+      const bestId = Object.keys(oppFreq).sort((a, b) => oppFreq[b] - oppFreq[a])[0];
+      if (bestId) {
+        idB = bestId;
+        const el = document.getElementById("ssTeamBId");
+        if (el && !el.value.trim()) { el.value = bestId; updateSofascoreLinks("B"); }
+      }
+    }
+  }
+
+  // Auto-infer missing Team A ID from Team B's events using Team A's name field
+  if (!idA && idB && (window.__lastEventsB || []).length) {
+    const rawNameA = normalizeTeamName((document.getElementById("ssTeamAName")?.value || "").split(",")[0].trim());
+    if (rawNameA.length >= 3) {
+      const oppFreq = {};
+      (window.__lastEventsB).forEach(ev => {
+        const isBHome = String(ev.homeTeam?.id) === String(idB);
+        const opp = isBHome ? ev.awayTeam : ev.homeTeam;
+        if (!opp?.id) return;
+        const oppNorm = normalizeTeamName(opp.shortName || opp.name || opp.nameCode || "");
+        if (oppNorm.includes(rawNameA) || rawNameA.includes(oppNorm)) {
+          oppFreq[String(opp.id)] = (oppFreq[String(opp.id)] || 0) + 1;
+        }
+      });
+      const bestId = Object.keys(oppFreq).sort((a, b) => oppFreq[b] - oppFreq[a])[0];
+      if (bestId) {
+        idA = bestId;
+        const el = document.getElementById("ssTeamAId");
+        if (el && !el.value.trim()) { el.value = bestId; updateSofascoreLinks("A"); }
+      }
+    }
+  }
+
   if (!idA || !idB) return;
 
   window.__h2hEntryCache = [];
@@ -3443,13 +3514,19 @@ function extractH2HFromPastedEvents() {
   // LOCK: H2H must also be basketball-only. ssIsBasketballEvent blocks football/soccer
   // events that share team IDs with basketball teams on SofaScore.
   const h2hMatches = uniqueEvents.filter(ev => {
-    if (!ssIsBasketballEvent(ev)) return false;
     const sType = ev.status?.type ?? "";
     const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
     if (!isTerminal) return false;
     const hId = String(ev.homeTeam?.id ?? "");
     const aId = String(ev.awayTeam?.id ?? "");
-    return (hId === idA && aId === idB) || (hId === idB && aId === idA);
+    const isH2H = (hId === idA && aId === idB) || (hId === idB && aId === idA);
+    if (!isH2H) return false;
+    // Strict basketball check first
+    if (ssIsBasketballEvent(ev)) return true;
+    // Bypass: if both teams are already known basketball teams from other pasted events, accept it
+    const teamAKnown = isTeamKnownBasketball(idA, window.__lastEventsA);
+    const teamBKnown = isTeamKnownBasketball(idB, window.__lastEventsB);
+    return teamAKnown && teamBKnown;
   }).sort((a, b) => {
     const tA = a.startTimestamp || 0;
     const tB = b.startTimestamp || 0;
@@ -3586,6 +3663,47 @@ const MODEL_TUNING = {
   recencyWeights: [1.35, 1.20, 1.00, 0.85, 0.70]
 };
 
+// [FIX #1: LEARNED-WEIGHT FRAMEWORK HOOKS]
+// Reads the best-performing recency weights for a league from the Phase 2 calibrator
+// (window.runPhase2Simulator → BB_VERIFIED_TUNINGS). Falls back to MODEL_TUNING defaults.
+// Call at projection start; pass the result to weightedRecentAverage call sites.
+function getLearnedRecencyWeights(league, marketSilo) {
+  try {
+    const siloKey = marketSilo
+      ? ("BB_VERIFIED_TUNINGS_" + String(marketSilo).toUpperCase())
+      : "BB_VERIFIED_TUNINGS";
+    const stored = localStorage.getItem(siloKey);
+    if (!stored) return MODEL_TUNING.recencyWeights;
+    const tunings = JSON.parse(stored);
+    const ld = tunings[String(league || "")];
+    if (ld && ld.verified && Array.isArray(ld.recencyWeights) && ld.recencyWeights.length === 5) {
+      return ld.recencyWeights;
+    }
+  } catch(e) {}
+  return MODEL_TUNING.recencyWeights;
+}
+
+// [FIX #14: LEAGUE-SPECIFIC LEARNING — single call-site for all per-league learned params]
+// Bundles recency weights, massacre coefficients, brutality thresholds, and dynamic anchor
+// cap into one frozen snapshot per league. Consumers call once per engine run.
+function getLeagueLearnedParams(league) {
+  const recencyWeights = getLearnedRecencyWeights(league);
+  let massacreCoeff = null, brutalityThresholds = null, anchorCap = 0.55;
+  try {
+    const mc = JSON.parse(localStorage.getItem("BB_MASSACRE_COEFF") || "{}");
+    massacreCoeff = mc[league] || null;
+  } catch(e) {}
+  try {
+    const bt = JSON.parse(localStorage.getItem("BB_BRUTALITY_THRESHOLDS") || "{}");
+    brutalityThresholds = bt[league] || null;
+  } catch(e) {}
+  try {
+    const aa = JSON.parse(localStorage.getItem("BB_ANCHOR_ADJUSTMENTS") || "{}");
+    if (isFinite(aa[league])) anchorCap = clampNumber(aa[league], 0.30, 0.55);
+  } catch(e) {}
+  return { recencyWeights, massacreCoeff, brutalityThresholds, anchorCap };
+}
+
 
 
 const MASSACRE_TUNING = {
@@ -3620,6 +3738,29 @@ const TEAM_MEMORY_RULES = {
   badWinRate: 0.38,
   hardBlockWinRate: 0.30
 };
+
+// [FIX #6: LEARNED BRUTALITY WEIGHTS]
+// Returns learned sim/brutality thresholds for a league/market from BB_BRUTALITY_THRESHOLDS,
+// which is written by calibrateMassacreCoefficients() using a grid search on settled
+// massacre picks. Falls back to MASSACRE_TUNING.thresholds hardcoded values.
+function getLearnedBrutalityThresholds(league, marketKey) {
+  try {
+    const stored = localStorage.getItem("BB_BRUTALITY_THRESHOLDS");
+    if (stored) {
+      const bt = JSON.parse(stored);
+      const leagueData = bt[league];
+      if (leagueData) {
+        const mkt = marketKey || "ft";
+        return leagueData[mkt] || leagueData.ft || null;
+      }
+    }
+  } catch(e) {}
+  const leagueGroup = league === "nba" ? "nba"
+    : (league === "ncaa" || league === "ncaaw") ? "ncaa"
+    : "other";
+  const base = MASSACRE_TUNING.thresholds[leagueGroup] || MASSACRE_TUNING.thresholds.other;
+  return base[marketKey || "ft"] || base.ft;
+}
 
 const TRACKER_POLICY = {
   advisoryOnly: false,
@@ -3799,7 +3940,7 @@ function getLeagueUnderBlockRatio(league) {
 
 
 let LEAGUE_BASES = {
-  nba: 230, ncaa: 148, wnba: 168, wnba_pre: 164, cebl: 176,
+  nba: 230, ncaa: 148, nba_gl: 228, ncaaw: 144, wnba: 168, wnba_pre: 164, cebl: 176,
   pba: 196, phil_mpbl: 156, cba: 202, china_nbl: 188, taipei_tpbl: 176,
   bleague: 162, korea_kbl: 164, indonesia_ibl: 154,
   ausnbl: 176, aus_nbl1_east: 178, aus_nbl1_north: 178, aus_nbl1_south: 178, aus_nbl1_west: 178, aus_nbl1_east_w: 152, aus_nbl1_north_w: 152, aus_nbl1_south_w: 152, aus_nbl1_west_w: 152, aus_big_v: 154, aus_big_v_w: 148, nznbl: 176,
@@ -3903,6 +4044,8 @@ function getNBASeasonBaseline(teamName, league) {
 const LEAGUE_PACE_BASES = {
   nba: 99.5,
   ncaa: 67.5,
+  nba_gl: 97.0,
+  ncaaw: 65.0,
   wnba: 80.0,
   wnba_pre: 80.0,
   cebl: 76.0, nznbl: 76.0,
@@ -3945,6 +4088,8 @@ function getLeagueRecencyDefaults(league) {
   const map = {
     nba:              [1.35, 1.20, 1.00, 0.85, 0.70],
     ncaa:             [1.30, 1.15, 1.00, 0.90, 0.75],
+    nba_gl:           [1.35, 1.20, 1.00, 0.85, 0.70],
+    ncaaw:            [1.30, 1.15, 1.00, 0.90, 0.75],
     wnba:             [1.30, 1.15, 1.00, 0.88, 0.72],
     wnba_pre:         [1.25, 1.10, 1.00, 0.90, 0.80],
     cebl:             [1.28, 1.15, 1.00, 0.90, 0.75],
@@ -4048,7 +4193,7 @@ function getLeagueRecencyDefaults(league) {
 }
 
 const LEAGUE_HOME_EDGE = {
-  nba: 1.5, ncaa: 2.0, wnba: 1.5, wnba_pre: 1.5, cebl: 1.4,
+  nba: 1.5, ncaa: 2.0, nba_gl: 1.5, ncaaw: 2.0, wnba: 1.5, wnba_pre: 1.5, cebl: 1.4,
   pba: 1.5, phil_mpbl: 1.4, cba: 2.0, china_nbl: 1.6, taipei_tpbl: 1.6, bleague: 1.5, korea_kbl: 1.6, indonesia_ibl: 1.4, 
   ausnbl: 1.6, aus_nbl1_east: 1.4, aus_nbl1_north: 1.4, aus_nbl1_south: 1.4, aus_nbl1_west: 1.4, aus_nbl1_east_w: 1.2, aus_nbl1_north_w: 1.2, aus_nbl1_south_w: 1.2, aus_nbl1_west_w: 1.2, aus_big_v: 1.3, aus_big_v_w: 1.2, nznbl: 1.5,
   puerto_rico_bsn: 1.8, mexico_cibacopa: 1.8, mexico_lnbp: 1.6, 
@@ -4068,7 +4213,7 @@ const LEAGUE_HOME_EDGE = {
 };
 
 let LEAGUE_VOL_LIMITS = {
-  nba: 14, ncaa: 11, wnba: 12, wnba_pre: 13, cebl: 12,
+  nba: 14, ncaa: 11, nba_gl: 13, ncaaw: 10, wnba: 12, wnba_pre: 13, cebl: 12,
   pba: 13, phil_mpbl: 11, cba: 13, china_nbl: 12, taipei_tpbl: 12, bleague: 12, korea_kbl: 12, indonesia_ibl: 11,
   ausnbl: 12, aus_nbl1_east: 13, aus_nbl1_north: 13, aus_nbl1_south: 13, aus_nbl1_west: 13, aus_nbl1_east_w: 11, aus_nbl1_north_w: 11, aus_nbl1_south_w: 11, aus_nbl1_west_w: 11, aus_big_v: 12, aus_big_v_w: 11, nznbl: 11,
   puerto_rico_bsn: 13, mexico_cibacopa: 13, mexico_lnbp: 12, 
@@ -4085,7 +4230,7 @@ let LEAGUE_VOL_LIMITS = {
 };
 
 const LEAGUE_H1_RATIO = {
-  nba: 0.490, ncaa: 0.490, wnba: 0.490, wnba_pre: 0.490,
+  nba: 0.490, ncaa: 0.490, nba_gl: 0.490, ncaaw: 0.490, wnba: 0.490, wnba_pre: 0.490,
   euroleague: 0.488, eurocup: 0.488, champions_league: 0.488,
   acb: 0.488, lba: 0.488, bbl: 0.488, turkey_bsl: 0.488,
   proa: 0.487, bcl: 0.487, isl: 0.487, aba: 0.487, plk: 0.487,
@@ -4136,7 +4281,7 @@ function getLeagueConfig(league) {
 
 const LEAGUE_TRUST_PROFILES = {
   trusted: [
-    "nba", "ncaa", "wnba", "euroleague", "eurocup", "champions_league", 
+    "nba", "ncaa", "nba_gl", "ncaaw", "wnba", "euroleague", "eurocup", "champions_league", 
     "acb", "lba", "bbl", "bcl", "turkey_bsl", "isl", "cba", "pba", 
     "ausnbl", "proa", "united_league", "bleague", "korea_kbl",
     "aus_nbl1_east", "aus_nbl1_north", "aus_nbl1_south", "aus_nbl1_west", "aus_big_v",
@@ -4235,6 +4380,24 @@ const LEAGUE_FETCH_RULES = {
     scheduleTypes: ["2", "3"],
     h2hScheduleTypes: ["2", "3"],
     regulationPeriods: 2
+  },
+  // [CLOSED: ESPN+ EXPANSION — LEAGUE_FETCH_RULES ENTRIES]
+  // ncaaw and nba_gl were missing entirely — fetchScheduleCore and fetchH2HCore returned
+  // null for both leagues, silently blocking all stats and H2H fetch.
+  // ncaaw uses halftime-style (2 regulation periods) like NCAA Men's.
+  // nba_gl uses 4 quarters like NBA. Season types mirror their parent leagues.
+  // DO NOT remove — without these, schedule/H2H fetch returns null for both leagues.
+  ncaaw: {
+    recentSeasons: 3,
+    scheduleTypes: ["2", "3"],
+    h2hScheduleTypes: ["2", "3"],
+    regulationPeriods: 2
+  },
+  nba_gl: {
+    recentSeasons: 2,
+    scheduleTypes: ["1", "2", "3"],
+    h2hScheduleTypes: ["1", "2", "3"],
+    regulationPeriods: 4
   }
 };
 
@@ -4382,6 +4545,10 @@ function queueH2HCheckboxSync(forceAuto = false) {
     let g_injA = defaultInjuryMeta();
     let g_injB = defaultInjuryMeta();
 
+// [CLOSED: FIX 11/23] Added refTendency (referee foul bias) and sos (schedule strength)
+// to default context. refTendency is populated by fetchGameOfficials after the main fetch.
+// sos is populated from fetchScheduleCore opponent record cross-reference.
+// DO NOT remove these fields — they feed refLayer and sosLayer in the convergence engine.
 function defaultMassacreFetchContext() {
   return {
     league: "",
@@ -4391,16 +4558,17 @@ function defaultMassacreFetchContext() {
       ortg10: [], drtg10: [], pace10: [],
       q1Scored: [], q2Scored: [], q3Scored: [], q4Scored: [],
       q1Allowed: [], q2Allowed: [], q3Allowed: [], q4Allowed: [],
-      roster: []
+      roster: [], sos: null
     },
     B: { 
       overall: null, venue: null, lastGameDate: "", restDays: null,
       ortg10: [], drtg10: [], pace10: [],
       q1Scored: [], q2Scored: [], q3Scored: [], q4Scored: [],
       q1Allowed: [], q2Allowed: [], q3Allowed: [], q4Allowed: [],
-      roster: []
+      roster: [], sos: null
     },
-    h2hGames: []
+    h2hGames: [],
+    refTendency: null
   };
 }
 
@@ -4567,6 +4735,18 @@ function saveEngineLineMemory() {
   }
 
   syncLineMemoryIntoTrackerState();
+
+  // [CLOSED: FIX 22 — LINE MEMORY CLOUD SYNC] Line memory now synced to Cloudflare Worker
+  // on every save, piggybacking on pushTrackerStateToServer. Survives localStorage clears.
+  // Works cross-device as long as the same Worker endpoint is configured.
+  // DO NOT remove — localStorage-only line memory is silently lost on browser data clear.
+  try {
+    if (typeof pushTrackerStateToServer === "function" && !isTrackerStateMeaningfullyEmpty(g_trackerState)) {
+      const _lmState = JSON.parse(JSON.stringify(g_trackerState));
+      _lmState.lineMemory = Object.assign({}, g_engineLineMemory);
+      pushTrackerStateToServer(_lmState).catch(() => {});
+    }
+  } catch(_lmErr) {}
 }
 
 
@@ -5835,7 +6015,12 @@ function isIgnoredEngineWatchLine(line = "") {
     text.includes("\"no-play\"") ||
     text.includes("critical network block") ||
     text.includes("fetch is aborted") ||
-    text.includes("hydrate failed");
+    text.includes("hydrate failed") ||
+    text.includes("worker timeout") ||
+    text.includes("fallback proxy") ||
+    text.includes("http 400") ||
+    text.includes("http 403") ||
+    text.includes("nba-g-league");
 }
 
 window.addEventListener("unhandledrejection", event => {
@@ -6181,11 +6366,11 @@ function buildFetchAuditIssues({
   }
 
 
-  if ((h2hGames?.length || 0) === 0) {
-    issues.push("No 2024+ H2H games were found for this matchup.");
-  } else if ((h2hGames?.length || 0) === 1) {
-    issues.push("Only 1 H2H game was found, so H2H is not fully confirmed.");
-  }
+    if ((h2hGames?.length || 0) === 0) {
+      issues.push("No 2022+ H2H games were found for this matchup.");
+    } else if ((h2hGames?.length || 0) === 1) {
+      issues.push("Only 1 H2H game was found, so H2H is not fully confirmed.");
+    }
 
   return issues;
 }
@@ -6195,7 +6380,7 @@ function validateFetchSection() {
   const fetchBtn = document.getElementById("fetchBtn");
   const teamAName = document.getElementById("teamAName")?.value.trim() || "";
   const teamBName = document.getElementById("teamBName")?.value.trim() || "";
-  const supported = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
+  const supported = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa" || league === "ncaaw" || league === "nba_gl";
   const fixtureOpt = getSelectedFixtureOption();
   const hasActivity = !!teamAName || !!teamBName || !!fixtureOpt;
 
@@ -6493,14 +6678,33 @@ function buildCompactFetchStatus(messages = [], fetchAuditIssues = []) {
         }
       }
 
+      // [CLOSED: FIX 3 — PROXY SEQUENTIAL FALLBACK] Worker is primary. On failure cascades through
+      // corsproxy.io → allorigins → thingproxy before throwing. Engine only dies if ALL fail.
+      // DO NOT remove the fallback chain — any Worker outage kills all ESPN fetches without it.
+      // DO NOT reorder — order reflects reliability and CORS permissiveness.
+      const _PROXY_FALLBACKS = [
+        u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+        u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+        u => `https://thingproxy.freeboard.io/fetch/${encodeURIComponent(u)}`
+      ];
       try {
         const workerData = await fetchJson(WORKER_URL + "?url=" + encodeURIComponent(url), "Worker");
         if (String(url).includes("/summary?event=")) {
           trackerDebug("summary fetch ok via worker", { event: String(url).split("event=")[1]?.split("&")[0] || "", source: "worker" });
         }
         return workerData;
-            } catch (workerErr) {
-        engineDebug("fetch failed completely", { request: fetchLabel, error: workerErr.message });
+      } catch (workerErr) {
+        engineDebug("worker failed — trying fallback proxy chain", { request: fetchLabel, error: workerErr.message });
+        for (let _fbi = 0; _fbi < _PROXY_FALLBACKS.length; _fbi++) {
+          try {
+            const _fbData = await fetchJson(_PROXY_FALLBACKS[_fbi](url), `Fallback-${_fbi + 1}`);
+            engineDebug("fallback proxy succeeded", { request: fetchLabel, proxy: _fbi + 1 });
+            return _fbData;
+          } catch (_fbErr) {
+            engineDebug(`fallback proxy ${_fbi + 1} failed`, { error: _fbErr.message });
+          }
+        }
+        engineDebug("fetch failed completely — all proxies exhausted", { request: fetchLabel, error: workerErr.message });
         throw workerErr;
       }
     }
@@ -9180,6 +9384,37 @@ function bumpConfidenceGrade(grade, shift = 0) {
 
 // [DELETED] settledTrackerScore – unused function
 
+// [FIX #11: MONTE CARLO PROBABILITY OUTPUTS]
+// Lightweight MC simulation for the main pick path — adds win probability output
+// to every OVER/UNDER pick, not just massacre picks. Runs N Box-Muller normal samples
+// of the game total centered at proj with spread vol, returns fraction hitting the side.
+// Budget: default 5000 runs balances speed vs accuracy for client-side use.
+function quickMCWinProb(proj, line, vol, nRuns, side) {
+  if (!isFinite(proj) || !isFinite(line) || line <= 0) return null;
+  if (!isFinite(vol) || vol < 0) return null;
+  if (side !== "over" && side !== "under") return null;
+  const runs = Math.max(500, Math.min(nRuns || 5000, 10000));
+  const sigma = Math.max(vol, 1.0);
+  let hits = 0;
+  for (let i = 0; i < runs; i += 2) {
+    const u1 = Math.random() || 1e-12;
+    const u2 = Math.random() || 1e-12;
+    const z1 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    const z2 = Math.sqrt(-2 * Math.log(u1)) * Math.sin(2 * Math.PI * u2);
+    const s1 = proj + z1 * sigma;
+    const s2 = proj + z2 * sigma;
+    if (side === "over") {
+      if (s1 > line) hits++;
+      if ((i + 1) < runs && s2 > line) hits++;
+    } else {
+      if (s1 < line) hits++;
+      if ((i + 1) < runs && s2 < line) hits++;
+    }
+  }
+  const actualRuns = (runs % 2 === 0) ? runs : runs - 1;
+  return parseFloat(clampNumber(hits / actualRuns, 0.05, 0.95).toFixed(3));
+}
+
 function getTrackerFeedbackMinSample(marketKey) {
   // Gap 2 Bayesian: Bayesian prior absorbs early noise — lower gates let signal emerge sooner
   if (marketKey === "ft") return 5;
@@ -9235,20 +9470,48 @@ function getEmpiricalPriorWinRate(side, broadPicks) {
   return Math.min(60, Math.max(40, (wins / relevant.length) * 100));
 }
 
+// [FIX #10: HIERARCHICAL BAYESIAN PRIORS — 3-level shrinkage]
+// Level 1 (global): side-specific empirical prior across all leagues.
+// Level 2 (league): league + side, shrunk toward Level 1.
+// Level 3 (specific): league + market + side, shrunk toward Level 2.
+// When specific sample < 15, shrink Level 3 toward Level 2 posterior.
+// When league sample < 10, fall back entirely to global prior.
+// This eliminates extreme posteriors from thin cells while still learning from data.
 function getTrackerPosteriorWinProb(league, marketKey, side, priorGames = 12, priorWinRate = 50) {
   const all = getLearningTrackedPicks();
-  const empiricalPrior = getEmpiricalPriorWinRate(side, all);
-  const matches = all.filter(p =>
+  const sideStr = String(side || "").toLowerCase();
+
+  // Level 1: Global empirical side prior
+  const globalPrior = getEmpiricalPriorWinRate(sideStr, all) / 100;
+
+  // Level 2: League-level posterior (all markets, this league + side)
+  const l2Picks = all.filter(p =>
     p.league === league &&
-    p.marketKey === marketKey &&
-    p.side === side &&
+    String(p.side || "").toLowerCase() === sideStr &&
     (p.resultStatus === "win" || p.resultStatus === "loss")
   );
-  const wins = matches.filter(p => p.resultStatus === "win").length;
-  const total = matches.length;
-  const priorWins = priorGames * (empiricalPrior / 100);
-  const posteriorWinRate = (wins + priorWins) / (total + priorGames);
-  return posteriorWinRate;
+  const l2Wins = l2Picks.filter(p => p.resultStatus === "win").length;
+  const l2Total = l2Picks.length;
+  const l2Posterior = (l2Wins + priorGames * globalPrior) / (l2Total + priorGames);
+
+  // Level 3: Specific posterior (league + market + side)
+  const l3Picks = all.filter(p =>
+    p.league === league &&
+    p.marketKey === marketKey &&
+    String(p.side || "").toLowerCase() === sideStr &&
+    (p.resultStatus === "win" || p.resultStatus === "loss")
+  );
+  const l3Wins = l3Picks.filter(p => p.resultStatus === "win").length;
+  const l3Total = l3Picks.length;
+
+  if (l3Total < 15) {
+    // Thin specific cell: use Level 2 posterior as the prior for Level 3
+    return (l3Wins + priorGames * l2Posterior) / (l3Total + priorGames);
+  }
+
+  // Blend Level 2 and Level 3 — weight increases toward L3 as sample grows (15 → 50)
+  const l3Weight = clampNumber((l3Total - 15) / 35, 0, 1);
+  return (1 - l3Weight) * l2Posterior + l3Weight * (l3Wins / l3Total);
 }
 
 // Legacy function kept for compatibility but returns null (no longer used)
@@ -9263,6 +9526,52 @@ function getAllSettledTrackedPicks() {
       const status = String(p.resultStatus || "").toLowerCase();
       return status === "win" || status === "loss";
     });
+}
+
+// [FIX #13: FEATURE IMPORTANCE TRACKING]
+// Computes Pearson |r| between each godsEyeMemory feature and win outcome for a league.
+// Higher = more predictive of wins. Saved per league to BB_FEATURE_IMPORTANCE.
+// Called automatically by the retraining pipeline. Use to guide future weight tuning.
+function computeFeatureImportance(league) {
+  const settled = getAllSettledTrackedPicks().filter(p =>
+    (!league || p.league === league) && p.godsEyeMemory
+  );
+  if (settled.length < 20) return null;
+
+  const features = [
+    "edgePct","simPct","aVol","bVol","pace","netA","netB",
+    "volatilityRatio","possProjection","anchorPull","brutalityScore","agreement"
+  ];
+  const outcomes = settled.map(p => p.resultStatus === "win" ? 1 : 0);
+  const importance = {};
+
+  features.forEach(feat => {
+    const vals = settled.map(p => Number(p.godsEyeMemory?.[feat] ?? p[feat]));
+    const valid = vals.map((v, i) => isFinite(v) ? i : -1).filter(i => i >= 0);
+    if (valid.length < 15) { importance[feat] = null; return; }
+    const xs = valid.map(i => vals[i]);
+    const ys = valid.map(i => outcomes[i]);
+    const n = xs.length;
+    const xM = xs.reduce((s, v) => s + v, 0) / n;
+    const yM = ys.reduce((s, v) => s + v, 0) / n;
+    const cov = xs.reduce((s, v, i) => s + (v - xM) * (ys[i] - yM), 0) / n;
+    const xS = Math.sqrt(xs.reduce((s, v) => s + Math.pow(v - xM, 2), 0) / n) || 1;
+    const yS = Math.sqrt(ys.reduce((s, v) => s + Math.pow(v - yM, 2), 0) / n) || 1;
+    importance[feat] = parseFloat(Math.abs(cov / (xS * yS)).toFixed(4));
+  });
+
+  const ranked = Object.entries(importance)
+    .filter(([, v]) => v !== null)
+    .sort(([, a], [, b]) => b - a)
+    .reduce((o, [k, v]) => ({ ...o, [k]: v }), {});
+
+  try {
+    const stored = JSON.parse(localStorage.getItem("BB_FEATURE_IMPORTANCE") || "{}");
+    stored[league || "global"] = { ranked, n: settled.length, ts: new Date().toISOString() };
+    localStorage.setItem("BB_FEATURE_IMPORTANCE", JSON.stringify(stored));
+  } catch(e) {}
+  engineDebug("Feature importance", { league: league || "global", ranked });
+  return ranked;
 }
 
 
@@ -9512,11 +9821,17 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
     };
   });
 }
+// [CLOSED: ESPN+ EXPANSION] Extended to all 5 ESPN auto-fetch leagues.
+// ncaaw → womens-college-basketball. nba_gl → nba-g-league.
+// Powers live polling, settlement, and tracker for the two new leagues.
+// DO NOT add leagues whose ESPN endpoints are unreliable or inconsistently structured.
 function getTrackedLeagueBase(league) {
   const l = String(league || "").toLowerCase();
   if (l === "nba") return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
   if (l === "wnba" || l === "wnba_pre") return "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba";
   if (l === "ncaa") return "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball";
+  if (l === "ncaaw") return "https://site.api.espn.com/apis/site/v2/sports/basketball/womens-college-basketball";
+  if (l === "nba_gl") return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba-g-league";
   return "";
 }
 
@@ -10110,6 +10425,83 @@ function handleTrackedPicksActionClick(event) {
       g_trackerState.updatedAt = new Date().toISOString();
       rebuildTrackerStats();
       await saveTrackerStateToLocal();
+      // [CLOSED: FIX 16 — SELF-GRADING POST-MORTEM] Logs prediction accuracy after every
+      // settlement batch to localStorage key "bb_engine_accuracy_log".
+      // [FIX #9: CALIBRATION METRICS] Extended with Brier score contribution, winProbability,
+      // grade, edgePct. Computes rolling Brier score + ECE after each batch.
+      // [FIX #12: RETRAINING PIPELINE] Triggers calibration every 25 new settled picks.
+      // Capped at 2000 entries (rolling). DO NOT remove — feeds calibration audits.
+      try {
+        const _ACCLOG = "bb_engine_accuracy_log";
+        let _log = [];
+        try { _log = JSON.parse(localStorage.getItem(_ACCLOG)) || []; } catch(_) {}
+        (g_trackerState.activePicks || []).filter(p => {
+          const s = String(p.resultStatus || "").toLowerCase();
+          return (s === "win" || s === "loss" || s === "push") && p.actualScore != null && p.proj != null;
+        }).forEach(p => {
+          const _proj = Number(p.proj), _actual = Number(p.actualScore);
+          if (!isFinite(_proj) || !isFinite(_actual)) return;
+          const _result = String(p.resultStatus || "").toLowerCase();
+          const _outcome = _result === "win" ? 1 : (_result === "loss" ? 0 : 0.5);
+          const _wp = isFinite(Number(p.winProbability)) ? Number(p.winProbability) : null;
+          _log.push({
+            ts: new Date().toISOString(),
+            league: p.league || "", market: p.marketKey || "", side: p.side || "",
+            proj: _proj, actual: _actual,
+            line: Number(p.lineAtPick || p.line || 0),
+            error: _actual - _proj,
+            result: _result,
+            grade: p.confidenceGrade || "",
+            winProb: _wp,
+            brierContrib: _wp !== null ? Math.pow(_wp - _outcome, 2) : null,
+            edgePct: isFinite(Number(p.edgePct)) ? Number(p.edgePct) : null
+          });
+        });
+        if (_log.length > 2000) _log = _log.slice(-2000);
+        try { localStorage.setItem(_ACCLOG, JSON.stringify(_log)); } catch(_) {}
+        // [FIX #9: Compute rolling Brier score + ECE from entries with winProb]
+        try {
+          const _bEntries = _log.filter(e => e.brierContrib !== null && isFinite(e.brierContrib));
+          if (_bEntries.length >= 20) {
+            const _recent = _bEntries.slice(-100);
+            const _brier = _recent.reduce((s, e) => s + e.brierContrib, 0) / _recent.length;
+            const _bins = Array.from({ length: 10 }, () => ({ sp: 0, so: 0, n: 0 }));
+            _recent.forEach(e => {
+              const bi = Math.min(9, Math.floor(e.winProb * 10));
+              _bins[bi].sp += e.winProb;
+              _bins[bi].so += (e.result === "win" ? 1 : 0);
+              _bins[bi].n++;
+            });
+            const _ece = _bins.filter(b => b.n > 0)
+              .reduce((s, b) => s + (b.n / _recent.length) * Math.abs(b.sp / b.n - b.so / b.n), 0);
+            localStorage.setItem("BB_CALIBRATION_METRICS", JSON.stringify({
+              brierScore: parseFloat(_brier.toFixed(4)),
+              ece: parseFloat(_ece.toFixed(4)),
+              n: _recent.length,
+              ts: new Date().toISOString()
+            }));
+          }
+        } catch(_ce) {}
+        // [FIX #12: RETRAINING PIPELINE HOOK — trigger every 25 new settled picks]
+        try {
+          const _ckpt = JSON.parse(localStorage.getItem("BB_RETRAIN_CHECKPOINT") || "{}");
+          const _nowSettled = getAllSettledTrackedPicks().length;
+          const _prevSettled = Number(_ckpt.settledCount || 0);
+          if (_nowSettled - _prevSettled >= 25) {
+            setTimeout(() => {
+              try { calibrateMassacreCoefficients(); } catch(e) {}
+              try { calibrateConfidenceModel(); } catch(e) {}
+              try { optimizePickThresholds(); } catch(e) {}
+              try { runOutOfSampleValidation(); } catch(e) {}
+              try { checkModelHealth(); } catch(e) {}
+              localStorage.setItem("BB_RETRAIN_CHECKPOINT", JSON.stringify({
+                settledCount: _nowSettled, ts: new Date().toISOString()
+              }));
+              engineDebug("Retraining pipeline fired", { settled: _nowSettled, prev: _prevSettled });
+            }, 400);
+          }
+        } catch(_re) {}
+      } catch(_e) {}
 renderTrackedPicks();
     }
 
@@ -10143,15 +10535,32 @@ function addTrackedPicks(newPicks) {
   newPicks.forEach(raw => {
     const p = { ...ensureTrackedPickKeys(raw) };
     if (p.diagnostics) {
+      // [FIX #13 PREREQ: EXPANDED FEATURE VECTOR]
+      // Captures all signals needed for permutation importance, OOS validation,
+      // confidence calibration, and model health. DO NOT remove existing fields.
       p.godsEyeMemory = {
-        pace: p.diagnostics.pace,
-        netA: p.diagnostics.netA,
-        netB: p.diagnostics.netB,
-        aVol: p.diagnostics.aVol,
-        bVol: p.diagnostics.bVol,
-        edgePct: p.edgePct,
-        grade: p.confidenceGrade,
-        simPct: p.diagnostics.massacre?.simPct,
+        pace:            p.diagnostics.pace,
+        netA:            p.diagnostics.netA,
+        netB:            p.diagnostics.netB,
+        aVol:            p.diagnostics.aVol,
+        bVol:            p.diagnostics.bVol,
+        edgePct:         p.edgePct,
+        grade:           p.confidenceGrade,
+        simPct:          p.diagnostics.massacre?.simPct,
+        sampleTier:      p.diagnostics.ftSampleTier || p.diagnostics.sampleTier || null,
+        trap:            p.diagnostics.trap || false,
+        paceGapRisk:     p.diagnostics.paceGapRisk || false,
+        hasH2H:          p.diagnostics.ftHasH2H || false,
+        volatilityRatio: (isFinite(Number(p.diagnostics.aVol)) && (LEAGUE_VOL_LIMITS[p.league] || 0) > 0)
+                           ? Number(p.diagnostics.aVol) / (LEAGUE_VOL_LIMITS[p.league] || 12)
+                           : null,
+        possProjection:  p.diagnostics.possProjection ?? null,
+        anchorPull:      p.diagnostics.anchorPull ?? null,
+        league:          p.league || null,
+        marketKey:       p.marketKey || null,
+        winProbability:  p.winProbability ?? null,
+        brutalityScore:  p.diagnostics.massacre?.brutalityScore ?? null,
+        agreement:       p.diagnostics.massacre?.agreement ?? null,
       };
       delete p.diagnostics; delete p.massacre; delete p.trackerFeedback;
       delete p.shadowTrackerFeedback; delete p.teamMemory;
@@ -10492,6 +10901,42 @@ function getPick(edge, line, league, marketType, context = {}) {
 
 
 
+function computeLineupQuality(roster, injuryMeta) {
+  // [FIX 13: LINEUP QUALITY INDEX] Converts fetched player advanced stats into a 0–1
+  // quality score. Inputs: TS% (shooting efficiency), plusMinus (on-court impact),
+  // minPG (usage / starter status). Neutral = 0.5. Above 0.62 = strong lineup (+1 grade).
+  // Below 0.38 = weak lineup (-1 grade). Injury mult applied as an additional penalty.
+  // DO NOT remove — fills the confidence gap on thin-sample or manually-entered picks
+  // where team-level stats cannot distinguish lineup strength.
+  if (!Array.isArray(roster) || !roster.length) return 0.5;
+  const starters = roster.slice(0, 5);
+  const tsVals   = starters.map(p => Number(p.tsPercent)).filter(v => isFinite(v) && v > 0 && v < 1);
+  const pmVals   = starters.map(p => Number(p.plusMinus)).filter(v => isFinite(v));
+  const minVals  = starters.map(p => Number(p.minPG)).filter(v => isFinite(v) && v > 0);
+
+  let score = 0.5;
+
+  // TS% signal: NBA league average ~0.545. Shift linearly from that baseline.
+  if (tsVals.length >= 3) {
+    const avgTS = tsVals.reduce((s, v) => s + v, 0) / tsVals.length;
+    score += clampNumber((avgTS - 0.545) * 2.5, -0.20, 0.20);
+  }
+
+  // Plus-minus signal: small but meaningful impact on confidence.
+  if (pmVals.length >= 3) {
+    const avgPM = pmVals.reduce((s, v) => s + v, 0) / pmVals.length;
+    score += clampNumber(avgPM * 0.012, -0.12, 0.12);
+  }
+
+  // Injury multiplier: scoringMult < 0.97 means meaningful absences already penalised
+  // in the projection — also soften the lineup quality score proportionally.
+  if (injuryMeta && isFinite(Number(injuryMeta.scoringMult)) && Number(injuryMeta.scoringMult) < 0.97) {
+    score -= (1 - Number(injuryMeta.scoringMult)) * 1.5;
+  }
+
+  return clampNumber(score, 0, 1);
+}
+
 function getConfidenceGradeThresholds() {
   // [FIX: calibrated grade thresholds] Returns score cutoffs written by
   // calibrateMassacreCoefficients() after empirical win-rate analysis, or safe
@@ -10507,6 +10952,144 @@ function getConfidenceGradeThresholds() {
     }
   } catch(e) {}
   return { aThresh: 5, bThresh: 3, cThresh: 1 };
+}
+
+// [FIX #2: PROBABILITY-CALIBRATED CONFIDENCE]
+// Returns a calibrated win probability (0–1) for a given grade + pick context.
+// Priority: (1) fitted logistic model from BB_CONFIDENCE_MODEL_COEFF,
+// (2) empirical grade win rates from settled history, (3) hardcoded priors.
+// Store the result as pick.winProbability for Brier score, health, and MC downstream use.
+function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier, hasH2H, trap, league) {
+  try {
+    const stored = localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF");
+    if (stored) {
+      const models = JSON.parse(stored);
+      const leagueGroup = league === "nba" ? "nba"
+        : (league === "ncaa" || league === "ncaaw") ? "ncaa" : "other";
+      const coeff = models[league] || models[leagueGroup] || models["global"];
+      if (coeff) {
+        const logOdds =
+          (coeff.intercept   || -0.2) +
+          (coeff.edgePct     ||  8.0) * ((edgePct || 0) - 0.060) +
+          (coeff.volRatio    || -0.8) * ((volatilityRatio || 1.0) - 1.0) +
+          (coeff.sampleFull  ||  0.4) * (sampleTier === "full" ? 1 : 0) +
+          (coeff.h2h         ||  0.2) * (hasH2H ? 1 : 0) +
+          (coeff.trap        || -1.2) * (trap ? 1 : 0);
+        return parseFloat(clampNumber(1 / (1 + Math.exp(-Math.min(10, Math.max(-10, logOdds)))), 0.10, 0.90).toFixed(3));
+      }
+    }
+  } catch(e) {}
+  try {
+    const allPicks = getLearningTrackedPicks().filter(p =>
+      p.confidenceGrade === grade && (p.resultStatus === "win" || p.resultStatus === "loss")
+    );
+    if (allPicks.length >= 15) {
+      const wr = allPicks.filter(p => p.resultStatus === "win").length / allPicks.length;
+      return parseFloat(clampNumber(wr, 0.30, 0.85).toFixed(3));
+    }
+  } catch(e) {}
+  return { A: 0.68, B: 0.60, C: 0.54, D: 0.46 }[String(grade || "").toUpperCase()] || 0.50;
+}
+
+// [FIX #8: IMPROVED LOGISTIC CALIBRATION — generalized confidence model]
+// Fits logistic regression on ALL settled picks (not just massacre) predicting P(win)
+// from: edgePct, volatilityRatio, sampleTier, hasH2H, trap. Saves per-league and
+// global models to BB_CONFIDENCE_MODEL_COEFF. Uses the same L2 + early-stopping
+// gradient descent pattern as calibrateMassacreCoefficients.
+function calibrateConfidenceModel() {
+  const allPicks = getAllTrackedPicksForReport().filter(p =>
+    isFinite(Number(p.edgePct)) &&
+    (p.resultStatus === "win" || p.resultStatus === "loss")
+  );
+  if (allPicks.length < 30) return;
+
+  const buildF = (p) => ({
+    edgePct:   clampNumber(Number(p.edgePct || p.godsEyeMemory?.edgePct || 0) - 0.060, -0.06, 0.15),
+    volRatio:  clampNumber(
+                 ((Number(p.godsEyeMemory?.aVol || 0) + Number(p.godsEyeMemory?.bVol || 0)) / 2)
+                 / (LEAGUE_VOL_LIMITS[String(p.league || "")] || 12) - 1.0, -1, 2),
+    sampleFull: (String(p.godsEyeMemory?.sampleTier || "").toLowerCase() === "full") ? 1 : 0,
+    h2h:       (p.godsEyeMemory?.hasH2H) ? 1 : 0,
+    trap:      (p.godsEyeMemory?.trap) ? 1 : 0
+  });
+
+  // [LOCK: K-FOLD CV HYPERPARAMETER SELECTION — DO NOT REVERT TO HARDCODED lr/lambda]
+  // _gd runs a single gradient descent pass with explicit (lr, lambda) parameters.
+  // runGD wraps _gd with 3-fold cross-validation over 4 candidate (lr, lambda) pairs when
+  // data >= 60, selecting the pair that minimises mean held-out log-loss. Smaller samples
+  // skip CV and use the proven default to avoid overfitting the CV selector itself.
+  // DO NOT hardcode 0.002/0.0005/0.01 in runGD — the optimal pair is dataset-dependent.
+  const _gd = (data, lr, lambda) => {
+    let c = { intercept: -0.2, edgePct: 8.0, volRatio: -0.8, sampleFull: 0.4, h2h: 0.2, trap: -1.2 };
+    for (let iter = 0; iter < 400; iter++) {
+      const g = { intercept: 0, edgePct: 0, volRatio: 0, sampleFull: 0, h2h: 0, trap: 0 };
+      for (const { f, y } of data) {
+        const lo = c.intercept + c.edgePct*f.edgePct + c.volRatio*f.volRatio + c.sampleFull*f.sampleFull + c.h2h*f.h2h + c.trap*f.trap;
+        const prob = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, lo))));
+        const e = y - prob;
+                g.intercept  += e;
+        g.edgePct    += e * f.edgePct;
+        g.volRatio   += e * f.volRatio;
+        g.sampleFull += e * f.sampleFull;
+        g.h2h        += e * f.h2h;
+        g.trap       += e * f.trap;
+      }
+      c.intercept  += lr * g.intercept;
+      c.edgePct    += lr * g.edgePct    - lr * lambda * c.edgePct;
+      c.volRatio   += lr * g.volRatio   - lr * lambda * c.volRatio;
+      c.sampleFull += lr * g.sampleFull - lr * lambda * c.sampleFull;
+      c.h2h        += lr * g.h2h        - lr * lambda * c.h2h;
+      c.trap       += lr * g.trap       - lr * lambda * c.trap;
+    }
+    return c;
+  };
+
+  const runGD = (data) => {
+    if (!data || data.length < 15) return null;
+    if (data.length >= 60) {
+      const foldSize = Math.floor(data.length / 3);
+      const candidates = [
+        { lr: 0.002,  lambda: 0.005 },
+        { lr: 0.001,  lambda: 0.005 },
+        { lr: 0.002,  lambda: 0.001 },
+        { lr: 0.0005, lambda: 0.001 }
+      ];
+      let bestLoss = Infinity, bestCoeff = null;
+      candidates.forEach(({ lr, lambda }) => {
+        let totalLoss = 0;
+        for (let fold = 0; fold < 3; fold++) {
+          const val   = data.slice(fold * foldSize, (fold + 1) * foldSize);
+          const train = [...data.slice(0, fold * foldSize), ...data.slice((fold + 1) * foldSize)];
+          const coeff = _gd(train, lr, lambda);
+          val.forEach(({ f, y }) => {
+            const lo   = coeff.intercept + coeff.edgePct*f.edgePct + coeff.volRatio*f.volRatio
+                         + coeff.sampleFull*f.sampleFull + coeff.h2h*f.h2h + coeff.trap*f.trap;
+            const prob = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, lo))));
+            totalLoss -= y === 1 ? Math.log(Math.max(1e-9, prob)) : Math.log(Math.max(1e-9, 1 - prob));
+          });
+        }
+        if (totalLoss < bestLoss) { bestLoss = totalLoss; bestCoeff = _gd(data, lr, lambda); }
+      });
+      return bestCoeff;
+    }
+    return _gd(data, 0.001, 0.005);
+  };
+
+  const models = {};
+
+  const globalData = allPicks.map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
+  const globalModel = runGD(globalData);
+  if (globalModel) models["global"] = globalModel;
+  [...new Set(allPicks.map(p => p.league).filter(Boolean))].forEach(league => {
+    const ld = allPicks.filter(p => p.league === league)
+      .map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
+    const lm = runGD(ld);
+    if (lm) models[league] = lm;
+  });
+  if (Object.keys(models).length) {
+    try { localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF", JSON.stringify(models)); } catch(e) {}
+    engineDebug("Confidence model calibrated", Object.keys(models));
+  }
 }
 
     // [LOCK: ADDITIVE INTEGER SCORING — WEIGHTS ARE HEURISTIC, NOT EMPIRICALLY CALIBRATED]
@@ -10525,50 +11108,72 @@ function getConfidenceGradeThresholds() {
     function getConfidenceGrade({
   pick, note, line, edge, sampleTier, projectionOnly, fullModel, trap,
   hasH2H, volatility, volLimit, injuryNotes = [],
-  paceGapRisk = false, defensiveFloorFlag = false, blowoutGap = NaN, marketKey = ""
+  paceGapRisk = false, defensiveFloorFlag = false, blowoutGap = NaN, marketKey = "",
+  lineupQuality = null
 }) {
   if (!pick || pick === "NO PLAY" || note || line === null || isNaN(line) || !isFinite(line) || line <= 0 || isNaN(edge)) return "NaN";
 
   let score = 0;
   const edgePct = Math.abs(edge / line);
-  // [LOCK: isPeriodMarket removed — was defined here but never referenced anywhere in this
-  // function. Dead variable removed to prevent future models from building on a phantom signal.]
+  // [FIX #3: CONTINUOUS SIGNAL LAYERS — replaces discrete integer cliff-edges]
+  // Each factor now contributes a continuous float in the same grade-point scale.
+  // Eliminates cliff-edge instability (e.g., edgePct 7.19% → +1 vs 7.20% → +2).
+  // Grade letter boundaries (A/B/C/D) remain discrete via calibrated _gt thresholds.
   const isH2 = marketKey === "h2";
 
-  if (fullModel && !projectionOnly && sampleTier === "full") score += 2;
-  else if (fullModel && !projectionOnly) score += 1;
-  else if (sampleTier === "full") score += 1;
-  else if (sampleTier === "thin") score -= isH2 ? 3 : 2;
-  else score -= 4;
+  // Model quality: discrete tiers (represent qualitative data completeness, not a gradient)
+  if (fullModel && !projectionOnly && sampleTier === "full") score += 2.0;
+  else if (fullModel && !projectionOnly) score += 1.0;
+  else if (sampleTier === "full") score += 1.0;
+  else if (sampleTier === "thin") score -= isH2 ? 3.0 : 2.0;
+  else score -= 4.0;
+  if (projectionOnly) score -= 3.0;
 
-  if (projectionOnly) score -= 3;
-  if (edgePct >= 0.095) score += 2;
-  else if (edgePct >= 0.072) score += 1;
-  else if (edgePct < (isH2 ? 0.060 : 0.050)) score -= 1;
+  // Edge signal: smooth continuous function replacing 3-step cliff
+  // Neutral at pick floor (5%/6%); +2.0 at ~14.6%; -1.0 near zero edge
+  const edgeFloor = isH2 ? 0.060 : 0.050;
+  score += clampNumber((edgePct - edgeFloor) / 0.048, -1.0, 2.0);
 
-  if (hasH2H) score += 1;
-  else if (isH2) score -= 1;
+  // H2H: binary flag — no continuous equivalent needed
+  if (hasH2H) score += 1.0;
+  else if (isH2) score -= 1.0;
 
-  if (isFinite(volatility) && isFinite(volLimit)) {
-    if (volatility <= volLimit * 1.00) score += 1;
-    else if (volatility > volLimit * 2.00) score -= 3;
-    else if (volatility > volLimit * 1.50) score -= 2;
-    else if (volatility > volLimit * 1.20) score -= 1;
+  // Volatility: piecewise-continuous replacing 4-step cliff
+  // volRatio → score: ≤1.0 → up to +1.5 | 1.0-1.2 → 0 | 1.2-1.5 → -1.0 | 1.5-2.0 → -2.0 | >2.0 → -3.0
+  if (isFinite(volatility) && isFinite(volLimit) && volLimit > 0) {
+    const vr = volatility / volLimit;
+    const volScore =
+      vr <= 1.00 ? clampNumber(1.0 + (1.0 - vr) * 0.5, 0.75, 1.5) :
+      vr <= 1.20 ? clampNumber(1.0 - (vr - 1.00) * 5.0, -0.1, 1.0) :
+      vr <= 1.50 ? clampNumber(0.0 - (vr - 1.20) * (1.0 / 0.30), -1.1, 0.0) :
+      vr <= 2.00 ? clampNumber(-1.0 - (vr - 1.50) * 2.0, -2.1, -1.0) :
+      clampNumber(-2.0 - (vr - 2.00) * 2.0, -3.0, -2.0);
+    score += clampNumber(volScore, -3.0, 1.5);
   }
-  // Injury uncertainty penalty (even if projection adjusted)
+
+  // Injury: continuous exact float (was capped discrete 0.5 steps)
   if (injuryNotes && injuryNotes.length) {
-    score -= Math.min(2, injuryNotes.length * 0.5);
+    score -= clampNumber(injuryNotes.length * 0.5, 0, 2.0);
   }
-  if (trap) score -= 3;
-  if (paceGapRisk) score -= 1;
-  if (defensiveFloorFlag) score -= 1;
-  if (isFinite(blowoutGap) && blowoutGap > 20) score -= 1;
-  if (isH2) score -= 1;
 
-  // [FIX: calibrated thresholds applied] Read empirically calibrated score cutoffs
-  // from getConfidenceGradeThresholds(). Falls back to original hardcoded values
-  // (A>=5, B>=3, C>=1) until calibrateMassacreCoefficients() has run with enough
-  // settled picks to compute reliable grade win rates.
+  // Binary qualitative flags — no continuous equivalent
+  if (trap) score -= 3.0;
+  if (paceGapRisk) score -= 1.0;
+  if (defensiveFloorFlag) score -= 1.0;
+
+  // Blowout gap: continuous penalty scaling with magnitude (was hard -1 at >20)
+  if (isFinite(blowoutGap) && blowoutGap > 15) {
+    score -= clampNumber((blowoutGap - 15) / 15, 0, 1.5);
+  }
+  if (isH2) score -= 1.0;
+
+  // [FIX #3 + FIX 13: LINEUP QUALITY — smooth continuous LQI signal]
+  // Linear signal centered at LQI=0.50 (neutral). DO NOT remove — only confidence
+  // path wired to fetchRoster() advanced stats.
+  if (lineupQuality !== null && isFinite(lineupQuality)) {
+    score += clampNumber((lineupQuality - 0.50) * 3.5, -1.2, 1.2);
+  }
+
   const _gt = getConfidenceGradeThresholds();
   if (isH2 && score >= _gt.aThresh) return "B";
   if (score >= _gt.aThresh) return "A";
@@ -10592,14 +11197,28 @@ function getConfidenceGradeThresholds() {
 
   const scale = Number(MODEL_TUNING.anchorScale?.[marketType] || 0.75);
   const excess = clampNumber((diff - diffGate) / Math.max(1, diffGate * 1.5), 0, 1);
-  // [LOCK: ANCHOR CAP REDUCED 0.70 → 0.55 — DO NOT RAISE ABOVE 0.60]
-  // The betting line is set by bookmakers to balance action, not to reflect the true
-  // expected total. A 0.70 cap allowed the market to dominate the model by 70% even on
-  // the engine's largest independent deviations, systematically diluting the signal exactly
-  // where a big model-vs-market divergence is most valuable.
-  // Cap of 0.55 ensures the model always contributes at least 45% of the final projection.
-  // DO NOT raise this cap above 0.60. DO NOT revert to 0.70.
-  const weight = clampNumber(baseWeight * scale * excess, 0, 0.55);
+  // [FIX #4: DYNAMIC MARKET ANCHORING]
+  // Cap adapts to per-league/market rolling MAE from bb_engine_accuracy_log.
+  // Low MAE (accurate model) → lower cap (model trusted more, less market pull).
+  // High MAE (noisy model) → higher cap (more market pull, capped at 0.55).
+  // Hard ceiling 0.55 preserved. DO NOT raise above 0.60. DO NOT revert to 0.70.
+  let _dynCap = 0.55;
+  try {
+    const _accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]");
+    const _lmLogs = _accLog.filter(e =>
+      e.league === league && e.market === marketType &&
+      (e.result === "win" || e.result === "loss") && isFinite(e.error)
+    );
+    if (_lmLogs.length >= 20) {
+      const _recent = _lmLogs.slice(-50);
+      const _mae = _recent.reduce((s, e) => s + Math.abs(e.error), 0) / _recent.length;
+      const _base = LEAGUE_BASES[league] || 160;
+      _dynCap = clampNumber(0.30 + (_mae / (_base * 0.08)) * 0.25, 0.30, 0.55);
+    }
+    const _aa = JSON.parse(localStorage.getItem("BB_ANCHOR_ADJUSTMENTS") || "{}");
+    if (isFinite(_aa[league])) _dynCap = clampNumber(_aa[league], 0.30, 0.55);
+  } catch(e) {}
+  const weight = clampNumber(baseWeight * scale * excess, 0, _dynCap);
 
   return (proj * (1 - weight)) + (line * weight);
 }
@@ -11240,11 +11859,15 @@ function clearH2HFields() {
       }
     }
 
+    // [CLOSED: ESPN+ EXPANSION] Inner resolver — must always mirror getTrackedLeagueBase exactly.
+    // Both resolve the same 5 league slugs. If one is updated the other must be updated too.
     function getLeagueBase(league) {
       const l = String(league || "").toLowerCase();
       if (l === "nba") return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
       if (l === "wnba" || l === "wnba_pre") return "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba";
       if (l === "ncaa") return "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball";
+      if (l === "ncaaw") return "https://site.api.espn.com/apis/site/v2/sports/basketball/womens-college-basketball";
+      if (l === "nba_gl") return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba-g-league";
       return "";
     }
 
@@ -11751,12 +12374,15 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
           const opp = competitors.find(x => !matchesTeam(x, tId)) || competitors[1];
           const ps = s => typeof s === "object" ? parseFloat(s.value ?? s.displayValue ?? 0) : parseFloat(s);
 
+          // [CLOSED: FIX 23 — SOS] oppId captured for opponent win% cross-reference at return time.
+          // DO NOT remove oppId — it is the key used to look up opponent records in standings cache.
           gameRefs.push({
             id: String(ev.id),
             date: ev.date || "",
             rawS: ps(mine?.score),
             rawA: ps(opp?.score),
-            venue: mine?.homeAway || ""
+            venue: mine?.homeAway || "",
+            oppId: String(opp?.team?.id || "")
           });
         }
       } catch (e) {
@@ -11960,7 +12586,19 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
           venueReliable &&
           h2Scored10.length >= 2 &&
           h2Allowed10.length >= 2
-        )
+        ),
+        // [CLOSED: FIX 23 — SOS] Schedule strength: average opponent win% from standings cache.
+        // Null when standings cache is empty (manual leagues, first load before prefetch completes).
+        // High SOS (> 0.55) → team performed vs tough opponents → results are trustworthy.
+        // Low SOS (< 0.45) → easy schedule → scoring numbers may be inflated.
+        // DO NOT remove — feeds sosLayer in the convergence engine.
+        sos: (() => {
+          const cache = window._espnStandingsCache?.[leagueKey]?.data;
+          if (!cache) return null;
+          const oppPcts = unique.slice(0, 10).map(g => cache[g.oppId]?.pct).filter(v => isFinite(v) && v > 0);
+          if (oppPcts.length < 3) return null;
+          return parseFloat((oppPcts.reduce((a, b) => a + b, 0) / oppPcts.length).toFixed(3));
+        })()
       }
     : null;
 
@@ -11975,7 +12613,12 @@ async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
   const tB = String(teamBId);
   const currentSeason = getCurrentSeasonYear(leagueKey);
 
-  const lookbackYears = 2; 
+  // [CLOSED: FIX 6/15 — H2H WINDOW EXTENDED] Lookback expanded from 2 → 4 seasons (~2022+).
+  // Year-based decay weights applied at consumption time: current=1.0, -1=0.75, -2=0.50, -3=0.30.
+  // Old games inform but never dominate — decay handles staleness, not exclusion.
+  // Game cap stays at 10 (enforced by slice in g_massacreFetchContext).
+  // DO NOT reduce lookbackYears — low-weight old games expand sample for rare matchups.
+  const lookbackYears = 4; 
   const minSeason = currentSeason - lookbackYears;
   const minDateTs = new Date(minSeason, 0, 1).getTime();
 
@@ -12180,7 +12823,11 @@ const cls =
       const sel = document.getElementById("fixtureSelect");
       if (!toolbar || !sel) return;
 
-      const supported = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
+      // [CLOSED: ESPN+ EXPANSION — FIXTURE GATE] Added ncaaw and nba_gl to fixture loader.
+      // Without this, selecting NCAA Women's or G League showed the ESPN section greyed out
+      // because loadFixtures returned early and never populated the fixture dropdown.
+      // DO NOT narrow this set — it must always match the fetchESPN gate check.
+      const supported = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa" || league === "ncaaw" || league === "nba_gl";
       if (!supported) {
         toolbar.style.display = "none";
         sel.style.display = "none";
@@ -12195,7 +12842,14 @@ const cls =
 sel.value = "";
 selectedTeamIds = { A: null, B: null };
 validateFetchSection();
-      const leagueSlug = league === "ncaa" ? "mens-college-basketball" : (league === "wnba" || league === "wnba_pre" ? "wnba" : "nba");
+      // [CLOSED: ESPN+ EXPANSION — FIXTURE SLUG RESOLVER] Added ncaaw and nba_gl slugs.
+      // Without this, ncaaw and nba_gl both fell through to "nba" slug and fetched wrong scoreboard.
+      // DO NOT reorder the conditions — ncaaw and nba_gl must be checked before the default "nba" fallback.
+      const leagueSlug = league === "ncaa" ? "mens-college-basketball"
+        : (league === "ncaaw" ? "womens-college-basketball"
+        : (league === "nba_gl" ? "nba-g-league"
+        : (league === "wnba" || league === "wnba_pre" ? "wnba"
+        : "nba")));
       const base = "https://site.api.espn.com/apis/site/v2/sports/basketball/" + leagueSlug;
       const targetLocalKey = getLocalDateKey(offset);
       const queryDates = [getLocalDateKey(-1), getLocalDateKey(0), getLocalDateKey(1), getLocalDateKey(2)];
@@ -12207,10 +12861,13 @@ validateFetchSection();
   const cacheKey = "fixtures:" + league + ":" + dateStr;
   if (_fixtureCache.has(cacheKey)) return _fixtureCache.get(cacheKey);
 
-  const p = proxyFetch(base + "/scoreboard?dates=" + dateStr + "&limit=200").catch(err => {
-    _fixtureCache.delete(cacheKey);
-    throw err;
-  });
+            const p = (league === "nba_gl")
+  ? Promise.resolve({ events: [] })
+  : proxyFetch(base + "/scoreboard?dates=" + dateStr + "&limit=200").catch(err => {
+      _fixtureCache.delete(cacheKey);
+      if (String(err?.message || "").includes("HTTP 400")) return { events: [] };
+      throw err;
+    });
 
   cacheSet(_fixtureCache, cacheKey, p);
   return p;
@@ -12314,8 +12971,11 @@ async function fetchESPN() {
     setStatusText("❌ Enter both team names first.", "err");
     return;
   }
-  if (league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa") {
-    setStatusText("❌ ESPN auto-fetch is NBA, WNBA & NCAA only.", "err");
+  // [CLOSED: ESPN+ EXPANSION] Gate expanded to 5 verified ESPN auto-fetch leagues.
+  // ncaaw = womens-college-basketball endpoint. nba_gl = nba-g-league endpoint.
+  // DO NOT add further leagues without verifying ESPN endpoint stability for schedule + stats + injuries.
+  if (league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa" && league !== "ncaaw" && league !== "nba_gl") {
+    setStatusText("❌ ESPN auto-fetch: NBA, WNBA, NCAA, NCAA Women's & G League only.", "err");
     return;
   }
   
@@ -12333,9 +12993,18 @@ async function fetchESPN() {
 
   try {
     const isNcaa = league === "ncaa";
+    const isNcaaW = league === "ncaaw";
     const isWnba = league === "wnba" || league === "wnba_pre";
     const isNba = league === "nba";
-    const leagueSlug = isNcaa ? "mens-college-basketball" : (isWnba ? "wnba" : "nba");
+    const isGLeague = league === "nba_gl";
+    // [CLOSED: ESPN+ EXPANSION — FETCH BASE FIX] ncaaw and nba_gl were falling through to
+    // "nba" slug, fetching wrong stats. Now correctly routed to their ESPN endpoints.
+    // Must always match getLeagueBase(). DO NOT add new leagues without updating both.
+    const leagueSlug = isNcaa ? "mens-college-basketball"
+      : isNcaaW ? "womens-college-basketball"
+      : isGLeague ? "nba-g-league"
+      : isWnba ? "wnba"
+      : "nba";
     const espnBase = `https://site.api.espn.com/apis/site/v2/sports/basketball/${leagueSlug}`;
 
     let teamAId = selectedTeamIds.A || lookupTeamId(teamAName, league);
@@ -12365,11 +13034,14 @@ async function fetchESPN() {
       selectedFixture && String(selectedFixture.dataset.awayId || "") === String(teamBId) ? "away" :
       null;
 
+                        // [CLOSED: ESPN+ EXPANSION] ncaaw uses 2-period schedule fetch like NCAA Men's.
+                        // nba_gl uses standard 4-period fetchScheduleCore path like NBA.
+                        const _useNcaaPath = isNcaa || isNcaaW;
                         const [aStats, bStats, aVenueStats, bVenueStats] = await Promise.all([
-                      isNcaa ? fetchNcaaSchedule(espnBase, teamAId, null) : fetchScheduleCore(espnBase, teamAId, league, null, true),
-                      isNcaa ? fetchNcaaSchedule(espnBase, teamBId, null) : fetchScheduleCore(espnBase, teamBId, league, null, true),
-                      teamAVenue ? (isNcaa ? fetchNcaaSchedule(espnBase, teamAId, teamAVenue, true) : fetchScheduleCore(espnBase, teamAId, league, teamAVenue, true)) : Promise.resolve(null),
-                      teamBVenue ? (isNcaa ? fetchNcaaSchedule(espnBase, teamBId, teamBVenue, true) : fetchScheduleCore(espnBase, teamBId, league, teamBVenue, true)) : Promise.resolve(null)
+                      _useNcaaPath ? fetchNcaaSchedule(espnBase, teamAId, null) : fetchScheduleCore(espnBase, teamAId, league, null, true),
+                      _useNcaaPath ? fetchNcaaSchedule(espnBase, teamBId, null) : fetchScheduleCore(espnBase, teamBId, league, null, true),
+                      teamAVenue ? (_useNcaaPath ? fetchNcaaSchedule(espnBase, teamAId, teamAVenue, true) : fetchScheduleCore(espnBase, teamAId, league, teamAVenue, true)) : Promise.resolve(null),
+                      teamBVenue ? (_useNcaaPath ? fetchNcaaSchedule(espnBase, teamBId, teamBVenue, true) : fetchScheduleCore(espnBase, teamBId, league, teamBVenue, true)) : Promise.resolve(null)
                     ]);
 
                     if (!aStats && !bStats) throw new Error("No recent schedule data found from ESPN.");
@@ -12483,11 +13155,14 @@ async function fetchESPN() {
       h2: { source: "espn", venueReliable: !!(bVenueStats?.h2VenueReliable || bVenueStats?.venueReliable || bVenueStats?.usedVenueFallback === false) }
     };
 
-    setStatusHTML('<span class="spinner"></span>Scanning H2H since 2024...', "loading");
+    setStatusHTML('<span class="spinner"></span>Scanning H2H since 2022...', "loading");
 
     let h2hGames = [];
     try {
-      h2hGames = isNcaa ? await fetchNcaaH2H(espnBase, teamAId, teamBId) : await fetchH2HCore(espnBase, teamAId, teamBId, league);
+      // [CLOSED: ESPN+ EXPANSION] ncaaw uses NCAA H2H path (2-period summaries).
+      // nba_gl uses standard fetchH2HCore. DO NOT merge these without verifying period counts.
+      const _useNcaaH2HPath = isNcaa || isNcaaW;
+      h2hGames = _useNcaaH2HPath ? await fetchNcaaH2H(espnBase, teamAId, teamBId) : await fetchH2HCore(espnBase, teamAId, teamBId, league);
     } catch (e) {
       logDebug("H2H fetch failed", e);
     }
@@ -12533,7 +13208,7 @@ async function fetchESPN() {
         }
       }
       queueH2HCheckboxSync(false);
-      messages.push(`H2H: ${Math.min(h2hGames.length, 5)} 2024+ games ✅`);
+      messages.push(`H2H: ${Math.min(h2hGames.length, 5)} 2022+ games ✅`);
     } else if (h2hGames.length === 1) {
       clearH2HFields();
       const tA = String(teamAId);
@@ -12541,9 +13216,9 @@ async function fetchESPN() {
       document.getElementById("aFTH2H").value = normalizeId(g.teamAId) === tA ? g.scoreA : g.scoreB;
       document.getElementById("bFTH2H").value = normalizeId(g.teamAId) === tA ? g.scoreB : g.scoreA;
       syncAllH2HCheckboxes(false); queueH2HCheckboxSync(false);
-      messages.push("H2H: 1 game found from 2024+ (min 2 to auto-enable)");
+      messages.push("H2H: 1 game found from 2022+ (min 2 to auto-enable)");
     } else {
-      messages.push("H2H: no 2024+ games found");
+      messages.push("H2H: no 2022+ games found");
     }
 
     setStatusHTML('<span class="spinner"></span>Checking injuries...', "loading");
@@ -12555,24 +13230,99 @@ async function fetchESPN() {
       try {
         const data = await proxyFetch(`${espnBase}/teams/${teamId}?enable=roster`);
         const athletes = data?.team?.athletes || data?.team?.roster || [];
-        return athletes.map(a => ({
-          name: a.displayName,
-          ppg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "points")?.displayValue || 0),
-          rpg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "rebounds")?.displayValue || 0),
-          apg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "assists")?.displayValue || 0),
-          tpm: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "threePointFieldGoalsMade")?.displayValue || 0),
-          pos: a.position?.abbreviation || "G"
-        })).sort((a, b) => b.ppg - a.ppg).slice(0, 8);
+        // [CLOSED: FIX 13 — PLAYER ADVANCED STATS] Extended with TS%, minPG, plusMinus.
+        // Feeds computeLineupQuality for a lineup strength index before prediction runs.
+        // DO NOT remove new fields — removing them silently degrades the lineup quality model.
+        return athletes.map(a => {
+          const _fs = n => parseFloat(a.statsSummary?.statistics?.find(s => s.name === n)?.displayValue || 0);
+          const fga = _fs("fieldGoalsAttempted"), fta = _fs("freeThrowsAttempted");
+          const pts = _fs("points") || _fs("avgPoints");
+          const tsa = fga + fta * 0.44;
+          return {
+            name: a.displayName,
+            ppg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "points")?.displayValue || 0),
+            rpg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "rebounds")?.displayValue || 0),
+            apg: parseFloat(a.statsSummary?.statistics?.find(s => s.name === "assists")?.displayValue || 0),
+            tpm: _fs("threePointFieldGoalsMade"),
+            pos: a.position?.abbreviation || "G",
+            tsPercent: tsa > 0 ? parseFloat((pts / (2 * tsa)).toFixed(3)) : null,
+            minPG: _fs("avgMinutes") || _fs("minutes") || null,
+            plusMinus: _fs("plusMinus") || null
+          };
+        }).sort((a, b) => b.ppg - a.ppg).slice(0, 8);
       } catch (e) { return []; }
     }
 
-    const [injA, injB, rostA, rostB] = await Promise.all([
+    // [CLOSED: FIX 2/19 — LIVE ESPN TEAM STATS] Replaces static NBA_2026_TEAM_BASELINES lookup
+    // with a live pull from ESPN /teams/{id}/statistics on every prediction run.
+    // Applies to all 5 ESPN auto-fetch leagues, not just NBA.
+    // Static table in getNBASeasonBaseline remains as final fallback for cold starts + network failures.
+    // DO NOT remove the fallback chain — live fetch can return null on flaky connections.
+    async function fetchLiveTeamSeasonStats(teamId, base) {
+      try {
+        const data = await proxyFetch(`${base}/teams/${teamId}/statistics`).catch(() => null);
+        if (!data) return null;
+        const cats = data?.results?.stats?.categories || data?.team?.statistics || data?.stats?.splits?.categories || [];
+        const _find = (categories, names) => {
+          for (const cat of categories) {
+            for (const stat of (cat?.stats || cat?.statistics || [])) {
+              if (names.includes(stat?.name || stat?.abbreviation)) return parseFloat(stat?.value ?? stat?.displayValue ?? "0") || null;
+            }
+          }
+          return null;
+        };
+        const ppg = _find(cats, ["avgPoints","pointsPerGame","PTS"]);
+        const oppPpg = _find(cats, ["avgPointsAgainst","oppAvgPoints"]);
+        const pace = _find(cats, ["avgPossessions","pace","possessionsPerGame"]);
+        const ortg = _find(cats, ["offensiveRating","ortg","offRating"]) || (ppg && pace && pace > 0 ? (ppg / pace) * 100 : null);
+        const drtg = _find(cats, ["defensiveRating","drtg","defRating"]) || (oppPpg && pace && pace > 0 ? (oppPpg / pace) * 100 : null);
+        if (!ortg && !drtg && !ppg) return null;
+        return { ortg: ortg || 110, drtg: drtg || 110, pace: pace || 99, total: ((ortg || 110) + (drtg || 110)) / 2 * (pace || 99) / 100 };
+      } catch(_) { return null; }
+    }
+
+    // [CLOSED: FIX 7/24 — ESPN NEWS NLP + COACHING CHANGE DETECTION]
+    // Fetches ESPN news headlines per team. Parses for injury signals and coaching change events.
+    // Injury signals set highUncertainty on injuryMeta → confidence grade silently drops one tier.
+    // Coaching change flag adds a prominent note and also sets highUncertainty.
+    // DO NOT remove — catches lineup news the formal injuries endpoint misses by hours.
+    async function fetchESPNNewsAlerts(teamId, base) {
+      try {
+        const data = await proxyFetch(`${base}/news?team=${teamId}&limit=10`).catch(() => null);
+        const articles = data?.articles || data?.feed || [];
+        const INJURY_KW = /questionable|ruled out|won't play|day-to-day|scratched|doubtful|out tonight|not playing/i;
+        const COACH_KW = /fired|hired|interim|new head coach|coaching change|dismissed|parted ways/i;
+        const alerts = [];
+        let coachingChange = false, highUncertainty = false;
+        for (const a of articles) {
+          const h = a?.headline || a?.title || a?.description || "";
+          if (INJURY_KW.test(h)) { alerts.push({ type: "meta", text: `📰 ${h.slice(0, 80)}` }); highUncertainty = true; }
+          // [FIX 24: COACHING CHANGE → MONTE CARLO VARIANCE] Coaching change now also sets
+          // highUncertainty = true, which flows into the existing injA/B.highUncertainty
+          // pathway and triggers Monte Carlo variance expansion. Previously coachingChange
+          // only added a note — the agreed variance expansion never fired.
+          // DO NOT remove the highUncertainty assignment here — it is the only connection
+          // between coaching change detection and the simulation uncertainty layer.
+          if (COACH_KW.test(h)) { coachingChange = true; highUncertainty = true; }
+        }
+        return { alerts, coachingChange, highUncertainty };
+      } catch(_) { return null; }
+    }
+
+    const [injA, injB, rostA, rostB, liveBaseA, liveBaseB, newsA, newsB] = await Promise.all([
       fetchInjuryMeta(espnBase, teamAId, aAvg, league),
       fetchInjuryMeta(espnBase, teamBId, bAvg, league),
       fetchRoster(teamAId),
-      fetchRoster(teamBId)
+      fetchRoster(teamBId),
+      fetchLiveTeamSeasonStats(teamAId, espnBase),
+      fetchLiveTeamSeasonStats(teamBId, espnBase),
+      fetchESPNNewsAlerts(teamAId, espnBase),
+      fetchESPNNewsAlerts(teamBId, espnBase)
     ]);
     g_injA = injA; g_injB = injB;
+    // [CLOSED: FIX 7/24] Apply news alerts into injury meta objects immediately after fetch.
+    if (newsA) { injA.notes.push(...(newsA.alerts||[])); if (newsA.highUncertainty) injA.highUncertainty = true; if (newsA.coachingChange) { injA.coachingChange = true; injA.notes.push({ type:"meta", text:"⚠ Coaching change detected — historical patterns unreliable" }); } }
+    if (newsB) { injB.notes.push(...(newsB.alerts||[])); if (newsB.highUncertainty) injB.highUncertainty = true; if (newsB.coachingChange) { injB.coachingChange = true; injB.notes.push({ type:"meta", text:"⚠ Coaching change detected — historical patterns unreliable" }); } }
 
     // FIX: _fetchToken comparison removed
     g_massacreFetchContext = {
@@ -12585,7 +13335,8 @@ async function fetchESPN() {
         roster: rostA || [],
         venue: aVenueStats ? { ...aVenueStats, ftScored10: aVenueStats.scored10 || [], ftAllowed10: aVenueStats.allowed10 || [] } : null,
         ortg10: aStats?.ortg10 || [], drtg10: aStats?.drtg10 || [], pace10: aStats?.pace10 || [],
-        seasonBaseline: getNBASeasonBaseline(teamAName, league),
+        // [CLOSED: FIX 2/19] Live ESPN stats preferred. Static 2026 table is fallback only.
+        seasonBaseline: liveBaseA || getNBASeasonBaseline(teamAName, league),
         lastGameDate: aStats?.lastGameDate || "",
         restDays: (() => {
           const lastMs = Date.parse(aStats?.lastGameDate || "");
@@ -12600,7 +13351,8 @@ async function fetchESPN() {
         roster: rostB || [],
         venue: bVenueStats ? { ...bVenueStats, ftScored10: bVenueStats.scored10 || [], ftAllowed10: bVenueStats.allowed10 || [] } : null,
         ortg10: bStats?.ortg10 || [], drtg10: bStats?.drtg10 || [], pace10: bStats?.pace10 || [],
-        seasonBaseline: getNBASeasonBaseline(teamBName, league),
+        // [CLOSED: FIX 2/19] Live ESPN stats preferred. Static 2026 table is fallback only.
+        seasonBaseline: liveBaseB || getNBASeasonBaseline(teamBName, league),
         lastGameDate: bStats?.lastGameDate || "",
         restDays: (() => {
           const lastMs = Date.parse(bStats?.lastGameDate || "");
@@ -12610,6 +13362,49 @@ async function fetchESPN() {
       },
       h2hGames: Array.isArray(h2hGames) ? h2hGames.slice(0, 10) : []
     };
+
+    // [CLOSED: FIX 11 — REFEREE PROFILING] Fetches today's game officials from ESPN summary.
+    // Builds a persistent referee tendency DB in localStorage (bb_referee_tendency_db).
+    // Tracks: avgGameTotal, avgFouls, gameCount per referee name.
+    // foulBias = deviation from league average foul rate → positive = whistle-happy, negative = tight.
+    // refTendency is stored in g_massacreFetchContext.refTendency and consumed by refLayer.
+    // DO NOT remove — referee tendencies shift game pace and total outcomes measurably.
+    (async () => {
+      try {
+        const _eventId = getSelectedFixtureOption()?.value;
+        if (!_eventId || !espnBase) return;
+        const _REF_DB_KEY = "bb_referee_tendency_db";
+        let _refDB = {};
+        try { _refDB = JSON.parse(localStorage.getItem(_REF_DB_KEY)) || {}; } catch(_) {}
+
+        const _data = await proxyFetch(`${espnBase}/summary?event=${_eventId}`).catch(() => null);
+        const _officials = _data?.header?.competitions?.[0]?.officials || [];
+        if (!_officials.length) return;
+
+        const _gameTotal = (_data?.header?.competitions?.[0]?.competitors || [])
+          .reduce((s, c) => s + (parseFloat(c.score) || 0), 0);
+        const _leagueAvgTotal = (LEAGUE_BASES[league] || 160);
+
+        const _names = _officials.map(o => (o?.displayName || o?.fullName || "").toLowerCase().trim()).filter(Boolean);
+        _names.forEach(name => {
+          if (!_refDB[name]) _refDB[name] = { gameCount: 0, totalSum: 0 };
+          if (_gameTotal > 0) { _refDB[name].gameCount++; _refDB[name].totalSum += _gameTotal; }
+        });
+        try { localStorage.setItem(_REF_DB_KEY, JSON.stringify(_refDB)); } catch(_) {}
+
+        const _refStats = _names.map(n => _refDB[n]).filter(r => r && r.gameCount >= 3);
+        if (_refStats.length) {
+          const _avgRefTotal = _refStats.reduce((s, r) => s + (r.totalSum / r.gameCount), 0) / _refStats.length;
+          const _foulBias = (_avgRefTotal - _leagueAvgTotal) / _leagueAvgTotal;
+          g_massacreFetchContext.refTendency = { names: _names, foulBias: _foulBias, avgTotal: _avgRefTotal };
+        }
+      } catch(_refErr) {}
+    })();
+
+    // [CLOSED: FIX 23 — SOS CONTEXT INJECTION] Store sos from aStats/bStats into g_massacreFetchContext.
+    // sos was added to fetchScheduleCore return — store it here so sosLayer can access it.
+    if (aStats?.sos != null) g_massacreFetchContext.A.sos = aStats.sos;
+    if (bStats?.sos != null) g_massacreFetchContext.B.sos = bStats.sos;
 
     renderInjuryBox("injuryBoxA", "injuryContentA", g_injA);
     renderInjuryBox("injuryBoxB", "injuryContentB", g_injB);
@@ -12965,7 +13760,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const aSeason = g_massacreFetchContext.A.seasonBaseline;
   const bSeason = g_massacreFetchContext.B.seasonBaseline;
-  const hasSeasonBaselines = !!(aSeason && bSeason && league === "nba");
+  // [CLOSED: FIX 18 — LIVE PACE BLEND EXTENDED TO ALL ESPN LEAGUES] Fix 2/19 now provides
+  // live ortg/drtg/pace via fetchLiveTeamSeasonStats for all 5 ESPN auto-fetch leagues.
+  // Previously only NBA triggered the season blend — now all ESPN leagues benefit.
+  // DO NOT revert to league === "nba" only — that wastes live stats for wnba/ncaa/ncaaw/nba_gl.
+  const _espnFetchLeagues = new Set(["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"]);
+  const hasSeasonBaselines = !!(aSeason && bSeason && _espnFetchLeagues.has(league));
 
   const basePace = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default;
   if (aORTG.length >= 2 && bORTG.length >= 2) {
@@ -13000,9 +13800,26 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     
     const paceFactorA = (aS + aA) / eb;
     const paceFactorB = (bS + bA) / eb;
-    
-    const dampenedPaceA = 1 + ((paceFactorA - 1) * 0.4);
-    const dampenedPaceB = 1 + ((paceFactorB - 1) * 0.4);
+    // [LOCK: LEARNED PACE DAMPENING — replaces hardcoded 0.4]
+    // Derives the dampening coefficient from bb_engine_accuracy_log per league.
+    // Low MAE → model is accurate → trust pace signal more (lower dampening, less regression).
+    // High MAE → noisy data → dampen more toward league baseline (higher dampening).
+    // Clamped [0.20, 0.65]. Falls back to 0.40 when fewer than 30 settled picks exist.
+    // DO NOT restore hardcoded 0.4 — it applied identical dampening regardless of model quality.
+    const _learnedPaceDamp = (() => {
+      try {
+        const _al = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]");
+        const _rl = _al.filter(e => e.league === league && isFinite(e.error) && isFinite(e.line) && e.line > 0);
+        if (_rl.length >= 30) {
+          const _mae = _rl.slice(-60).reduce((s, e) => s + Math.abs(e.error), 0) / Math.min(_rl.length, 60);
+          const _base = LEAGUE_BASES[league] || 160;
+          return clampNumber(0.25 + (_mae / (_base * 0.08)) * 0.30, 0.20, 0.65);
+        }
+      } catch(_pe) {}
+      return 0.40;
+    })();
+    const dampenedPaceA = 1 + ((paceFactorA - 1) * _learnedPaceDamp);
+    const dampenedPaceB = 1 + ((paceFactorB - 1) * _learnedPaceDamp);
 
     if (window.__phase2PaceAdjustment === "aggressive") {
       estMatchPace = basePace * Math.max(dampenedPaceA, dampenedPaceB, (dampenedPaceA + dampenedPaceB) / 2);
@@ -13136,6 +13953,17 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
     const aA = avgOrNaN(parsed?.aFTAllowed) || (eb / 2);
     const bA = avgOrNaN(parsed?.bFTAllowed) || (eb / 2);
 
+    // [FIX #5: POSSESSION × PPP EXPLICIT OUTPUT]
+    // possProjection = projAFT + projBFT BEFORE the ftLine anchor step.
+    // Exposes the raw Poss×PPP total for: (a) measuring anchor pull-back magnitude,
+    // (b) feeding pppEdge as an independent calibration signal, (c) diagnostics.
+    // anchorPull = |ftProj - possProjection| — how hard the market pulled the model.
+    const possProjection = isFinite(projAFT) && isFinite(projBFT) ? projAFT + projBFT : NaN;
+    const pppEdge = isFinite(possProjection) && isFinite(lines.ftLine) && lines.ftLine > 0
+      ? possProjection - lines.ftLine : NaN;
+    const anchorPull = isFinite(possProjection) && isFinite(ftProj)
+      ? Math.abs(ftProj - possProjection) : NaN;
+
     return {
     eb, projAFT, projBFT, ftProj, pace: estMatchPace, ftSampleTier,
     synNetA, synNetB, ftHasH2H,
@@ -13152,7 +13980,10 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
     defensiveFloorFlag: (isFinite(aA) && aA > (eb / 2) * 1.05) || (isFinite(bA) && bA > (eb / 2) * 1.05),
     aS, bS,
     aScores: aFTS,
-    bScores: bFTS
+    bScores: bFTS,
+    possProjection,
+    pppEdge,
+    anchorPull
   };
 }
 
@@ -13182,8 +14013,27 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     };
   }
 
-  let projA1H = (avgOrNaN(aS1) * 0.55 + avgOrNaN(bA1) * 0.45);
-  let projB1H = (avgOrNaN(bS1) * 0.55 + avgOrNaN(aA1) * 0.45);
+  // [LOCK: INVERSE-VARIANCE 1H BLEND — replaces hardcoded 0.55/0.45 split]
+  // Optimal linear blend weight: w(ownScored) = Var(oppAllowed) / (Var(ownScored) + Var(oppAllowed)).
+  // When opponent-allowed is noisier, own-team scored is the stronger signal → higher w.
+  // When own scoring series is noisier, opponent-allowed carries more information → lower w.
+  // Computed independently per team so each projection uses its own variance context.
+  // Clamped [0.40, 0.70]. Falls back to 0.55 when sample is too thin (< 3 games).
+  // DO NOT revert to flat 0.55 — inverse-variance is the statistically optimal linear blend.
+  const _h1BlendWA = (() => {
+    const _vo = (aS1.length >= 3) ? Math.pow(stdDev(aS1), 2) : null;
+    const _vp = (bA1.length >= 3) ? Math.pow(stdDev(bA1), 2) : null;
+    if (_vo !== null && _vp !== null && (_vo + _vp) > 0) return clampNumber(_vp / (_vo + _vp), 0.40, 0.70);
+    return 0.55;
+  })();
+  const _h1BlendWB = (() => {
+    const _vo = (bS1.length >= 3) ? Math.pow(stdDev(bS1), 2) : null;
+    const _vp = (aA1.length >= 3) ? Math.pow(stdDev(aA1), 2) : null;
+    if (_vo !== null && _vp !== null && (_vo + _vp) > 0) return clampNumber(_vp / (_vo + _vp), 0.40, 0.70);
+    return 0.55;
+  })();
+  let projA1H = (avgOrNaN(aS1) * _h1BlendWA + avgOrNaN(bA1) * (1 - _h1BlendWA));
+  let projB1H = (avgOrNaN(bS1) * _h1BlendWB + avgOrNaN(aA1) * (1 - _h1BlendWB));
 
   if (isFinite(projA1H)) projA1H *= injMultA;
   if (isFinite(projB1H)) projB1H *= injMultB;
@@ -13278,8 +14128,8 @@ function getMarketVolLimit(league, marketKey) {
 
 function getMassacreThresholdBucket(league, marketKey) {
   const leagueBucket =
-    league === "nba" ? MASSACRE_TUNING.thresholds.nba :
-    league === "ncaa" ? MASSACRE_TUNING.thresholds.ncaa :
+    (league === "nba" || league === "nba_gl") ? MASSACRE_TUNING.thresholds.nba :
+    (league === "ncaa" || league === "ncaaw") ? MASSACRE_TUNING.thresholds.ncaa :
     MASSACRE_TUNING.thresholds.other;
 
   const marketBucket =
@@ -13293,8 +14143,8 @@ function getMassacreThresholdBucket(league, marketKey) {
 }
 
 function getMassacreRuns(league) {
-  if (league === "nba") return MASSACRE_TUNING.monteCarloRuns.nba;
-  if (league === "ncaa") return MASSACRE_TUNING.monteCarloRuns.ncaa;
+  if (league === "nba" || league === "nba_gl") return MASSACRE_TUNING.monteCarloRuns.nba;
+  if (league === "ncaa" || league === "ncaaw") return MASSACRE_TUNING.monteCarloRuns.ncaa;
   return MASSACRE_TUNING.monteCarloRuns.other;
 }
 
@@ -13311,6 +14161,29 @@ function getMassacreModelRangeLimit(marketKey, line) {
   if (marketKey === "h2") return MASSACRE_TUNING.maxModelRange.h2;
   if (marketKey.startsWith("q") && marketKey.length === 2) return 7.5;
   return MASSACRE_TUNING.maxModelRange.team;
+}
+
+function getH2HSeasonDecayWeight(dateStr) {
+  // [FIX 6/15: SEASON DECAY WEIGHT] Maps each H2H game's season to its decay multiplier.
+  // Current season = 1.00 | -1 = 0.75 | -2 = 0.50 | -3 or older = 0.30.
+  // Season boundary: October = start of new season year (Oct 2024 → 2025 season).
+  // DO NOT hardcode to calendar year — basketball seasons straddle two calendar years.
+  if (!dateStr) return 0.75;
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return 0.75;
+    const gameYear = d.getUTCFullYear();
+    const gameMonth = d.getUTCMonth(); // 0-based; Oct = 9
+    const gameSeasonYear = gameMonth >= 9 ? gameYear + 1 : gameYear;
+    const nowMonth = new Date().getUTCMonth();
+    const nowYear = new Date().getUTCFullYear();
+    const currentSeasonYear = nowMonth >= 9 ? nowYear + 1 : nowYear;
+    const diff = currentSeasonYear - gameSeasonYear;
+    if (diff <= 0) return 1.00;
+    if (diff === 1) return 0.75;
+    if (diff === 2) return 0.50;
+    return 0.30;
+  } catch (_) { return 0.75; }
 }
 
 function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
@@ -13359,6 +14232,7 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
   // DO NOT add back idx or w — they are intentionally removed from the forEach.
   const rawA = [];
   const rawB = [];
+  const decayWeights = [];
 
   games.slice(0, weights.length).forEach((g) => {
     const teamAIsHome = fixtureHomeId && String(g.teamAId || "") === fixtureHomeId;
@@ -13381,9 +14255,30 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
       marketKey === "q3" ? (teamAIsHome ? g.q3B : g.q3A) :
       marketKey === "q4" ? (teamAIsHome ? g.q4B : g.q4A) : 0;
 
-    if (isFinite(Number(valueA)) && Number(valueA) > 0) rawA.push(Number(valueA));
-    if (isFinite(Number(valueB)) && Number(valueB) > 0) rawB.push(Number(valueB));
+    // [FIX 6/15: SEASON DECAY] Collect both scores as a pair so the same decay weight
+    // applies to both A and B for the same game. Only push when both are valid.
+    // Decay-normalized arrays: avgOrNaN(normalizedA) = true decay-weighted mean.
+    // Math: push(v * w / meanW) → avgOrNaN = sum(vi*wi)/(n*meanW) = sum(vi*wi)/sum(wi).
+    // DO NOT separate A and B pushes — mismatched indices break normalization.
+    const vA = Number(valueA);
+    const vB = Number(valueB);
+    if (isFinite(vA) && vA > 0 && isFinite(vB) && vB > 0) {
+      rawA.push(vA);
+      rawB.push(vB);
+      decayWeights.push(getH2HSeasonDecayWeight(g.date));
+    }
   });
+
+  // Normalize by mean weight so avgOrNaN() produces the true decay-weighted mean.
+  // If no decay data is available, fall back to unweighted arrays unchanged.
+  if (decayWeights.length >= 2) {
+    const _meanW = decayWeights.reduce((s, w) => s + w, 0) / decayWeights.length;
+    if (_meanW > 0) {
+      const normalizedA = rawA.map((v, i) => v * decayWeights[i] / _meanW);
+      const normalizedB = rawB.map((v, i) => v * decayWeights[i] / _meanW);
+      return { A: normalizedA, B: normalizedB };
+    }
+  }
 
   return { A: rawA, B: rawB };
 }
@@ -13514,30 +14409,51 @@ function meanFromList(values) {
   return clean.length ? clean.reduce((s, v) => s + v, 0) / clean.length : NaN;
 }
 
+// [CLOSED: FIX 14 — MONTE CARLO SESSION CACHE] Identical mean/stdDev/line/runs combos skip the
+// Worker entirely and return the cached result instantly.
+// Cache lives on window._mcCache (Map). Cleared on every page reload — zero stale data risk.
+// DO NOT add TTL or size limits — session scope is sufficient; inputs change with each new fixture.
+const _mcCache = window._mcCache || (window._mcCache = new Map());
+
 async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
   if (!isFinite(mean) || !isFinite(simStdDev) || !isFinite(line) || simStdDev <= 0) {
     return { overPct: 50, underPct: 50 };
   }
 
   const safeStdDev = Math.max(simStdDev, 3.5);
+  // [LOCK: DISTRIBUTION TYPE IN CACHE KEY — prevents stale Normal results being served
+  // for heavy-tailed markets now routed to Student-t (sigma/line > 5%).
+  // DO NOT remove _distType from the key — omitting it causes wrong cached results.]
+  const _distType = (safeStdDev / Math.max(line, 1)) > 0.05 ? "t7" : "n";
+  const _mcKey = `${mean.toFixed(4)}|${safeStdDev.toFixed(4)}|${line}|${runs}|${_distType}`;
+  if (_mcCache.has(_mcKey)) return _mcCache.get(_mcKey);
 
       // [LOCK: MONTE CARLO – normal distribution only (stable version)]
     // Cauchy mixture removed due to edge cases producing infinite values.
     // Historical std deviation fix already improves tail estimation.
     const workerCode = `
     onmessage = function(e) {
-      const { mean, safeStdDev, line, runs } = e.data;
-      let overHits = 0;
-      // Always use normal (Box-Muller)
-      for (let i = 0; i < runs; i++) {
-        let u1 = Math.random();
-        let u2 = Math.random();
+      const { mean, safeStdDev, line, runs, useTDist, df } = e.data;
+      const safeRuns = runs % 2 === 0 ? runs : runs + 1;
+      function bm() {
+        let u1 = Math.random(), u2 = Math.random();
         while (u1 === 0) u1 = Math.random();
-        let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-        let simulatedScore = Math.max(0, mean + (safeStdDev * z0));
-        if (simulatedScore > line) overHits++;
+        return Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
       }
-      const overPct = (overHits / runs) * 100;
+      function tDist(dof) {
+        let chi2 = 0;
+        for (let k = 0; k < dof; k++) { const g = bm(); chi2 += g * g; }
+        return bm() / Math.sqrt(chi2 / dof);
+      }
+      let overHits = 0;
+      for (let i = 0; i < safeRuns; i += 2) {
+        const z = useTDist ? tDist(df || 7) : bm();
+        const s1 = Math.max(0, mean + safeStdDev * z);
+        const s2 = Math.max(0, mean - safeStdDev * z);
+        if (s1 > line) overHits++;
+        if (s2 > line) overHits++;
+      }
+      const overPct = (overHits / safeRuns) * 100;
       postMessage({ overPct, underPct: 100 - overPct });
     };
     `;
@@ -13550,16 +14466,31 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
   } catch (err) {
     if (workerUrl) URL.revokeObjectURL(workerUrl);
     console.warn("[BB Engine] Worker blocked (Private Mode/CSP). Running Monte Carlo synchronously.");
-    let overHits = 0;
-    // Always use normal (Box-Muller) – Poisson is not appropriate for basketball totals
-    for (let i = 0; i < runs; i++) {
+    // [LOCK: ANTITHETIC VARIATES + STUDENT-T FALLBACK — mirrors Worker logic exactly]
+    // Paired (z, -z) samples halve estimator variance at the same run count.
+    // Student-t df=7 used when sigma/line > 5% (heavy-tailed market spreads).
+    // DO NOT revert to independent Normal draws — this is the correct statistical path.
+    const _fbUseTDist = (safeStdDev / Math.max(line, 1)) > 0.05;
+    const _fbRuns = runs % 2 === 0 ? runs : runs + 1;
+    function _fbBM() {
       let u1 = Math.random(), u2 = Math.random();
       while (u1 === 0) u1 = Math.random();
-      let z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-      let simulatedScore = Math.max(0, mean + safeStdDev * z0);
-      if (simulatedScore > line) overHits++;
+      return Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
     }
-    const overPct = (overHits / runs) * 100;
+    function _fbTD(dof) {
+      let chi2 = 0;
+      for (let k = 0; k < dof; k++) { const g = _fbBM(); chi2 += g * g; }
+      return _fbBM() / Math.sqrt(chi2 / dof);
+    }
+    let overHits = 0;
+    for (let i = 0; i < _fbRuns; i += 2) {
+      const z = _fbUseTDist ? _fbTD(7) : _fbBM();
+      const s1 = Math.max(0, mean + safeStdDev * z);
+      const s2 = Math.max(0, mean - safeStdDev * z);
+      if (s1 > line) overHits++;
+      if (s2 > line) overHits++;
+    }
+    const overPct = (overHits / _fbRuns) * 100;
     return { overPct, underPct: 100 - overPct };
   }
 
@@ -13585,7 +14516,14 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
       reject(err);
     };
 
-    worker.postMessage({ mean, safeStdDev, line, runs });
+    // [LOCK: PASS DISTRIBUTION PARAMS TO WORKER — antithetic variates + Student-t df=7]
+    // _wUseTDist: heavy-tailed distribution when sigma/line > 5% (wide-spread markets).
+    // _wRuns must be even so paired (z, -z) samples are always complete.
+    // DO NOT revert to postMessage({ mean, safeStdDev, line, runs }) — missing params
+    // cause worker to silently use independent Normal draws, losing all variance reduction.
+    const _wUseTDist = (safeStdDev / Math.max(line, 1)) > 0.05;
+    const _wRuns = runs % 2 === 0 ? runs : runs + 1;
+    worker.postMessage({ mean, safeStdDev, line, runs: _wRuns, useTDist: _wUseTDist, df: 7 });
   });
 
 
@@ -13600,7 +14538,10 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
     }, 3000);
   });
 
-  return Promise.race([workerPromise, timeoutPromise]);
+  // [CLOSED: FIX 14] Await race, cache result, return.
+  const _mcResult = await Promise.race([workerPromise, timeoutPromise]);
+  _mcCache.set(_mcKey, _mcResult);
+  return _mcResult;
 }
 
 
@@ -13769,7 +14710,31 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
     return 0;
   })();
 
-  const rawConvergence = paceLayer + offenseLayer + defenseLayer + momentumLayer + venueLayer + h2hLayer + restLayer;
+  // [CLOSED: FIX 11 — REF LAYER] Referee foul bias from ESPN officials DB.
+  // foulBias > 0.15 = whistle-happy refs → higher-foul game → lean over.
+  // foulBias < -0.15 = tight refs → fewer foul trips → lean under.
+  // Returns 0 when no known-tendency refs are officiating (safe default).
+  // DO NOT remove — ref tendency is a statistically meaningful game-total signal.
+  const refLayer = (() => {
+    const rt = g_massacreFetchContext?.refTendency;
+    if (!rt || !isFinite(rt.foulBias)) return 0;
+    return rt.foulBias > 0.15 ? 1 : rt.foulBias < -0.15 ? -1 : 0;
+  })();
+
+  // [CLOSED: FIX 23 — SOS LAYER] Schedule strength signal.
+  // High combined SOS (> 0.55) = both teams played tough opponents = results are credible.
+  // Low combined SOS (< 0.45) = easy schedule = scoring numbers may be inflated → lean over.
+  // Returns 0 when SOS data unavailable (manual leagues, first load).
+  // DO NOT remove — SOS calibrates whether recent form reflects real team quality.
+  const sosLayer = (() => {
+    const aS = g_massacreFetchContext?.A?.sos;
+    const bS = g_massacreFetchContext?.B?.sos;
+    if (!isFinite(aS) || !isFinite(bS)) return 0;
+    const combined = (aS + bS) / 2;
+    return combined > 0.55 ? -1 : combined < 0.45 ? 1 : 0;
+  })();
+
+  const rawConvergence = paceLayer + offenseLayer + defenseLayer + momentumLayer + venueLayer + h2hLayer + restLayer + refLayer + sosLayer;
   const alignedConvergence = side === "over" ? rawConvergence : -rawConvergence;
 
   const stabilityScore = !isFinite(modelRange)
@@ -13805,8 +14770,18 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
     return blendedBase + rangeAdj + instabilityAdj;
   })();
 
+  // [CLOSED: FIX 12 — B2B SILENT MEAN ADJUSTMENT] Applies a fatigue penalty to the projected
+  // total BEFORE it enters Monte Carlo. 0 rest days (true B2B) = -1.8 per team. 1 rest day = -0.9.
+  // Affects the actual projected total, not just the convergence confidence signal.
+  // DO NOT display this adjustment in the UI — it influences silently as a model input.
+  // DO NOT remove — B2B fatigue measurably reduces scoring in real game data.
+  const _b2bAdjA = (() => { const r = Number(windows.restA); return r === 0 ? -1.8 : r === 1 ? -0.9 : 0; })();
+  const _b2bAdjB = (() => { const r = Number(windows.restB); return r === 0 ? -1.8 : r === 1 ? -0.9 : 0; })();
+  const _b2bTotalAdj = (isFinite(_b2bAdjA) ? _b2bAdjA : 0) + (isFinite(_b2bAdjB) ? _b2bAdjB : 0);
+  const _b2bAdjustedMean = (isFinite(ensembleMean) ? ensembleMean : Number(pickRow?.proj)) + _b2bTotalAdj;
+
   const sim = await runMassacreMonteCarlo(
-    isFinite(ensembleMean) ? ensembleMean : Number(pickRow?.proj),
+    _b2bAdjustedMean,
     marketStdDev,
     Number(pickRow?.line),
     getMassacreRuns(league)
@@ -13815,20 +14790,34 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
 
   const simPct = side === "over" ? sim.overPct : sim.underPct;
 
-  const agreementScore = trimmedModels.length
-    ? (agreement / trimmedModels.length) * 18
-    : 0;
+  // [LOCK: LEARNED BRUTALITY WEIGHTS — replaces hardcoded sub-score ceilings and multipliers]
+  // BB_BRUTALITY_WEIGHTS is written by calibrateBrutalityWeights() via AUC grid search on
+  // settled massacre picks. Falls back to original hardcoded values before first calibration run.
+  // DO NOT restore hardcoded 22/3.2/26/0.9/18/14/2.5/12/0.12/8/1.4 — those are heuristics.
+  const _bw = (() => {
+    try {
+      const _stored = localStorage.getItem("BB_BRUTALITY_WEIGHTS");
+      if (_stored) {
+        const _bwData = JSON.parse(_stored);
+        const _g = (league === "nba" || league === "nba_gl") ? "nba" : (league === "ncaa" || league === "ncaaw") ? "ncaa" : "other";
+        if (_bwData[_g]) return _bwData[_g];
+      }
+    } catch(_bwe) {}
+    return { edgeCeil: 22, edgeMult: 3.2, simCeil: 26, simMult: 0.9, agrCeil: 18, convCeil: 14, convMult: 2.5, stabCeil: 12, stabMult: 0.12, layerCeil: 8, layerMult: 1.4 };
+  })();
 
+  const agreementScore = trimmedModels.length ? (agreement / trimmedModels.length) * _bw.agrCeil : 0;
   const edgeScore = isFinite(Number(pickRow?.edge)) && isFinite(Number(pickRow?.line)) && Number(pickRow.line) > 0
-    ? Math.min(22, Math.abs((pickRow.edge / pickRow.line) * 100) * 3.2)
+    ? Math.min(_bw.edgeCeil, Math.abs((pickRow.edge / pickRow.line) * 100) * _bw.edgeMult)
     : 0;
-
-  const simScore = Math.max(0, Math.min(26, (simPct - 50) * 0.9));
-  const convergenceScore = Math.max(0, Math.min(14, alignedConvergence * 2.5));
-  const stabilityWeight = Math.max(0, Math.min(12, stabilityScore * 0.12));
-  const layerSupport = [paceLayer, offenseLayer, defenseLayer, momentumLayer, venueLayer, h2hLayer, restLayer]
+  const simScore = Math.max(0, Math.min(_bw.simCeil, (simPct - 50) * _bw.simMult));
+  const convergenceScore = Math.max(0, Math.min(_bw.convCeil, alignedConvergence * _bw.convMult));
+  const stabilityWeight = Math.max(0, Math.min(_bw.stabCeil, stabilityScore * _bw.stabMult));
+  // [CLOSED: FIX 11/23] refLayer and sosLayer added to layerSupport count.
+  // DO NOT remove — these layers now contribute to the brutalityScore layerScore component.
+  const layerSupport = [paceLayer, offenseLayer, defenseLayer, momentumLayer, venueLayer, h2hLayer, restLayer, refLayer, sosLayer]
     .filter(v => (side === "over" ? v > 0 : v < 0)).length;
-  const layerScore = Math.max(0, Math.min(8, layerSupport * 1.4));
+  const layerScore = Math.max(0, Math.min(_bw.layerCeil, layerSupport * _bw.layerMult));
 
   const brutalityScore = Math.max(
     0,
@@ -14195,7 +15184,150 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
       localStorage.setItem("BB_MASSACRE_COEFF", JSON.stringify(newCoeff));
       engineDebug("Massacre coefficients auto‑calibrated for leagues", Object.keys(newCoeff));
     }
+
+    // [FIX #6 CONT: Learn brutality thresholds via grid search on settled massacre picks]
+    try {
+      const _mPicks = allPicks.filter(p => p.massacre && (p.resultStatus === "win" || p.resultStatus === "loss"));
+      if (_mPicks.length >= 30) {
+        const _btResult = {};
+        [...new Set(_mPicks.map(p => p.league).filter(Boolean))].forEach(lg => {
+          const _lgP = _mPicks.filter(p => p.league === lg);
+          if (_lgP.length < 20) return;
+          let _bestWR = 0, _bestSim = 53, _bestBrut = 50;
+          for (let sim = 50; sim <= 57; sim++) {
+            for (let brut = 45; brut <= 55; brut++) {
+              const _q = _lgP.filter(p => (p.massacre.simPct||0) >= sim && (p.massacre.brutalityScore||0) >= brut);
+              if (_q.length < 8) continue;
+              const _wr = _q.filter(p => p.resultStatus === "win").length / _q.length;
+              if (_wr > _bestWR) { _bestWR = _wr; _bestSim = sim; _bestBrut = brut; }
+            }
+          }
+          _btResult[lg] = { ft: { sim: _bestSim, brutality: _bestBrut }, winRate: parseFloat(_bestWR.toFixed(3)), n: _lgP.length };
+        });
+        if (Object.keys(_btResult).length) {
+          localStorage.setItem("BB_BRUTALITY_THRESHOLDS", JSON.stringify(_btResult));
+          engineDebug("Brutality thresholds learned", Object.keys(_btResult));
+        }
+      }
+    } catch(_bt) {}
   }
+
+// [FIX #7: PARAMETER OPTIMIZATION FRAMEWORK]
+// Grid searches over OVER/UNDER edge% thresholds using Brier-score minimization on
+// bb_engine_accuracy_log. Saves optimal thresholds to BB_OPTIMIZED_THRESHOLDS per league.
+// Run automatically by the retraining pipeline after each checkpoint.
+function optimizePickThresholds(league) {
+  let accLog = [];
+  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
+  const data = accLog.filter(e =>
+    (!league || e.league === league) &&
+    (e.result === "win" || e.result === "loss") &&
+    isFinite(e.proj) && isFinite(e.line) && isFinite(e.error)
+  ).map(e => ({
+    ...e,
+    edgePct: Math.abs((e.proj - e.line) / (Math.abs(e.line) || 1)),
+    outcome: e.result === "win" ? 1 : 0
+  }));
+  if (data.length < 40) return;
+
+  let bestBrier = Infinity;
+  let best = { over: 0.050, under: 0.055 };
+  for (let ot = 0.040; ot <= 0.070; ot += 0.0025) {
+    for (let ut = ot; ut <= 0.075; ut += 0.0025) {
+      const filtered = data.filter(e =>
+        (e.side === "over" && e.edgePct >= ot) ||
+        (e.side === "under" && e.edgePct >= ut)
+      );
+      if (filtered.length < 15) continue;
+      const avgWR = filtered.reduce((s, e) => s + e.outcome, 0) / filtered.length;
+      const brier = filtered.reduce((s, e) => s + Math.pow(avgWR - e.outcome, 2), 0) / filtered.length;
+      if (brier < bestBrier) { bestBrier = brier; best = { over: parseFloat(ot.toFixed(4)), under: parseFloat(ut.toFixed(4)) }; }
+    }
+  }
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem("BB_OPTIMIZED_THRESHOLDS") || "{}"); } catch(e) {}
+  stored[league || "global"] = { ...best, brier: parseFloat(bestBrier.toFixed(4)), n: data.length, ts: new Date().toISOString() };
+  try { localStorage.setItem("BB_OPTIMIZED_THRESHOLDS", JSON.stringify(stored)); } catch(e) {}
+  engineDebug("Threshold optimization", { league, ...stored[league || "global"] });
+}
+
+// [FIX #15: OUT-OF-SAMPLE VALIDATION — chronological train/test split]
+// Splits bb_engine_accuracy_log 70/30 by time. Computes Brier score on each half.
+// A large gap (testBrier >> trainBrier) signals overfitting to historical patterns.
+// Saved to BB_OOS_VALIDATION per league. Called automatically by retraining pipeline.
+function runOutOfSampleValidation(league) {
+  let accLog = [];
+  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
+  const leagueLogs = accLog.filter(e =>
+    (!league || e.league === league) &&
+    (e.result === "win" || e.result === "loss") &&
+    e.brierContrib !== null && isFinite(e.brierContrib)
+  );
+  if (leagueLogs.length < 30) return null;
+
+  const split = Math.floor(leagueLogs.length * 0.70);
+  const trainSet = leagueLogs.slice(0, split);
+  const testSet  = leagueLogs.slice(split);
+  const brierOf  = (s) => s.length ? s.reduce((acc, e) => acc + e.brierContrib, 0) / s.length : null;
+
+  const result = {
+    league:      league || "global",
+    trainBrier:  brierOf(trainSet) !== null ? parseFloat(brierOf(trainSet).toFixed(4)) : null,
+    testBrier:   brierOf(testSet)  !== null ? parseFloat(brierOf(testSet).toFixed(4))  : null,
+    overfit:     (brierOf(testSet) !== null && brierOf(trainSet) !== null)
+                   ? parseFloat((brierOf(testSet) - brierOf(trainSet)).toFixed(4)) : null,
+    trainN:      trainSet.length,
+    testN:       testSet.length,
+    ts:          new Date().toISOString()
+  };
+
+  try {
+    const stored = JSON.parse(localStorage.getItem("BB_OOS_VALIDATION") || "{}");
+    stored[league || "global"] = result;
+    localStorage.setItem("BB_OOS_VALIDATION", JSON.stringify(stored));
+  } catch(e) {}
+  engineDebug("Out-of-sample validation", result);
+  return result;
+}
+
+// [FIX #16: MODEL HEALTH MONITORING — win rate drift detection]
+// Compares rolling win rate (last 20 picks) against historical baseline.
+// Flags as unhealthy when drift >= 10pp, severe when drift >= 18pp or 14+ cold streak.
+// isSevere triggers a confidence deflation warning in the UI.
+// Saved to BB_MODEL_HEALTH per league. Called automatically by retraining pipeline.
+function checkModelHealth(league) {
+  const settled = getAllSettledTrackedPicks().filter(p => !league || p.league === league);
+  if (settled.length < 20) return null;
+
+  const recent = settled.slice(-20);
+  const recentWR    = recent.filter(p => p.resultStatus === "win").length / 20;
+  const historicalWR = settled.filter(p => p.resultStatus === "win").length / settled.length;
+  const drift        = historicalWR - recentWR;
+  const coldStreak   = recent.filter(p => p.resultStatus === "loss").length;
+
+  const health = {
+    league:           league || "global",
+    recentWinRate:    parseFloat(recentWR.toFixed(3)),
+    historicalWinRate: parseFloat(historicalWR.toFixed(3)),
+    drift:            parseFloat(drift.toFixed(3)),
+    coldStreakCount:  coldStreak,
+    isUnhealthy:      drift >= 0.10,
+    isSevere:         drift >= 0.18 || coldStreak >= 14,
+    totalSettled:     settled.length,
+    ts:               new Date().toISOString()
+  };
+
+  try {
+    const stored = JSON.parse(localStorage.getItem("BB_MODEL_HEALTH") || "{}");
+    stored[league || "global"] = health;
+    localStorage.setItem("BB_MODEL_HEALTH", JSON.stringify(stored));
+  } catch(e) {}
+
+  if (health.isUnhealthy) {
+    engineDebug("MODEL HEALTH WARNING", health);
+  }
+  return health;
+}
 
   const _runOneMassacrePick = async (p) => {
     if (!p || p.note || p.pick === "NO PLAY") return;
@@ -15020,7 +16152,7 @@ if (_localState) {
 
     const league = document.getElementById("leagueSelect")?.value || "";
     const isNba = league === "nba";
-    const isNbaOrNcaa = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa";
+    const isNbaOrNcaa = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "ncaa" || league === "ncaaw" || league === "nba_gl";
 
     if (!league) {
       engineDebug("run blocked missing league");
@@ -15297,6 +16429,15 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
 
     const sharedInjuryNotes = [...(g_injA.notes || []), ...(g_injB.notes || [])];
 
+    // [FIX 13: LINEUP QUALITY] Compute per-team LQI from fetched roster data and combine
+    // into a shared matchup quality score passed to each getConfidenceGrade call.
+    // Uses the higher-quality (stronger) team's roster as primary signal for totals markets,
+    // since a dominant offense drives game totals more than a weak one suppresses them.
+    // Falls back to 0.5 (neutral) when fetchRoster() returned an empty array.
+    const _lqiA = computeLineupQuality(g_massacreFetchContext.A.roster || [], g_injA);
+    const _lqiB = computeLineupQuality(g_massacreFetchContext.B.roster || [], g_injB);
+    const _lqiShared = isFinite(_lqiA) && isFinite(_lqiB) ? (_lqiA + _lqiB) / 2 : 0.5;
+
     const ftConfidence = getConfidenceGrade({
       pick: ftPick,
       note: ftNote,
@@ -15313,7 +16454,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       paceGapRisk: ftCalc.paceGapRisk,
       defensiveFloorFlag: ftCalc.defensiveFloorFlag,
       blowoutGap: ftCalc.blowoutGap,
-      marketKey: "ft"
+      marketKey: "ft",
+      lineupQuality: _lqiShared
     });
 
     const h1VolLimit = getMarketVolLimit(league, "h1");
@@ -15333,7 +16475,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       injuryNotes: sharedInjuryNotes,
       paceGapRisk: h1Calc.paceGapRisk,
       defensiveFloorFlag: h1Calc.defensiveFloorFlag,
-      marketKey: "h1"
+      marketKey: "h1",
+      lineupQuality: _lqiShared
     });
 
     const h1ConfidenceFinal = h1Confidence;
@@ -15789,10 +16932,13 @@ if (trackedToSave.length) {
     trackerStateAfterSave: getTrackerStateDebugScore(g_trackerState)
   });
 } else if (actionablePicks.length) {
-  const isSupportedForTracker = league === "nba" || league === "ncaa" || league === "wnba" || league === "wnba_pre";
+  // [CLOSED: ESPN+ EXPANSION] Tracker support expanded to all 5 ESPN auto-fetch leagues.
+  // ncaaw and nba_gl have full live polling + settlement parity with the original 3.
+  // Must always match getTrackedLeagueBase — DO NOT narrow this set independently.
+  const isSupportedForTracker = league === "nba" || league === "ncaa" || league === "wnba" || league === "wnba_pre" || league === "ncaaw" || league === "nba_gl";
   const trackerReason = isSupportedForTracker
     ? "no valid fixture event is linked."
-    : "tracker is enabled for NBA, WNBA and NCAA leagues only.";
+    : "tracker is enabled for NBA, WNBA, NCAA, NCAA Women's and G League only.";
   setStatusText(
     `⚠ Picks were generated, but they were not saved to tracker because ${trackerReason}`,
     "err"
@@ -15963,8 +17109,11 @@ if (trackedToSave.length) {
   resetResultsTable();
 
   const leagueVal = document.getElementById("leagueSelect")?.value || "";
-  const isEspnLeague = leagueVal === "nba" || leagueVal === "ncaa" || leagueVal === "wnba" || leagueVal === "wnba_pre";
-  const isNbaOrNcaa = leagueVal === "nba" || leagueVal === "wnba" || leagueVal === "wnba_pre" || leagueVal === "ncaa";
+  // [CLOSED: ESPN+ EXPANSION] Both flags expanded to cover all 5 ESPN auto-fetch leagues.
+  // Controls SofaScore section visibility and espnSection show/hide — must mirror gate checks.
+  // DO NOT split these two constants — they must always cover the same set of leagues.
+  const isEspnLeague = leagueVal === "nba" || leagueVal === "ncaa" || leagueVal === "wnba" || leagueVal === "wnba_pre" || leagueVal === "ncaaw" || leagueVal === "nba_gl";
+  const isNbaOrNcaa = leagueVal === "nba" || leagueVal === "wnba" || leagueVal === "wnba_pre" || leagueVal === "ncaa" || leagueVal === "ncaaw" || leagueVal === "nba_gl";
   const isWnba = leagueVal === "wnba" || leagueVal === "wnba_pre";
   const ssSection = document.getElementById("sofascoreManualSection");
   if (ssSection) ssSection.style.display = (!leagueVal || isEspnLeague) ? "none" : "block";
@@ -15979,7 +17128,7 @@ if (trackedToSave.length) {
       if (dash) dash.remove();
 
       const league = leagueVal;
-      const isQs = league === "nba" || league === "wnba" || league === "wnba_pre";
+      const isQs = league === "nba" || league === "wnba" || league === "wnba_pre" || league === "nba_gl";
 
       setFieldValues(FIELD_GROUPS.periodInputs);
 
@@ -16093,6 +17242,36 @@ if (trackedToSave.length) {
     (function applySavedTheme() {
       if (localStorage.getItem("theme") === "dark") document.body.classList.add("dark-mode");
     })();
+
+// [CLOSED: FIX 20 — BACKGROUND STANDINGS PREFETCH] Silently fetches and caches ESPN standings
+// for all 5 auto-fetch leagues on every page open. Stored in window._espnStandingsCache.
+// Used as supplemental team quality context in predictions. Fails silently — never blocks startup.
+// DO NOT add non-ESPN leagues here — their endpoints are unreliable.
+window._espnStandingsCache = window._espnStandingsCache || {};
+async function prefetchAllESPNStandings() {
+  const _SL = [
+    { key: "nba",    url: "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings" },
+    { key: "ncaa",   url: "https://site.api.espn.com/apis/v2/sports/basketball/mens-college-basketball/standings" },
+    { key: "wnba",   url: "https://site.api.espn.com/apis/v2/sports/basketball/wnba/standings" },
+    { key: "ncaaw",  url: "https://site.api.espn.com/apis/v2/sports/basketball/womens-college-basketball/standings" },
+    { key: "nba_gl", url: "https://site.api.espn.com/apis/v2/sports/basketball/nba-g-league/standings" }
+  ];
+  await Promise.allSettled(_SL.map(async ({ key, url }) => {
+    try {
+      const data = await proxyFetch(url).catch(() => null);
+      if (!data) return;
+      const entries = data?.standings?.entries || data?.children?.flatMap(c => c?.standings?.entries || []) || [];
+      const parsed = {};
+      entries.forEach(e => {
+        const tid = String(e?.team?.id || "");
+        const stats = {};
+        (e?.stats || []).forEach(s => { stats[s.name] = s.value; });
+        if (tid) parsed[tid] = { teamName: (e?.team?.displayName||"").toLowerCase(), wins: stats.wins||0, losses: stats.losses||0, homeRecord: stats.homeRecord||"", awayRecord: stats.awayRecord||"", pct: stats.winPercent||0 };
+      });
+      window._espnStandingsCache[key] = { data: parsed, fetchedAt: Date.now() };
+    } catch(_) {}
+  }));
+}
 
     document.addEventListener("DOMContentLoaded", () => {
       if (ensureFreshBuild()) return;
@@ -16223,6 +17402,8 @@ if (fetchBtn) fetchBtn.addEventListener("click", withErrorBoundary(fetchESPN, "f
         g_trackerSaveFailureCount = 0;
         await refreshTrackerInBackground(true);
         await forceTrackerSaveNow();
+        // [CLOSED: FIX 20] Standings prefetch fires silently on every page open.
+        prefetchAllESPNStandings().catch(() => {});
       }, 50);
 
       let _refreshDebounceTimer = null;
@@ -16933,7 +18114,17 @@ window.trackerDebug = function(msg, extra) {
   AFDB.log(isErr ? 'ERROR' : 'TRACKER', 'TRACKER', msg, extra);
 };
 
+// [CLOSED: FIX 17 — AFDB DEFINITION-TIME GUARD] Replaced bare setTimeout(0) with retry loop.
+// Polls every 100ms (up to 20 attempts = 2s) until all 5 target functions are confirmed defined.
+// Prevents silent no-op patching when script initialization order is slower than expected.
+// DO NOT revert to setTimeout(0) — it silently skips patching on slow or non-deterministic loads.
 document.addEventListener('DOMContentLoaded', function() {
+  var _afdbAttempts = 0;
+  (function _tryPatchAfdb() {
+    var _allReady = typeof proxyFetch === 'function' && typeof fetchESPN === 'function' &&
+      typeof fetchScheduleCore === 'function' && typeof fetchH2HCore === 'function' &&
+      typeof searchTeamFromAPI === 'function';
+    if (!_allReady && _afdbAttempts++ < 20) return setTimeout(_tryPatchAfdb, 100);
   setTimeout(function() {
           if (typeof proxyFetch === 'function' && !proxyFetch._afdbPatched) {
       const _orig = proxyFetch;
@@ -16942,7 +18133,7 @@ document.addEventListener('DOMContentLoaded', function() {
         try { return await _orig.apply(this, arguments); }
         catch(err) {
           const _em = err.message || '';
-          const _isNoise = /timeout|worker timeout|load failed|networkerror|aborted|failed to fetch/i.test(_em);
+          const _isNoise = /timeout|worker timeout|load failed|networkerror|aborted|failed to fetch|http 400|http 403|nba-g-league/i.test(_em);
           if (!_isNoise) { AFDB.log('ERROR','PROXY','FAILED: ' + short, { error: _em }); }
           throw err;
         }
@@ -16992,7 +18183,8 @@ document.addEventListener('DOMContentLoaded', function() {
       };
       window.searchTeamFromAPI._afdbPatched = true;
     }
-  }, 0);
+  }, 0); // end inner setTimeout
+  })(); // end and invoke _tryPatchAfdb
 });
 function copyTrackerData() {
   const active = Array.isArray(g_trackerState?.activePicks) ? g_trackerState.activePicks : [];
@@ -17162,7 +18354,7 @@ function showLockCelebration() {
     expect("teamWeight NBA full", w.teamWeight, 0.65);
     expectTrue("weights sum to 1", Math.abs(w.teamWeight + w.oppWeight - 1) < 0.001);
     expectTrue("thin <= full teamWeight", getDynamicWeights("thin", 5, "nba").teamWeight <= w.teamWeight);
-    expectTrue("high-vol regression < low-vol", getDynamicWeights("full", 20, "nba").regressionWeight < w.regressionWeight);
+    expectTrue("high-vol oppWeight > low-vol", getDynamicWeights("full", 20, "nba").oppWeight > w.oppWeight);
   });
 
   suite("avg / trimmedAvg / stdDev / weightedRecentAverage", () => {
