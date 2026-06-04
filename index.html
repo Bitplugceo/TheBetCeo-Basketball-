@@ -1,4 +1,4 @@
-C
+J
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10326,11 +10326,6 @@ function handleTrackedPicksActionClick(event) {
   const btn = target.closest?.(".tracker-settle-btn");
   if (!btn) return;
 
-  if (g_trackerSaveInFlight) {
-    engineDebug("Manual settle blocked: Tracker save currently in flight.");
-    return;
-  }
-
   const resultStatus = String(btn.getAttribute("data-manual-settle") || "").toLowerCase();
   const encodedSig = String(btn.getAttribute("data-sig") || "");
   const signature = encodedSig ? decodeURIComponent(encodedSig) : "";
@@ -10338,14 +10333,30 @@ function handleTrackedPicksActionClick(event) {
   if (!signature || !["win", "loss", "push"].includes(resultStatus)) return;
 
   btn.disabled = true;
-  settleTrackedPick(signature, resultStatus)
-    .catch(err => {
-      console.error("[BB Engine] manual settle failed", err);
-      trackerDebug("manual settle failed", { error: String(err?.message || err), result: resultStatus });
-    })
-    .finally(() => {
-      btn.disabled = false;
-    });
+  
+  // If a save is already in flight, wait for it to finish before settling
+  const settle = async () => {
+    if (g_trackerSaveInFlight) {
+      engineDebug("Manual settle waiting for save to complete...");
+      // Wait up to 5 seconds for the save to finish
+      let waited = 0;
+      while (g_trackerSaveInFlight && waited < 5000) {
+        await new Promise(r => setTimeout(r, 100));
+        waited += 100;
+      }
+      if (g_trackerSaveInFlight) {
+        engineDebug("Manual settle proceeding despite save still in flight (timeout)");
+      }
+    }
+    await settleTrackedPick(signature, resultStatus);
+  };
+  
+  settle().catch(err => {
+    console.error("[BB Engine] manual settle failed", err);
+    trackerDebug("manual settle failed", { error: String(err?.message || err), result: resultStatus });
+  }).finally(() => {
+    btn.disabled = false;
+  });
 }
 
 
@@ -18772,14 +18783,39 @@ function renderConfigsPanel() {
     }
   }
   
-  if (configs.length === 0) {
+  // Also gather candidate configs (from BB_CANDIDATE_SCORES_* keys)
+  const candidates = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && key.startsWith("BB_CANDIDATE_SCORES_")) {
+      try {
+        const val = JSON.parse(localStorage.getItem(key));
+        if (val && typeof val === "object") {
+          const parts = key.split("_");
+          const leagueMarket = parts.slice(3).join("_");
+          for (const [configKey, data] of Object.entries(val)) {
+            if (data && data.netDelta !== undefined && data.count > 0) {
+              candidates.push({
+                leagueMarket,
+                configKey,
+                netDelta: data.netDelta,
+                sampleCount: data.count
+              });
+            }
+          }
+        }
+      } catch(e) {}
+    }
+  }
+  
+  if (configs.length === 0 && candidates.length === 0) {
     panel.innerHTML = `
       <div class="tracker-analytics-shell">
         <div class="tracker-analytics-topbar">
           <div class="tracker-analytics-heading">
             <div class="tracker-analytics-kicker">Configuration</div>
-            <div class="tracker-analytics-title">Verified Configs</div>
-            <div class="tracker-analytics-subtitle">No verified configs yet. Settle at least 20 picks in a league/market to generate one.</div>
+            <div class="tracker-analytics-title">Verified & Candidate Configs</div>
+            <div class="tracker-analytics-subtitle">Settle picks to generate candidate configs. After 20 settled picks, the best candidate is auto‑verified.</div>
           </div>
         </div>
       </div>
@@ -18807,16 +18843,49 @@ function renderConfigsPanel() {
     </div>
   `).join("");
   
+  // Group candidates by leagueMarket (read‑only, no lock buttons)
+  const candidateGroups = new Map();
+  candidates.forEach(c => {
+    if (!candidateGroups.has(c.leagueMarket)) candidateGroups.set(c.leagueMarket, []);
+    candidateGroups.get(c.leagueMarket).push(c);
+  });
+  
+  const candidateHtml = Array.from(candidateGroups.entries()).map(([leagueMarket, cands]) => {
+    cands.sort((a, b) => b.netDelta - a.netDelta);
+    return `
+      <div style="border:1px solid var(--table-border); margin-bottom:10px; padding:10px; background:var(--panel-soft);">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+          <strong style="font-size:12px;">${escapeHtml(leagueMarket)} (candidates)</strong>
+          <span class="league-trust-pill trust-advisory" style="font-size:9px;">Review needed</span>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr; gap:8px;">
+          ${cands.map(cand => `
+            <div style="border:1px solid var(--table-border); padding:8px; background:var(--panel); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+              <div style="font-size:11px; font-family:monospace;">${escapeHtml(cand.configKey)}</div>
+              <div style="display:flex; gap:12px; align-items:center;">
+                <span style="font-size:10px;">Net delta: ${cand.netDelta > 0 ? '+' : ''}${cand.netDelta.toFixed(2)}</span>
+                <span style="font-size:10px;">Sample: ${cand.sampleCount}</span>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `;
+  }).join('');
+  
   panel.innerHTML = `
     <div class="tracker-analytics-shell">
       <div class="tracker-analytics-topbar">
         <div class="tracker-analytics-heading">
           <div class="tracker-analytics-kicker">Configuration</div>
-          <div class="tracker-analytics-title">Verified Configs</div>
-          <div class="tracker-analytics-subtitle">Manually override or delete per‑league/market configs. Changes take effect on next "Run".</div>
+          <div class="tracker-analytics-title">Verified & Candidate Configs</div>
+          <div class="tracker-analytics-subtitle">Candidates appear immediately after settling picks. No manual lock – auto‑verification needs 20 settled picks.</div>
         </div>
       </div>
-      <div id="configs-list">${rowsHtml}</div>
+      <div id="configs-list">
+        ${rowsHtml}
+        ${candidateHtml}
+      </div>
     </div>
   `;
   
