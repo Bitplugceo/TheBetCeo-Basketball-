@@ -1,4 +1,4 @@
-N
+J
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1803,12 +1803,17 @@ body.dark-mode .tracker-bar-stage {
   font-size: 12px;
   font-weight: 800;
   line-height: 1.4;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 .tracker-review-action {
   color: var(--tracker-subtext);
   font-size: 11px;
   font-weight: 700;
   line-height: 1.4;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  overflow: hidden;
 }
 
 .tracker-line-list {
@@ -3238,9 +3243,39 @@ function getLeagueGender() {
 
 function parseSofascoreIndividual(side) {
   const pasteEl = document.getElementById(side === "A" ? "ssPasteA" : "ssPasteB");
-  const rawText = (pasteEl?.value || "").trim();
+  let rawText = (pasteEl?.value || "").trim();
   const st = document.getElementById("ssFetchStatus");
   if (!rawText) return;
+
+  // [FIX: TRUNCATED JSON RECOVERY] If JSON is truncated (clipboard cut off), attempt
+  // to close open arrays/objects before parsing. This prevents "Unterminated string"
+  // and "Expected '}'" crashes visible in the debug log when pasting partial API responses.
+  if (rawText.length > 0) {
+    // Count open braces/brackets to detect truncation
+    let openBraces = 0, openBrackets = 0, inString = false, escape = false;
+    for (let ci = 0; ci < rawText.length; ci++) {
+      const ch = rawText[ci];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\' && inString) { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === '{') openBraces++;
+      else if (ch === '}') openBraces--;
+      else if (ch === '[') openBrackets++;
+      else if (ch === ']') openBrackets--;
+    }
+    // If we have unclosed structures, try to close them
+    if (openBraces > 0 || openBrackets > 0) {
+      // Trim trailing comma or incomplete value
+      const truncated = rawText.replace(/,\s*$/, '').replace(/:\s*"[^"]*$/, ': null').replace(/:\s*\d*$/, ': null').replace(/:\s*$/, ': null');
+      // Close open brackets first, then braces
+      let repaired = truncated;
+      for (let b = 0; b < openBrackets; b++) repaired += ']';
+      for (let b = 0; b < openBraces; b++) repaired += '}';
+      if (st) { st.style.color = "#d98a00"; st.textContent = "⚠️ Truncated JSON detected — attempting repair..."; }
+      rawText = repaired;
+    }
+  }
 
   try {
     const parsed = JSON.parse(rawText);
@@ -5715,7 +5750,7 @@ function finalizeDerivedBucket(bucket) {
   const decisive = wins + losses;
 
   const rawWinRate = decisive ? Number(((wins / decisive) * 100).toFixed(2)) : null;
-  // [FIX: empirical prior replaces universal 50% — DO NOT REVERT TO HARDCODED 50]
+  // [FIX: empirical prior replaces universal 50%]
   // Hardcoding priorWinRate=50 injected 6 phantom losses per 12-game prior whenever
   // the model had systematic positive edge, creating a persistent downward bias that
   // never fully corrects regardless of sample size. The prior should reflect the model's
@@ -7604,6 +7639,13 @@ function isTrackerStateMeaningfullyEmpty(state) {
 
 async function pushTrackerStateToServer(state, isExit = false) {
   if (isTrackerStateMeaningfullyEmpty(state)) return { ok: true };
+
+  // [FIX: NETWORK TIMEOUT GUARD] "TypeError: Load failed" occurs when the Cloudflare Worker
+  // is unreachable or the network drops. Previously this threw, incremented failure count,
+  // and scheduled retries that also threw — flooding the debug log with cascading errors.
+  // Fix: catch network errors silently, return { ok: false } without throwing, so
+  // flushTrackerSave does not propagate the error to the UI red-screen alert system.
+  // Local save is always completed first in flushTrackerSave so data is never lost.
   
   g_trackerSaveInFlight = true;
   renderTrackerAnalytics();
@@ -7611,7 +7653,8 @@ async function pushTrackerStateToServer(state, isExit = false) {
   try {
     let stateToPush = state;
     // Safari 64KB Keepalive Protection: Strip heavy metadata if exiting or too large
-    if (isExit || JSON.stringify(state).length > 60000) {
+    const rawSize = (() => { try { return JSON.stringify(state).length; } catch(e) { return 999999; } })();
+    if (isExit || rawSize > 60000) {
       const leanActive = (state.activePicks || []).map(p => {
         const { diagnostics, ...rest } = p;
         return rest;
@@ -7619,7 +7662,14 @@ async function pushTrackerStateToServer(state, isExit = false) {
       stateToPush = { ...state, activePicks: leanActive, archivedPicks: [], lineMemory: {} };
     }
 
-    const payload = JSON.stringify(stateToPush);
+    let payload;
+    try {
+      payload = JSON.stringify(stateToPush);
+    } catch (serializeErr) {
+      trackerDebug("pushTrackerStateToServer: serialization failed — skipping push", { error: serializeErr.message });
+      return { ok: false };
+    }
+
     const { res, data } = await fetchTrackerJson(TRACKER_API_URL, {
       method: "POST",
       body: payload,
@@ -7627,20 +7677,35 @@ async function pushTrackerStateToServer(state, isExit = false) {
       keepalive: !!isExit
     });
     
-    if (!res.ok) throw new Error("Cloudflare rejected push: " + res.status);
+    if (!res.ok) {
+      trackerDebug("Cloudflare push rejected: " + res.status + " — local copy preserved");
+      return { ok: false };
+    }
     
     g_trackerSaveFailureCount = 0;
     g_trackerPersistedVersion = state.vId || g_trackerSaveVersion;
     return { ok: true, state: data?.state };
   } catch (err) {
+    // [FIX] Silently swallow network errors. "Load failed" = no connectivity.
+    // Do NOT rethrow — it triggers the red-screen engine alert for a non-engine problem.
+    // Do NOT schedule retries on isExit — the page is unloading.
+    const errMsg = String(err?.message || err).toLowerCase();
+    const isNetworkError = errMsg.includes("load failed") || errMsg.includes("fetch") ||
+      errMsg.includes("networkerror") || errMsg.includes("aborted") || errMsg.includes("timeout");
+    
     g_trackerSaveFailureCount = (g_trackerSaveFailureCount || 0) + 1;
-    if (g_trackerSaveFailureCount <= 3) {
-      const delay = Math.min(1000 * Math.pow(2, g_trackerSaveFailureCount), 30000);
+    
+    if (!isExit && g_trackerSaveFailureCount <= 2 && !isNetworkError) {
+      const delay = Math.min(1500 * Math.pow(2, g_trackerSaveFailureCount), 20000);
       setTimeout(() => {
-        pushTrackerStateToServer(state, isExit).catch(() => {});
+        pushTrackerStateToServer(state, false).catch(() => {});
       }, delay);
     }
-    throw err;
+    
+    if (!isNetworkError) {
+      trackerDebug("flush save failed — local copy preserved", { error: err?.message || String(err) });
+    }
+    return { ok: false };
   } finally {
     g_trackerSaveInFlight = false;
     renderTrackerAnalytics();
@@ -7649,17 +7714,31 @@ async function pushTrackerStateToServer(state, isExit = false) {
 
 async function flushTrackerSave() {
   if (isTrackerStateMeaningfullyEmpty(g_trackerState)) return;
+  // [FIX: LOCAL-FIRST SAVE] Always save locally first before attempting network push.
+  // Previously if JSON.parse(JSON.stringify(...)) threw (e.g. circular ref), the local
+  // save was skipped entirely. Now local save is unconditional and network push is
+  // best-effort only.
+  try {
+    await saveTrackerStateToLocal();
+  } catch (localErr) {
+    trackerDebug("flush save: local write failed", { error: String(localErr?.message || localErr) });
+    return; // If local save fails, no point pushing stale data
+  }
   try {
     const snapshot = JSON.parse(JSON.stringify(g_trackerState));
-    await saveTrackerStateToLocal();
     const pushed = await pushTrackerStateToServer(snapshot);
-    if (pushed && pushed.state) {
+    if (pushed && pushed.ok && pushed.state) {
       const merged = mergeTrackerStates(snapshot, pushed.state);
       normalizeTrackerState(merged);
       await saveTrackerStateToLocal();
     }
   } catch (err) {
-    trackerDebug("flush save failed — local copy preserved", { error: String(err) });
+    // Network push failed — local copy was already saved above, so data is safe.
+    // Do not log as error to avoid triggering red-screen alert for network issues.
+    const errMsg = String(err?.message || err).toLowerCase();
+    if (!errMsg.includes("load failed") && !errMsg.includes("networkerror")) {
+      trackerDebug("flush save push error (non-network)", { error: String(err?.message || err) });
+    }
   }
 }
 
@@ -9046,35 +9125,14 @@ function renderConfigsPanel() {
     });
 
     html += `</div>`;
-  }
+    });
 
-  html += `</div></div>`;
-
-  // ── Cold-start notice ──
-  if (!hasCandidates && !verifiedList.length) {
-    html += `
-      <div class="tracker-analytics-card">
-        <div class="tracker-analytics-card-head">
-          <div class="tracker-analytics-card-title">⏳ Building Config Grid</div>
-        </div>
-        <div class="tracker-analytics-card-body">
-          <div class="tracker-insight-text">
-            The engine silently runs ${totalCombos} parameter combinations (H2H weight ×5,
-            recency profile ×3, pace dampening ×3, edge multiplier ×3, injury multiplier ×3)
-            against every settled pick. After 20 picks per market, the highest net-delta config
-            locks in and immediately starts influencing projections. No action needed — keep
-            settling picks normally.
-          </div>
-        </div>
-      </div>
-    `;
-  }
+    html += `</div>`;
 
   html += `</div>`; // close tracker-analytics-shell
   panel.innerHTML = html;
   updateTrackerInsightsButton();
 }
-
 
 
 
