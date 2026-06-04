@@ -1,4 +1,4 @@
-T
+D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13241,6 +13241,13 @@ async function fetchESPN() {
   g_massacreFetchContext = defaultMassacreFetchContext();
   g_massacreFetchContext.league = league;
 
+  // Clear market lines as well (user expectation: new match = fresh lines)
+  const marketFields = ["ftMarket", "h1Market", "h2Market", "teamAMarket", "teamBMarket", "q1Market", "q2Market", "q3Market", "q4Market", "h1TeamAMarket", "h1TeamBMarket", "q1TeamAMarket", "q1TeamBMarket", "highQTotalMarket", "lowQTotalMarket"];
+  marketFields.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = "";
+  });
+
   if (!teamAName || !teamBName) {
     setStatusText("❌ Enter both team names first.", "err");
     return;
@@ -13551,7 +13558,7 @@ async function fetchESPN() {
         const ortg = _find(cats, ["offensiveRating","ortg","offRating"]) || (ppg && pace && pace > 0 ? (ppg / pace) * 100 : null);
         const drtg = _find(cats, ["defensiveRating","drtg","defRating"]) || (oppPpg && pace && pace > 0 ? (oppPpg / pace) * 100 : null);
         if (!ortg && !drtg && !ppg) return null;
-        return { ortg: ortg || 110, drtg: drtg || 110, pace: pace || 99, total: ((ortg || 110) + (drtg || 110)) / 2 * (pace || 99) / 100 };
+        return { ortg: ortg || 110, drtg: drtg || 110, pace: pace || null, total: ((ortg || 110) + (drtg || 110)) / 2 * ((pace || 99) / 100) };
       } catch(_) { return null; }
     }
 
@@ -14044,6 +14051,13 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     }
   }
 
+  // Force league correction for any league (not just WNBA) if the stored context league mismatches
+  if (g_massacreFetchContext.league && g_massacreFetchContext.league !== league) {
+    engineDebug("computeFTProjection: forcing context league reset", { stored: g_massacreFetchContext.league, passed: league });
+    g_massacreFetchContext = defaultMassacreFetchContext();
+    g_massacreFetchContext.league = league;
+  }
+
   const aORTG = g_massacreFetchContext.A.ortg10 || [];
   const aDRTG = g_massacreFetchContext.A.drtg10 || [];
   const bORTG = g_massacreFetchContext.B.ortg10 || [];
@@ -14074,29 +14088,36 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const _espnFetchLeagues = new Set(["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"]);
   const hasSeasonBaselines = !!(aSeason && bSeason && _espnFetchLeagues.has(league));
 
-  const basePace = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default;
+      const basePace = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default;
+    // Force use of expected base pace for consistency
+    const expectedBasePace = basePace;
   if (aORTG.length >= 2 && bORTG.length >= 2) {
     const minL2 = Math.min(aORTG.length, bORTG.length);
     const seasonBlend = hasSeasonBaselines ? Math.max(0, 0.30 - (minL2 * 0.06)) : 0;
     let expEffA = (avgOrNaN(aORTG) + avgOrNaN(bDRTG)) / 2;
     let expEffB = (avgOrNaN(bORTG) + avgOrNaN(aDRTG)) / 2;
     let rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
+    if (!isFinite(rawPace)) rawPace = basePace;
     if (seasonBlend > 0) {
       const sEffA = (aSeason.ortg + bSeason.drtg) / 2;
       const sEffB = (bSeason.ortg + aSeason.drtg) / 2;
-      const sPace = (aSeason.pace + bSeason.pace) / 2;
+      const _spBlendA = (isFinite(aSeason.pace) && aSeason.pace > 30) ? aSeason.pace : basePace;
+      const _spBlendB = (isFinite(bSeason.pace) && bSeason.pace > 30) ? bSeason.pace : basePace;
+      const sPace = (_spBlendA + _spBlendB) / 2;
       expEffA = expEffA * (1 - seasonBlend) + sEffA * seasonBlend;
       expEffB = expEffB * (1 - seasonBlend) + sEffB * seasonBlend;
       rawPace = rawPace * (1 - seasonBlend) + sPace * seasonBlend;
     }
-    estMatchPace = clampNumber(rawPace, cl.min * basePace, cl.max * basePace);
+    estMatchPace = clampNumber(rawPace, cl.min * expectedBasePace, cl.max * expectedBasePace);
     projAFT = (expEffA / 100) * estMatchPace * injMultA;
     projBFT = (expEffB / 100) * estMatchPace * injMultB;
   } else if (hasSeasonBaselines) {
     const expEffA = (aSeason.ortg + bSeason.drtg) / 2;
     const expEffB = (bSeason.ortg + aSeason.drtg) / 2;
-    const rawPace = (aSeason.pace + bSeason.pace) / 2;
-    estMatchPace = clampNumber(rawPace, cl.min * 100, cl.max * 100);
+    const _spSeasonA = (isFinite(aSeason.pace) && aSeason.pace > 30) ? aSeason.pace : basePace;
+    const _spSeasonB = (isFinite(bSeason.pace) && bSeason.pace > 30) ? bSeason.pace : basePace;
+    const rawPace = (_spSeasonA + _spSeasonB) / 2;
+    estMatchPace = clampNumber(rawPace, cl.min * expectedBasePace, cl.max * expectedBasePace);
     projAFT = (expEffA / 100) * estMatchPace * injMultA;
     projBFT = (expEffB / 100) * estMatchPace * injMultB;
   } else {
@@ -14136,7 +14157,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     if (window.__phase2PaceAdjustment === "aggressive") {
       estMatchPace = basePace * Math.max(dampenedPaceA, dampenedPaceB, combinedPaceFactor);
     } else {
-      estMatchPace = clampNumber(basePace * combinedPaceFactor, basePace * 0.85, basePace * 1.15);
+      estMatchPace = clampNumber(expectedBasePace * combinedPaceFactor, expectedBasePace * 0.85, expectedBasePace * 1.15);
     }
     
     // [FIX: league-derived ORTG/DRTG prior — DO NOT HARDCODE 100 HERE AGAIN]
