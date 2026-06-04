@@ -1,4 +1,4 @@
-J
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3848,7 +3848,7 @@ async function runRetrospectiveAnalysis(pick) {
 
   // After processing, check if we have enough settled picks to lock a config
   const totalPicks = getTotalSettledCountForLeagueMarket(league, marketKey);
-  if (totalPicks >= 20) {
+  if (totalPicks >= 10) {
     const best = selectBestConfig(league, marketKey);
     if (best && best.netDelta > 0) {
       storeVerifiedConfig(league, marketKey, best.configKey, best.netDelta, best.sampleCount);
@@ -10204,7 +10204,7 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
 
   archiveExpiredTrackedPicks();
 
-  if (["win","loss","push"].includes(normalizedStatus) && typeof recordPickVariance === "function") {
+    if (["win","loss","push"].includes(normalizedStatus) && typeof recordPickVariance === "function") {
     recordPickVariance(updatedPick);
   }
 
@@ -10223,10 +10223,33 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
     (async () => {
       try {
         await runRetrospectiveAnalysis(updatedPick);
+        // Refresh configs panel after analysis completes
+        if (typeof renderConfigsPanel === "function") renderConfigsPanel();
       } catch (err) {
         engineDebug("Retrospective analysis error", err.message);
       }
     })();
+  }
+  
+  if (g_trackerState.shadowPicks && touchedPick) {
+    const shadowMatches = g_trackerState.shadowPicks.filter(sp => sp.eventId === touchedPick.eventId);
+    for (const sp of shadowMatches) {
+      if (sp.resultStatus !== "pending") continue;
+      sp.actualScore = updatedPick.actualScore;
+      const side = sp.side;
+      const marketLine = sp.line;
+      const actual = parseFloat(sp.actualScore);
+      if (isFinite(actual) && isFinite(marketLine)) {
+        let shadowStatus = "push";
+        if (actual > marketLine) shadowStatus = side === "over" ? "win" : "loss";
+        else if (actual < marketLine) shadowStatus = side === "under" ? "win" : "loss";
+        sp.resultStatus = shadowStatus;
+        sp.settledAt = new Date().toISOString();
+        if (typeof runRetrospectiveAnalysis === "function") {
+          runRetrospectiveAnalysis(sp).catch(err => engineDebug("Shadow retro error", err));
+        }
+      }
+    }
   }
   
   if (touchedPick && touchedPick.league && touchedPick.league !== "nba" && touchedPick.league !== "wnba" && touchedPick.league !== "wnba_pre" && touchedPick.league !== "ncaa") {
@@ -10645,6 +10668,22 @@ function handleTrackedPicksActionClick(event) {
                             changed = true;
                             g_liveGameStatus.delete(pick.eventId);
                             trackerDebug("auto-settled pick", { eventId: pick.eventId, market: pick.marketKey, result: settled, actual: pick.actualScore, line: pick.lineAtPick || pick.line });
+                            
+                            if (g_trackerState.shadowPicks) {
+                              const shadowMatches = g_trackerState.shadowPicks.filter(sp => sp.eventId === pick.eventId);
+                              for (const sp of shadowMatches) {
+                                if (sp.resultStatus !== "pending") continue;
+                                const shadowSettled = settleTrackedPickFromCompetition(sp, competition);
+                                if (shadowSettled && shadowSettled !== "pending") {
+                                  sp.resultStatus = shadowSettled;
+                                  sp.actualScore = pick.actualScore;
+                                  sp.settledAt = new Date().toISOString();
+                                  if (typeof runRetrospectiveAnalysis === "function") {
+                                    runRetrospectiveAnalysis(sp).catch(err => engineDebug("Shadow retro error", err));
+                                  }
+                                }
+                              }
+                            }
                           }
                                 } else {
                           g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: `⏳ NOT FINAL`, apiFinal, clock, period, stateName, statusName, settled: null, actual: null, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
@@ -10826,13 +10865,13 @@ function addTrackedPicks(newPicks) {
   const current = loadTrackedPicks();
   const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
   let changed = false;
+  let shadowChanged = false;
+  
+  if (!g_trackerState.shadowPicks) g_trackerState.shadowPicks = [];
 
   newPicks.forEach(raw => {
     const p = { ...ensureTrackedPickKeys(raw) };
     if (p.diagnostics) {
-      // [FIX #13 PREREQ: EXPANDED FEATURE VECTOR]
-      // Captures all signals needed for permutation importance, OOS validation,
-      // confidence calibration, and model health. DO NOT remove existing fields.
       p.godsEyeMemory = {
         pace:            p.diagnostics.pace,
         netA:            p.diagnostics.netA,
@@ -10861,6 +10900,21 @@ function addTrackedPicks(newPicks) {
       delete p.shadowTrackerFeedback; delete p.teamMemory;
     }
     if (!p.signature) p.signature = makeTrackedSignature(p);
+
+    if (p.isShadow) {
+      const existingShadowIdx = g_trackerState.shadowPicks.findIndex(s => 
+        s.eventId === p.eventId && s.marketKey === p.marketKey && s.side === p.side
+      );
+      if (existingShadowIdx !== -1) {
+        g_trackerState.shadowPicks[existingShadowIdx] = p;
+        shadowChanged = true;
+      } else {
+        g_trackerState.shadowPicks.unshift(p);
+        shadowChanged = true;
+      }
+      if (g_trackerState.shadowPicks.length > 500) g_trackerState.shadowPicks = g_trackerState.shadowPicks.slice(0, 500);
+      return;
+    }
 
     const prisonKey = makeTrackerActiveMergeKey(p);
     const exactIdx = current.findIndex(x => makeTrackerActiveMergeKey(x) === prisonKey);
@@ -10892,6 +10946,7 @@ function addTrackedPicks(newPicks) {
   });
 
   if (changed) saveTrackedPicks(current);
+  if (shadowChanged) saveTrackerStateToLocal();
   renderTrackedPicks();
 }
 
@@ -15881,15 +15936,16 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     } catch(e) { return null; }
   })();
 
-  if (
-  !pickRow ||
-  pickRow.pick === "NO PLAY" ||
-  ((pickRow.note && !isExoticNoLine) && !isSavablePick) ||
-  (!isFinite(pickRow.line) && !isExoticNoLine) ||
-  !fixtureMeta?.eventId
-) {
-  return null;
-}
+  // Always save a shadow record, even for NO PLAY, but don't show it in main tracker
+  const isActualPlay = !(
+    !pickRow ||
+    pickRow.pick === "NO PLAY" ||
+    ((pickRow.note && !isExoticNoLine) && !isSavablePick) ||
+    (!isFinite(pickRow.line) && !isExoticNoLine) ||
+    !fixtureMeta?.eventId
+  );
+
+  if (!isActualPlay && !fixtureMeta?.eventId) return null;
 
         const marketKey = pickRow.marketKey;
       let side = getPickSideFromText(pickRow.pick);
@@ -16051,7 +16107,7 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
   // Attach snapshot to the payload
   if (snapshot) snapshot.capturedAt = nowIso;
 
-  return {
+  const payload = {
     pickId: (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
       ? crypto.randomUUID()
       : (`pick_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
@@ -16092,9 +16148,7 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     shadowTrackerFeedback: pickRow.shadowTrackerFeedback || null,
     teamMemory: pickRow.teamMemory || null,
     lockRestricted: !!pickRow.lockRestricted,
-        confidenceGrade: grade,
-
-
+    confidenceGrade: grade,
     originalConfidenceGrade: String(pickRow.shadowTrackerFeedback?.originalConfidence || grade || "").toUpperCase(),
     modelVersion: getCurrentModelVersion(),
     isLock,
@@ -16115,11 +16169,11 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     memoryProfileKey,
     environmentKey,
     resultStatus: "pending",
-                diagnostics: {
+    isShadow: !isActualPlay,
+    diagnostics: {
       ...(diagnostics || {}),
       phase2Mode: diagnostics?.phase2Activation?.phase2Mode || (isPhase2ShadowMode() ? "shadow" : "live"),
       phase2Activation: diagnostics?.phase2Activation || null,
-
       trackerImpactKey,
       trackerImpactLabel,
       trackerSoftInfluence: pickRow.trackerSoftInfluence || null,
@@ -16130,6 +16184,8 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     },
     createdAt: nowIso
   };
+
+  return payload;
 }
 
 function resolveStoredLineBeforeDecision({
@@ -18779,6 +18835,130 @@ function renderConfigsPanel() {
             ...val
           });
         }
+      } catch(e) {}
+    }
+  }
+  
+  // Gather candidate configs from BB_CANDIDATE_SCORES_* keys
+  const candidates = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && key.startsWith("BB_CANDIDATE_SCORES_")) {
+      try {
+        const val = JSON.parse(localStorage.getItem(key));
+        if (val && typeof val === "object") {
+          const parts = key.split("_");
+          const leagueMarket = parts.slice(3).join("_");
+          for (const [configKey, data] of Object.entries(val)) {
+            if (data && data.netDelta !== undefined && data.count > 0) {
+              candidates.push({
+                leagueMarket,
+                configKey,
+                netDelta: data.netDelta,
+                sampleCount: data.count
+              });
+            }
+          }
+        }
+      } catch(e) {}
+    }
+  }
+  
+  if (configs.length === 0 && candidates.length === 0) {
+    panel.innerHTML = `
+      <div class="tracker-analytics-shell">
+        <div class="tracker-analytics-topbar">
+          <div class="tracker-analytics-heading">
+            <div class="tracker-analytics-kicker">Configuration</div>
+            <div class="tracker-analytics-title">Verified & Candidate Configs</div>
+            <div class="tracker-analytics-subtitle">Settle picks to generate candidate configs. After 20 settled picks, the best candidate is auto‑verified.</div>
+          </div>
+        </div>
+      </div>
+    `;
+    return;
+  }
+  
+  const rowsHtml = configs.map(cfg => `
+    <div class="config-row" data-key="${escapeHtml(cfg.rawKey)}" style="border:1px solid var(--table-border); margin-bottom:10px; padding:10px; background:var(--panel);">
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+        <strong style="font-size:12px;">${escapeHtml(cfg.key)}</strong>
+        <span class="league-trust-pill trust-trusted" style="font-size:9px;">Verified</span>
+        <button class="config-delete-btn" data-key="${escapeHtml(cfg.rawKey)}" style="background:#3a404c; color:#fff; border:none; padding:2px 6px; cursor:pointer;">🗑️ Delete</button>
+      </div>
+      <div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:8px;">
+        <div><label style="font-size:10px;">Config Key</label><input class="config-param" data-param="configKey" value="${escapeHtml(cfg.configKey)}" style="width:100%; font-size:10px;"></div>
+        <div><label style="font-size:10px;">Net Delta (saved wins)</label><input class="config-param" data-param="netDelta" value="${cfg.netDelta}" style="width:100%; font-size:10px;"></div>
+        <div><label style="font-size:10px;">Sample Count</label><input class="config-param" data-param="sampleCount" value="${cfg.sampleCount}" style="width:100%; font-size:10px;"></div>
+        <div><label style="font-size:10px;">Manual Override</label><input class="config-param" data-param="manualOverride" type="checkbox" ${cfg.manualOverride ? "checked" : ""}></div>
+      </div>
+      <div style="margin-top:8px; display:flex; gap:8px; justify-content:flex-end;">
+        <button class="config-save-btn" data-key="${escapeHtml(cfg.rawKey)}" style="background:#3a9c35; color:#fff; border:none; padding:4px 12px; cursor:pointer;">Save</button>
+        <button class="config-reset-btn" data-key="${escapeHtml(cfg.rawKey)}" style="background:#c91920; color:#fff; border:none; padding:4px 12px; cursor:pointer;">Reset to Auto</button>
+      </div>
+    </div>
+  `).join("");
+  
+  // Group candidates by leagueMarket (read‑only, no manual lock)
+  const candidateGroups = new Map();
+  candidates.forEach(c => {
+    if (!candidateGroups.has(c.leagueMarket)) candidateGroups.set(c.leagueMarket, []);
+    candidateGroups.get(c.leagueMarket).push(c);
+  });
+  
+  const candidateHtml = Array.from(candidateGroups.entries()).map(([leagueMarket, cands]) => {
+    cands.sort((a, b) => b.netDelta - a.netDelta);
+    return `
+      <div style="border:1px solid var(--table-border); margin-bottom:10px; padding:10px; background:var(--panel-soft);">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+          <strong style="font-size:12px;">${escapeHtml(leagueMarket)} (candidates)</strong>
+          <span class="league-trust-pill trust-advisory" style="font-size:9px;">Review needed</span>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr; gap:8px;">
+          ${cands.map(cand => `
+            <div style="border:1px solid var(--table-border); padding:8px; background:var(--panel); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+              <div style="font-size:11px; font-family:monospace;">${escapeHtml(cand.configKey)}</div>
+              <div style="display:flex; gap:12px; align-items:center;">
+                <span style="font-size:10px;">Net delta: ${cand.netDelta > 0 ? '+' : ''}${cand.netDelta.toFixed(2)}</span>
+                <span style="font-size:10px;">Sample: ${cand.sampleCount}</span>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `;
+  }).join('');
+  
+  panel.innerHTML = `
+    <div class="tracker-analytics-shell">
+      <div class="tracker-analytics-topbar">
+        <div class="tracker-analytics-heading">
+          <div class="tracker-analytics-kicker">Configuration</div>
+          <div class="tracker-analytics-title">Verified & Candidate Configs</div>
+          <div class="tracker-analytics-subtitle">Candidates appear immediately after settling picks. Auto‑verification needs 20 settled picks.</div>
+        </div>
+      </div>
+      <div id="configs-list">
+        ${rowsHtml}
+        ${candidateHtml}
+      </div>
+    </div>
+  `;
+  
+  // Attach event handlers after rendering
+  document.querySelectorAll('.config-save-btn').forEach(btn => {
+    btn.removeEventListener('click', handleConfigSave);
+    btn.addEventListener('click', handleConfigSave);
+  });
+  document.querySelectorAll('.config-delete-btn').forEach(btn => {
+    btn.removeEventListener('click', handleConfigDelete);
+    btn.addEventListener('click', handleConfigDelete);
+  });
+  document.querySelectorAll('.config-reset-btn').forEach(btn => {
+    btn.removeEventListener('click', handleConfigReset);
+    btn.addEventListener('click', handleConfigReset);
+  });
+}
       } catch(e) {}
     }
   }
