@@ -1,3 +1,4 @@
+N
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -8858,6 +8859,221 @@ function renderTrackedPicks() {
 
 let g_lastRenderedTrackerVersion = null;
 let g_lastRenderedTrackerView = null;
+
+function renderConfigsPanel() {
+  const panel = document.getElementById("trackerAnalyticsPanel");
+  if (!panel) return;
+
+  syncTrackerModalView();
+  panel.classList.remove("tracker-hidden");
+  panel.style.display = "block";
+
+  // ── Pull candidate + verified config data from localStorage ──
+  const candidateMap = {}; // { "league_marketKey" : { configKey, netDelta, count } }
+  const verifiedMap  = {}; // { "league_marketKey" : verified config object }
+
+  try {
+    Object.keys(localStorage).forEach(k => {
+      if (k.startsWith("BB_CANDIDATE_SCORES_")) {
+        const meta = k.slice("BB_CANDIDATE_SCORES_".length);
+        try {
+          const scores = JSON.parse(localStorage.getItem(k) || "{}");
+          let best = null;
+          Object.entries(scores).forEach(([ck, data]) => {
+            if (!best || (data.netDelta > best.netDelta)) {
+              best = { configKey: ck, netDelta: data.netDelta, count: data.count || 0 };
+            }
+          });
+          if (best) candidateMap[meta] = best;
+        } catch(e) {}
+      }
+      if (k.startsWith("BB_VERIFIED_CONFIG_")) {
+        const meta = k.slice("BB_VERIFIED_CONFIG_".length);
+        try {
+          const data = JSON.parse(localStorage.getItem(k) || "{}");
+          if (data && data.verified) verifiedMap[meta] = data;
+        } catch(e) {}
+      }
+    });
+  } catch(e) {}
+
+  // ── Decode a raw config key into human-readable form ──
+  function describeConfig(ck) {
+    if (!ck) return "—";
+    const parts = [];
+    ck.split("_").forEach(seg => {
+      if (seg.startsWith("h2h"))  parts.push("H2H " + seg.slice(3) + "×");
+      else if (seg.startsWith("rec"))  parts.push("Recency:" + seg.slice(3));
+      else if (seg.startsWith("pace")) parts.push("Pace " + seg.slice(4));
+      else if (seg.startsWith("edge")) parts.push("Edge " + seg.slice(4) + "×");
+      else if (seg.startsWith("inj"))  parts.push("Inj " + seg.slice(3) + "×");
+    });
+    return parts.join(" · ") || ck;
+  }
+
+  const settledPicks = getAllTrackedPicksForReport()
+    .filter(p => p.resultStatus === "win" || p.resultStatus === "loss")
+    .sort((a, b) => getTrackedPickTimeMs(b) - getTrackedPickTimeMs(a));
+
+  const totalCombos = (TUNING_GRID.h2hFactors.length *
+    TUNING_GRID.recencyProfiles.length *
+    TUNING_GRID.paceDampenings.length *
+    TUNING_GRID.edgeMults.length *
+    TUNING_GRID.injuryMults.length);
+
+  const verifiedList  = Object.entries(verifiedMap);
+  const hasCandidates = Object.keys(candidateMap).length > 0;
+
+  let html = `
+    <div class="tracker-analytics-shell">
+      <div class="tracker-analytics-topbar">
+        <div class="tracker-analytics-heading">
+          <div class="tracker-analytics-kicker">Configuration Lab</div>
+          <div class="tracker-analytics-title">Pick-by-Pick Config Replay</div>
+          <div class="tracker-analytics-subtitle">
+            The engine silently tests ${totalCombos} parameter combos on every settled pick in
+            the background. The best config locks in after 20+ settled picks per market and
+            immediately improves future predictions.
+          </div>
+        </div>
+      </div>
+  `;
+
+  // ── Verified configs ──
+  if (verifiedList.length) {
+    html += `
+      <div class="tracker-analytics-card">
+        <div class="tracker-analytics-card-head">
+          <div class="tracker-analytics-card-title">✅ Locked & Active Configs</div>
+          <div class="tracker-analytics-card-meta">${verifiedList.length} verified</div>
+        </div>
+        <div class="tracker-analytics-card-body">
+          <div class="tracker-insight-list">
+    `;
+    verifiedList.forEach(([meta, data]) => {
+      const deltaStr = isFinite(data.netDelta)
+        ? (data.netDelta > 0 ? "+" : "") + data.netDelta
+        : "—";
+      html += `
+        <div class="tracker-insight-item">
+          <div class="tracker-insight-dot"></div>
+          <div>
+            <div class="tracker-insight-title">${safeText(meta)}</div>
+            <div class="tracker-insight-text">${safeText(describeConfig(data.configKey))}</div>
+            <div class="tracker-insight-text" style="color:var(--muted);">
+              Net Δ ${safeText(deltaStr)} over ${safeText(String(data.sampleCount || "?"))} picks
+              ${data.manualOverride ? " · Manual override" : " · Auto-verified"}
+            </div>
+          </div>
+        </div>
+      `;
+    });
+    html += `</div></div></div>`;
+  }
+
+  // ── Pick-by-pick replay ──
+  html += `
+    <div class="tracker-analytics-card">
+      <div class="tracker-analytics-card-head">
+        <div class="tracker-analytics-card-title">🔬 Settled Pick Replay</div>
+        <div class="tracker-analytics-card-meta">What the best alt-config would have done</div>
+      </div>
+      <div class="tracker-analytics-card-body">
+  `;
+
+  if (!settledPicks.length) {
+    html += `<div class="tracker-empty-note">
+      No settled picks yet. Settle picks going forward — the config grid runs automatically
+      in the background after each settlement.
+    </div>`;
+  } else {
+    html += `<div class="tracker-review-list">`;
+
+    settledPicks.slice(0, 40).forEach(pick => {
+      const isWin   = pick.resultStatus === "win";
+      const market  = String(pick.marketName || pick.marketKey || "—").split("<")[0].trim();
+      const match   = `${pick.homeTeam || "A"} vs ${pick.awayTeam || "B"}`;
+      const pickTxt = pick.predictionText || "—";
+      const line    = isFinite(Number(pick.line)) ? pick.line : "—";
+      const actual  = pick.actualScore != null ? String(pick.actualScore) : "—";
+      const metaKey = (pick.league || "") + "_" + (pick.marketKey || "");
+
+      const verified  = verifiedMap[metaKey];
+      const candidate = candidateMap[metaKey];
+
+      let configNote, dotClass;
+      if (verified) {
+        configNote = `Using locked config: ${describeConfig(verified.configKey)}`;
+        dotClass   = "";
+      } else if (candidate && candidate.netDelta > 0) {
+        const deltaStr = (candidate.netDelta > 0 ? "+" : "") + candidate.netDelta;
+        configNote = `Best candidate so far: ${describeConfig(candidate.configKey)} `
+          + `(Δ${deltaStr} across ${candidate.count} pick${candidate.count !== 1 ? "s" : ""})`;
+        dotClass   = "";
+      } else if (candidate && candidate.netDelta <= 0) {
+        configNote = `No winning alt-config found yet for ${pick.league || "?"} ${pick.marketKey || "?"}`;
+        dotClass   = "warn";
+      } else if (pick.snapshot) {
+        configNote = `Config grid queued — will surface after 20 settled picks for `
+          + `${pick.league || "?"} ${pick.marketKey || "?"}`;
+        dotClass   = "neutral";
+      } else {
+        configNote = `No snapshot captured (pick saved before snapshot tracking was active)`;
+        dotClass   = "neutral";
+      }
+
+      html += `
+        <div class="tracker-review-row">
+          <div class="tracker-review-top">
+            <div class="tracker-review-area" style="font-size:10px;line-height:1.35;">
+              ${safeText(match)}
+              <br><span style="color:var(--muted);font-weight:700;">
+                ${safeText(market)} · ${safeText(String(pick.league || "").toUpperCase())}
+              </span>
+            </div>
+            <div class="tracker-review-status ${isWin ? "confirmed" : "candidate"}">
+              ${isWin ? "WIN" : "LOSS"}
+            </div>
+          </div>
+          <div class="tracker-review-text">
+            ${safeText(pickTxt)} @ ${safeText(String(line))} — Final: ${safeText(actual)}
+          </div>
+          <div class="tracker-review-action ${dotClass ? "tracker-insight-dot " + dotClass : ""}">
+            ${safeText(configNote)}
+          </div>
+        </div>
+      `;
+    });
+
+    html += `</div>`;
+  }
+
+  html += `</div></div>`;
+
+  // ── Cold-start notice ──
+  if (!hasCandidates && !verifiedList.length) {
+    html += `
+      <div class="tracker-analytics-card">
+        <div class="tracker-analytics-card-head">
+          <div class="tracker-analytics-card-title">⏳ Building Config Grid</div>
+        </div>
+        <div class="tracker-analytics-card-body">
+          <div class="tracker-insight-text">
+            The engine silently runs ${totalCombos} parameter combinations (H2H weight ×5,
+            recency profile ×3, pace dampening ×3, edge multiplier ×3, injury multiplier ×3)
+            against every settled pick. After 20 picks per market, the highest net-delta config
+            locks in and immediately starts influencing projections. No action needed — keep
+            settling picks normally.
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  html += `</div>`; // close tracker-analytics-shell
+  panel.innerHTML = html;
+  updateTrackerInsightsButton();
+}
 
 
 
