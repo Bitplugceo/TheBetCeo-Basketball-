@@ -1,4 +1,4 @@
-S
+G
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6858,8 +6858,21 @@ function buildCompactFetchStatus(messages = [], fetchAuditIssues = []) {
       if (normalizeId(competitor.id) === tid) return true;
       return false;
     }
-            async function proxyFetch(url, timeoutMs = 12000) {
+            const _proxyFetchCache = new Map();
+        async function proxyFetch(url, timeoutMs = 12000) {
       const fetchLabel = getEngineFetchLabel(url);
+      // Check cache for successful responses within the last 5 minutes
+      const cacheKey = url;
+      if (_proxyFetchCache.has(cacheKey)) {
+        const { data, timestamp } = _proxyFetchCache.get(cacheKey);
+        if (Date.now() - timestamp < 5 * 60 * 1000) {
+          engineDebug("fetch cache hit", { request: fetchLabel });
+          return data;
+        } else {
+          _proxyFetchCache.delete(cacheKey);
+        }
+      }
+
       engineDebug("fetch start", { request: fetchLabel, timeoutMs });
             async function fetchJson(requestUrl, label) {
         const ctrl = new AbortController();
@@ -6900,25 +6913,30 @@ function buildCompactFetchStatus(messages = [], fetchAuditIssues = []) {
         u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
         u => `https://thingproxy.freeboard.io/fetch/${encodeURIComponent(u)}`
       ];
+      let lastError = null;
       try {
         const workerData = await fetchJson(WORKER_URL + "?url=" + encodeURIComponent(url), "Worker");
         if (String(url).includes("/summary?event=")) {
           trackerDebug("summary fetch ok via worker", { event: String(url).split("event=")[1]?.split("&")[0] || "", source: "worker" });
         }
+        _proxyFetchCache.set(cacheKey, { data: workerData, timestamp: Date.now() });
         return workerData;
       } catch (workerErr) {
         engineDebug("worker failed — trying fallback proxy chain", { request: fetchLabel, error: workerErr.message });
+        lastError = workerErr;
         for (let _fbi = 0; _fbi < _PROXY_FALLBACKS.length; _fbi++) {
           try {
             const _fbData = await fetchJson(_PROXY_FALLBACKS[_fbi](url), `Fallback-${_fbi + 1}`);
             engineDebug("fallback proxy succeeded", { request: fetchLabel, proxy: _fbi + 1 });
+            _proxyFetchCache.set(cacheKey, { data: _fbData, timestamp: Date.now() });
             return _fbData;
           } catch (_fbErr) {
-            engineDebug(`fallback proxy ${_fbi + 1} failed`, { error: _fbErr.message });
+            // Only log the first failure per fallback to reduce noise
+            if (!lastError) engineDebug(`fallback proxy ${_fbi + 1} failed`, { error: _fbErr.message });
           }
         }
-        engineDebug("fetch failed completely — all proxies exhausted", { request: fetchLabel, error: workerErr.message });
-        throw workerErr;
+        engineDebug("fetch failed completely — all proxies exhausted", { request: fetchLabel, error: lastError?.message || workerErr.message });
+        throw lastError || workerErr;
       }
     }
 
@@ -13672,18 +13690,37 @@ async function fetchESPN() {
     const fetchAuditIssues = buildFetchAuditIssues({ league, teamAName, teamBName, aStats, bStats, h2hGames });
     setFetchAuditIssues(fetchAuditIssues);
 
-    const allGood =
-      Math.min(aStats?.scored?.length || 0, aStats?.allowed?.length || 0) >= 5 &&
-      Math.min(bStats?.scored?.length || 0, bStats?.allowed?.length || 0) >= 5;
+        const aGameCount = Math.min(aStats?.scored?.length || 0, aStats?.allowed?.length || 0);
+    const bGameCount = Math.min(bStats?.scored?.length || 0, bStats?.allowed?.length || 0);
+    const allGood = aGameCount >= 5 && bGameCount >= 5;
 
     if (allGood) {
       g_lastFetchedTeams.A = normalizeTeamName(teamAName);
       g_lastFetchedTeams.B = normalizeTeamName(teamBName);
       updateSectionLocks();
+    } else {
+      // Explicit failure notification – force error status and disable fetch button? No, but show clear message.
+      const missingMsg = `⚠️ FETCH INCOMPLETE: ${teamAName} has only ${aGameCount} games, ${teamBName} has ${bGameCount} games. Full model requires 5 each. Some markets will be NO PLAY. Click "Fetch Stats" again if data looks wrong.`;
+      if (!fetchAuditIssues.includes(missingMsg)) fetchAuditIssues.push(missingMsg);
+      setFetchAuditIssues(fetchAuditIssues);
+      // Also add to messages for status display
+      if (!messages.includes(missingMsg)) messages.push(missingMsg);
     }
 
     const compactFetchStatus = buildCompactFetchStatus(messages, fetchAuditIssues);
-    setStatusHTML(compactFetchStatus ? `<div>${compactFetchStatus}</div>` : "", allGood && !fetchAuditIssues.length ? "ok" : "err");
+    // Force "err" class if incomplete fetch
+    const statusClass = (allGood && !fetchAuditIssues.length) ? "ok" : "err";
+    setStatusHTML(compactFetchStatus ? `<div style="font-weight:bold;">${compactFetchStatus}</div>` : "", statusClass);
+    
+    // Additionally, if incomplete, log a critical engine debug message
+    if (!allGood) {
+      engineDebug("CRITICAL: Incomplete fetch - insufficient games retrieved", { 
+        teamA: teamAName, aGames: aGameCount, 
+        teamB: teamBName, bGames: bGameCount,
+        aStatsScoredLen: aStats?.scored?.length,
+        bStatsScoredLen: bStats?.scored?.length
+      });
+    }
 
   } catch (e) {
     if (e.name !== 'AbortError') {
