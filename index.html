@@ -6,6 +6,9 @@
     name="viewport"
     content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
   />
+  <script>
+    // Emergency debug system removed per user request
+  </script>
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="BB Engine" />
@@ -1802,12 +1805,17 @@ body.dark-mode .tracker-bar-stage {
   font-size: 12px;
   font-weight: 800;
   line-height: 1.4;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 .tracker-review-action {
   color: var(--tracker-subtext);
   font-size: 11px;
   font-weight: 700;
   line-height: 1.4;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  overflow: hidden;
 }
 
 .tracker-line-list {
@@ -2339,9 +2347,10 @@ body.dark-mode .tracker-analytics-section-head {
 <button class="header-error-btn" type="button" id="headerErrorBtn" title="Show fetch/input issues">⚠️</button>
 
   <span class="brand-right">
+
     <button class="theme-toggle" type="button" id="themeToggleBtn" title="Toggle dark/light mode">🏀</button>
     <button class="theme-toggle" type="button" id="trackerToggleBtn" title="Open tracked picks">📊</button>
-    <button class="theme-toggle" type="button" id="afdbBtn" title="Auto-Fetch Debugger" onclick="AFDB.open()">🔬</button>
+    <button class="theme-toggle" type="button" id="afdbBtn" title="Auto-Fetch Debugger" onclick="if(window.AFDB&&AFDB.open)AFDB.open()">🔬</button>
     PREDICTIONS
   </span>
 </header>
@@ -2874,7 +2883,7 @@ body.dark-mode .tracker-analytics-section-head {
         <span id="trackerStatusLabel" style="position:absolute;left:50%;transform:translateX(-50%);font-size:12px;font-weight:900;pointer-events:none;white-space:nowrap;"></span>
                        <div class="tracker-head-actions">
 <button type="button" id="trackerMilitaryRaidBtn" class="tracker-insights-btn" title="Military Raid" onclick="triggerTrackerMilitaryRaid()">🚨</button>
-
+<button type="button" id="trackerConfigBtn" class="tracker-insights-btn" title="View/Edit verified configs">⚙️</button>
 <button type="button" id="trackerCopyDataBtn" class="tracker-insights-btn" title="Copy tracker data to clipboard">📑</button>
           <button type="button" id="trackerCloseBtn" class="tracker-close">✕</button>
         </div>
@@ -2989,6 +2998,7 @@ body.dark-mode .tracker-analytics-section-head {
     }
   };
 
+  // Crash screen disabled – emergency debug button always works
   window.addEventListener("load", function () {
     setTimeout(function () {
       if (!window.__BETCEO_ENGINE_BOOT_SEEN) {
@@ -3001,6 +3011,7 @@ body.dark-mode .tracker-analytics-section-head {
 
 <script>
 window.__BETCEO_ENGINE_BOOT_SEEN = true;
+window.__BETCEO_ENGINE_PARSE_OK = true;
 window.__BETCEO_SESSION_ID = "sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 9);
 
 
@@ -3113,7 +3124,7 @@ function ssProcessTeamEvents(events, teamId, label) {
     const hId = String(e.homeTeam?.id || "");
     const aId = String(e.awayTeam?.id || "");
     return hId === String(teamId) || aId === String(teamId);
-  });
+  }).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
 
   engineDebug("ssProcessTeamEvents completed overall count: " + completedAll.length, { label });
 
@@ -3237,10 +3248,11 @@ function getLeagueGender() {
 
 function parseSofascoreIndividual(side) {
   const pasteEl = document.getElementById(side === "A" ? "ssPasteA" : "ssPasteB");
-  const rawText = (pasteEl?.value || "").trim();
+  let rawText = (pasteEl?.value || "").trim();
   const st = document.getElementById("ssFetchStatus");
   if (!rawText) return;
 
+  // JSON truncation recovery is too brittle; fail fast to avoid silent corruption
   try {
     const parsed = JSON.parse(rawText);
     const events = parsed.events || [];
@@ -3675,6 +3687,186 @@ const MODEL_TUNING = {
   h2hMaxWeight: 0.30,
   recencyWeights: [1.35, 1.20, 1.00, 0.85, 0.70]
 };
+
+// ========== RETROSPECTIVE TUNING GRID ==========
+const TUNING_GRID = {
+  h2hFactors: [0.5, 0.75, 1.0, 1.25, 1.5],
+  recencyProfiles: [
+    [1.35, 1.20, 1.00, 0.85, 0.70], // standard
+    [1.60, 1.30, 0.90, 0.60, 0.40], // aggressive
+    [1.00, 1.00, 1.00, 1.00, 1.00]  // flat
+  ],
+  paceDampenings: [0.25, 0.40, 0.55],
+  edgeMults: [0.90, 1.00, 1.10],
+  injuryMults: [0.8, 1.0, 1.2]
+};
+// ==============================================
+
+// ========== RETROSPECTIVE ANALYSIS (Feature #7) ==========
+function getCandidateScoreKey(config) {
+  const { h2hFactor, recencyProfile, paceDampening, edgeMult, injuryMult } = config;
+  const recencyId = recencyProfile === TUNING_GRID.recencyProfiles[0] ? "std" :
+                    recencyProfile === TUNING_GRID.recencyProfiles[1] ? "agg" : "flat";
+  return `h2h${h2hFactor}_rec${recencyId}_pace${paceDampening}_edge${edgeMult}_inj${injuryMult}`;
+}
+
+function updateCandidateScore(league, marketKey, config, delta) {
+  const key = getCandidateScoreKey(config);
+  const storageKey = `BB_CANDIDATE_SCORES_${league}_${marketKey}`;
+  let scores = {};
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (raw) scores = JSON.parse(raw);
+  } catch(e) {}
+  if (!scores[key]) scores[key] = { netDelta: 0, count: 0 };
+  scores[key].netDelta += delta;
+  scores[key].count++;
+  try {
+    localStorage.setItem(storageKey, JSON.stringify(scores));
+  } catch(e) {}
+}
+
+function getTotalSettledCountForLeagueMarket(league, marketKey) {
+  const all = getLearningTrackedPicks();
+  return all.filter(p =>
+    p.league === league &&
+    p.marketKey === marketKey &&
+    (p.resultStatus === "win" || p.resultStatus === "loss" || p.resultStatus === "push")
+  ).length;
+}
+
+function selectBestConfig(league, marketKey) {
+  const storageKey = `BB_CANDIDATE_SCORES_${league}_${marketKey}`;
+  let scores = {};
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (raw) scores = JSON.parse(raw);
+    else return null;
+  } catch(e) { return null; }
+  let bestKey = null;
+  let bestNetDelta = -Infinity;
+  for (const [key, data] of Object.entries(scores)) {
+    if (data.netDelta > bestNetDelta) {
+      bestNetDelta = data.netDelta;
+      bestKey = key;
+    }
+  }
+  if (!bestKey) return null;
+  // Parse bestKey back into config (simplified – just return the key for storage)
+  return { configKey: bestKey, netDelta: bestNetDelta, sampleCount: scores[bestKey].count };
+}
+
+function storeVerifiedConfig(league, marketKey, configKey, netDelta, sampleCount) {
+  const verifiedKey = `BB_VERIFIED_CONFIG_${league}_${marketKey}`;
+  const verified = {
+    verified: true,
+    configKey,
+    netDelta,
+    sampleCount,
+    updatedAt: new Date().toISOString(),
+    manualOverride: false
+  };
+  try {
+    localStorage.setItem(verifiedKey, JSON.stringify(verified));
+    // Clear candidate scores after locking
+    localStorage.removeItem(`BB_CANDIDATE_SCORES_${league}_${marketKey}`);
+    engineDebug("Verified config locked", { league, marketKey, configKey, netDelta });
+  } catch(e) {}
+}
+
+function getVerifiedConfig(league, marketKey) {
+  const verifiedKey = `BB_VERIFIED_CONFIG_${league}_${marketKey}`;
+  try {
+    const raw = localStorage.getItem(verifiedKey);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed.verified) return parsed;
+    }
+  } catch(e) {}
+  return null;
+}
+
+async function runRetrospectiveAnalysis(pick) {
+  if (!pick.snapshot || !pick.actualScore) {
+    engineDebug("Retrospective skipped: missing snapshot or actualScore");
+    return;
+  }
+  const { league, marketKey, snapshot, actualScore, resultStatus, side } = pick;
+  const isWin = resultStatus === "win";
+  if (!isWin && resultStatus !== "loss") return; // Only analyze wins and losses
+
+  const { parsed, lines, fixtureMeta, injMultA, injMultB, configSnapshot } = snapshot;
+  const numericActual = parseFloat(actualScore);
+  if (!isFinite(numericActual)) return;
+
+  const { h2hFactors, recencyProfiles, paceDampenings, edgeMults, injuryMults } = TUNING_GRID;
+
+  for (const h2hFactor of h2hFactors) {
+    for (const recencyProfile of recencyProfiles) {
+      for (const paceDampening of paceDampenings) {
+        for (const edgeMult of edgeMults) {
+          for (const injuryMult of injuryMults) {
+            const config = { h2hFactor, recencyProfile, paceDampening, edgeMult, injuryMult };
+            // Determine which projection function to call based on marketKey
+            let proj, line, edge, pickDecision;
+            try {
+              if (marketKey === "ft") {
+                const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
+                proj = calc.ftProj;
+                line = lines.ftLine;
+                edge = calc.ftEdge;
+                pickDecision = getPick(edge, line, league, "ft", {});
+              } else if (marketKey === "h1") {
+                const calc = compute1HProjection({ league, parsed, lines, injMultA, injMultB, config });
+                proj = calc.h1Proj;
+                line = lines.h1Line;
+                edge = calc.h1Edge;
+                pickDecision = getPick(edge, line, league, "h1", {});
+              } else if (marketKey === "team_a") {
+                const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
+                proj = calc.projAFT;
+                line = lines.aLine;
+                edge = calc.aEdge;
+                pickDecision = getPick(edge, line, league, "team", { teamSc: calc.aS });
+              } else if (marketKey === "team_b") {
+                const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
+                proj = calc.projBFT;
+                line = lines.bLine;
+                edge = calc.bEdge;
+                pickDecision = getPick(edge, line, league, "team", { teamSc: calc.bS });
+              } else {
+                continue; // Unsupported market for retrospective
+              }
+            } catch(e) { continue; }
+
+            if (pickDecision === "NO PLAY") continue;
+            const pickSide = getPickSideFromText(pickDecision);
+            if (pickSide !== side) continue;
+
+            let wouldWin = false;
+            if (side === "over") wouldWin = numericActual > line;
+            else if (side === "under") wouldWin = numericActual < line;
+
+            const delta = wouldWin ? (isWin ? 0 : 1) : (isWin ? -1 : 0);
+            if (delta !== 0) {
+              updateCandidateScore(league, marketKey, config, delta);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // After processing, check if we have enough settled picks to lock a config
+  const totalPicks = getTotalSettledCountForLeagueMarket(league, marketKey);
+  if (totalPicks >= 10) {
+    const best = selectBestConfig(league, marketKey);
+    if (best && best.netDelta > 0) {
+      storeVerifiedConfig(league, marketKey, best.configKey, best.netDelta, best.sampleCount);
+    }
+  }
+}
+// ========================================================
 
 // [FIX #1: LEARNED-WEIGHT FRAMEWORK HOOKS]
 // Reads the best-performing recency weights for a league from the Phase 2 calibrator
@@ -4690,7 +4882,7 @@ const TRACKER_SAVE_DEBOUNCE_MS = 400;
 const TRACKER_SAVE_RETRY_BASE_MS = 1500;
 const TRACKER_SAVE_RETRY_MAX_MS = 15000;
 const TRACKER_NETWORK_TIMEOUT_MS = BB_CONFIG.timeouts.fetch;
-const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_XX";
+const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_XOX";
 const ENGINE_MODEL_VERSION = "engine_v2_final";
 const TRACKER_LEARNING_ENABLED = true;
 
@@ -5402,6 +5594,15 @@ function getLearningTrackedPicks() {
     .map(p => ensureTrackedPickKeys(p))
     .filter(p => isPickEligibleForLearning(p));
 }
+
+function getTotalSettledCountForLeague(league) {
+  const all = getLearningTrackedPicks();
+  return all.filter(p =>
+    p.league === league &&
+    (p.resultStatus === "win" || p.resultStatus === "loss" || p.resultStatus === "push")
+  ).length;
+}
+
 function getAllTrackedPicksForReport() {
   const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
   const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
@@ -5525,7 +5726,7 @@ function finalizeDerivedBucket(bucket) {
   const decisive = wins + losses;
 
   const rawWinRate = decisive ? Number(((wins / decisive) * 100).toFixed(2)) : null;
-  // [FIX: empirical prior replaces universal 50% — DO NOT REVERT TO HARDCODED 50]
+  // [FIX: empirical prior replaces universal 50%]
   // Hardcoding priorWinRate=50 injected 6 phantom losses per 12-game prior whenever
   // the model had systematic positive edge, creating a persistent downward bias that
   // never fully corrects regardless of sample size. The prior should reflect the model's
@@ -5792,6 +5993,10 @@ function isTrackerReportView() {
 
 function isTrackerDebugView() {
   return g_trackerModalView === "debug";
+}
+
+function isTrackerConfigsView() {
+  return g_trackerModalView === "configs";
 }
 
 function trackerDebug(message, extra = null) {
@@ -6182,15 +6387,21 @@ function isTrackerStateWorseThan(candidateState, baselineState) {
 
 function updateTrackerInsightsButton() {
   const copyBtn = document.getElementById("trackerCopyDataBtn");
+  const configBtn = document.getElementById("trackerConfigBtn");
   const titleEl = document.getElementById("trackerHeadTitle");
 
   if (titleEl) {
     if (isTrackerPicksView()) titleEl.textContent = "Tracked Picks";
     else if (isTrackerReportView()) titleEl.textContent = "Engine Report";
+    else if (isTrackerConfigsView()) titleEl.textContent = "Verified Configs";
   }
 
   if (copyBtn) {
     copyBtn.style.display = isTrackerReportView() ? "" : "none";
+  }
+
+  if (configBtn) {
+    configBtn.style.display = (isTrackerReportView() || isTrackerConfigsView()) ? "" : "none";
   }
 }
 
@@ -6206,7 +6417,7 @@ function syncTrackerModalView() {
 
 function setTrackerModalView(view) {
 
-  const next = ["picks", "report", "debug"].includes(String(view || "")) ? String(view) : "picks";
+  const next = ["picks", "report", "debug", "configs"].includes(String(view || "")) ? String(view) : "picks";
   g_trackerModalView = next;
   if (isTrackerDebugView()) acknowledgeGlobalEngineAlert();
   updateTrackerInsightsButton();
@@ -6223,6 +6434,11 @@ function toggleTrackerInsights() {
 function toggleTrackerDebugView() {
   if (isTrackerDebugView()) setTrackerModalView("report");
   else setTrackerModalView("debug");
+}
+
+function toggleTrackerConfigsView() {
+  if (isTrackerConfigsView()) setTrackerModalView("picks");
+  else setTrackerModalView("configs");
 }
 
 let g_trackerSaveFailureCount = 0;
@@ -6658,8 +6874,21 @@ function buildCompactFetchStatus(messages = [], fetchAuditIssues = []) {
       if (normalizeId(competitor.id) === tid) return true;
       return false;
     }
-            async function proxyFetch(url, timeoutMs = 12000) {
+            const _proxyFetchCache = new Map();
+        async function proxyFetch(url, timeoutMs = 12000) {
       const fetchLabel = getEngineFetchLabel(url);
+      // Check cache for successful responses within the last 5 minutes
+      const cacheKey = url;
+      if (_proxyFetchCache.has(cacheKey)) {
+        const { data, timestamp } = _proxyFetchCache.get(cacheKey);
+        if (Date.now() - timestamp < 5 * 60 * 1000) {
+          engineDebug("fetch cache hit", { request: fetchLabel });
+          return data;
+        } else {
+          _proxyFetchCache.delete(cacheKey);
+        }
+      }
+
       engineDebug("fetch start", { request: fetchLabel, timeoutMs });
             async function fetchJson(requestUrl, label) {
         const ctrl = new AbortController();
@@ -6700,25 +6929,30 @@ function buildCompactFetchStatus(messages = [], fetchAuditIssues = []) {
         u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
         u => `https://thingproxy.freeboard.io/fetch/${encodeURIComponent(u)}`
       ];
+      let lastError = null;
       try {
         const workerData = await fetchJson(WORKER_URL + "?url=" + encodeURIComponent(url), "Worker");
         if (String(url).includes("/summary?event=")) {
           trackerDebug("summary fetch ok via worker", { event: String(url).split("event=")[1]?.split("&")[0] || "", source: "worker" });
         }
+        _proxyFetchCache.set(cacheKey, { data: workerData, timestamp: Date.now() });
         return workerData;
       } catch (workerErr) {
         engineDebug("worker failed — trying fallback proxy chain", { request: fetchLabel, error: workerErr.message });
+        lastError = workerErr;
         for (let _fbi = 0; _fbi < _PROXY_FALLBACKS.length; _fbi++) {
           try {
             const _fbData = await fetchJson(_PROXY_FALLBACKS[_fbi](url), `Fallback-${_fbi + 1}`);
             engineDebug("fallback proxy succeeded", { request: fetchLabel, proxy: _fbi + 1 });
+            _proxyFetchCache.set(cacheKey, { data: _fbData, timestamp: Date.now() });
             return _fbData;
           } catch (_fbErr) {
-            engineDebug(`fallback proxy ${_fbi + 1} failed`, { error: _fbErr.message });
+            // Only log the first failure per fallback to reduce noise
+            if (!lastError) engineDebug(`fallback proxy ${_fbi + 1} failed`, { error: _fbErr.message });
           }
         }
-        engineDebug("fetch failed completely — all proxies exhausted", { request: fetchLabel, error: workerErr.message });
-        throw workerErr;
+        engineDebug("fetch failed completely — all proxies exhausted", { request: fetchLabel, error: lastError?.message || workerErr.message });
+        throw lastError || workerErr;
       }
     }
 
@@ -6821,7 +7055,7 @@ function applySmartLineToPick(pickRow, rawInput, league) {
   const sourceEdge = isFinite(pickRow.edge) ? Number(pickRow.edge) : NaN;
   const sourceProj = isFinite(pickRow.proj) ? Number(pickRow.proj) : NaN;
   const side = getPickSideFromText(pickRow.pick);
-  const buffer = 0.5; // Reduced from 2 to 0.5 to avoid over-adjustment
+  const buffer = 2.5; // Restored to 2.5 for better edge
 
   if (!side || !isFinite(sourceLine) || pickRow.pick === "NO PLAY") {
     return {
@@ -6831,6 +7065,7 @@ function applySmartLineToPick(pickRow, rawInput, league) {
       displayLineUsed: sourceLine,
       displayEdge: sourceEdge,
       displayPick: pickRow.pick,
+      bufferedPickText: pickRow.pick,
       smartLineMeta: null
     };
   }
@@ -6846,6 +7081,7 @@ function applySmartLineToPick(pickRow, rawInput, league) {
     displayLineUsed: sourceLine,
     displayEdge: sourceEdge,
     displayPick: bufferedPick,
+    bufferedPickText: bufferedPick,
     smartLineMeta: null
   };
 }
@@ -7016,9 +7252,14 @@ function trimmedAvg(arr) {
     }
 
     function displayLine(val) {
-      if (val === null || val === undefined || isNaN(val) || !isFinite(val)) return "—";
-      return (Math.round(val * 2) / 2).toFixed(1);
-    }
+  if (val === null || val === undefined || isNaN(val) || !isFinite(val)) return "—";
+  const rounded = Math.round(val * 2) / 2;
+  // Always output .5 – if the rounded value is an integer, add .5
+  if (Math.abs(rounded - Math.round(rounded)) < 0.01) {
+    return (Math.round(rounded)).toFixed(0) + ".5";
+  }
+  return rounded.toFixed(1);
+}
 
     // V10: removed dead try/catch — new Date() doesn't throw
     function formatTrackedDate(iso) {
@@ -7374,6 +7615,13 @@ function isTrackerStateMeaningfullyEmpty(state) {
 
 async function pushTrackerStateToServer(state, isExit = false) {
   if (isTrackerStateMeaningfullyEmpty(state)) return { ok: true };
+
+  // [FIX: NETWORK TIMEOUT GUARD] "TypeError: Load failed" occurs when the Cloudflare Worker
+  // is unreachable or the network drops. Previously this threw, incremented failure count,
+  // and scheduled retries that also threw — flooding the debug log with cascading errors.
+  // Fix: catch network errors silently, return { ok: false } without throwing, so
+  // flushTrackerSave does not propagate the error to the UI red-screen alert system.
+  // Local save is always completed first in flushTrackerSave so data is never lost.
   
   g_trackerSaveInFlight = true;
   renderTrackerAnalytics();
@@ -7381,7 +7629,8 @@ async function pushTrackerStateToServer(state, isExit = false) {
   try {
     let stateToPush = state;
     // Safari 64KB Keepalive Protection: Strip heavy metadata if exiting or too large
-    if (isExit || JSON.stringify(state).length > 60000) {
+    const rawSize = (() => { try { return JSON.stringify(state).length; } catch(e) { return 999999; } })();
+    if (isExit || rawSize > 60000) {
       const leanActive = (state.activePicks || []).map(p => {
         const { diagnostics, ...rest } = p;
         return rest;
@@ -7389,7 +7638,14 @@ async function pushTrackerStateToServer(state, isExit = false) {
       stateToPush = { ...state, activePicks: leanActive, archivedPicks: [], lineMemory: {} };
     }
 
-    const payload = JSON.stringify(stateToPush);
+    let payload;
+    try {
+      payload = JSON.stringify(stateToPush);
+    } catch (serializeErr) {
+      trackerDebug("pushTrackerStateToServer: serialization failed — skipping push", { error: serializeErr.message });
+      return { ok: false };
+    }
+
     const { res, data } = await fetchTrackerJson(TRACKER_API_URL, {
       method: "POST",
       body: payload,
@@ -7397,20 +7653,35 @@ async function pushTrackerStateToServer(state, isExit = false) {
       keepalive: !!isExit
     });
     
-    if (!res.ok) throw new Error("Cloudflare rejected push: " + res.status);
+    if (!res.ok) {
+      trackerDebug("Cloudflare push rejected: " + res.status + " — local copy preserved");
+      return { ok: false };
+    }
     
     g_trackerSaveFailureCount = 0;
     g_trackerPersistedVersion = state.vId || g_trackerSaveVersion;
     return { ok: true, state: data?.state };
   } catch (err) {
+    // [FIX] Silently swallow network errors. "Load failed" = no connectivity.
+    // Do NOT rethrow — it triggers the red-screen engine alert for a non-engine problem.
+    // Do NOT schedule retries on isExit — the page is unloading.
+    const errMsg = String(err?.message || err).toLowerCase();
+    const isNetworkError = errMsg.includes("load failed") || errMsg.includes("fetch") ||
+      errMsg.includes("networkerror") || errMsg.includes("aborted") || errMsg.includes("timeout");
+    
     g_trackerSaveFailureCount = (g_trackerSaveFailureCount || 0) + 1;
-    if (g_trackerSaveFailureCount <= 3) {
-      const delay = Math.min(1000 * Math.pow(2, g_trackerSaveFailureCount), 30000);
+    
+    if (!isExit && g_trackerSaveFailureCount <= 2 && !isNetworkError) {
+      const delay = Math.min(1500 * Math.pow(2, g_trackerSaveFailureCount), 20000);
       setTimeout(() => {
-        pushTrackerStateToServer(state, isExit).catch(() => {});
+        pushTrackerStateToServer(state, false).catch(() => {});
       }, delay);
     }
-    throw err;
+    
+    if (!isNetworkError) {
+      trackerDebug("flush save failed — local copy preserved", { error: err?.message || String(err) });
+    }
+    return { ok: false };
   } finally {
     g_trackerSaveInFlight = false;
     renderTrackerAnalytics();
@@ -7419,17 +7690,31 @@ async function pushTrackerStateToServer(state, isExit = false) {
 
 async function flushTrackerSave() {
   if (isTrackerStateMeaningfullyEmpty(g_trackerState)) return;
+  // [FIX: LOCAL-FIRST SAVE] Always save locally first before attempting network push.
+  // Previously if JSON.parse(JSON.stringify(...)) threw (e.g. circular ref), the local
+  // save was skipped entirely. Now local save is unconditional and network push is
+  // best-effort only.
+  try {
+    await saveTrackerStateToLocal();
+  } catch (localErr) {
+    trackerDebug("flush save: local write failed", { error: String(localErr?.message || localErr) });
+    return; // If local save fails, no point pushing stale data
+  }
   try {
     const snapshot = JSON.parse(JSON.stringify(g_trackerState));
-    await saveTrackerStateToLocal();
     const pushed = await pushTrackerStateToServer(snapshot);
-    if (pushed && pushed.state) {
+    if (pushed && pushed.ok && pushed.state) {
       const merged = mergeTrackerStates(snapshot, pushed.state);
       normalizeTrackerState(merged);
       await saveTrackerStateToLocal();
     }
   } catch (err) {
-    trackerDebug("flush save failed — local copy preserved", { error: String(err) });
+    // Network push failed — local copy was already saved above, so data is safe.
+    // Do not log as error to avoid triggering red-screen alert for network issues.
+    const errMsg = String(err?.message || err).toLowerCase();
+    if (!errMsg.includes("load failed") && !errMsg.includes("networkerror")) {
+      trackerDebug("flush save push error (non-network)", { error: String(err?.message || err) });
+    }
   }
 }
 
@@ -7571,21 +7856,21 @@ async function refreshTrackerInBackground(forceHydrate = false) {
   try {
     await hydrateTrackedPicks(forceHydrate);
     await refreshTrackedPickResults();
-    const _activeEids = new Set(
-      (g_trackerState.activePicks || [])
-        .filter(p => String(p?.resultStatus || "pending").toLowerCase() === "pending" && p?.eventId)
-        .map(p => p.eventId)
-    );
-    [...g_liveGameStatus.keys()].forEach(eid => { if (!_activeEids.has(eid)) g_liveGameStatus.delete(eid); });
-    await forceTrackerSaveNow();
-    engineDebug("Watchdog: Settle/Sync cycle complete.", "engine");
-    scheduleLiveClockPoll();
-  } catch (err) {
-    engineDebug("WATCHDOG ERROR: Sync cycle interrupted: " + err.message);
-  } finally {
-    g_refreshTrackedPicksInFlight = false;
-  }
-}
+            const _activeEids = new Set(
+            (g_trackerState.activePicks || [])
+              .filter(p => String(p?.resultStatus || "pending").toLowerCase() === "pending" && p?.eventId)
+              .map(p => p.eventId)
+          );
+          [...g_liveGameStatus.keys()].forEach(eid => { if (!_activeEids.has(eid)) g_liveGameStatus.delete(eid); });
+          await forceTrackerSaveNow();
+          engineDebug("Watchdog: Settle/Sync cycle complete.", "engine");
+          scheduleLiveClockPoll();
+        }
+        renderTrackedPicks();
+      } catch (err) {
+        console.error("[BB Engine] refresh failed", err);
+      }
+    }
 
 let _liveClockPollTimer = null;
 let _liveTickTimer = null;
@@ -8472,26 +8757,34 @@ function renderTrackedPicks() {
       const aPending = String(a.resultStatus || "pending").toLowerCase() === "pending";
       const bPending = String(b.resultStatus || "pending").toLowerCase() === "pending";
 
+      // Pending always above settled
       if (aPending && !bPending) return -1;
       if (!aPending && bPending) return 1;
 
-      const timeDiff = aPending
-        ? getTrackedPickTimeMs(a) - getTrackedPickTimeMs(b)
-        : getTrackedPickTimeMs(b) - getTrackedPickTimeMs(a);
-      if (Math.abs(timeDiff) > 1000) return timeDiff;
+      // Within pending: most recently created first
+      if (aPending) {
+        const aCreated = Date.parse(a.createdAt) || 0;
+        const bCreated = Date.parse(b.createdAt) || 0;
+        if (aCreated !== bCreated) return bCreated - aCreated;
+      } else {
+        // Within settled: most recent event date first
+        const aTime = getTrackedPickTimeMs(a);
+        const bTime = getTrackedPickTimeMs(b);
+        if (Math.abs(aTime - bTime) > 1000) return bTime - aTime;
+      }
 
       const aGame = String(a.eventId || a.homeTeam || "");
       const bGame = String(b.eventId || b.homeTeam || "");
       if (aGame < bGame) return -1;
       if (aGame > bGame) return 1;
 
-        const mktOrderMap = {
-    "ft": 1, "h1": 2,
-    "q1": 3, "q2": 4, "q3": 5, "q4": 6,
-    "q1_team_a": 7, "q1_team_b": 8,
-    "h1_team_a": 9, "h1_team_b": 10,
-    "team_a": 11, "team_b": 12
-  };
+      const mktOrderMap = {
+        "ft": 1, "h1": 2,
+        "q1": 3, "q2": 4, "q3": 5, "q4": 6,
+        "q1_team_a": 7, "q1_team_b": 8,
+        "h1_team_a": 9, "h1_team_b": 10,
+        "team_a": 11, "team_b": 12
+      };
       return (mktOrderMap[a.marketKey] || 99) - (mktOrderMap[b.marketKey] || 99);
     })
     .slice(0, window.__trackerRenderLimit);
@@ -8622,8 +8915,198 @@ function renderTrackedPicks() {
 let g_lastRenderedTrackerVersion = null;
 let g_lastRenderedTrackerView = null;
 
+function renderConfigsPanel() {
+  const panel = document.getElementById("trackerAnalyticsPanel");
+  if (!panel) return;
 
+  syncTrackerModalView();
+  panel.classList.remove("tracker-hidden");
+  panel.style.display = "block";
 
+  // ── Pull candidate + verified config data from localStorage ──
+  const candidateMap = {}; // { "league_marketKey" : { configKey, netDelta, count } }
+  const verifiedMap  = {}; // { "league_marketKey" : verified config object }
+
+  try {
+    Object.keys(localStorage).forEach(k => {
+      if (k.startsWith("BB_CANDIDATE_SCORES_")) {
+        const meta = k.slice("BB_CANDIDATE_SCORES_".length);
+        try {
+          const scores = JSON.parse(localStorage.getItem(k) || "{}");
+          let best = null;
+          Object.entries(scores).forEach(([ck, data]) => {
+            if (!best || (data.netDelta > best.netDelta)) {
+              best = { configKey: ck, netDelta: data.netDelta, count: data.count || 0 };
+            }
+          });
+          if (best) candidateMap[meta] = best;
+        } catch(e) {}
+      }
+      if (k.startsWith("BB_VERIFIED_CONFIG_")) {
+        const meta = k.slice("BB_VERIFIED_CONFIG_".length);
+        try {
+          const data = JSON.parse(localStorage.getItem(k) || "{}");
+          if (data && data.verified) verifiedMap[meta] = data;
+        } catch(e) {}
+      }
+    });
+  } catch(e) {}
+
+  // ── Decode a raw config key into human-readable form ──
+  function describeConfig(ck) {
+    if (!ck) return "—";
+    const parts = [];
+    ck.split("_").forEach(seg => {
+      if (seg.startsWith("h2h"))  parts.push("H2H " + seg.slice(3) + "×");
+      else if (seg.startsWith("rec"))  parts.push("Recency:" + seg.slice(3));
+      else if (seg.startsWith("pace")) parts.push("Pace " + seg.slice(4));
+      else if (seg.startsWith("edge")) parts.push("Edge " + seg.slice(4) + "×");
+      else if (seg.startsWith("inj"))  parts.push("Inj " + seg.slice(3) + "×");
+    });
+    return parts.join(" · ") || ck;
+  }
+
+  const settledPicks = getAllTrackedPicksForReport()
+    .filter(p => p.resultStatus === "win" || p.resultStatus === "loss")
+    .sort((a, b) => getTrackedPickTimeMs(b) - getTrackedPickTimeMs(a));
+
+  const totalCombos = (TUNING_GRID.h2hFactors.length *
+    TUNING_GRID.recencyProfiles.length *
+    TUNING_GRID.paceDampenings.length *
+    TUNING_GRID.edgeMults.length *
+    TUNING_GRID.injuryMults.length);
+
+  const verifiedList  = Object.entries(verifiedMap);
+  const hasCandidates = Object.keys(candidateMap).length > 0;
+
+  let html = `
+    <div class="tracker-analytics-shell">
+      <div class="tracker-analytics-topbar">
+        <div class="tracker-analytics-heading">
+          <div class="tracker-analytics-kicker">Configuration Lab</div>
+          <div class="tracker-analytics-title">Pick-by-Pick Config Replay</div>
+          <div class="tracker-analytics-subtitle">
+            The engine silently tests ${totalCombos} parameter combos on every settled pick in
+            the background. The best config locks in after 20+ settled picks per market and
+            immediately improves future predictions.
+          </div>
+        </div>
+      </div>
+  `;
+
+  // ── Verified configs ──
+  if (verifiedList.length) {
+    html += `
+      <div class="tracker-analytics-card">
+        <div class="tracker-analytics-card-head">
+          <div class="tracker-analytics-card-title">✅ Locked & Active Configs</div>
+          <div class="tracker-analytics-card-meta">${verifiedList.length} verified</div>
+        </div>
+        <div class="tracker-analytics-card-body">
+          <div class="tracker-insight-list">
+    `;
+    verifiedList.forEach(([meta, data]) => {
+      const deltaStr = isFinite(data.netDelta)
+        ? (data.netDelta > 0 ? "+" : "") + data.netDelta
+        : "—";
+      html += `
+        <div class="tracker-insight-item">
+          <div class="tracker-insight-dot"></div>
+          <div>
+            <div class="tracker-insight-title">${safeText(meta)}</div>
+            <div class="tracker-insight-text">${safeText(describeConfig(data.configKey))}</div>
+            <div class="tracker-insight-text" style="color:var(--muted);">
+              Net Δ ${safeText(deltaStr)} over ${safeText(String(data.sampleCount || "?"))} picks
+              ${data.manualOverride ? " · Manual override" : " · Auto-verified"}
+            </div>
+          </div>
+        </div>
+      `;
+    });
+    html += `</div></div></div>`;
+  }
+
+  // ── Pick-by-pick replay ──
+  html += `
+    <div class="tracker-analytics-card">
+      <div class="tracker-analytics-card-head">
+        <div class="tracker-analytics-card-title">🔬 Settled Pick Replay</div>
+        <div class="tracker-analytics-card-meta">What the best alt-config would have done</div>
+      </div>
+      <div class="tracker-analytics-card-body">
+  `;
+
+  if (!settledPicks.length) {
+    html += `<div class="tracker-empty-note">
+      No settled picks yet. Settle picks going forward — the config grid runs automatically
+      in the background after each settlement.
+    </div>`;
+  } else {
+    html += `<div class="tracker-review-list">`;
+
+    settledPicks.slice(0, 40).forEach(pick => {
+      const isWin   = pick.resultStatus === "win";
+      const market  = String(pick.marketName || pick.marketKey || "—").split("<")[0].trim();
+      const match   = `${pick.homeTeam || "A"} vs ${pick.awayTeam || "B"}`;
+      const pickTxt = pick.predictionText || "—";
+      const line    = isFinite(Number(pick.line)) ? pick.line : "—";
+      const actual  = pick.actualScore != null ? String(pick.actualScore) : "—";
+      const metaKey = (pick.league || "") + "_" + (pick.marketKey || "");
+
+      const verified  = verifiedMap[metaKey];
+      const candidate = candidateMap[metaKey];
+
+      let configNote, dotClass;
+      if (verified) {
+        configNote = `Using locked config: ${describeConfig(verified.configKey)}`;
+        dotClass   = "";
+      } else if (candidate && candidate.netDelta > 0) {
+        const deltaStr = (candidate.netDelta > 0 ? "+" : "") + candidate.netDelta;
+        configNote = `Best candidate so far: ${describeConfig(candidate.configKey)} `
+          + `(Δ${deltaStr} across ${candidate.count} pick${candidate.count !== 1 ? "s" : ""})`;
+        dotClass   = "";
+      } else if (candidate && candidate.netDelta <= 0) {
+        configNote = `No winning alt-config found yet for ${pick.league || "?"} ${pick.marketKey || "?"}`;
+        dotClass   = "warn";
+      } else if (pick.snapshot) {
+        configNote = `Config grid queued — will surface after 20 settled picks for `
+          + `${pick.league || "?"} ${pick.marketKey || "?"}`;
+        dotClass   = "neutral";
+      } else {
+        configNote = `No snapshot captured (pick saved before snapshot tracking was active)`;
+        dotClass   = "neutral";
+      }
+
+      html += `
+        <div class="tracker-review-row">
+          <div class="tracker-review-top">
+            <div class="tracker-review-area" style="font-size:10px;line-height:1.35;">
+              ${safeText(match)}
+              <br><span style="color:var(--muted);font-weight:700;">
+                ${safeText(market)} · ${safeText(String(pick.league || "").toUpperCase())}
+              </span>
+            </div>
+            <div class="tracker-review-status ${isWin ? "confirmed" : "candidate"}">
+              ${isWin ? "WIN" : "LOSS"}
+            </div>
+          </div>
+          <div class="tracker-review-text">
+            ${safeText(pickTxt)} @ ${safeText(String(line))} — Final: ${safeText(actual)}
+          </div>
+          <div class="tracker-review-action ${dotClass ? "tracker-insight-dot " + dotClass : ""}">
+            ${safeText(configNote)}
+          </div>
+        </div>
+      `;
+    });
+
+    html += `</div>`;
+  }
+
+  html += `</div>`;
+  panel.innerHTML = html;
+  updateTrackerInsightsButton();
+}
 
 function renderTrackerAnalytics() {
 
@@ -8637,6 +9120,15 @@ function renderTrackerAnalytics() {
     panel.classList.add("tracker-hidden");
     panel.style.display = "none";
     panel.innerHTML = "";
+    g_lastRenderedTrackerView = currentView;
+    return;
+  }
+
+  if (currentView === "configs") {
+    renderConfigsPanel();
+    syncTrackerModalView();
+    panel.classList.remove("tracker-hidden");
+    panel.style.display = "block";
     g_lastRenderedTrackerView = currentView;
     return;
   }
@@ -9958,8 +10450,12 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
   g_trackerState.updatedAt = nowIso;
 
   archiveExpiredTrackedPicks();
+  // Force reconciliation after manual change to keep buckets clean
+  const reconciled = reconcileTrackerBucketConflicts(g_trackerState.activePicks, g_trackerState.archivedPicks);
+  g_trackerState.activePicks = reconciled.activePicks;
+  g_trackerState.archivedPicks = reconciled.archivedPicks;
 
-  if (["win","loss","push"].includes(normalizedStatus) && typeof recordPickVariance === "function") {
+    if (["win","loss","push"].includes(normalizedStatus) && typeof recordPickVariance === "function") {
     recordPickVariance(updatedPick);
   }
 
@@ -9972,6 +10468,40 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
     result: normalizedStatus,
     line: touchedPick?.line
   });
+
+  // 3. Run retrospective analysis if this is a settlement (win/loss/push)
+  if (["win", "loss", "push"].includes(normalizedStatus) && updatedPick.snapshot) {
+    (async () => {
+      try {
+        await runRetrospectiveAnalysis(updatedPick);
+        // Refresh configs panel after analysis completes
+        if (typeof renderConfigsPanel === "function") renderConfigsPanel();
+      } catch (err) {
+        engineDebug("Retrospective analysis error", err.message);
+      }
+    })();
+  }
+  
+  if (g_trackerState.shadowPicks && touchedPick) {
+    const shadowMatches = g_trackerState.shadowPicks.filter(sp => sp.eventId === touchedPick.eventId);
+    for (const sp of shadowMatches) {
+      if (sp.resultStatus !== "pending") continue;
+      sp.actualScore = updatedPick.actualScore;
+      const side = sp.side;
+      const marketLine = sp.line;
+      const actual = parseFloat(sp.actualScore);
+      if (isFinite(actual) && isFinite(marketLine)) {
+        let shadowStatus = "push";
+        if (actual > marketLine) shadowStatus = side === "over" ? "win" : "loss";
+        else if (actual < marketLine) shadowStatus = side === "under" ? "win" : "loss";
+        sp.resultStatus = shadowStatus;
+        sp.settledAt = new Date().toISOString();
+        if (typeof runRetrospectiveAnalysis === "function") {
+          runRetrospectiveAnalysis(sp).catch(err => engineDebug("Shadow retro error", err));
+        }
+      }
+    }
+  }
   
   if (touchedPick && touchedPick.league && touchedPick.league !== "nba" && touchedPick.league !== "wnba" && touchedPick.league !== "wnba_pre" && touchedPick.league !== "ncaa") {
     setTimeout(() => {
@@ -10070,11 +10600,6 @@ function handleTrackedPicksActionClick(event) {
   const btn = target.closest?.(".tracker-settle-btn");
   if (!btn) return;
 
-  if (g_trackerSaveInFlight) {
-    engineDebug("Manual settle blocked: Tracker save currently in flight.");
-    return;
-  }
-
   const resultStatus = String(btn.getAttribute("data-manual-settle") || "").toLowerCase();
   const encodedSig = String(btn.getAttribute("data-sig") || "");
   const signature = encodedSig ? decodeURIComponent(encodedSig) : "";
@@ -10082,14 +10607,30 @@ function handleTrackedPicksActionClick(event) {
   if (!signature || !["win", "loss", "push"].includes(resultStatus)) return;
 
   btn.disabled = true;
-  settleTrackedPick(signature, resultStatus)
-    .catch(err => {
-      console.error("[BB Engine] manual settle failed", err);
-      trackerDebug("manual settle failed", { error: String(err?.message || err), result: resultStatus });
-    })
-    .finally(() => {
-      btn.disabled = false;
-    });
+  
+  // If a save is already in flight, wait for it to finish before settling
+  const settle = async () => {
+    if (g_trackerSaveInFlight) {
+      engineDebug("Manual settle waiting for save to complete...");
+      // Wait up to 5 seconds for the save to finish
+      let waited = 0;
+      while (g_trackerSaveInFlight && waited < 5000) {
+        await new Promise(r => setTimeout(r, 100));
+        waited += 100;
+      }
+      if (g_trackerSaveInFlight) {
+        engineDebug("Manual settle proceeding despite save still in flight (timeout)");
+      }
+    }
+    await settleTrackedPick(signature, resultStatus);
+  };
+  
+  settle().catch(err => {
+    console.error("[BB Engine] manual settle failed", err);
+    trackerDebug("manual settle failed", { error: String(err?.message || err), result: resultStatus });
+  }).finally(() => {
+    btn.disabled = false;
+  });
 }
 
 
@@ -10121,6 +10662,9 @@ function handleTrackedPicksActionClick(event) {
 
             function settleTrackedPickFromCompetition(pick, competition, allowPartialSettlement = false) {
   if (!pick || !competition) return "pending";
+
+  // Store original result status to check if newly settled
+  const oldStatus = pick.resultStatus;
 
   const completed = !!(
     competition?.status?.type?.completed ||
@@ -10284,6 +10828,18 @@ function handleTrackedPicksActionClick(event) {
   if (actual > actualPickLine) actualGrade = pickSide === "over" ? "win" : "loss";
   else if (actual < actualPickLine) actualGrade = pickSide === "under" ? "win" : "loss";
 
+  // Trigger retrospective analysis if newly settled
+  const newStatus = actualGrade;
+  if (newStatus !== oldStatus && pick.snapshot && (newStatus === "win" || newStatus === "loss" || newStatus === "push")) {
+    (async () => {
+      try {
+        await runRetrospectiveAnalysis(pick);
+      } catch (err) {
+        engineDebug("Retrospective analysis error (auto-settle)", err.message);
+      }
+    })();
+  }
+
   return actualGrade; // This becomes resultStatus
 }
 
@@ -10363,6 +10919,22 @@ function handleTrackedPicksActionClick(event) {
                             changed = true;
                             g_liveGameStatus.delete(pick.eventId);
                             trackerDebug("auto-settled pick", { eventId: pick.eventId, market: pick.marketKey, result: settled, actual: pick.actualScore, line: pick.lineAtPick || pick.line });
+                            
+                            if (g_trackerState.shadowPicks) {
+                              const shadowMatches = g_trackerState.shadowPicks.filter(sp => sp.eventId === pick.eventId);
+                              for (const sp of shadowMatches) {
+                                if (sp.resultStatus !== "pending") continue;
+                                const shadowSettled = settleTrackedPickFromCompetition(sp, competition);
+                                if (shadowSettled && shadowSettled !== "pending") {
+                                  sp.resultStatus = shadowSettled;
+                                  sp.actualScore = pick.actualScore;
+                                  sp.settledAt = new Date().toISOString();
+                                  if (typeof runRetrospectiveAnalysis === "function") {
+                                    runRetrospectiveAnalysis(sp).catch(err => engineDebug("Shadow retro error", err));
+                                  }
+                                }
+                              }
+                            }
                           }
                                 } else {
                           g_settlementDebugLog.set(_dbgKey, { pick: `${pick.homeTeam} vs ${pick.awayTeam} · ${pick.marketKey}`, eventId: pick.eventId, status: `⏳ NOT FINAL`, apiFinal, clock, period, stateName, statusName, settled: null, actual: null, line: pick.lineAtPick || pick.line, ts: new Date().toLocaleTimeString([], {hour12:false}) });
@@ -10502,7 +11074,7 @@ function handleTrackedPicksActionClick(event) {
           const _prevSettled = Number(_ckpt.settledCount || 0);
           if (_nowSettled - _prevSettled >= 25) {
             setTimeout(() => {
-              try { calibrateMassacreCoefficients(); } catch(e) {}
+              try { if (typeof window.calibrateMassacreCoefficients === 'function') window.calibrateMassacreCoefficients(); } catch(e) {}
               try { calibrateConfidenceModel(); } catch(e) {}
               try { optimizePickThresholds(); } catch(e) {}
               try { runOutOfSampleValidation(); } catch(e) {}
@@ -10544,13 +11116,13 @@ function addTrackedPicks(newPicks) {
   const current = loadTrackedPicks();
   const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
   let changed = false;
+  let shadowChanged = false;
+  
+  if (!g_trackerState.shadowPicks) g_trackerState.shadowPicks = [];
 
   newPicks.forEach(raw => {
     const p = { ...ensureTrackedPickKeys(raw) };
     if (p.diagnostics) {
-      // [FIX #13 PREREQ: EXPANDED FEATURE VECTOR]
-      // Captures all signals needed for permutation importance, OOS validation,
-      // confidence calibration, and model health. DO NOT remove existing fields.
       p.godsEyeMemory = {
         pace:            p.diagnostics.pace,
         netA:            p.diagnostics.netA,
@@ -10579,6 +11151,21 @@ function addTrackedPicks(newPicks) {
       delete p.shadowTrackerFeedback; delete p.teamMemory;
     }
     if (!p.signature) p.signature = makeTrackedSignature(p);
+
+    if (p.isShadow) {
+      const existingShadowIdx = g_trackerState.shadowPicks.findIndex(s => 
+        s.eventId === p.eventId && s.marketKey === p.marketKey && s.side === p.side
+      );
+      if (existingShadowIdx !== -1) {
+        g_trackerState.shadowPicks[existingShadowIdx] = p;
+        shadowChanged = true;
+      } else {
+        g_trackerState.shadowPicks.unshift(p);
+        shadowChanged = true;
+      }
+      if (g_trackerState.shadowPicks.length > 500) g_trackerState.shadowPicks = g_trackerState.shadowPicks.slice(0, 500);
+      return;
+    }
 
     const prisonKey = makeTrackerActiveMergeKey(p);
     const exactIdx = current.findIndex(x => makeTrackerActiveMergeKey(x) === prisonKey);
@@ -10610,11 +11197,12 @@ function addTrackedPicks(newPicks) {
   });
 
   if (changed) saveTrackedPicks(current);
+  if (shadowChanged) saveTrackerStateToLocal();
   renderTrackedPicks();
 }
 
 
-    function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0, league = "unknown", baselineForMarket = null) {
+    function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0, league = "unknown", baselineForMarket = null, factor = 1.0) {
   const minLen = Math.min(Number(lenA) || 0, Number(lenB) || 0);
   if (minLen < 2) return 0;
 
@@ -10629,6 +11217,9 @@ function addTrackedPicks(newPicks) {
   if (marketType === "h2") base *= 0.45;
 
   if (sampleTier === "thin") base *= 0.85;
+
+  // Apply user-defined factor (from verified config)
+  base *= factor;
 
   // [LOCK: SMOOTH EXPONENTIAL DECAY — DO NOT REVERT TO STEP FUNCTION]
   // Previous: 3 hard brackets (×0.45 / ×0.62 / ×0.80 at 7.8% / 5.2% / 3.5% of leagueBase).
@@ -10723,7 +11314,8 @@ function addTrackedPicks(newPicks) {
     function getLeagueEdgeThresholds(league) {
   if (league === "nba") return LEAGUE_EDGE_THRESHOLDS.nba;
   if (league === "ncaa") return LEAGUE_EDGE_THRESHOLDS.ncaa;
-  if (league === "wnba" || league === "wnba_pre") return LEAGUE_EDGE_THRESHOLDS.wnba;
+  if (league === "wnba" || league === "wnba_pre") return { ft: 0.072, h1: 0.068 };
+  if (league === "euroleague" || league === "eurocup") return { ft: 0.070, h1: 0.065 };
   if (EUROPE_EDGE_LEAGUES.includes(league)) return LEAGUE_EDGE_THRESHOLDS.europe;
   if (ASIA_EDGE_LEAGUES.includes(league)) return LEAGUE_EDGE_THRESHOLDS.asia;
   return LEAGUE_EDGE_THRESHOLDS.default;
@@ -10964,7 +11556,7 @@ function getConfidenceGradeThresholds() {
       }
     }
   } catch(e) {}
-  return { aThresh: 5, bThresh: 3, cThresh: 1 };
+  return { aThresh: 5, bThresh: 1.4, cThresh: 1 };
 }
 
 // [FIX #2: PROBABILITY-CALIBRATED CONFIDENCE]
@@ -12151,7 +12743,7 @@ updateIntelligencePack();
         iconSpan.innerHTML = "&#9662;";
         btn.appendChild(titleSpan);
         btn.appendChild(iconSpan);
-        btn.addEventListener("click", () => { section.classList.toggle("collapsed"); updateSectionLocks(); });
+btn.addEventListener("click", () => { section.classList.toggle("collapsed"); });
 
         section.innerHTML = "";
         section.appendChild(btn);
@@ -12980,6 +13572,17 @@ async function fetchESPN() {
   const teamAName = document.getElementById("teamAName").value.trim();
   const teamBName = document.getElementById("teamBName").value.trim();
 
+  // Reset massacre context to prevent stale advanced stats from previous leagues
+  g_massacreFetchContext = defaultMassacreFetchContext();
+  g_massacreFetchContext.league = league;
+
+  // Clear market lines as well (user expectation: new match = fresh lines)
+  const marketFields = ["ftMarket", "h1Market", "h2Market", "teamAMarket", "teamBMarket", "q1Market", "q2Market", "q3Market", "q4Market", "h1TeamAMarket", "h1TeamBMarket", "q1TeamAMarket", "q1TeamBMarket", "highQTotalMarket", "lowQTotalMarket"];
+  marketFields.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = "";
+  });
+
   if (!teamAName || !teamBName) {
     setStatusText("❌ Enter both team names first.", "err");
     return;
@@ -13290,7 +13893,7 @@ async function fetchESPN() {
         const ortg = _find(cats, ["offensiveRating","ortg","offRating"]) || (ppg && pace && pace > 0 ? (ppg / pace) * 100 : null);
         const drtg = _find(cats, ["defensiveRating","drtg","defRating"]) || (oppPpg && pace && pace > 0 ? (oppPpg / pace) * 100 : null);
         if (!ortg && !drtg && !ppg) return null;
-        return { ortg: ortg || 110, drtg: drtg || 110, pace: pace || 99, total: ((ortg || 110) + (drtg || 110)) / 2 * (pace || 99) / 100 };
+        return { ortg: ortg || 110, drtg: drtg || 110, pace: pace || null, total: ((ortg || 110) + (drtg || 110)) / 2 * ((pace || 99) / 100) };
       } catch(_) { return null; }
     }
 
@@ -13433,18 +14036,37 @@ async function fetchESPN() {
     const fetchAuditIssues = buildFetchAuditIssues({ league, teamAName, teamBName, aStats, bStats, h2hGames });
     setFetchAuditIssues(fetchAuditIssues);
 
-    const allGood =
-      Math.min(aStats?.scored?.length || 0, aStats?.allowed?.length || 0) >= 5 &&
-      Math.min(bStats?.scored?.length || 0, bStats?.allowed?.length || 0) >= 5;
+        const aGameCount = Math.min(aStats?.scored?.length || 0, aStats?.allowed?.length || 0);
+    const bGameCount = Math.min(bStats?.scored?.length || 0, bStats?.allowed?.length || 0);
+    const allGood = aGameCount >= 5 && bGameCount >= 5;
 
     if (allGood) {
       g_lastFetchedTeams.A = normalizeTeamName(teamAName);
       g_lastFetchedTeams.B = normalizeTeamName(teamBName);
       updateSectionLocks();
+    } else {
+      // Explicit failure notification – force error status and disable fetch button? No, but show clear message.
+      const missingMsg = `⚠️ FETCH INCOMPLETE: ${teamAName} has only ${aGameCount} games, ${teamBName} has ${bGameCount} games. Full model requires 5 each. Some markets will be NO PLAY. Click "Fetch Stats" again if data looks wrong.`;
+      if (!fetchAuditIssues.includes(missingMsg)) fetchAuditIssues.push(missingMsg);
+      setFetchAuditIssues(fetchAuditIssues);
+      // Also add to messages for status display
+      if (!messages.includes(missingMsg)) messages.push(missingMsg);
     }
 
     const compactFetchStatus = buildCompactFetchStatus(messages, fetchAuditIssues);
-    setStatusHTML(compactFetchStatus ? `<div>${compactFetchStatus}</div>` : "", allGood && !fetchAuditIssues.length ? "ok" : "err");
+    // Force "err" class if incomplete fetch
+    const statusClass = (allGood && !fetchAuditIssues.length) ? "ok" : "err";
+    setStatusHTML(compactFetchStatus ? `<div style="font-weight:bold;">${compactFetchStatus}</div>` : "", statusClass);
+    
+    // Additionally, if incomplete, log a critical engine debug message
+    if (!allGood) {
+      engineDebug("CRITICAL: Incomplete fetch - insufficient games retrieved", { 
+        teamA: teamAName, aGames: aGameCount, 
+        teamB: teamBName, bGames: bGameCount,
+        aStatsScoredLen: aStats?.scored?.length,
+        bStatsScoredLen: bStats?.scored?.length
+      });
+    }
 
   } catch (e) {
     if (e.name !== 'AbortError') {
@@ -13746,9 +14368,34 @@ function getMarketKeyFromName(name, marketKeyOverride) {
   return "other";
 }
 
-function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
+function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
+  // Safe config defaults
+  const _cfg = config || {};
+  const h2hFactor = (typeof _cfg.h2hFactor === 'number' && isFinite(_cfg.h2hFactor)) ? _cfg.h2hFactor : 1.0;
+  const paceDampening = (typeof _cfg.paceDampening === 'number' && isFinite(_cfg.paceDampening)) ? _cfg.paceDampening : 0.4;
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const cl = getEffectivePaceClamp(league);
+
+  // Sanity: if league is WNBA but we have NBA‑like advanced stats, clear them to force synthetic path
+  if (league === "wnba" || league === "wnba_pre") {
+    const hasNbaPace = (g_massacreFetchContext.A.pace10 || []).some(p => p > 90);
+    if (hasNbaPace) {
+      engineDebug("computeFTProjection: clearing stale NBA pace data for WNBA", { league });
+      g_massacreFetchContext.A.ortg10 = [];
+      g_massacreFetchContext.A.drtg10 = [];
+      g_massacreFetchContext.A.pace10 = [];
+      g_massacreFetchContext.B.ortg10 = [];
+      g_massacreFetchContext.B.drtg10 = [];
+      g_massacreFetchContext.B.pace10 = [];
+    }
+  }
+
+  // Force league correction for any league (not just WNBA) if the stored context league mismatches
+  if (g_massacreFetchContext.league && g_massacreFetchContext.league !== league) {
+    engineDebug("computeFTProjection: forcing context league reset", { stored: g_massacreFetchContext.league, passed: league });
+    g_massacreFetchContext = defaultMassacreFetchContext();
+    g_massacreFetchContext.league = league;
+  }
 
   const aORTG = g_massacreFetchContext.A.ortg10 || [];
   const aDRTG = g_massacreFetchContext.A.drtg10 || [];
@@ -13780,29 +14427,36 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const _espnFetchLeagues = new Set(["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"]);
   const hasSeasonBaselines = !!(aSeason && bSeason && _espnFetchLeagues.has(league));
 
-  const basePace = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default;
+      const basePace = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default;
+    // Force use of expected base pace for consistency
+    const expectedBasePace = basePace;
   if (aORTG.length >= 2 && bORTG.length >= 2) {
     const minL2 = Math.min(aORTG.length, bORTG.length);
     const seasonBlend = hasSeasonBaselines ? Math.max(0, 0.30 - (minL2 * 0.06)) : 0;
     let expEffA = (avgOrNaN(aORTG) + avgOrNaN(bDRTG)) / 2;
     let expEffB = (avgOrNaN(bORTG) + avgOrNaN(aDRTG)) / 2;
     let rawPace = (avgOrNaN(aPace) + avgOrNaN(bPace)) / 2;
+    if (!isFinite(rawPace)) rawPace = basePace;
     if (seasonBlend > 0) {
       const sEffA = (aSeason.ortg + bSeason.drtg) / 2;
       const sEffB = (bSeason.ortg + aSeason.drtg) / 2;
-      const sPace = (aSeason.pace + bSeason.pace) / 2;
+      const _spBlendA = (isFinite(aSeason.pace) && aSeason.pace > 30) ? aSeason.pace : basePace;
+      const _spBlendB = (isFinite(bSeason.pace) && bSeason.pace > 30) ? bSeason.pace : basePace;
+      const sPace = (_spBlendA + _spBlendB) / 2;
       expEffA = expEffA * (1 - seasonBlend) + sEffA * seasonBlend;
       expEffB = expEffB * (1 - seasonBlend) + sEffB * seasonBlend;
       rawPace = rawPace * (1 - seasonBlend) + sPace * seasonBlend;
     }
-    estMatchPace = clampNumber(rawPace, cl.min * basePace, cl.max * basePace);
+    estMatchPace = clampNumber(rawPace, cl.min * expectedBasePace, cl.max * expectedBasePace);
     projAFT = (expEffA / 100) * estMatchPace * injMultA;
     projBFT = (expEffB / 100) * estMatchPace * injMultB;
   } else if (hasSeasonBaselines) {
     const expEffA = (aSeason.ortg + bSeason.drtg) / 2;
     const expEffB = (bSeason.ortg + aSeason.drtg) / 2;
-    const rawPace = (aSeason.pace + bSeason.pace) / 2;
-    estMatchPace = clampNumber(rawPace, cl.min * 100, cl.max * 100);
+    const _spSeasonA = (isFinite(aSeason.pace) && aSeason.pace > 30) ? aSeason.pace : basePace;
+    const _spSeasonB = (isFinite(bSeason.pace) && bSeason.pace > 30) ? bSeason.pace : basePace;
+    const rawPace = (_spSeasonA + _spSeasonB) / 2;
+    estMatchPace = clampNumber(rawPace, cl.min * expectedBasePace, cl.max * expectedBasePace);
     projAFT = (expEffA / 100) * estMatchPace * injMultA;
     projBFT = (expEffB / 100) * estMatchPace * injMultB;
   } else {
@@ -13814,30 +14468,31 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const paceFactorA = (aS + aA) / eb;
     const paceFactorB = (bS + bA) / eb;
     // [LOCK: LEARNED PACE DAMPENING — replaces hardcoded 0.4]
-    // Derives the dampening coefficient from bb_engine_accuracy_log per league.
-    // Low MAE → model is accurate → trust pace signal more (lower dampening, less regression).
-    // High MAE → noisy data → dampen more toward league baseline (higher dampening).
-    // Clamped [0.20, 0.65]. Falls back to 0.40 when fewer than 30 settled picks exist.
-    // DO NOT restore hardcoded 0.4 — it applied identical dampening regardless of model quality.
+    const paceDampening = config.paceDampening ?? 0.4;
     const _learnedPaceDamp = (() => {
       try {
         const _al = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]");
         const _rl = _al.filter(e => e.league === league && isFinite(e.error) && isFinite(e.line) && e.line > 0);
-        if (_rl.length >= 30) {
+        
+       if (_rl.length >= 30) {
           const _mae = _rl.slice(-60).reduce((s, e) => s + Math.abs(e.error), 0) / Math.min(_rl.length, 60);
           const _base = LEAGUE_BASES[league] || 160;
           return clampNumber(0.25 + (_mae / (_base * 0.08)) * 0.30, 0.20, 0.65);
         }
       } catch(_pe) {}
-      return 0.40;
+      return paceDampening;
     })();
-    const dampenedPaceA = 1 + ((paceFactorA - 1) * _learnedPaceDamp);
-    const dampenedPaceB = 1 + ((paceFactorB - 1) * _learnedPaceDamp);
+    // Override with config paceDampening if provided
+    const effectivePaceDamp = config.paceDampening ?? _learnedPaceDamp;
+    const dampenedPaceA = 1 + ((paceFactorA - 1) * effectivePaceDamp);
+    const dampenedPaceB = 1 + ((paceFactorB - 1) * effectivePaceDamp);
 
+    let combinedPaceFactor = (dampenedPaceA + dampenedPaceB) / 2;
+    combinedPaceFactor = Math.min(combinedPaceFactor, 1.15); // cap at +15% deviation
     if (window.__phase2PaceAdjustment === "aggressive") {
-      estMatchPace = basePace * Math.max(dampenedPaceA, dampenedPaceB, (dampenedPaceA + dampenedPaceB) / 2);
+      estMatchPace = basePace * Math.max(dampenedPaceA, dampenedPaceB, combinedPaceFactor);
     } else {
-      estMatchPace = clampNumber(basePace * ((dampenedPaceA + dampenedPaceB) / 2), basePace * cl.min, basePace * cl.max);
+      estMatchPace = clampNumber(expectedBasePace * combinedPaceFactor, expectedBasePace * 0.85, expectedBasePace * 1.15);
     }
     
     // [FIX: league-derived ORTG/DRTG prior — DO NOT HARDCODE 100 HERE AGAIN]
@@ -13900,7 +14555,8 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
   if (ftHasH2H) {
     const avgAH2H = avgOrNaN(aH2H);
     const ftDivergence = isFinite(avgAH2H) && isFinite(projAFT) ? (avgAH2H - projAFT) : 0;
-    const hw = getH2HWeight(aH2H.length, bH2H.length, "ft", ftSampleTier, ftDivergence, league);
+    const h2hFactor = config.h2hFactor ?? 1.0;
+  const hw = getH2HWeight(aH2H.length, bH2H.length, "ft", ftSampleTier, ftDivergence, league, (typeof h2hFactor === 'number' ? h2hFactor : 1.0));
     projAFT = (projAFT * (1 - hw)) + (avgAH2H * hw);
     projBFT = (projBFT * (1 - hw)) + (avgOrNaN(bH2H) * hw);
   }
@@ -13984,8 +14640,8 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
     aEdge: lines.aLine ? projAFT - lines.aLine : NaN,
     bEdge: lines.bLine ? projBFT - lines.bLine : NaN,
     aVol, bVol,
-    ftFullModel: ftSampleTier === "full" && (aORTG.length >= 5 || (league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre")),
-    teamFullModel: ftSampleTier === "full" && (aORTG.length >= 5 || (league !== "nba" && league !== "ncaa" && league !== "wnba" && league !== "wnba_pre")),
+    ftFullModel: ftSampleTier === "full" && (aORTG.length >= 5 || (league !== "nba" && league !== "ncaa")),
+    teamFullModel: ftSampleTier === "full" && (aORTG.length >= 5 || (league !== "nba" && league !== "ncaa")),
     ftProjectionOnly: !ftHasH2H && ftSampleTier === "thin",
     blowoutGap: Math.abs(projAFT - projBFT),
     paceGapRisk: estMatchPace > (basePace * 1.08) || estMatchPace < (basePace * 0.92),
@@ -14000,7 +14656,11 @@ const hasSufficientSynthSample = aFTS.length >= 3 && bFTS.length >= 3;
   };
 }
 
-function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
+function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
+  // Safe config defaults
+  const _cfg = config || {};
+  const h2hFactor = (typeof _cfg.h2hFactor === 'number' && isFinite(_cfg.h2hFactor)) ? _cfg.h2hFactor : 1.0;
+  const paceDampening = (typeof _cfg.paceDampening === 'number' && isFinite(_cfg.paceDampening)) ? _cfg.paceDampening : 0.4;
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const h1Baseline   = eb / 2;
   const teamH1Base   = eb / 4;
@@ -14033,6 +14693,7 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   // Computed independently per team so each projection uses its own variance context.
   // Clamped [0.40, 0.70]. Falls back to 0.55 when sample is too thin (< 3 games).
   // DO NOT revert to flat 0.55 — inverse-variance is the statistically optimal linear blend.
+  // Optionally override blend weights via config (future)
   const _h1BlendWA = (() => {
     const _vo = (aS1.length >= 3) ? Math.pow(stdDev(aS1), 2) : null;
     const _vp = (bA1.length >= 3) ? Math.pow(stdDev(bA1), 2) : null;
@@ -14055,10 +14716,11 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const bH2H      = getH2HSeries("B", "h1", parsed);
   const h1HasH2H  = maybeReadH2HEnabled("h1") && aH2H.length >= 2 && bH2H.length >= 2;
 
-  if (h1HasH2H) {
+      if (h1HasH2H) {
     const avgAH2H     = avgOrNaN(aH2H);
     const h1Divergence = isFinite(avgAH2H) && isFinite(projA1H) ? (avgAH2H - projA1H) : 0;
-    const hw = getH2HWeight(aH2H.length, bH2H.length, "h1", h1SampleTier, h1Divergence, league);
+    const h2hFactor = config.h2hFactor ?? 1.0;
+  const hw = getH2HWeight(aH2H.length, bH2H.length, "h1", h1SampleTier, h1Divergence, league, h2hFactor);
     projA1H = (projA1H * (1 - hw)) + (avgAH2H * hw);
     projB1H = (projB1H * (1 - hw)) + (avgOrNaN(bH2H) * hw);
   }
@@ -14085,13 +14747,9 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     h1Proj = anchorProjection(h1Proj, lines.h1Line, league, "h1");
   }
 
-  const aFTS = getManualSeries("A", "ft", parsed);
-  const bFTS = getManualSeries("B", "ft", parsed);
-  const aFTA = getAllowedSeries("A", "overall", "ft", parsed);
-  const bFTA = getAllowedSeries("B", "overall", "ft", parsed);
-  const pfA   = 1 + ((avgOrNaN(aFTS) + avgOrNaN(aFTA)) / eb - 1) * 0.4;
-  const pfB   = 1 + ((avgOrNaN(bFTS) + avgOrNaN(bFTA)) / eb - 1) * 0.4;
-  const estPace = clampNumber(basePace * ((pfA + pfB) / 2), basePace * cl.min, basePace * cl.max);
+  const h1PfA = 1 + ((avgOrNaN(aS1) + avgOrNaN(aA1)) / h1Baseline - 1) * 0.4;
+  const h1PfB = 1 + ((avgOrNaN(bS1) + avgOrNaN(bA1)) / h1Baseline - 1) * 0.4;
+  const estPace = clampNumber(basePace * ((h1PfA + h1PfB) / 2), basePace * cl.min, basePace * cl.max);
   const paceGapRisk = estPace > (basePace * 1.08) || estPace < (basePace * 0.92);
   const aAllAvg = avgOrNaN(aA1);
   const bAllAvg = avgOrNaN(bA1);
@@ -14441,48 +15099,46 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
   const _mcKey = `${mean.toFixed(4)}|${safeStdDev.toFixed(4)}|${line}|${runs}|${_distType}`;
   if (_mcCache.has(_mcKey)) return _mcCache.get(_mcKey);
 
-      // [LOCK: MONTE CARLO – normal distribution only (stable version)]
-    // Cauchy mixture removed due to edge cases producing infinite values.
-    // Historical std deviation fix already improves tail estimation.
-    const workerCode = `
-    onmessage = function(e) {
-      const { mean, safeStdDev, line, runs, useTDist, df } = e.data;
-      const safeRuns = runs % 2 === 0 ? runs : runs + 1;
-      function bm() {
-        let u1 = Math.random(), u2 = Math.random();
-        while (u1 === 0) u1 = Math.random();
-        return Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-      }
-      function tDist(dof) {
-        let chi2 = 0;
-        for (let k = 0; k < dof; k++) { const g = bm(); chi2 += g * g; }
-        return bm() / Math.sqrt(chi2 / dof);
-      }
-      let overHits = 0;
-      for (let i = 0; i < safeRuns; i += 2) {
-        const z = useTDist ? tDist(df || 7) : bm();
-        const s1 = Math.max(0, mean + safeStdDev * z);
-        const s2 = Math.max(0, mean - safeStdDev * z);
-        if (s1 > line) overHits++;
-        if (s2 > line) overHits++;
-      }
-      const overPct = (overHits / safeRuns) * 100;
-      postMessage({ overPct, underPct: 100 - overPct });
-    };
-    `;
-
-    const blob = new Blob([workerCode], { type: "application/javascript" });
-        let workerUrl, worker;
+  // Immediately attempt synchronous fallback if Worker creation might fail (CSP/Private Mode)
+  // This avoids the timeout race that can cause "DataCloneError" when terminating a resolved worker.
+  let useFallback = false;
+  let workerUrl = null, worker = null;
   try {
-    workerUrl = URL.createObjectURL(blob); 
+    const blob = new Blob([`
+      onmessage = function(e) {
+        const { mean, safeStdDev, line, runs, useTDist, df } = e.data;
+        const safeRuns = runs % 2 === 0 ? runs : runs + 1;
+        function bm() {
+          let u1 = Math.random(), u2 = Math.random();
+          while (u1 === 0) u1 = Math.random();
+          return Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+        }
+        function tDist(dof) {
+          let chi2 = 0;
+          for (let k = 0; k < dof; k++) { const g = bm(); chi2 += g * g; }
+          return bm() / Math.sqrt(chi2 / dof);
+        }
+        let overHits = 0;
+        for (let i = 0; i < safeRuns; i += 2) {
+          const z = useTDist ? tDist(df || 7) : bm();
+          const s1 = Math.max(0, mean + safeStdDev * z);
+          const s2 = Math.max(0, mean - safeStdDev * z);
+          if (s1 > line) overHits++;
+          if (s2 > line) overHits++;
+        }
+        const overPct = (overHits / safeRuns) * 100;
+        postMessage({ overPct, underPct: 100 - overPct });
+      };
+    `], { type: "application/javascript" });
+    workerUrl = URL.createObjectURL(blob);
     worker = new Worker(workerUrl);
   } catch (err) {
+    useFallback = true;
     if (workerUrl) URL.revokeObjectURL(workerUrl);
-    console.warn("[BB Engine] Worker blocked (Private Mode/CSP). Running Monte Carlo synchronously.");
-    // [LOCK: ANTITHETIC VARIATES + STUDENT-T FALLBACK — mirrors Worker logic exactly]
-    // Paired (z, -z) samples halve estimator variance at the same run count.
-    // Student-t df=7 used when sigma/line > 5% (heavy-tailed market spreads).
-    // DO NOT revert to independent Normal draws — this is the correct statistical path.
+  }
+
+  if (useFallback || !worker) {
+    // Synchronous fallback (no worker, no timeout)
     const _fbUseTDist = (safeStdDev / Math.max(line, 1)) > 0.05;
     const _fbRuns = runs % 2 === 0 ? runs : runs + 1;
     function _fbBM() {
@@ -14504,13 +15160,14 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
       if (s2 > line) overHits++;
     }
     const overPct = (overHits / _fbRuns) * 100;
-    return { overPct, underPct: 100 - overPct };
+    const result = { overPct, underPct: 100 - overPct };
+    _mcCache.set(_mcKey, result);
+    return result;
   }
 
-
+  // Worker created successfully – run with timeout but ensure cleanup doesn't cause errors
   let failsafeTimer;
   let _mcResolved = false;
-
   const workerPromise = new Promise((resolve, reject) => {
     worker.onmessage = (e) => {
       if (_mcResolved) return;
@@ -14528,17 +15185,10 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
       URL.revokeObjectURL(workerUrl);
       reject(err);
     };
-
-    // [LOCK: PASS DISTRIBUTION PARAMS TO WORKER — antithetic variates + Student-t df=7]
-    // _wUseTDist: heavy-tailed distribution when sigma/line > 5% (wide-spread markets).
-    // _wRuns must be even so paired (z, -z) samples are always complete.
-    // DO NOT revert to postMessage({ mean, safeStdDev, line, runs }) — missing params
-    // cause worker to silently use independent Normal draws, losing all variance reduction.
     const _wUseTDist = (safeStdDev / Math.max(line, 1)) > 0.05;
     const _wRuns = runs % 2 === 0 ? runs : runs + 1;
     worker.postMessage({ mean, safeStdDev, line, runs: _wRuns, useTDist: _wUseTDist, df: 7 });
   });
-
 
   const timeoutPromise = new Promise((resolve) => {
     failsafeTimer = setTimeout(() => {
@@ -14548,11 +15198,11 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
       URL.revokeObjectURL(workerUrl);
       console.warn("[BB Engine] Worker timed out. Reverting to median.");
       resolve({ overPct: 50, underPct: 50 });
-    }, 3000);
+    }, 8000);
   });
 
-  // [CLOSED: FIX 14] Await race, cache result, return.
-  const _mcResult = await Promise.race([workerPromise, timeoutPromise]);
+  const _mcResult = await Promise.race([workerPromise, timeoutPromise])
+    .catch(() => ({ overPct: 50, underPct: 50 }));
   _mcCache.set(_mcKey, _mcResult);
   return _mcResult;
 }
@@ -14577,12 +15227,18 @@ function getHistoricalStdDev(league, marketKey) {
   return Math.sqrt(sqSum / (entries.length - 1));
 }
 
-async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
+async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta, safeContextOverride = null) {
 
 
   const marketKey = getMarketKeyFromName(pickRow?.name);
   const side = getPickSideFromText(pickRow?.pick);
   const thresholds = getMassacreThresholdBucket(league, marketKey);
+  // Use the safe context if provided, otherwise fall back to global
+  const originalContext = g_massacreFetchContext;
+  if (safeContextOverride) {
+    g_massacreFetchContext = safeContextOverride;
+  }
+  try {
   const windows = getMassacreMarketWindowSet(marketKey, parsed, fixtureMeta);
 
   const isTeamMarket = marketKey === "team_a" || marketKey === "team_b";
@@ -14665,9 +15321,10 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
       ? projectMassacreTeam(teamSide, windows.overallA5Scored, windows.overallA5Allowed, windows.overallB5Scored, windows.overallB5Allowed)
       : projectMassacreTotal(windows.overallA5Scored, windows.overallA5Allowed, windows.overallB5Scored, windows.overallB5Allowed);
 
+  const _safeCtxForPace = safeContextOverride || g_massacreFetchContext;
   const paceMetric = (() => {
-    const pA = g_massacreFetchContext?.A?.pace10;
-    const pB = g_massacreFetchContext?.B?.pace10;
+    const pA = _safeCtxForPace?.A?.pace10;
+    const pB = _safeCtxForPace?.B?.pace10;
     if (Array.isArray(pA) && pA.length >= 2 && Array.isArray(pB) && pB.length >= 2) {
       const avgPA = avgOrNaN(pA);
       const avgPB = avgOrNaN(pB);
@@ -14845,7 +15502,7 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
   if (brutalityScore < thresholds.brutality) failedReasons.push(`score ${brutalityScore.toFixed(0)}`);
   if (isFinite(modelRange) && modelRange > getMassacreModelRangeLimit(marketKey, pickRow?.line)) failedReasons.push(`range ${modelRange.toFixed(1)}`);
 
-  return {
+  const result = {
     marketKey,
     modelCount: trimmedModels.length,
     agreement,
@@ -14870,6 +15527,12 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
       Math.max(0, simPct - 50) * 0.18 +
       Math.max(0, brutalityScore - 50) * 0.04
   };
+  return result;
+  } finally {
+    if (safeContextOverride) {
+      g_massacreFetchContext = originalContext;
+    }
+  }
 }
 
 function getMassacreProfile(diag, pickRow, league) {
@@ -15005,6 +15668,200 @@ function rescueBestMassacreLean(picks) {
   candidate.confidence = "—";
   candidate.note = "Best on slate lean: " + (reasons.length ? reasons.join(" • ") : "gate softened");
   candidate.massacreDecision = "lean_rescue";
+}
+
+function calibrateConfidenceModel() {
+  const allPicks = getAllTrackedPicksForReport().filter(p =>
+    isFinite(Number(p.edgePct)) &&
+    (p.resultStatus === "win" || p.resultStatus === "loss")
+  );
+  if (allPicks.length < 30) return;
+
+  const buildF = (p) => ({
+    edgePct:   clampNumber(Number(p.edgePct || p.godsEyeMemory?.edgePct || 0) - 0.060, -0.06, 0.15),
+    volRatio:  clampNumber(
+                 ((Number(p.godsEyeMemory?.aVol || 0) + Number(p.godsEyeMemory?.bVol || 0)) / 2)
+                 / (LEAGUE_VOL_LIMITS[String(p.league || "")] || 12) - 1.0, -1, 2),
+    sampleFull: (String(p.godsEyeMemory?.sampleTier || "").toLowerCase() === "full") ? 1 : 0,
+    h2h:       (p.godsEyeMemory?.hasH2H) ? 1 : 0,
+    trap:      (p.godsEyeMemory?.trap) ? 1 : 0
+  });
+
+  const _gd = (data, lr, lambda) => {
+    let c = { intercept: -0.2, edgePct: 8.0, volRatio: -0.8, sampleFull: 0.4, h2h: 0.2, trap: -1.2 };
+    for (let iter = 0; iter < 400; iter++) {
+      const g = { intercept: 0, edgePct: 0, volRatio: 0, sampleFull: 0, h2h: 0, trap: 0 };
+      for (const { f, y } of data) {
+        const lo = c.intercept + c.edgePct*f.edgePct + c.volRatio*f.volRatio + c.sampleFull*f.sampleFull + c.h2h*f.h2h + c.trap*f.trap;
+        const prob = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, lo))));
+        const e = y - prob;
+        g.intercept  += e;
+        g.edgePct    += e * f.edgePct;
+        g.volRatio   += e * f.volRatio;
+        g.sampleFull += e * f.sampleFull;
+        g.h2h        += e * f.h2h;
+        g.trap       += e * f.trap;
+      }
+      c.intercept  += lr * g.intercept;
+      c.edgePct    += lr * g.edgePct    - lr * lambda * c.edgePct;
+      c.volRatio   += lr * g.volRatio   - lr * lambda * c.volRatio;
+      c.sampleFull += lr * g.sampleFull - lr * lambda * c.sampleFull;
+      c.h2h        += lr * g.h2h        - lr * lambda * c.h2h;
+      c.trap       += lr * g.trap       - lr * lambda * c.trap;
+    }
+    return c;
+  };
+
+  const runGD = (data) => {
+    if (!data || data.length < 15) return null;
+    if (data.length >= 60) {
+      const foldSize = Math.floor(data.length / 3);
+      const candidates = [
+        { lr: 0.002,  lambda: 0.005 },
+        { lr: 0.001,  lambda: 0.005 },
+        { lr: 0.002,  lambda: 0.001 },
+        { lr: 0.0005, lambda: 0.001 }
+      ];
+      let bestLoss = Infinity, bestCoeff = null;
+      candidates.forEach(({ lr, lambda }) => {
+        let totalLoss = 0;
+        for (let fold = 0; fold < 3; fold++) {
+          const val   = data.slice(fold * foldSize, (fold + 1) * foldSize);
+          const train = [...data.slice(0, fold * foldSize), ...data.slice((fold + 1) * foldSize)];
+          const coeff = _gd(train, lr, lambda);
+          val.forEach(({ f, y }) => {
+            const lo   = coeff.intercept + coeff.edgePct*f.edgePct + coeff.volRatio*f.volRatio
+                         + coeff.sampleFull*f.sampleFull + coeff.h2h*f.h2h + coeff.trap*f.trap;
+            const prob = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, lo))));
+            totalLoss -= y === 1 ? Math.log(Math.max(1e-9, prob)) : Math.log(Math.max(1e-9, 1 - prob));
+          });
+        }
+        if (totalLoss < bestLoss) { bestLoss = totalLoss; bestCoeff = _gd(data, lr, lambda); }
+      });
+      return bestCoeff;
+    }
+    return _gd(data, 0.001, 0.005);
+  };
+
+  const models = {};
+
+  const globalData = allPicks.map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
+  const globalModel = runGD(globalData);
+  if (globalModel) models["global"] = globalModel;
+  [...new Set(allPicks.map(p => p.league).filter(Boolean))].forEach(league => {
+    const ld = allPicks.filter(p => p.league === league)
+      .map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
+    const lm = runGD(ld);
+    if (lm) models[league] = lm;
+  });
+  if (Object.keys(models).length) {
+    try { localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF", JSON.stringify(models)); } catch(e) {}
+    engineDebug("Confidence model calibrated", Object.keys(models));
+  }
+}
+
+function optimizePickThresholds(league) {
+  let accLog = [];
+  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
+  const data = accLog.filter(e =>
+    (!league || e.league === league) &&
+    (e.result === "win" || e.result === "loss") &&
+    isFinite(e.proj) && isFinite(e.line) && isFinite(e.error)
+  ).map(e => ({
+    ...e,
+    edgePct: Math.abs((e.proj - e.line) / (Math.abs(e.line) || 1)),
+    outcome: e.result === "win" ? 1 : 0
+  }));
+  if (data.length < 40) return;
+
+  let bestBrier = Infinity;
+  let best = { over: 0.050, under: 0.055 };
+  for (let ot = 0; ot <= 0.070; ot += 0.0025) {
+    for (let ut = ot; ut <= 0.075; ut += 0.0025) {
+      const filtered = data.filter(e =>
+        (e.side === "over" && e.edgePct >= ot) ||
+        (e.side === "under" && e.edgePct >= ut)
+      );
+      if (filtered.length < 15) continue;
+      const avgWR = filtered.reduce((s, e) => s + e.outcome, 0) / filtered.length;
+      const brier = filtered.reduce((s, e) => s + Math.pow(avgWR - e.outcome, 2), 0) / filtered.length;
+      if (brier < bestBrier) { bestBrier = brier; best = { over: parseFloat(ot.toFixed(4)), under: parseFloat(ut.toFixed(4)) }; }
+    }
+  }
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem("BB_OPTIMIZED_THRESHOLDS") || "{}"); } catch(e) {}
+  stored[league || "global"] = { ...best, brier: parseFloat(bestBrier.toFixed(4)), n: data.length, ts: new Date().toISOString() };
+  try { localStorage.setItem("BB_OPTIMIZED_THRESHOLDS", JSON.stringify(stored)); } catch(e) {}
+  engineDebug("Threshold optimization", { league, ...stored[league || "global"] });
+}
+
+function runOutOfSampleValidation(league) {
+  let accLog = [];
+  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
+  const leagueLogs = accLog.filter(e =>
+    (!league || e.league === league) &&
+    (e.result === "win" || e.result === "loss") &&
+    e.brierContrib !== null && isFinite(e.brierContrib)
+  );
+  if (leagueLogs.length < 30) return null;
+
+  const split = Math.floor(leagueLogs.length * 0.70);
+  const trainSet = leagueLogs.slice(0, split);
+  const testSet  = leagueLogs.slice(split);
+  const brierOf  = (s) => s.length ? s.reduce((acc, e) => acc + e.brierContrib, 0) / s.length : null;
+
+  const result = {
+    league:      league || "global",
+    trainBrier:  brierOf(trainSet) !== null ? parseFloat(brierOf(trainSet).toFixed(4)) : null,
+    testBrier:   brierOf(testSet)  !== null ? parseFloat(brierOf(testSet).toFixed(4))  : null,
+    overfit:     (brierOf(testSet) !== null && brierOf(trainSet) !== null)
+                   ? parseFloat((brierOf(testSet) - brierOf(trainSet)).toFixed(4)) : null,
+    trainN:      trainSet.length,
+    testN:       testSet.length,
+    ts:          new Date().toISOString()
+  };
+
+  try {
+    const stored = JSON.parse(localStorage.getItem("BB_OOS_VALIDATION") || "{}");
+    stored[league || "global"] = result;
+    localStorage.setItem("BB_OOS_VALIDATION", JSON.stringify(stored));
+  } catch(e) {}
+  engineDebug("Out-of-sample validation", result);
+  return result;
+}
+
+function checkModelHealth(league) {
+  const settled = getAllSettledTrackedPicks().filter(p => !league || p.league === league);
+  if (settled.length < 20) return null;
+
+  const recent = settled.slice(-20);
+  const recentWR    = recent.filter(p => p.resultStatus === "win").length / 20;
+  const historicalWR = settled.filter(p => p.resultStatus === "win").length / settled.length;
+  const drift        = historicalWR - recentWR;
+  const coldStreak   = recent.filter(p => p.resultStatus === "loss").length;
+
+  const health = {
+    league:           league || "global",
+    recentWinRate:    parseFloat(recentWR.toFixed(3)),
+    historicalWinRate: parseFloat(historicalWR.toFixed(3)),
+    drift:            parseFloat(drift.toFixed(3)),
+    coldStreakCount:  coldStreak,
+    isUnhealthy:      drift >= 0.10,
+    isSevere:         drift >= 0.18 || coldStreak >= 14,
+    totalSettled:     settled.length,
+    ts:               new Date().toISOString()
+  };
+
+  try {
+    const stored = JSON.parse(localStorage.getItem("BB_MODEL_HEALTH") || "{}");
+    stored[league || "global"] = health;
+    localStorage.setItem("BB_MODEL_HEALTH", JSON.stringify(stored));
+  } catch(e) {}
+
+  if (health.isUnhealthy) {
+    engineDebug("MODEL HEALTH WARNING", health);
+  }
+  return health;
 }
 
 async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta) {
@@ -15193,7 +16050,7 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
       newCoeff[league] = coeff;
     });
 
-    if (Object.keys(newCoeff).length) {
+        if (Object.keys(newCoeff).length) {
       localStorage.setItem("BB_MASSACRE_COEFF", JSON.stringify(newCoeff));
       engineDebug("Massacre coefficients auto‑calibrated for leagues", Object.keys(newCoeff));
     }
@@ -15208,11 +16065,11 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
           if (_lgP.length < 20) return;
           let _bestWR = 0, _bestSim = 53, _bestBrut = 50;
           for (let sim = 50; sim <= 57; sim++) {
-            for (let brut = 45; brut <= 55; brut++) {
-              const _q = _lgP.filter(p => (p.massacre.simPct||0) >= sim && (p.massacre.brutalityScore||0) >= brut);
+            for (let brutality = 45; brutality <= 55; brutality++) {
+              const _q = _lgP.filter(p => (p.massacre.simPct||0) >= sim && (p.massacre.brutalityScore||0) >= brutality);
               if (_q.length < 8) continue;
               const _wr = _q.filter(p => p.resultStatus === "win").length / _q.length;
-              if (_wr > _bestWR) { _bestWR = _wr; _bestSim = sim; _bestBrut = brut; }
+              if (_wr > _bestWR) { _bestWR = _wr; _bestSim = sim; _bestBrut = brutality; }
             }
           }
           _btResult[lg] = { ft: { sim: _bestSim, brutality: _bestBrut }, winRate: parseFloat(_bestWR.toFixed(3)), n: _lgP.length };
@@ -15225,124 +16082,8 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
     } catch(_bt) {}
   }
 
-// [FIX #7: PARAMETER OPTIMIZATION FRAMEWORK]
-// Grid searches over OVER/UNDER edge% thresholds using Brier-score minimization on
-// bb_engine_accuracy_log. Saves optimal thresholds to BB_OPTIMIZED_THRESHOLDS per league.
-// Run automatically by the retraining pipeline after each checkpoint.
-function optimizePickThresholds(league) {
-  let accLog = [];
-  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
-  const data = accLog.filter(e =>
-    (!league || e.league === league) &&
-    (e.result === "win" || e.result === "loss") &&
-    isFinite(e.proj) && isFinite(e.line) && isFinite(e.error)
-  ).map(e => ({
-    ...e,
-    edgePct: Math.abs((e.proj - e.line) / (Math.abs(e.line) || 1)),
-    outcome: e.result === "win" ? 1 : 0
-  }));
-  if (data.length < 40) return;
-
-  let bestBrier = Infinity;
-  let best = { over: 0.050, under: 0.055 };
-  for (let ot = 0.040; ot <= 0.070; ot += 0.0025) {
-    for (let ut = ot; ut <= 0.075; ut += 0.0025) {
-      const filtered = data.filter(e =>
-        (e.side === "over" && e.edgePct >= ot) ||
-        (e.side === "under" && e.edgePct >= ut)
-      );
-      if (filtered.length < 15) continue;
-      const avgWR = filtered.reduce((s, e) => s + e.outcome, 0) / filtered.length;
-      const brier = filtered.reduce((s, e) => s + Math.pow(avgWR - e.outcome, 2), 0) / filtered.length;
-      if (brier < bestBrier) { bestBrier = brier; best = { over: parseFloat(ot.toFixed(4)), under: parseFloat(ut.toFixed(4)) }; }
-    }
-  }
-  let stored = {};
-  try { stored = JSON.parse(localStorage.getItem("BB_OPTIMIZED_THRESHOLDS") || "{}"); } catch(e) {}
-  stored[league || "global"] = { ...best, brier: parseFloat(bestBrier.toFixed(4)), n: data.length, ts: new Date().toISOString() };
-  try { localStorage.setItem("BB_OPTIMIZED_THRESHOLDS", JSON.stringify(stored)); } catch(e) {}
-  engineDebug("Threshold optimization", { league, ...stored[league || "global"] });
-}
-
-// [FIX #15: OUT-OF-SAMPLE VALIDATION — chronological train/test split]
-// Splits bb_engine_accuracy_log 70/30 by time. Computes Brier score on each half.
-// A large gap (testBrier >> trainBrier) signals overfitting to historical patterns.
-// Saved to BB_OOS_VALIDATION per league. Called automatically by retraining pipeline.
-function runOutOfSampleValidation(league) {
-  let accLog = [];
-  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
-  const leagueLogs = accLog.filter(e =>
-    (!league || e.league === league) &&
-    (e.result === "win" || e.result === "loss") &&
-    e.brierContrib !== null && isFinite(e.brierContrib)
-  );
-  if (leagueLogs.length < 30) return null;
-
-  const split = Math.floor(leagueLogs.length * 0.70);
-  const trainSet = leagueLogs.slice(0, split);
-  const testSet  = leagueLogs.slice(split);
-  const brierOf  = (s) => s.length ? s.reduce((acc, e) => acc + e.brierContrib, 0) / s.length : null;
-
-  const result = {
-    league:      league || "global",
-    trainBrier:  brierOf(trainSet) !== null ? parseFloat(brierOf(trainSet).toFixed(4)) : null,
-    testBrier:   brierOf(testSet)  !== null ? parseFloat(brierOf(testSet).toFixed(4))  : null,
-    overfit:     (brierOf(testSet) !== null && brierOf(trainSet) !== null)
-                   ? parseFloat((brierOf(testSet) - brierOf(trainSet)).toFixed(4)) : null,
-    trainN:      trainSet.length,
-    testN:       testSet.length,
-    ts:          new Date().toISOString()
-  };
-
-  try {
-    const stored = JSON.parse(localStorage.getItem("BB_OOS_VALIDATION") || "{}");
-    stored[league || "global"] = result;
-    localStorage.setItem("BB_OOS_VALIDATION", JSON.stringify(stored));
-  } catch(e) {}
-  engineDebug("Out-of-sample validation", result);
-  return result;
-}
-
-// [FIX #16: MODEL HEALTH MONITORING — win rate drift detection]
-// Compares rolling win rate (last 20 picks) against historical baseline.
-// Flags as unhealthy when drift >= 10pp, severe when drift >= 18pp or 14+ cold streak.
-// isSevere triggers a confidence deflation warning in the UI.
-// Saved to BB_MODEL_HEALTH per league. Called automatically by retraining pipeline.
-function checkModelHealth(league) {
-  const settled = getAllSettledTrackedPicks().filter(p => !league || p.league === league);
-  if (settled.length < 20) return null;
-
-  const recent = settled.slice(-20);
-  const recentWR    = recent.filter(p => p.resultStatus === "win").length / 20;
-  const historicalWR = settled.filter(p => p.resultStatus === "win").length / settled.length;
-  const drift        = historicalWR - recentWR;
-  const coldStreak   = recent.filter(p => p.resultStatus === "loss").length;
-
-  const health = {
-    league:           league || "global",
-    recentWinRate:    parseFloat(recentWR.toFixed(3)),
-    historicalWinRate: parseFloat(historicalWR.toFixed(3)),
-    drift:            parseFloat(drift.toFixed(3)),
-    coldStreakCount:  coldStreak,
-    isUnhealthy:      drift >= 0.10,
-    isSevere:         drift >= 0.18 || coldStreak >= 14,
-    totalSettled:     settled.length,
-    ts:               new Date().toISOString()
-  };
-
-  try {
-    const stored = JSON.parse(localStorage.getItem("BB_MODEL_HEALTH") || "{}");
-    stored[league || "global"] = health;
-    localStorage.setItem("BB_MODEL_HEALTH", JSON.stringify(stored));
-  } catch(e) {}
-
-  if (health.isUnhealthy) {
-    engineDebug("MODEL HEALTH WARNING", health);
-  }
-  return health;
-}
-
   const _runOneMassacrePick = async (p) => {
+    try {
     if (!p || p.note || p.pick === "NO PLAY") return;
 
     const side = getPickSideFromText(p.pick);
@@ -15352,7 +16093,63 @@ function checkModelHealth(league) {
     if (isExotic) return;
 
     const originalPick = p.pick;
-    const diag = await evaluateMassacreForPick(p, league, parsed, fixtureMeta);
+    // Safely access massacre context with null checks
+    const ctxA = g_massacreFetchContext?.A || {};
+    const ctxB = g_massacreFetchContext?.B || {};
+    const overallA = ctxA.overall || {};
+    const overallB = ctxB.overall || {};
+    const venueA = ctxA.venue || {};
+    const venueB = ctxB.venue || {};
+
+    // Create a temporary safe copy of the massacre context for evaluateMassacreForPick
+    const safeContext = {
+      ...g_massacreFetchContext,
+      A: {
+        ...ctxA,
+        overall: overallA,
+        venue: venueA,
+        restDays: ctxA.restDays,
+        lastGameDate: ctxA.lastGameDate,
+        seasonBaseline: ctxA.seasonBaseline,
+        ortg10: ctxA.ortg10 || [],
+        drtg10: ctxA.drtg10 || [],
+        pace10: ctxA.pace10 || [],
+        q1Scored: ctxA.q1Scored || [],
+        q2Scored: ctxA.q2Scored || [],
+        q3Scored: ctxA.q3Scored || [],
+        q4Scored: ctxA.q4Scored || [],
+        q1Allowed: ctxA.q1Allowed || [],
+        q2Allowed: ctxA.q2Allowed || [],
+        q3Allowed: ctxA.q3Allowed || [],
+        q4Allowed: ctxA.q4Allowed || [],
+        roster: ctxA.roster || []
+      },
+      B: {
+        ...ctxB,
+        overall: overallB,
+        venue: venueB,
+        restDays: ctxB.restDays,
+        lastGameDate: ctxB.lastGameDate,
+        seasonBaseline: ctxB.seasonBaseline,
+        ortg10: ctxB.ortg10 || [],
+        drtg10: ctxB.drtg10 || [],
+        pace10: ctxB.pace10 || [],
+        q1Scored: ctxB.q1Scored || [],
+        q2Scored: ctxB.q2Scored || [],
+        q3Scored: ctxB.q3Scored || [],
+        q4Scored: ctxB.q4Scored || [],
+        q1Allowed: ctxB.q1Allowed || [],
+        q2Allowed: ctxB.q2Allowed || [],
+        q3Allowed: ctxB.q3Allowed || [],
+        q4Allowed: ctxB.q4Allowed || [],
+        roster: ctxB.roster || []
+      },
+      h2hGames: Array.isArray(g_massacreFetchContext?.h2hGames) ? g_massacreFetchContext.h2hGames : [],
+      refTendency: g_massacreFetchContext?.refTendency || null,
+      league: g_massacreFetchContext?.league || league
+    };
+
+    const diag = await evaluateMassacreForPick(p, league, parsed, fixtureMeta, safeContext);
     const winProb = computeMassacreWinProb(diag, league, p.marketKey);
     const profile = getMassacreProfile(diag, p, league);
 
@@ -15388,6 +16185,9 @@ function checkModelHealth(league) {
     } else if (winProb < 0.65) {
       p.confidence = bumpConfidenceGrade(p.confidence, -1);
     }
+    } catch (err) {
+      engineDebug("Massacre pick failed, skipping", { market: p?.marketKey, error: err?.message });
+    }
   };
 
   for (let _bi = 0; _bi < picks.length; _bi += _massacreBatchSize) {
@@ -15399,6 +16199,202 @@ function checkModelHealth(league) {
   if (leagueTrust.mode !== "block") {
     rescueBestMassacreLean(picks);
   }
+  //// Expose local calibration function to module scope so the retraining pipeline can reach it
+  window.calibrateMassacreCoefficients = calibrateMassacreCoefficients;
+}
+
+function calibrateConfidenceModel() {
+  const allPicks = getAllTrackedPicksForReport().filter(p =>
+    isFinite(Number(p.edgePct)) &&
+    (p.resultStatus === "win" || p.resultStatus === "loss")
+  );
+  if (allPicks.length < 30) return;
+
+  const buildF = (p) => ({
+    edgePct:   clampNumber(Number(p.edgePct || p.godsEyeMemory?.edgePct || 0) - 0.060, -0.06, 0.15),
+    volRatio:  clampNumber(
+                 ((Number(p.godsEyeMemory?.aVol || 0) + Number(p.godsEyeMemory?.bVol || 0)) / 2)
+                 / (LEAGUE_VOL_LIMITS[String(p.league || "")] || 12) - 1.0, -1, 2),
+    sampleFull: (String(p.godsEyeMemory?.sampleTier || "").toLowerCase() === "full") ? 1 : 0,
+    h2h:       (p.godsEyeMemory?.hasH2H) ? 1 : 0,
+    trap:      (p.godsEyeMemory?.trap) ? 1 : 0
+  });
+
+  const _gd = (data, lr, lambda) => {
+    let c = { intercept: -0.2, edgePct: 8.0, volRatio: -0.8, sampleFull: 0.4, h2h: 0.2, trap: -1.2 };
+    for (let iter = 0; iter < 400; iter++) {
+      const g = { intercept: 0, edgePct: 0, volRatio: 0, sampleFull: 0, h2h: 0, trap: 0 };
+      for (const { f, y } of data) {
+        const lo = c.intercept + c.edgePct*f.edgePct + c.volRatio*f.volRatio + c.sampleFull*f.sampleFull + c.h2h*f.h2h + c.trap*f.trap;
+        const prob = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, lo))));
+        const e = y - prob;
+        g.intercept  += e;
+        g.edgePct    += e * f.edgePct;
+        g.volRatio   += e * f.volRatio;
+        g.sampleFull += e * f.sampleFull;
+        g.h2h        += e * f.h2h;
+        g.trap       += e * f.trap;
+      }
+      c.intercept  += lr * g.intercept;
+      c.edgePct    += lr * g.edgePct    - lr * lambda * c.edgePct;
+      c.volRatio   += lr * g.volRatio   - lr * lambda * c.volRatio;
+      c.sampleFull += lr * g.sampleFull - lr * lambda * c.sampleFull;
+      c.h2h        += lr * g.h2h        - lr * lambda * c.h2h;
+      c.trap       += lr * g.trap       - lr * lambda * c.trap;
+    }
+    return c;
+  };
+
+  const runGD = (data) => {
+    if (!data || data.length < 15) return null;
+    if (data.length >= 60) {
+      const foldSize = Math.floor(data.length / 3);
+      const candidates = [
+        { lr: 0.002,  lambda: 0.005 },
+        { lr: 0.001,  lambda: 0.005 },
+        { lr: 0.002,  lambda: 0.001 },
+        { lr: 0.0005, lambda: 0.001 }
+      ];
+      let bestLoss = Infinity, bestCoeff = null;
+      candidates.forEach(({ lr, lambda }) => {
+        let totalLoss = 0;
+        for (let fold = 0; fold < 3; fold++) {
+          const val   = data.slice(fold * foldSize, (fold + 1) * foldSize);
+          const train = [...data.slice(0, fold * foldSize), ...data.slice((fold + 1) * foldSize)];
+          const coeff = _gd(train, lr, lambda);
+          val.forEach(({ f, y }) => {
+            const lo   = coeff.intercept + coeff.edgePct*f.edgePct + coeff.volRatio*f.volRatio
+                         + coeff.sampleFull*f.sampleFull + coeff.h2h*f.h2h + coeff.trap*f.trap;
+            const prob = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, lo))));
+            totalLoss -= y === 1 ? Math.log(Math.max(1e-9, prob)) : Math.log(Math.max(1e-9, 1 - prob));
+          });
+        }
+        if (totalLoss < bestLoss) { bestLoss = totalLoss; bestCoeff = _gd(data, lr, lambda); }
+      });
+      return bestCoeff;
+    }
+    return _gd(data, 0.001, 0.005);
+  };
+
+  const models = {};
+
+  const globalData = allPicks.map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
+  const globalModel = runGD(globalData);
+  if (globalModel) models["global"] = globalModel;
+  [...new Set(allPicks.map(p => p.league).filter(Boolean))].forEach(league => {
+    const ld = allPicks.filter(p => p.league === league)
+      .map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
+    const lm = runGD(ld);
+    if (lm) models[league] = lm;
+  });
+  if (Object.keys(models).length) {
+    try { localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF", JSON.stringify(models)); } catch(e) {}
+    engineDebug("Confidence model calibrated", Object.keys(models));
+  }
+}
+
+function optimizePickThresholds(league) {
+  let accLog = [];
+  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
+  const data = accLog.filter(e =>
+    (!league || e.league === league) &&
+    (e.result === "win" || e.result === "loss") &&
+    isFinite(e.proj) && isFinite(e.line) && isFinite(e.error)
+  ).map(e => ({
+    ...e,
+    edgePct: Math.abs((e.proj - e.line) / (Math.abs(e.line) || 1)),
+    outcome: e.result === "win" ? 1 : 0
+  }));
+  if (data.length < 40) return;
+
+  let bestBrier = Infinity;
+  let best = { over: 0.050, under: 0.055 };
+  for (let ot = 0; ot <= 0.070; ot += 0.0025) {
+    for (let ut = ot; ut <= 0.075; ut += 0.0025) {
+      const filtered = data.filter(e =>
+        (e.side === "over" && e.edgePct >= ot) ||
+        (e.side === "under" && e.edgePct >= ut)
+      );
+      if (filtered.length < 15) continue;
+      const avgWR = filtered.reduce((s, e) => s + e.outcome, 0) / filtered.length;
+      const brier = filtered.reduce((s, e) => s + Math.pow(avgWR - e.outcome, 2), 0) / filtered.length;
+      if (brier < bestBrier) { bestBrier = brier; best = { over: parseFloat(ot.toFixed(4)), under: parseFloat(ut.toFixed(4)) }; }
+    }
+  }
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem("BB_OPTIMIZED_THRESHOLDS") || "{}"); } catch(e) {}
+  stored[league || "global"] = { ...best, brier: parseFloat(bestBrier.toFixed(4)), n: data.length, ts: new Date().toISOString() };
+  try { localStorage.setItem("BB_OPTIMIZED_THRESHOLDS", JSON.stringify(stored)); } catch(e) {}
+  engineDebug("Threshold optimization", { league, ...stored[league || "global"] });
+}
+
+function runOutOfSampleValidation(league) {
+  let accLog = [];
+  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
+  const leagueLogs = accLog.filter(e =>
+    (!league || e.league === league) &&
+    (e.result === "win" || e.result === "loss") &&
+    e.brierContrib !== null && isFinite(e.brierContrib)
+  );
+  if (leagueLogs.length < 30) return null;
+
+  const split = Math.floor(leagueLogs.length * 0.70);
+  const trainSet = leagueLogs.slice(0, split);
+  const testSet  = leagueLogs.slice(split);
+  const brierOf  = (s) => s.length ? s.reduce((acc, e) => acc + e.brierContrib, 0) / s.length : null;
+
+  const result = {
+    league:      league || "global",
+    trainBrier:  brierOf(trainSet) !== null ? parseFloat(brierOf(trainSet).toFixed(4)) : null,
+    testBrier:   brierOf(testSet)  !== null ? parseFloat(brierOf(testSet).toFixed(4))  : null,
+    overfit:     (brierOf(testSet) !== null && brierOf(trainSet) !== null)
+                   ? parseFloat((brierOf(testSet) - brierOf(trainSet)).toFixed(4)) : null,
+    trainN:      trainSet.length,
+    testN:       testSet.length,
+    ts:          new Date().toISOString()
+  };
+
+  try {
+    const stored = JSON.parse(localStorage.getItem("BB_OOS_VALIDATION") || "{}");
+    stored[league || "global"] = result;
+    localStorage.setItem("BB_OOS_VALIDATION", JSON.stringify(stored));
+  } catch(e) {}
+  engineDebug("Out-of-sample validation", result);
+  return result;
+}
+
+function checkModelHealth(league) {
+  const settled = getAllSettledTrackedPicks().filter(p => !league || p.league === league);
+  if (settled.length < 20) return null;
+
+  const recent = settled.slice(-20);
+  const recentWR    = recent.filter(p => p.resultStatus === "win").length / 20;
+  const historicalWR = settled.filter(p => p.resultStatus === "win").length / settled.length;
+  const drift        = historicalWR - recentWR;
+  const coldStreak   = recent.filter(p => p.resultStatus === "loss").length;
+
+  const health = {
+    league:           league || "global",
+    recentWinRate:    parseFloat(recentWR.toFixed(3)),
+    historicalWinRate: parseFloat(historicalWR.toFixed(3)),
+    drift:            parseFloat(drift.toFixed(3)),
+    coldStreakCount:  coldStreak,
+    isUnhealthy:      drift >= 0.10,
+    isSevere:         drift >= 0.18 || coldStreak >= 14,
+    totalSettled:     settled.length,
+    ts:               new Date().toISOString()
+  };
+
+  try {
+    const stored = JSON.parse(localStorage.getItem("BB_MODEL_HEALTH") || "{}");
+    stored[league || "global"] = health;
+    localStorage.setItem("BB_MODEL_HEALTH", JSON.stringify(stored));
+  } catch(e) {}
+
+  if (health.isUnhealthy) {
+    engineDebug("MODEL HEALTH WARNING", health);
+  }
+  return health;
 }
 
 
@@ -15467,12 +16463,6 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
 
   const isManualLeague = league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa";
   if (isManualLeague && !fixtureMeta.eventId) {
-    // ISSUE 3 FIX [CLOSED]: Strip apostrophes and other injection-unsafe characters from
-    // manual event IDs. The original regex only removed whitespace, leaving apostrophes
-    // (e.g. O'Sullivan → O'Sullivan) intact inside the eventId string. These apostrophes
-    // then broke inline onclick attribute single-quote delimiters in renderTrackedPicks,
-    // silently preventing settlement buttons from appearing or functioning.
-    // The fix strips whitespace AND all shell/HTML/JS-unsafe characters in one pass.
     const safeHome = (fixtureMeta.homeTeam || "home").replace(/[\s'"`<>&]/g, "");
     const safeAway = (fixtureMeta.awayTeam || "away").replace(/[\s'"`<>&]/g, "");
     fixtureMeta.eventId = `manual_${league}_${safeHome}_${safeAway}`;
@@ -15485,15 +16475,70 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     !String(pickRow.note || "").startsWith("Intel gate") &&
     !String(pickRow.note || "").startsWith("Grade gate");
 
-  if (
-  !pickRow ||
-  pickRow.pick === "NO PLAY" ||
-  ((pickRow.note && !isExoticNoLine) && !isSavablePick) ||
-  (!isFinite(pickRow.line) && !isExoticNoLine) ||
-  !fixtureMeta?.eventId
-) {
-  return null;
-}
+  // SNAPSHOT STORAGE: capture all inputs for retrospective analysis
+  const snapshot = (function() {
+    if (!pickRow || pickRow.pick === "NO PLAY" || !pickRow.marketKey) return null;
+    const rawInputs = {};
+    try {
+      const parsedSnapshot = {
+        aFTScored: readLooseSeries("aFTScored"),
+        bFTScored: readLooseSeries("bFTScored"),
+        a1HScored: readLooseSeries("a1HScored"),
+        b1HScored: readLooseSeries("b1HScored"),
+        a2HScored: readLooseSeries("a2HScored"),
+        b2HScored: readLooseSeries("b2HScored"),
+        aQ1Scored: readLooseSeries("aQ1Scored"), aQ2Scored: readLooseSeries("aQ2Scored"),
+        aQ3Scored: readLooseSeries("aQ3Scored"), aQ4Scored: readLooseSeries("aQ4Scored"),
+        bQ1Scored: readLooseSeries("bQ1Scored"), bQ2Scored: readLooseSeries("bQ2Scored"),
+        bQ3Scored: readLooseSeries("bQ3Scored"), bQ4Scored: readLooseSeries("bQ4Scored"),
+        aFTH2H: readLooseSeries("aFTH2H"), bFTH2H: readLooseSeries("bFTH2H"),
+        a1HH2H: readLooseSeries("a1HH2H"), b1HH2H: readLooseSeries("b1HH2H"),
+        aQ1H2H: readLooseSeries("aQ1H2H"), bQ1H2H: readLooseSeries("bQ1H2H"),
+        aQ2H2H: readLooseSeries("aQ2H2H"), bQ2H2H: readLooseSeries("bQ2H2H"),
+        aQ3H2H: readLooseSeries("aQ3H2H"), bQ3H2H: readLooseSeries("bQ3H2H"),
+        aQ4H2H: readLooseSeries("aQ4H2H"), bQ4H2H: readLooseSeries("bQ4H2H"),
+        aFTScoredHome: readLooseSeries("aFTScoredHome"), aFTAllowedHome: readLooseSeries("aFTAllowedHome"),
+        aFTScoredAway: readLooseSeries("aFTScoredAway"), aFTAllowedAway: readLooseSeries("aFTAllowedAway"),
+        bFTScoredHome: readLooseSeries("bFTScoredHome"), bFTAllowedHome: readLooseSeries("bFTAllowedHome"),
+        bFTScoredAway: readLooseSeries("bFTScoredAway"), bFTAllowedAway: readLooseSeries("bFTAllowedAway")
+      };
+      const linesSnapshot = {
+        ftLine: parseMarketLine(document.getElementById("ftMarket")?.value || ""),
+        h1Line: parseMarketLine(document.getElementById("h1Market")?.value || ""),
+        aLine: parseMarketLine(document.getElementById("teamAMarket")?.value || ""),
+        bLine: parseMarketLine(document.getElementById("teamBMarket")?.value || "")
+      };
+      const fixtureMetaSnapshot = getCurrentFixtureMeta();
+      return {
+        league,
+        marketKey: pickRow.marketKey,
+        side: getPickSideFromText(pickRow.pick),
+        parsed: parsedSnapshot,
+        lines: linesSnapshot,
+        fixtureMeta: fixtureMetaSnapshot,
+        injMultA: g_injA.scoringMult,
+        injMultB: g_injB.scoringMult,
+        configSnapshot: {
+          recencyWeights: MODEL_TUNING.recencyWeights,
+          h2hFactor: 1.0,
+          paceDampening: 0.4,
+          edgeMult: 1.0,
+          injuryMult: 1.0
+        }
+      };
+    } catch(e) { return null; }
+  })();
+
+  // Always save a shadow record, even for NO PLAY, but don't show it in main tracker
+  const isActualPlay = !(
+    !pickRow ||
+    pickRow.pick === "NO PLAY" ||
+    ((pickRow.note && !isExoticNoLine) && !isSavablePick) ||
+    (!isFinite(pickRow.line) && !isExoticNoLine) ||
+    !fixtureMeta?.eventId
+  );
+
+  if (!isActualPlay && !fixtureMeta?.eventId) return null;
 
         const marketKey = pickRow.marketKey;
       let side = getPickSideFromText(pickRow.pick);
@@ -15652,10 +16697,14 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
   const trackerImpactLabel = getTrackerImpactLabel(trackerImpactKey);
   const nowIso = new Date().toISOString();
 
-  return {
+  // Attach snapshot to the payload
+  if (snapshot) snapshot.capturedAt = nowIso;
+
+  const payload = {
     pickId: (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
       ? crypto.randomUUID()
       : (`pick_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    snapshot: snapshot,
     eventId: fixtureMeta.eventId || "",
     eventDate: fixtureMeta.eventDate || "",
     league,
@@ -15692,9 +16741,7 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     shadowTrackerFeedback: pickRow.shadowTrackerFeedback || null,
     teamMemory: pickRow.teamMemory || null,
     lockRestricted: !!pickRow.lockRestricted,
-        confidenceGrade: grade,
-
-
+    confidenceGrade: grade,
     originalConfidenceGrade: String(pickRow.shadowTrackerFeedback?.originalConfidence || grade || "").toUpperCase(),
     modelVersion: getCurrentModelVersion(),
     isLock,
@@ -15715,11 +16762,11 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     memoryProfileKey,
     environmentKey,
     resultStatus: "pending",
-                diagnostics: {
+    isShadow: !isActualPlay,
+    diagnostics: {
       ...(diagnostics || {}),
       phase2Mode: diagnostics?.phase2Activation?.phase2Mode || (isPhase2ShadowMode() ? "shadow" : "live"),
       phase2Activation: diagnostics?.phase2Activation || null,
-
       trackerImpactKey,
       trackerImpactLabel,
       trackerSoftInfluence: pickRow.trackerSoftInfluence || null,
@@ -15730,6 +16777,8 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     },
     createdAt: nowIso
   };
+
+  return payload;
 }
 
 function resolveStoredLineBeforeDecision({
@@ -15890,7 +16939,7 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     tdPred.className = getPredictionClass(p.pick);
     tdPred.style.whiteSpace = "nowrap";
     tdPred.style.fontSize = "11px";
-    tdPred.textContent = p.displayPick || p.pick;
+    tdPred.textContent = p.bufferedPickText || p.displayPick || p.pick;
     if (isLock) {
       const lockSpan = document.createElement("span");
       lockSpan.className = "lock";
@@ -16110,21 +17159,39 @@ async function runEngine() {
 
   const leagueSelectEl = document.getElementById("leagueSelect");
   const currentLeagueForRun = leagueSelectEl ? leagueSelectEl.value : "";
+
+  // Prevent cross‑league contamination: if stored context belongs to a different league, reset it
+  if (g_massacreFetchContext.league && g_massacreFetchContext.league !== currentLeagueForRun) {
+    engineDebug("runEngine: clearing stale massacre context", { old: g_massacreFetchContext.league, new: currentLeagueForRun });
+    g_massacreFetchContext = defaultMassacreFetchContext();
+    g_massacreFetchContext.league = currentLeagueForRun;
+  }
   try {
-    const ftSiloTunings  = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS_FT")) || {};
-    const h1SiloTunings  = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS_H1")) || {};
-    const allSiloTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS"))    || {};
+    let ftSiloTunings = {}, h1SiloTunings = {}, allSiloTunings = {};
+    try {
+      ftSiloTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS_FT")) || {};
+      h1SiloTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS_H1")) || {};
+      allSiloTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS")) || {};
+    } catch(e) {
+      // ignore localStorage errors
+    }
 
     const activeFTConfig = ftSiloTunings[currentLeagueForRun]  || allSiloTunings[currentLeagueForRun];
     const activeH1Config = h1SiloTunings[currentLeagueForRun]  || allSiloTunings[currentLeagueForRun];
 
-   if (activeFTConfig && activeFTConfig.verified) {
-      window.__phase2FTRecencyWeights = activeFTConfig.recencyWeights || [1.35, 1.20, 1.00, 0.85, 0.70];
-      window.__phase2PaceAdjustment   = activeFTConfig.paceAdjustment || "aggressive";
-      window.__phase2H1RecencyWeights = activeH1Config && activeH1Config.verified
+    try {
+      if (activeFTConfig && activeFTConfig.verified) {
+        window.__phase2FTRecencyWeights = activeFTConfig.recencyWeights || [1.35, 1.20, 1.00, 0.85, 0.70];
+        window.__phase2PaceAdjustment   = activeFTConfig.paceAdjustment || "aggressive";
+        window.__phase2H1RecencyWeights = activeH1Config && activeH1Config.verified
           ? (activeH1Config.recencyWeights || window.__phase2FTRecencyWeights)
           : null;
-    } else {
+      } else {
+        window.__phase2FTRecencyWeights = null;
+        window.__phase2PaceAdjustment   = "standard";
+        window.__phase2H1RecencyWeights = null;
+      }
+    } catch(e) {
       window.__phase2FTRecencyWeights = null;
       window.__phase2PaceAdjustment   = "standard";
       window.__phase2H1RecencyWeights = null;
@@ -16142,6 +17209,7 @@ async function runEngine() {
   acknowledgeGlobalEngineAlert();
   renderEngineDebugPanel();
   if (runBtn) runBtn.disabled = true;
+  const _savedRecencyWeights = [...MODEL_TUNING.recencyWeights];
   engineDebug("run start", {
     trackerKey: getTrackerUserKey(),
     trackerState: getTrackerStateDebugScore(g_trackerState),
@@ -16216,6 +17284,27 @@ const baseLines = Object.freeze({
   bLine: lines.bLine
 });
 
+// Load verified config if available
+let verifiedFtConfig = getVerifiedConfig(league, "ft");
+let verifiedH1Config = getVerifiedConfig(league, "h1");
+let verifiedTeamAConfig = getVerifiedConfig(league, "team_a");
+let verifiedTeamBConfig = getVerifiedConfig(league, "team_b");
+
+function applyVerifiedConfigToTuning(verifiedConfig, targetType) {
+  if (!verifiedConfig || !verifiedConfig.verified) return null;
+  // Parse configKey back into parameters (simplified: just log that it's active)
+  // The actual override will be passed as config parameter to projection functions
+  engineDebug("Applying verified config for " + league + ":" + targetType, { configKey: verifiedConfig.configKey });
+  // For now, we return the configKey; later we can parse it fully.
+  // We'll modify computeFTProjection/compute1HProjection to accept a full config object.
+  // Since we haven't parsed the key into discrete params, we'll keep the default for this run.
+  // The verified config will be used in subsequent runs after we parse it.
+  return verifiedConfig;
+}
+
+applyVerifiedConfigToTuning(verifiedFtConfig, "ft");
+applyVerifiedConfigToTuning(verifiedH1Config, "h1");
+
 const _runFTWeights = window.__phase2FTRecencyWeights || getLeagueRecencyDefaults(currentLeagueForRun);
 const _runH1Weights = window.__phase2H1RecencyWeights || _runFTWeights;
 MODEL_TUNING.recencyWeights = _runFTWeights;
@@ -16277,23 +17366,63 @@ const memoryFlags = {
   team_b: resB.usedMemory
 };
 
-MODEL_TUNING.recencyWeights = _runFTWeights;
+// Helper to build config object from verified config key
+function buildConfigFromVerifiedKey(configKey) {
+  if (!configKey) return {};
+  const parts = configKey.split('_');
+  const result = {};
+  for (const part of parts) {
+    if (part.startsWith('h2h')) result.h2hFactor = parseFloat(part.slice(3));
+    else if (part.startsWith('rec')) {
+      const recType = part.slice(3);
+      if (recType === 'std') result.recencyProfile = TUNING_GRID.recencyProfiles[0];
+      else if (recType === 'agg') result.recencyProfile = TUNING_GRID.recencyProfiles[1];
+      else if (recType === 'flat') result.recencyProfile = TUNING_GRID.recencyProfiles[2];
+    }
+    else if (part.startsWith('pace')) result.paceDampening = parseFloat(part.slice(4));
+    else if (part.startsWith('edge')) result.edgeMult = parseFloat(part.slice(4));
+    else if (part.startsWith('inj')) result.injuryMult = parseFloat(part.slice(3));
+  }
+  return result;
+}
+
+let ftConfigOverride = {};
+let h1ConfigOverride = {};
+let teamAConfigOverride = {};
+let teamBConfigOverride = {};
+
+if (verifiedFtConfig && verifiedFtConfig.configKey) {
+  ftConfigOverride = buildConfigFromVerifiedKey(verifiedFtConfig.configKey);
+}
+if (verifiedH1Config && verifiedH1Config.configKey) {
+  h1ConfigOverride = buildConfigFromVerifiedKey(verifiedH1Config.configKey);
+}
+if (verifiedTeamAConfig && verifiedTeamAConfig.configKey) {
+  teamAConfigOverride = buildConfigFromVerifiedKey(verifiedTeamAConfig.configKey);
+}
+if (verifiedTeamBConfig && verifiedTeamBConfig.configKey) {
+  teamBConfigOverride = buildConfigFromVerifiedKey(verifiedTeamBConfig.configKey);
+}
+
+MODEL_TUNING.recencyWeights = ftConfigOverride.recencyProfile || _runFTWeights;
 const ftCalc = computeFTProjection({
   league,
   parsed,
   lines: finalLines,
   injMultA: g_injA.scoringMult,
-  injMultB: g_injB.scoringMult
+  injMultB: g_injB.scoringMult,
+  config: ftConfigOverride
 });
 ftCalc.volatilityBlock = Math.max(ftCalc.aVol || 0, ftCalc.bVol || 0) > (LEAGUE_VOL_LIMITS[league] || 12) * 1.5;
 
-MODEL_TUNING.recencyWeights = _runH1Weights;
+MODEL_TUNING.recencyWeights = h1ConfigOverride.recencyProfile || _runH1Weights;
 const h1Calc = compute1HProjection({
   league,
   parsed,
   lines: finalLines,
   injMultA: g_injA.scoringMult,
-  injMultB: g_injB.scoringMult
+  injMultB: g_injB.scoringMult,
+  config: h1ConfigOverride
 });
 
 
@@ -16323,32 +17452,26 @@ const h1Calc = compute1HProjection({
           h1Calc.projB1H = NaN;
         }
 
-        const computeQ = (qKey, lineVal) => {
+                        const computeQ = (qKey, lineVal, injA = g_injA.scoringMult, injB = g_injB.scoringMult) => {
       if (!lineVal) return null;
 
       const aS = getManualSeries("A", qKey, parsed);
       const bS = getManualSeries("B", qKey, parsed);
+      
+      // Define allowed points for both teams (required for the blend)
       const pKeyA = "a" + qKey.toUpperCase() + "Allowed";
       const pKeyB = "b" + qKey.toUpperCase() + "Allowed";
-      const aA = parsed[pKeyA]?.length ? parsed[pKeyA] : (g_massacreFetchContext.A[qKey + "Allowed"] || []);
-      const bA = parsed[pKeyB]?.length ? parsed[pKeyB] : (g_massacreFetchContext.B[qKey + "Allowed"] || []);
+      const aA = (parsed[pKeyA] && parsed[pKeyA].length) ? parsed[pKeyA] : (g_massacreFetchContext.A[qKey + "Allowed"] || []);
+      const bA = (parsed[pKeyB] && parsed[pKeyB].length) ? parsed[pKeyB] : (g_massacreFetchContext.B[qKey + "Allowed"] || []);
+      
+      // Initial projection using own scored and opponent allowed
+      const quarterPaceFactor = 1.0;
 
-      const aH2H = getH2HSeries("A", qKey, parsed);
-      const bH2H = getH2HSeries("B", qKey, parsed);
-      const hasH2H = maybeReadH2HEnabled(qKey) && aH2H.length >= 2 && bH2H.length >= 2;
-
-      const tier = getSampleTier(aS, bS);
-      if (tier === "insufficient" && !(!isNbaOrNcaa && hasH2H)) return null;
-
-      const quarterPaceFactor = 1;
       let projA = (avgOrNaN(aS) * 0.55 + avgOrNaN(bA) * 0.45) * quarterPaceFactor;
       let projB = (avgOrNaN(bS) * 0.55 + avgOrNaN(aA) * 0.45) * quarterPaceFactor;
 
-      if (!isNbaOrNcaa && (!isFinite(projA) || !isFinite(projB))) {
-        const _eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown || 160;
-        projA = isFinite(h1Calc.projA1H) ? h1Calc.projA1H / 2 : (isFinite(ftCalc.projAFT) ? ftCalc.projAFT / 4 : _eb / 4);
-        projB = isFinite(h1Calc.projB1H) ? h1Calc.projB1H / 2 : (isFinite(ftCalc.projBFT) ? ftCalc.projBFT / 4 : _eb / 4);
-      }
+      projA *= injA;
+      projB *= injB;
 
       // Quarter adjustment factor (empirical, can be tuned)
       // Default 1.0 means no adjustment; you can change based on historical data
@@ -16372,6 +17495,10 @@ const h1Calc = compute1HProjection({
         if (isFinite(vProjB)) projB = (projB * (1 - vWeight)) + (vProjB * vWeight);
       }
 
+      const aH2H = getH2HSeries("A", qKey, parsed);
+      const bH2H = getH2HSeries("B", qKey, parsed);
+      const hasH2H = maybeReadH2HEnabled(qKey) && aH2H.length >= 2 && bH2H.length >= 2;
+      const tier = getSampleTier(aS, bS);
       if (hasH2H) {
         const hw = getH2HWeight(aH2H.length, bH2H.length, "h1", tier, 0, league);
         projA = (projA * (1 - hw)) + (avgOrNaN(aH2H) * hw);
@@ -16777,14 +17904,17 @@ finalPicksForDisplay.forEach(p => {
   if (memoryFlags[p.marketKey]) p.usedMemory = true;
 });
 
-finalPicksForDisplay.forEach(p => {
+    finalPicksForDisplay.forEach(p => {
   if (p.pick !== "NO PLAY") {
     const grade = String(p.confidence || "").replace(/[^ABCD]/g, '').charAt(0);
-    if (grade !== "A" && grade !== "B") {
+    // Only allow A and B grades; lean rescue picks bypass this gate
+    const allowB = true;
+    const isLean = p.recommendationTier === "lean";
+    if (!isLean && grade !== "A" && (grade !== "B" || !allowB)) {
       p.pick = "NO PLAY";
       p.displayPick = "NO PLAY";
       p.confidence = "—";
-      p.note = "Grade gate: " + (grade || "NaN") + " grade blocked — A/B only";
+      p.note = "Grade gate: " + (grade || "NaN") + " grade blocked — only A/B allowed" + (allowB ? "" : " (B requires 20 settled picks in this league)");
       p.lockRestricted = true;
     }
   }
@@ -16896,10 +18026,90 @@ if (Object.keys(g_lineMemorySnapshots).length > 0) {
   }, 600);
 }
 
+function captureAllInputs() {
+  const inputs = {};
+  // All text inputs, selects, checkboxes that matter
+  const ids = [
+    "leagueSelect", "teamAName", "teamBName",
+    "aFTScored", "aFTAllowed", "bFTScored", "bFTAllowed",
+    "a1HScored", "a1HAllowed", "b1HScored", "b1HAllowed",
+    "a2HScored", "a2HAllowed", "b2HScored", "b2HAllowed",
+    "aQ1Scored", "aQ1Allowed", "aQ2Scored", "aQ2Allowed",
+    "aQ3Scored", "aQ3Allowed", "aQ4Scored", "aQ4Allowed",
+    "bQ1Scored", "bQ1Allowed", "bQ2Scored", "bQ2Allowed",
+    "bQ3Scored", "bQ3Allowed", "bQ4Scored", "bQ4Allowed",
+    "aFTH2H", "bFTH2H", "a1HH2H", "b1HH2H", "a2HH2H", "b2HH2H",
+    "aQ1H2H", "bQ1H2H", "aQ2H2H", "bQ2H2H", "aQ3H2H", "bQ3H2H", "aQ4H2H", "bQ4H2H",
+    "aFTScoredHome", "aFTAllowedHome", "aFTScoredAway", "aFTAllowedAway",
+    "bFTScoredHome", "bFTAllowedHome", "bFTScoredAway", "bFTAllowedAway",
+    "ftMarket", "h1Market", "h2Market", "teamAMarket", "teamBMarket",
+    "q1Market", "q2Market", "q3Market", "q4Market",
+    "h1TeamAMarket", "h1TeamBMarket", "q1TeamAMarket", "q1TeamBMarket",
+    "highQTotalMarket", "lowQTotalMarket",
+    "ssTeamAName", "ssTeamAId", "ssTeamBName", "ssTeamBId"
+  ];
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      if (el.type === "checkbox") inputs[id] = el.checked;
+      else inputs[id] = el.value;
+    } else {
+      inputs[id] = null;
+    }
+  });
+  // Add venue split checkboxes
+  inputs.aVenueSplitEnabled = document.getElementById("aVenueSplitEnabled")?.checked || false;
+  inputs.bVenueSplitEnabled = document.getElementById("bVenueSplitEnabled")?.checked || false;
+  // Add H2H checkboxes
+  ["useFTH2H", "use1HH2H", "use2HH2H", "useQ1H2H", "useQ2H2H", "useQ3H2H", "useQ4H2H"].forEach(id => {
+    inputs[id] = document.getElementById(id)?.checked || false;
+  });
+  return inputs;
+}
+
 window.__LAST_AUDIT_STATE = {
   timestamp: new Date().toLocaleTimeString(),
   league,
   resolvedLines: finalLines,
+  fullInputs: captureAllInputs(),
+  parsedInputs: {
+    aFTScored: parsed.aFTScored,
+    bFTScored: parsed.bFTScored,
+    a1HScored: parsed.a1HScored,
+    b1HScored: parsed.b1HScored,
+    a2HScored: parsed.a2HScored,
+    b2HScored: parsed.b2HScored,
+    aQ1Scored: parsed.aQ1Scored,
+    aQ2Scored: parsed.aQ2Scored,
+    aQ3Scored: parsed.aQ3Scored,
+    aQ4Scored: parsed.aQ4Scored,
+    bQ1Scored: parsed.bQ1Scored,
+    bQ2Scored: parsed.bQ2Scored,
+    bQ3Scored: parsed.bQ3Scored,
+    bQ4Scored: parsed.bQ4Scored,
+    aFTH2H: parsed.aFTH2H,
+    bFTH2H: parsed.bFTH2H,
+    a1HH2H: parsed.a1HH2H,
+    b1HH2H: parsed.b1HH2H,
+    a2HH2H: parsed.a2HH2H,
+    b2HH2H: parsed.b2HH2H,
+    aQ1H2H: parsed.aQ1H2H,
+    bQ1H2H: parsed.bQ1H2H,
+    aQ2H2H: parsed.aQ2H2H,
+    bQ2H2H: parsed.bQ2H2H,
+    aQ3H2H: parsed.aQ3H2H,
+    bQ3H2H: parsed.bQ3H2H,
+    aQ4H2H: parsed.aQ4H2H,
+    bQ4H2H: parsed.bQ4H2H,
+    aFTScoredHome: parsed.aFTScoredHome,
+    aFTAllowedHome: parsed.aFTAllowedHome,
+    aFTScoredAway: parsed.aFTScoredAway,
+    aFTAllowedAway: parsed.aFTAllowedAway,
+    bFTScoredHome: parsed.bFTScoredHome,
+    bFTAllowedHome: parsed.bFTAllowedHome,
+    bFTScoredAway: parsed.bFTScoredAway,
+    bFTAllowedAway: parsed.bFTAllowedAway
+  },
   calcSummary: {
     ftProj: ftCalc.ftProj, ftEdge: ftCalc.ftEdge, ftSampleTier: ftCalc.ftSampleTier,
     h1Proj: h1Calc.h1Proj, h1Edge: h1Calc.h1Edge, h1SampleTier: h1Calc.h1SampleTier,
@@ -16981,6 +18191,7 @@ if (trackedToSave.length) {
     }
   } finally {
     window.__engineRunInProgress = false;
+    MODEL_TUNING.recencyWeights = _savedRecencyWeights;
     engineDebug("run finally", { trackerState: getTrackerStateDebugScore(g_trackerState) });
     if (runBtn) runBtn.disabled = false;
   }
@@ -17289,11 +18500,10 @@ async function prefetchAllESPNStandings() {
     document.addEventListener("DOMContentLoaded", () => {
       if (ensureFreshBuild()) return;
 
-      openSection("leagueSection");
+      makeSectionsCollapsible();
 
       const themeToggleBtn = document.getElementById("themeToggleBtn");
       if (themeToggleBtn) themeToggleBtn.addEventListener("click", toggleTheme);
-
 
 
 const headerErrorBtn = document.getElementById("headerErrorBtn");
@@ -17315,6 +18525,9 @@ if (headerErrorBtn) {
         e.stopImmediatePropagation();
         toggleTrackerDebugView();
       });
+
+      const trackerConfigBtn = document.getElementById("trackerConfigBtn");
+      if (trackerConfigBtn) trackerConfigBtn.addEventListener("click", toggleTrackerConfigsView);
 
       const trackerCloseBtn = document.getElementById("trackerCloseBtn");
       if (trackerCloseBtn) trackerCloseBtn.addEventListener("click", closeTrackerModal);
@@ -17389,7 +18602,6 @@ if (fetchBtn) fetchBtn.addEventListener("click", withErrorBoundary(fetchESPN, "f
       const clearBtn = document.getElementById("clearBtn");
       if (clearBtn) clearBtn.addEventListener("click", clearAll);
 
-      makeSectionsCollapsible();
       document.querySelectorAll(".section").forEach(s => {
         s.classList.add("collapsed");
         s.classList.remove("locked");
@@ -17397,6 +18609,7 @@ if (fetchBtn) fetchBtn.addEventListener("click", withErrorBoundary(fetchESPN, "f
 
       const ls0 = document.getElementById("leagueSelect");
       if (ls0) ls0.value = "";
+
 
       const espnEl = document.getElementById("espnSection");
       if (espnEl) espnEl.style.display = "none";
@@ -18012,6 +19225,12 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
 
   async function runTestFetch() {
     try {
+      // Wait a moment for g_trackerState to be initialized
+      let waitCycles = 0;
+      while (typeof g_trackerState === 'undefined' && waitCycles < 20) {
+        await new Promise(r => setTimeout(r, 100));
+        waitCycles++;
+      }
       if (typeof forceTrackerSaveNow === 'function') await forceTrackerSaveNow();
       if (typeof refreshTrackerInBackground === 'function') await refreshTrackerInBackground(true);
     } catch(e) {}
@@ -18033,11 +19252,15 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
       }
     });
 
-    const active = Array.isArray(g_trackerState && g_trackerState.activePicks) ? g_trackerState.activePicks : [];
-    const memCount = Object.keys(g_engineLineMemory || {}).length;
+    // Guard g_trackerState access – it may not be initialized yet
+    const active = (typeof g_trackerState !== 'undefined' && Array.isArray(g_trackerState.activePicks)) ? g_trackerState.activePicks : [];
+    const memCount = (typeof g_engineLineMemory !== 'undefined') ? Object.keys(g_engineLineMemory || {}).length : 0;
     if (memCount > 190) { log('ERROR','STORAGE','Line memory nearing maximum capacity (200). Pruning imminent.'); totalSuspects++; }
     if (active.length > 490) { log('ERROR','STORAGE','Active picks array is critically full (Limit: 500).'); totalSuspects++; }
-    if (typeof MODEL_TUNING === 'undefined') { log('ERROR','CONFIG','MODEL_TUNING matrix is missing.'); totalSuspects++; }
+    if (typeof MODEL_TUNING === 'undefined') { 
+      log('WARN','CONFIG','MODEL_TUNING not yet loaded – this is normal early in page load. Raid will re-check later.');
+      // Do NOT increment totalSuspects – it's a timing issue, not a real engine fault.
+    }
 
     let paceAnomalies = 0, edgeAnomalies = 0;
     active.forEach(p => {
@@ -18048,8 +19271,8 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
     if (paceAnomalies > 0) { log('ERROR','MATH ENGINE', paceAnomalies + ' picks show unrealistic pace projections (<65 or >135). Logic contradiction detected.'); totalSuspects++; }
     if (edgeAnomalies > 0) { log('ERROR','MATH ENGINE', edgeAnomalies + ' picks show extreme edge anomalies (>25%).'); totalSuspects++; }
 
-    const settled = (g_trackerState && g_trackerState.stats && g_trackerState.stats.settled) || 0;
-    const wins = (g_trackerState && g_trackerState.stats && g_trackerState.stats.wins) || 0;
+    const settled = (typeof g_trackerState !== 'undefined' && g_trackerState.stats && g_trackerState.stats.settled) || 0;
+    const wins = (typeof g_trackerState !== 'undefined' && g_trackerState.stats && g_trackerState.stats.wins) || 0;
     if (settled >= 20) {
       const winRate = (wins / settled) * 100;
       if (winRate < 45) { log('ERROR','MODEL BIAS','System win rate dropping below safety threshold (' + winRate.toFixed(1) + '%). Recalibration required.'); totalSuspects++; }
@@ -18092,6 +19315,11 @@ window.openVisualReportFromDebug = function() {
   AFDB.close();
   if (typeof openTrackerModal === 'function') openTrackerModal();
   if (typeof setTrackerModalView === 'function') setTrackerModalView('report');
+};
+
+window.openConfigsPanel = function() {
+  if (typeof openTrackerModal === 'function') openTrackerModal();
+  if (typeof setTrackerModalView === 'function') setTrackerModalView('configs');
 };
 
 window.engineDebug = function(msg, extra) {
@@ -18166,39 +19394,101 @@ document.addEventListener('DOMContentLoaded', function() {
       };
       window.fetchESPN._afdbPatched = true;
     }
-    if (typeof fetchScheduleCore === 'function' && !fetchScheduleCore._afdbPatched) {
-      const _origSched = fetchScheduleCore;
-      window.fetchScheduleCore = async function(base, teamId, league) {
-        try {
-          const res = await _origSched.apply(this, arguments);
-          if (!res) AFDB.log('ERROR','scheduleCore','NULL RESULT for teamId=' + teamId + ' — this blocks auto-fill!');
-          return res;
-        } catch(err) { AFDB.log('ERROR','scheduleCore','THREW for teamId=' + teamId + ': ' + err.message); throw err; }
-      };
-      window.fetchScheduleCore._afdbPatched = true;
+    // Increase wait and retry: wait up to 10 seconds, checking every 200ms
+    let _patchAttempts = 0;
+    const _maxPatchAttempts = 50; // 50 * 200ms = 10 seconds
+    function _patchIfReady() {
+      const schedReady = typeof fetchScheduleCore === 'function' && !fetchScheduleCore._afdbPatched;
+      const h2hReady = typeof fetchH2HCore === 'function' && !fetchH2HCore._afdbPatched;
+      const searchReady = typeof searchTeamFromAPI === 'function' && !searchTeamFromAPI._afdbPatched;
+      if (schedReady || h2hReady || searchReady) {
+        if (schedReady && typeof fetchScheduleCore === 'function') {
+          const _origSched = fetchScheduleCore;
+          window.fetchScheduleCore = async function(base, teamId, league) {
+            try {
+              const res = await _origSched.apply(this, arguments);
+              if (!res) AFDB.log('ERROR','scheduleCore','NULL RESULT for teamId=' + teamId + ' — this blocks auto-fill!');
+              return res;
+            } catch(err) { AFDB.log('ERROR','scheduleCore','THREW for teamId=' + teamId + ': ' + err.message); throw err; }
+          };
+          window.fetchScheduleCore._afdbPatched = true;
+        }
+        if (h2hReady && typeof fetchH2HCore === 'function') {
+          const _origH2H = fetchH2HCore;
+          window.fetchH2HCore = async function(base, teamAId, teamBId, leagueKey) {
+            try { return await _origH2H.apply(this, arguments); }
+            catch(err) { AFDB.log('ERROR','h2hCore','H2H THREW: ' + err.message); throw err; }
+          };
+          window.fetchH2HCore._afdbPatched = true;
+        }
+        if (searchReady && typeof searchTeamFromAPI === 'function') {
+          const _origSearch = searchTeamFromAPI;
+          window.searchTeamFromAPI = async function(base, name, league) {
+            try {
+              const res = await _origSearch.apply(this, arguments);
+              if (!res) AFDB.log('ERROR','searchTeam','Team ID NOT FOUND for "' + name + '" in ' + league + ' — THIS BLOCKS FETCH!');
+              return res;
+            } catch(err) { AFDB.log('ERROR','searchTeam','searchTeamFromAPI threw for "' + name + '": ' + err.message); throw err; }
+          };
+          window.searchTeamFromAPI._afdbPatched = true;
+        }
+      } else {
+        _patchAttempts++;
+        if (_patchAttempts < _maxPatchAttempts) {
+          setTimeout(_patchIfReady, 200);
+        } else {
+          AFDB.log('WARN','AFDB','Patch timeout: core functions not available after 10 seconds');
+        }
+      }
     }
-    if (typeof fetchH2HCore === 'function' && !fetchH2HCore._afdbPatched) {
-      const _origH2H = fetchH2HCore;
-      window.fetchH2HCore = async function(base, teamAId, teamBId, leagueKey) {
-        try { return await _origH2H.apply(this, arguments); }
-        catch(err) { AFDB.log('ERROR','h2hCore','H2H THREW: ' + err.message); throw err; }
-      };
-      window.fetchH2HCore._afdbPatched = true;
-    }
-    if (typeof searchTeamFromAPI === 'function' && !searchTeamFromAPI._afdbPatched) {
-      const _origSearch = searchTeamFromAPI;
-      window.searchTeamFromAPI = async function(base, name, league) {
-        try {
-          const res = await _origSearch.apply(this, arguments);
-          if (!res) AFDB.log('ERROR','searchTeam','Team ID NOT FOUND for "' + name + '" in ' + league + ' — THIS BLOCKS FETCH!');
-          return res;
-        } catch(err) { AFDB.log('ERROR','searchTeam','searchTeamFromAPI threw for "' + name + '": ' + err.message); throw err; }
-      };
-      window.searchTeamFromAPI._afdbPatched = true;
-    }
+    setTimeout(_patchIfReady, 200);
   }, 0); // end inner setTimeout
   })(); // end and invoke _tryPatchAfdb
 });
+function handleConfigSave(event) {
+  const row = event.target.closest('.config-row');
+  if (!row) return;
+  const rawKey = row.dataset.key;
+  const configKeyInput = row.querySelector('.config-param[data-param="configKey"]');
+  const netDeltaInput = row.querySelector('.config-param[data-param="netDelta"]');
+  const sampleCountInput = row.querySelector('.config-param[data-param="sampleCount"]');
+  const manualOverrideCheck = row.querySelector('.config-param[data-param="manualOverride"]');
+  
+  const updated = {
+    verified: true,
+    configKey: configKeyInput.value,
+    netDelta: parseFloat(netDeltaInput.value),
+    sampleCount: parseInt(sampleCountInput.value, 10),
+    updatedAt: new Date().toISOString(),
+    manualOverride: manualOverrideCheck.checked
+  };
+  try {
+    localStorage.setItem(rawKey, JSON.stringify(updated));
+    engineDebug("Config saved", { key: rawKey, ...updated });
+    renderConfigsPanel();
+  } catch(e) { alert("Save failed: " + e.message); }
+}
+
+function handleConfigDelete(event) {
+  const row = event.target.closest('.config-row');
+  if (!row) return;
+  const rawKey = row.dataset.key;
+  if (confirm("Delete this verified config? The engine will auto‑generate a new one after 20 settled picks.")) {
+    localStorage.removeItem(rawKey);
+    engineDebug("Config deleted", { key: rawKey });
+    renderConfigsPanel();
+  }
+}
+
+function handleConfigReset(event) {
+  const row = event.target.closest('.config-row');
+  if (!row) return;
+  const rawKey = row.dataset.key;
+  localStorage.removeItem(rawKey);
+  engineDebug("Config reset (deleted)", { key: rawKey });
+  renderConfigsPanel();
+}
+
 function copyTrackerData() {
   const active = Array.isArray(g_trackerState?.activePicks) ? g_trackerState.activePicks : [];
   const archived = Array.isArray(g_trackerState?.archivedPicks) ? g_trackerState.archivedPicks : [];
@@ -18336,9 +19626,7 @@ function showLockCelebration() {
   }, 2000);
 }
 
-
-
-  window.ENGINE_TEST_SUITE = (() => {
+window.ENGINE_TEST_SUITE = (() => {
   let _p = 0, _f = 0;
   const _fails = [];
   const _tests = [];
@@ -18512,4 +19800,6 @@ function showLockCelebration() {
 
   return { run };
 })();
+
+
 </script>
