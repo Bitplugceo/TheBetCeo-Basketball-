@@ -1,4 +1,4 @@
-C
+H
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3651,228 +3651,7 @@ const MODEL_TUNING = {
   recencyWeights: [1.35, 1.20, 1.00, 0.85, 0.70]
 };
 
-// ========== RETROSPECTIVE TUNING GRID ==========
-const TUNING_GRID = {
-  h2hFactors: [0.5, 0.75, 1.0, 1.25, 1.5],
-  recencyProfiles: [
-    [1.35, 1.20, 1.00, 0.85, 0.70], // standard
-    [1.60, 1.30, 0.90, 0.60, 0.40], // aggressive
-    [1.00, 1.00, 1.00, 1.00, 1.00]  // flat
-  ],
-  paceDampenings: [0.25, 0.40, 0.55],
-  edgeMults: [0.90, 1.00, 1.10],
-  injuryMults: [0.8, 1.0, 1.2]
-};
-// ==============================================
-
-// ========== RETROSPECTIVE ANALYSIS (Feature #7) ==========
-function getCandidateScoreKey(config) {
-  const { h2hFactor, recencyProfile, paceDampening, edgeMult, injuryMult } = config;
-  const recencyId = recencyProfile === TUNING_GRID.recencyProfiles[0] ? "std" :
-                    recencyProfile === TUNING_GRID.recencyProfiles[1] ? "agg" : "flat";
-  return `h2h${h2hFactor}_rec${recencyId}_pace${paceDampening}_edge${edgeMult}_inj${injuryMult}`;
-}
-
-function updateCandidateScore(league, marketKey, config, delta) {
-  const key = getCandidateScoreKey(config);
-  const storageKey = `BB_CANDIDATE_SCORES_${league}_${marketKey}`;
-  let scores = {};
-  try {
-    const raw = localStorage.getItem(storageKey);
-    if (raw) scores = JSON.parse(raw);
-  } catch(e) {}
-  if (!scores[key]) scores[key] = { netDelta: 0, count: 0 };
-  scores[key].netDelta += delta;
-  scores[key].count++;
-  try {
-    localStorage.setItem(storageKey, JSON.stringify(scores));
-  } catch(e) {}
-}
-
-function getTotalSettledCountForLeagueMarket(league, marketKey) {
-  const all = getLearningTrackedPicks();
-  return all.filter(p =>
-    p.league === league &&
-    p.marketKey === marketKey &&
-    (p.resultStatus === "win" || p.resultStatus === "loss" || p.resultStatus === "push")
-  ).length;
-}
-
-function selectBestConfig(league, marketKey) {
-  const storageKey = `BB_CANDIDATE_SCORES_${league}_${marketKey}`;
-  let scores = {};
-  try {
-    const raw = localStorage.getItem(storageKey);
-    if (raw) scores = JSON.parse(raw);
-    else return null;
-  } catch(e) { return null; }
-  let bestKey = null;
-  let bestNetDelta = -Infinity;
-  for (const [key, data] of Object.entries(scores)) {
-    if (data.netDelta > bestNetDelta) {
-      bestNetDelta = data.netDelta;
-      bestKey = key;
-    }
-  }
-  if (!bestKey) return null;
-  // Parse bestKey back into config (simplified – just return the key for storage)
-  return { configKey: bestKey, netDelta: bestNetDelta, sampleCount: scores[bestKey].count };
-}
-
-function storeVerifiedConfig(league, marketKey, configKey, netDelta, sampleCount) {
-  const verifiedKey = `BB_VERIFIED_CONFIG_${league}_${marketKey}`;
-  const verified = {
-    verified: true,
-    configKey,
-    netDelta,
-    sampleCount,
-    updatedAt: new Date().toISOString(),
-    manualOverride: false
-  };
-  try {
-    localStorage.setItem(verifiedKey, JSON.stringify(verified));
-    // Clear candidate scores after locking
-    localStorage.removeItem(`BB_CANDIDATE_SCORES_${league}_${marketKey}`);
-    engineDebug("Verified config locked", { league, marketKey, configKey, netDelta });
-  } catch(e) {}
-}
-
-function getVerifiedConfig(league, marketKey) {
-  const verifiedKey = `BB_VERIFIED_CONFIG_${league}_${marketKey}`;
-  try {
-    const raw = localStorage.getItem(verifiedKey);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed.verified) return parsed;
-    }
-  } catch(e) {}
-  return null;
-}
-
-async function runRetrospectiveAnalysis(pick) {
-  // Wrap entire function in try-catch to prevent any error from crashing the UI or stopping tracker settlement
-  try {
-    if (!pick.snapshot || !pick.actualScore) {
-      engineDebug("Retrospective skipped: missing snapshot or actualScore");
-      return;
-    }
-    // Guard: picks saved before full context was added cannot be analysed safely
-    if (!pick.snapshot.massacreContext) {
-      engineDebug("Retrospective skipped: snapshot lacks massacreContext (old pick format)");
-      return;
-    }
-    const { league, marketKey, snapshot, actualScore, resultStatus, side } = pick;
-    const isWin = resultStatus === "win";
-    if (!isWin && resultStatus !== "loss") return; // Only analyze wins and losses
-
-    const { parsed, lines, fixtureMeta, injMultA, injMultB, configSnapshot } = snapshot;
-
-    const numericActual = parseFloat(actualScore);
-    if (!isFinite(numericActual)) return;
-
-    // Save original global state
-    const originalMassacreContext = g_massacreFetchContext;
-    const originalFetchMeta = g_fetchMeta;
-    const originalInjA = g_injA;
-    const originalInjB = g_injB;
-    const originalSelectedTeamIds = selectedTeamIds;
-
-    // Restore the exact runtime context from when the pick was made
-    try {
-      if (snapshot.massacreContext) {
-        g_massacreFetchContext = snapshot.massacreContext;
-      }
-      if (snapshot.fetchMeta) {
-        g_fetchMeta = snapshot.fetchMeta;
-      }
-      if (snapshot.injuryMeta) {
-        g_injA = snapshot.injuryMeta.A;
-        g_injB = snapshot.injuryMeta.B;
-      }
-      if (snapshot.selectedTeamIds) {
-        selectedTeamIds = snapshot.selectedTeamIds;
-      }
-
-      const { h2hFactors, recencyProfiles, paceDampenings, edgeMults, injuryMults } = TUNING_GRID;
-
-      for (const h2hFactor of h2hFactors) {
-        for (const recencyProfile of recencyProfiles) {
-          for (const paceDampening of paceDampenings) {
-            for (const edgeMult of edgeMults) {
-              for (const injuryMult of injuryMults) {
-                const config = { h2hFactor, recencyProfile, paceDampening, edgeMult, injuryMult };
-                // Determine which projection function to call based on marketKey
-                let proj, line, edge, pickDecision;
-                try {
-                  if (marketKey === "ft") {
-                    const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
-                    proj = calc.ftProj;
-                    line = lines.ftLine;
-                    edge = calc.ftEdge;
-                    pickDecision = getPick(edge, line, league, "ft", {});
-                  } else if (marketKey === "h1") {
-                    const calc = compute1HProjection({ league, parsed, lines, injMultA, injMultB, config });
-                    proj = calc.h1Proj;
-                    line = lines.h1Line;
-                    edge = calc.h1Edge;
-                    pickDecision = getPick(edge, line, league, "h1", {});
-                  } else if (marketKey === "team_a") {
-                    const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
-                    proj = calc.projAFT;
-                    line = lines.aLine;
-                    edge = calc.aEdge;
-                    pickDecision = getPick(edge, line, league, "team", { teamSc: calc.aS });
-                  } else if (marketKey === "team_b") {
-                    const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
-                    proj = calc.projBFT;
-                    line = lines.bLine;
-                    edge = calc.bEdge;
-                    pickDecision = getPick(edge, line, league, "team", { teamSc: calc.bS });
-                  } else {
-                    continue; // Unsupported market for retrospective
-                  }
-                } catch(e) { continue; }
-
-                if (pickDecision === "NO PLAY") continue;
-                const pickSide = getPickSideFromText(pickDecision);
-                if (pickSide !== side) continue;
-
-                let wouldWin = false;
-                if (side === "over") wouldWin = numericActual > line;
-                else if (side === "under") wouldWin = numericActual < line;
-
-                const delta = wouldWin ? (isWin ? 0 : 1) : (isWin ? -1 : 0);
-                if (delta !== 0) {
-                  updateCandidateScore(league, marketKey, config, delta);
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // After processing, check if we have enough settled picks to lock a config
-      const totalPicks = getTotalSettledCountForLeagueMarket(league, marketKey);
-      if (totalPicks >= 10) {
-        const best = selectBestConfig(league, marketKey);
-        if (best && best.netDelta > 0) {
-          storeVerifiedConfig(league, marketKey, best.configKey, best.netDelta, best.sampleCount);
-        }
-      }
-    } finally {
-      // Restore original global state
-      g_massacreFetchContext = originalMassacreContext;
-      g_fetchMeta = originalFetchMeta;
-      g_injA = originalInjA;
-      g_injB = originalInjB;
-      selectedTeamIds = originalSelectedTeamIds;
-    }
-  } catch (err) {
-    // Never let a retrospective error break the UI or prevent tracker settlement
-    engineDebug("Retrospective analysis crashed, but engine continues", { error: err?.message || String(err) });
-  }
-}
-// ========================================================
+// Retrospective analysis has been permanently removed.
 
 // [FIX #1: LEARNED-WEIGHT FRAMEWORK HOOKS]
 // Reads the best-performing recency weights for a league from the Phase 2 calibrator
@@ -10471,21 +10250,7 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
     line: touchedPick?.line
   });
 
-  // 3. Run retrospective analysis if this is a settlement (win/loss/push)
-  // Only run if snapshot has full massacreContext (old picks without it would crash)
-  if (["win", "loss", "push"].includes(normalizedStatus) && updatedPick.snapshot && updatedPick.snapshot.massacreContext) {
-    // Run retrospective analysis, but never let it block the settlement or UI
-    (async () => {
-      try {
-        await runRetrospectiveAnalysis(updatedPick);
-        if (typeof renderConfigsPanel === "function") renderConfigsPanel();
-      } catch (err) {
-        engineDebug("Retrospective analysis error (caught, settlement continues)", err.message);
-      }
-    })();
-  } else if (["win", "loss", "push"].includes(normalizedStatus) && updatedPick.snapshot && !updatedPick.snapshot.massacreContext) {
-    engineDebug("Manual settle: pick has snapshot but no massacreContext – skipping retrospective (old format)", { pickId: updatedPick.pickId });
-  }
+  // Retrospective analysis has been removed.
   
   if (g_trackerState.shadowPicks && touchedPick) {
     const shadowMatches = g_trackerState.shadowPicks.filter(sp => sp.eventId === touchedPick.eventId);
@@ -10501,9 +10266,7 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
         else if (actual < marketLine) shadowStatus = side === "under" ? "win" : "loss";
         sp.resultStatus = shadowStatus;
         sp.settledAt = new Date().toISOString();
-        if (typeof runRetrospectiveAnalysis === "function" && sp.snapshot && sp.snapshot.massacreContext) {
-          runRetrospectiveAnalysis(sp).catch(err => engineDebug("Shadow retro error", err));
-        }
+        // Retrospective analysis removed.
       }
     }
   }
@@ -10833,17 +10596,7 @@ function handleTrackedPicksActionClick(event) {
   if (actual > actualPickLine) actualGrade = pickSide === "over" ? "win" : "loss";
   else if (actual < actualPickLine) actualGrade = pickSide === "under" ? "win" : "loss";
 
-  // Trigger retrospective analysis if newly settled
-  const newStatus = actualGrade;
-  if (newStatus !== oldStatus && pick.snapshot && (newStatus === "win" || newStatus === "loss" || newStatus === "push")) {
-    (async () => {
-      try {
-        await runRetrospectiveAnalysis(pick);
-      } catch (err) {
-        engineDebug("Retrospective analysis error (auto-settle)", err.message);
-      }
-    })();
-  }
+  // Retrospective analysis removed.
 
   return actualGrade; // This becomes resultStatus
 }
@@ -10934,9 +10687,6 @@ function handleTrackedPicksActionClick(event) {
                                   sp.resultStatus = shadowSettled;
                                   sp.actualScore = pick.actualScore;
                                   sp.settledAt = new Date().toISOString();
-                                  if (typeof runRetrospectiveAnalysis === "function") {
-                                    runRetrospectiveAnalysis(sp).catch(err => engineDebug("Shadow retro error", err));
-                                  }
                                 }
                               }
                             }
@@ -12287,20 +12037,12 @@ function hideInjuryBox(side) {
 }
 
     function toggleVenueSplit(side) {
-      try {
-        const fieldsId = side === "A" ? "aVenueSplitFields" : "bVenueSplitFields";
-        const cbId = side === "A" ? "aVenueSplitEnabled" : "bVenueSplitEnabled";
-        const cb = document.getElementById(cbId);
-        const fields = document.getElementById(fieldsId);
-        if (fields) {
-          fields.style.display = (cb && cb.checked) ? "block" : "none";
-        } else {
-          engineDebug("toggleVenueSplit: fields element not found for " + side);
-        }
-        invalidateFetchedAudit();
-      } catch (err) {
-        engineDebug("toggleVenueSplit error", err?.message);
-      }
+      const fieldsId = side === "A" ? "aVenueSplitFields" : "bVenueSplitFields";
+      const cbId = side === "A" ? "aVenueSplitEnabled" : "bVenueSplitEnabled";
+      const cb = document.getElementById(cbId);
+      const fields = document.getElementById(fieldsId);
+      if (fields) fields.style.display = cb && cb.checked ? "block" : "none";
+      invalidateFetchedAudit();
     }
 
     function clearSideFields(side) {
@@ -16486,143 +16228,57 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
 
   // SNAPSHOT STORAGE: capture all inputs for retrospective analysis
   const snapshot = (function() {
-  if (!pickRow || pickRow.pick === "NO PLAY" || !pickRow.marketKey) return null;
-  const rawInputs = {};
-  try {
-    const parsedSnapshot = {
-      aFTScored: readLooseSeries("aFTScored"),
-      bFTScored: readLooseSeries("bFTScored"),
-      a1HScored: readLooseSeries("a1HScored"),
-      b1HScored: readLooseSeries("b1HScored"),
-      a2HScored: readLooseSeries("a2HScored"),
-      b2HScored: readLooseSeries("b2HScored"),
-      aQ1Scored: readLooseSeries("aQ1Scored"), aQ2Scored: readLooseSeries("aQ2Scored"),
-      aQ3Scored: readLooseSeries("aQ3Scored"), aQ4Scored: readLooseSeries("aQ4Scored"),
-      bQ1Scored: readLooseSeries("bQ1Scored"), bQ2Scored: readLooseSeries("bQ2Scored"),
-      bQ3Scored: readLooseSeries("bQ3Scored"), bQ4Scored: readLooseSeries("bQ4Scored"),
-      aFTH2H: readLooseSeries("aFTH2H"), bFTH2H: readLooseSeries("bFTH2H"),
-      a1HH2H: readLooseSeries("a1HH2H"), b1HH2H: readLooseSeries("b1HH2H"),
-      aQ1H2H: readLooseSeries("aQ1H2H"), bQ1H2H: readLooseSeries("bQ1H2H"),
-      aQ2H2H: readLooseSeries("aQ2H2H"), bQ2H2H: readLooseSeries("bQ2H2H"),
-      aQ3H2H: readLooseSeries("aQ3H2H"), bQ3H2H: readLooseSeries("bQ3H2H"),
-      aQ4H2H: readLooseSeries("aQ4H2H"), bQ4H2H: readLooseSeries("bQ4H2H"),
-      aFTScoredHome: readLooseSeries("aFTScoredHome"), aFTAllowedHome: readLooseSeries("aFTAllowedHome"),
-      aFTScoredAway: readLooseSeries("aFTScoredAway"), aFTAllowedAway: readLooseSeries("aFTAllowedAway"),
-      bFTScoredHome: readLooseSeries("bFTScoredHome"), bFTAllowedHome: readLooseSeries("bFTAllowedHome"),
-      bFTScoredAway: readLooseSeries("bFTScoredAway"), bFTAllowedAway: readLooseSeries("bFTAllowedAway")
-    };
-    const linesSnapshot = {
-      ftLine: parseMarketLine(document.getElementById("ftMarket")?.value || ""),
-      h1Line: parseMarketLine(document.getElementById("h1Market")?.value || ""),
-      aLine: parseMarketLine(document.getElementById("teamAMarket")?.value || ""),
-      bLine: parseMarketLine(document.getElementById("teamBMarket")?.value || "")
-    };
-    const fixtureMetaSnapshot = getCurrentFixtureMeta();
-    // Capture full runtime context for retrospective analysis
-    const massacreContextSnapshot = {
-      league: g_massacreFetchContext.league,
-      A: {
-        overall: g_massacreFetchContext.A?.overall ? { ...g_massacreFetchContext.A.overall } : null,
-        venue: g_massacreFetchContext.A?.venue ? { ...g_massacreFetchContext.A.venue } : null,
-        ortg10: [...(g_massacreFetchContext.A?.ortg10 || [])],
-        drtg10: [...(g_massacreFetchContext.A?.drtg10 || [])],
-        pace10: [...(g_massacreFetchContext.A?.pace10 || [])],
-        restDays: g_massacreFetchContext.A?.restDays,
-        seasonBaseline: g_massacreFetchContext.A?.seasonBaseline ? { ...g_massacreFetchContext.A.seasonBaseline } : null,
-        roster: g_massacreFetchContext.A?.roster ? [...g_massacreFetchContext.A.roster] : [],
-        sos: g_massacreFetchContext.A?.sos,
-        lastGameDate: g_massacreFetchContext.A?.lastGameDate,
-        q1Scored: [...(g_massacreFetchContext.A?.q1Scored || [])],
-        q2Scored: [...(g_massacreFetchContext.A?.q2Scored || [])],
-        q3Scored: [...(g_massacreFetchContext.A?.q3Scored || [])],
-        q4Scored: [...(g_massacreFetchContext.A?.q4Scored || [])],
-        q1Allowed: [...(g_massacreFetchContext.A?.q1Allowed || [])],
-        q2Allowed: [...(g_massacreFetchContext.A?.q2Allowed || [])],
-        q3Allowed: [...(g_massacreFetchContext.A?.q3Allowed || [])],
-        q4Allowed: [...(g_massacreFetchContext.A?.q4Allowed || [])]
-      },
-      B: {
-        overall: g_massacreFetchContext.B?.overall ? { ...g_massacreFetchContext.B.overall } : null,
-        venue: g_massacreFetchContext.B?.venue ? { ...g_massacreFetchContext.B.venue } : null,
-        ortg10: [...(g_massacreFetchContext.B?.ortg10 || [])],
-        drtg10: [...(g_massacreFetchContext.B?.drtg10 || [])],
-        pace10: [...(g_massacreFetchContext.B?.pace10 || [])],
-        restDays: g_massacreFetchContext.B?.restDays,
-        seasonBaseline: g_massacreFetchContext.B?.seasonBaseline ? { ...g_massacreFetchContext.B.seasonBaseline } : null,
-        roster: g_massacreFetchContext.B?.roster ? [...g_massacreFetchContext.B.roster] : [],
-        sos: g_massacreFetchContext.B?.sos,
-        lastGameDate: g_massacreFetchContext.B?.lastGameDate,
-        q1Scored: [...(g_massacreFetchContext.B?.q1Scored || [])],
-        q2Scored: [...(g_massacreFetchContext.B?.q2Scored || [])],
-        q3Scored: [...(g_massacreFetchContext.B?.q3Scored || [])],
-        q4Scored: [...(g_massacreFetchContext.B?.q4Scored || [])],
-        q1Allowed: [...(g_massacreFetchContext.B?.q1Allowed || [])],
-        q2Allowed: [...(g_massacreFetchContext.B?.q2Allowed || [])],
-        q3Allowed: [...(g_massacreFetchContext.B?.q3Allowed || [])],
-        q4Allowed: [...(g_massacreFetchContext.B?.q4Allowed || [])]
-      },
-      h2hGames: g_massacreFetchContext.h2hGames ? [...g_massacreFetchContext.h2hGames] : [],
-      refTendency: g_massacreFetchContext.refTendency ? { ...g_massacreFetchContext.refTendency } : null
-    };
-    const fetchMetaSnapshot = {
-      A: {
-        ft: { ...(g_fetchMeta?.A?.ft || { source: "manual", venueReliable: true }) },
-        h1: { ...(g_fetchMeta?.A?.h1 || { source: "manual", venueReliable: true }) },
-        h2: { ...(g_fetchMeta?.A?.h2 || { source: "manual", venueReliable: true }) }
-      },
-      B: {
-        ft: { ...(g_fetchMeta?.B?.ft || { source: "manual", venueReliable: true }) },
-        h1: { ...(g_fetchMeta?.B?.h1 || { source: "manual", venueReliable: true }) },
-        h2: { ...(g_fetchMeta?.B?.h2 || { source: "manual", venueReliable: true }) }
-      }
-    };
-    const injuryMetaSnapshot = {
-      A: {
-        scoringMult: g_injA.scoringMult,
-        notes: g_injA.notes ? [...g_injA.notes] : [],
-        outCount: g_injA.outCount,
-        dtdCount: g_injA.dtdCount,
-        unknownImpactCount: g_injA.unknownImpactCount,
-        hasUnknownImpact: g_injA.hasUnknownImpact,
-        highUncertainty: g_injA.highUncertainty
-      },
-      B: {
-        scoringMult: g_injB.scoringMult,
-        notes: g_injB.notes ? [...g_injB.notes] : [],
-        outCount: g_injB.outCount,
-        dtdCount: g_injB.dtdCount,
-        unknownImpactCount: g_injB.unknownImpactCount,
-        hasUnknownImpact: g_injB.hasUnknownImpact,
-        highUncertainty: g_injB.highUncertainty
-      }
-    };
-    const selectedTeamIdsSnapshot = {
-      A: selectedTeamIds.A,
-      B: selectedTeamIds.B
-    };
-    return {
-      league,
-      marketKey: pickRow.marketKey,
-      side: getPickSideFromText(pickRow.pick),
-      parsed: parsedSnapshot,
-      lines: linesSnapshot,
-      fixtureMeta: fixtureMetaSnapshot,
-      injMultA: g_injA.scoringMult,
-      injMultB: g_injB.scoringMult,
-      configSnapshot: {
-        recencyWeights: MODEL_TUNING.recencyWeights,
-        h2hFactor: 1.0,
-        paceDampening: 0.4,
-        edgeMult: 1.0,
-        injuryMult: 1.0
-      },
-      massacreContext: massacreContextSnapshot,
-      fetchMeta: fetchMetaSnapshot,
-      injuryMeta: injuryMetaSnapshot,
-      selectedTeamIds: selectedTeamIdsSnapshot
-    };
-  } catch(e) { return null; }
-})();
+    if (!pickRow || pickRow.pick === "NO PLAY" || !pickRow.marketKey) return null;
+    const rawInputs = {};
+    try {
+      const parsedSnapshot = {
+        aFTScored: readLooseSeries("aFTScored"),
+        bFTScored: readLooseSeries("bFTScored"),
+        a1HScored: readLooseSeries("a1HScored"),
+        b1HScored: readLooseSeries("b1HScored"),
+        a2HScored: readLooseSeries("a2HScored"),
+        b2HScored: readLooseSeries("b2HScored"),
+        aQ1Scored: readLooseSeries("aQ1Scored"), aQ2Scored: readLooseSeries("aQ2Scored"),
+        aQ3Scored: readLooseSeries("aQ3Scored"), aQ4Scored: readLooseSeries("aQ4Scored"),
+        bQ1Scored: readLooseSeries("bQ1Scored"), bQ2Scored: readLooseSeries("bQ2Scored"),
+        bQ3Scored: readLooseSeries("bQ3Scored"), bQ4Scored: readLooseSeries("bQ4Scored"),
+        aFTH2H: readLooseSeries("aFTH2H"), bFTH2H: readLooseSeries("bFTH2H"),
+        a1HH2H: readLooseSeries("a1HH2H"), b1HH2H: readLooseSeries("b1HH2H"),
+        aQ1H2H: readLooseSeries("aQ1H2H"), bQ1H2H: readLooseSeries("bQ1H2H"),
+        aQ2H2H: readLooseSeries("aQ2H2H"), bQ2H2H: readLooseSeries("bQ2H2H"),
+        aQ3H2H: readLooseSeries("aQ3H2H"), bQ3H2H: readLooseSeries("bQ3H2H"),
+        aQ4H2H: readLooseSeries("aQ4H2H"), bQ4H2H: readLooseSeries("bQ4H2H"),
+        aFTScoredHome: readLooseSeries("aFTScoredHome"), aFTAllowedHome: readLooseSeries("aFTAllowedHome"),
+        aFTScoredAway: readLooseSeries("aFTScoredAway"), aFTAllowedAway: readLooseSeries("aFTAllowedAway"),
+        bFTScoredHome: readLooseSeries("bFTScoredHome"), bFTAllowedHome: readLooseSeries("bFTAllowedHome"),
+        bFTScoredAway: readLooseSeries("bFTScoredAway"), bFTAllowedAway: readLooseSeries("bFTAllowedAway")
+      };
+      const linesSnapshot = {
+        ftLine: parseMarketLine(document.getElementById("ftMarket")?.value || ""),
+        h1Line: parseMarketLine(document.getElementById("h1Market")?.value || ""),
+        aLine: parseMarketLine(document.getElementById("teamAMarket")?.value || ""),
+        bLine: parseMarketLine(document.getElementById("teamBMarket")?.value || "")
+      };
+      const fixtureMetaSnapshot = getCurrentFixtureMeta();
+      return {
+        league,
+        marketKey: pickRow.marketKey,
+        side: getPickSideFromText(pickRow.pick),
+        parsed: parsedSnapshot,
+        lines: linesSnapshot,
+        fixtureMeta: fixtureMetaSnapshot,
+        injMultA: g_injA.scoringMult,
+        injMultB: g_injB.scoringMult,
+        configSnapshot: {
+          recencyWeights: MODEL_TUNING.recencyWeights,
+          h2hFactor: 1.0,
+          paceDampening: 0.4,
+          edgeMult: 1.0,
+          injuryMult: 1.0
+        }
+      };
+    } catch(e) { return null; }
+  })();
 
   // Always save a shadow record, even for NO PLAY, but don't show it in main tracker
   const isActualPlay = !(
@@ -17368,26 +17024,7 @@ const baseLines = Object.freeze({
   bLine: lines.bLine
 });
 
-// Load verified config if available
-let verifiedFtConfig = getVerifiedConfig(league, "ft");
-let verifiedH1Config = getVerifiedConfig(league, "h1");
-let verifiedTeamAConfig = getVerifiedConfig(league, "team_a");
-let verifiedTeamBConfig = getVerifiedConfig(league, "team_b");
-
-function applyVerifiedConfigToTuning(verifiedConfig, targetType) {
-  if (!verifiedConfig || !verifiedConfig.verified) return null;
-  // Parse configKey back into parameters (simplified: just log that it's active)
-  // The actual override will be passed as config parameter to projection functions
-  engineDebug("Applying verified config for " + league + ":" + targetType, { configKey: verifiedConfig.configKey });
-  // For now, we return the configKey; later we can parse it fully.
-  // We'll modify computeFTProjection/compute1HProjection to accept a full config object.
-  // Since we haven't parsed the key into discrete params, we'll keep the default for this run.
-  // The verified config will be used in subsequent runs after we parse it.
-  return verifiedConfig;
-}
-
-applyVerifiedConfigToTuning(verifiedFtConfig, "ft");
-applyVerifiedConfigToTuning(verifiedH1Config, "h1");
+// Verified config loading removed.
 
 const _runFTWeights = window.__phase2FTRecencyWeights || getLeagueRecencyDefaults(currentLeagueForRun);
 const _runH1Weights = window.__phase2H1RecencyWeights || _runFTWeights;
@@ -17450,63 +17087,25 @@ const memoryFlags = {
   team_b: resB.usedMemory
 };
 
-// Helper to build config object from verified config key
-function buildConfigFromVerifiedKey(configKey) {
-  if (!configKey) return {};
-  const parts = configKey.split('_');
-  const result = {};
-  for (const part of parts) {
-    if (part.startsWith('h2h')) result.h2hFactor = parseFloat(part.slice(3));
-    else if (part.startsWith('rec')) {
-      const recType = part.slice(3);
-      if (recType === 'std') result.recencyProfile = TUNING_GRID.recencyProfiles[0];
-      else if (recType === 'agg') result.recencyProfile = TUNING_GRID.recencyProfiles[1];
-      else if (recType === 'flat') result.recencyProfile = TUNING_GRID.recencyProfiles[2];
-    }
-    else if (part.startsWith('pace')) result.paceDampening = parseFloat(part.slice(4));
-    else if (part.startsWith('edge')) result.edgeMult = parseFloat(part.slice(4));
-    else if (part.startsWith('inj')) result.injuryMult = parseFloat(part.slice(3));
-  }
-  return result;
-}
+// Config overrides from verified configs removed.
 
-let ftConfigOverride = {};
-let h1ConfigOverride = {};
-let teamAConfigOverride = {};
-let teamBConfigOverride = {};
-
-if (verifiedFtConfig && verifiedFtConfig.configKey) {
-  ftConfigOverride = buildConfigFromVerifiedKey(verifiedFtConfig.configKey);
-}
-if (verifiedH1Config && verifiedH1Config.configKey) {
-  h1ConfigOverride = buildConfigFromVerifiedKey(verifiedH1Config.configKey);
-}
-if (verifiedTeamAConfig && verifiedTeamAConfig.configKey) {
-  teamAConfigOverride = buildConfigFromVerifiedKey(verifiedTeamAConfig.configKey);
-}
-if (verifiedTeamBConfig && verifiedTeamBConfig.configKey) {
-  teamBConfigOverride = buildConfigFromVerifiedKey(verifiedTeamBConfig.configKey);
-}
-
-MODEL_TUNING.recencyWeights = ftConfigOverride.recencyProfile || _runFTWeights;
+MODEL_TUNING.recencyWeights = _runFTWeights;
 const ftCalc = computeFTProjection({
   league,
   parsed,
   lines: finalLines,
   injMultA: g_injA.scoringMult,
-  injMultB: g_injB.scoringMult,
-  config: ftConfigOverride
+  injMultB: g_injB.scoringMult
 });
 ftCalc.volatilityBlock = Math.max(ftCalc.aVol || 0, ftCalc.bVol || 0) > (LEAGUE_VOL_LIMITS[league] || 12) * 1.5;
 
-MODEL_TUNING.recencyWeights = h1ConfigOverride.recencyProfile || _runH1Weights;
+MODEL_TUNING.recencyWeights = _runH1Weights;
 const h1Calc = compute1HProjection({
   league,
   parsed,
   lines: finalLines,
   injMultA: g_injA.scoringMult,
-  injMultB: g_injB.scoringMult,
-  config: h1ConfigOverride
+  injMultB: g_injB.scoringMult
 });
 
 
@@ -18099,16 +17698,7 @@ window.__lastRunParsed = parsed;
 window.__lastRunFinalLines = finalLines;
 window.__lastRunLeague = league;
 window.__lastRunFixtureMeta = fixtureMeta;
-if (Object.keys(g_lineMemorySnapshots).length > 0) {
-  setTimeout(async () => {
-    try {
-      await executeRetrospectiveBacktest({ league, parsed, lines: finalLines, fixtureMeta });
-      engineDebug("Phase 2 retrospective complete", { league, snapshots: Object.keys(g_lineMemorySnapshots).length });
-    } catch (err) {
-      engineDebug("Phase 2 retrospective error", err.message);
-    }
-  }, 600);
-}
+  // Retrospective backtest removed.
 
 function captureAllInputs() {
   const inputs = {};
