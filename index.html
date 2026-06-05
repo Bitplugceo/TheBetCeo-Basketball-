@@ -1,4 +1,4 @@
-A
+B
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3754,79 +3754,116 @@ async function runRetrospectiveAnalysis(pick) {
     engineDebug("Retrospective skipped: missing snapshot or actualScore");
     return;
   }
+  // Guard: picks saved before full context was added cannot be analysed safely
+  if (!pick.snapshot.massacreContext) {
+    engineDebug("Retrospective skipped: snapshot lacks massacreContext (old pick format)");
+    return;
+  }
   const { league, marketKey, snapshot, actualScore, resultStatus, side } = pick;
   const isWin = resultStatus === "win";
   if (!isWin && resultStatus !== "loss") return; // Only analyze wins and losses
 
   const { parsed, lines, fixtureMeta, injMultA, injMultB, configSnapshot } = snapshot;
+
   const numericActual = parseFloat(actualScore);
   if (!isFinite(numericActual)) return;
 
-  const { h2hFactors, recencyProfiles, paceDampenings, edgeMults, injuryMults } = TUNING_GRID;
+  // Save original global state
+  const originalMassacreContext = g_massacreFetchContext;
+  const originalFetchMeta = g_fetchMeta;
+  const originalInjA = g_injA;
+  const originalInjB = g_injB;
+  const originalSelectedTeamIds = selectedTeamIds;
 
-  for (const h2hFactor of h2hFactors) {
-    for (const recencyProfile of recencyProfiles) {
-      for (const paceDampening of paceDampenings) {
-        for (const edgeMult of edgeMults) {
-          for (const injuryMult of injuryMults) {
-            const config = { h2hFactor, recencyProfile, paceDampening, edgeMult, injuryMult };
-            // Determine which projection function to call based on marketKey
-            let proj, line, edge, pickDecision;
-            try {
-              if (marketKey === "ft") {
-                const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
-                proj = calc.ftProj;
-                line = lines.ftLine;
-                edge = calc.ftEdge;
-                pickDecision = getPick(edge, line, league, "ft", {});
-              } else if (marketKey === "h1") {
-                const calc = compute1HProjection({ league, parsed, lines, injMultA, injMultB, config });
-                proj = calc.h1Proj;
-                line = lines.h1Line;
-                edge = calc.h1Edge;
-                pickDecision = getPick(edge, line, league, "h1", {});
-              } else if (marketKey === "team_a") {
-                const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
-                proj = calc.projAFT;
-                line = lines.aLine;
-                edge = calc.aEdge;
-                pickDecision = getPick(edge, line, league, "team", { teamSc: calc.aS });
-              } else if (marketKey === "team_b") {
-                const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
-                proj = calc.projBFT;
-                line = lines.bLine;
-                edge = calc.bEdge;
-                pickDecision = getPick(edge, line, league, "team", { teamSc: calc.bS });
-              } else {
-                continue; // Unsupported market for retrospective
+  // Restore the exact runtime context from when the pick was made
+  try {
+    if (snapshot.massacreContext) {
+      g_massacreFetchContext = snapshot.massacreContext;
+    }
+    if (snapshot.fetchMeta) {
+      g_fetchMeta = snapshot.fetchMeta;
+    }
+    if (snapshot.injuryMeta) {
+      g_injA = snapshot.injuryMeta.A;
+      g_injB = snapshot.injuryMeta.B;
+    }
+    if (snapshot.selectedTeamIds) {
+      selectedTeamIds = snapshot.selectedTeamIds;
+    }
+
+    const { h2hFactors, recencyProfiles, paceDampenings, edgeMults, injuryMults } = TUNING_GRID;
+
+    for (const h2hFactor of h2hFactors) {
+      for (const recencyProfile of recencyProfiles) {
+        for (const paceDampening of paceDampenings) {
+          for (const edgeMult of edgeMults) {
+            for (const injuryMult of injuryMults) {
+              const config = { h2hFactor, recencyProfile, paceDampening, edgeMult, injuryMult };
+              // Determine which projection function to call based on marketKey
+              let proj, line, edge, pickDecision;
+              try {
+                if (marketKey === "ft") {
+                  const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
+                  proj = calc.ftProj;
+                  line = lines.ftLine;
+                  edge = calc.ftEdge;
+                  pickDecision = getPick(edge, line, league, "ft", {});
+                } else if (marketKey === "h1") {
+                  const calc = compute1HProjection({ league, parsed, lines, injMultA, injMultB, config });
+                  proj = calc.h1Proj;
+                  line = lines.h1Line;
+                  edge = calc.h1Edge;
+                  pickDecision = getPick(edge, line, league, "h1", {});
+                } else if (marketKey === "team_a") {
+                  const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
+                  proj = calc.projAFT;
+                  line = lines.aLine;
+                  edge = calc.aEdge;
+                  pickDecision = getPick(edge, line, league, "team", { teamSc: calc.aS });
+                } else if (marketKey === "team_b") {
+                  const calc = computeFTProjection({ league, parsed, lines, injMultA, injMultB, config });
+                  proj = calc.projBFT;
+                  line = lines.bLine;
+                  edge = calc.bEdge;
+                  pickDecision = getPick(edge, line, league, "team", { teamSc: calc.bS });
+                } else {
+                  continue; // Unsupported market for retrospective
+                }
+              } catch(e) { continue; }
+
+              if (pickDecision === "NO PLAY") continue;
+              const pickSide = getPickSideFromText(pickDecision);
+              if (pickSide !== side) continue;
+
+              let wouldWin = false;
+              if (side === "over") wouldWin = numericActual > line;
+              else if (side === "under") wouldWin = numericActual < line;
+
+              const delta = wouldWin ? (isWin ? 0 : 1) : (isWin ? -1 : 0);
+              if (delta !== 0) {
+                updateCandidateScore(league, marketKey, config, delta);
               }
-            } catch(e) { continue; }
-
-            if (pickDecision === "NO PLAY") continue;
-            const pickSide = getPickSideFromText(pickDecision);
-            if (pickSide !== side) continue;
-
-            let wouldWin = false;
-            if (side === "over") wouldWin = numericActual > line;
-            else if (side === "under") wouldWin = numericActual < line;
-
-            const delta = wouldWin ? (isWin ? 0 : 1) : (isWin ? -1 : 0);
-            if (delta !== 0) {
-              updateCandidateScore(league, marketKey, config, delta);
             }
           }
         }
       }
     }
-  }
 
-  // After processing, check if we have enough settled picks to lock a config
-  const totalPicks = getTotalSettledCountForLeagueMarket(league, marketKey);
-  if (totalPicks >= 10) {
-    const best = selectBestConfig(league, marketKey);
-    if (best && best.netDelta > 0) {
-      storeVerifiedConfig(league, marketKey, best.configKey, best.netDelta, best.sampleCount);
+    // After processing, check if we have enough settled picks to lock a config
+    const totalPicks = getTotalSettledCountForLeagueMarket(league, marketKey);
+    if (totalPicks >= 10) {
+      const best = selectBestConfig(league, marketKey);
+      if (best && best.netDelta > 0) {
+        storeVerifiedConfig(league, marketKey, best.configKey, best.netDelta, best.sampleCount);
+      }
     }
+  } finally {
+    // Restore original global state
+    g_massacreFetchContext = originalMassacreContext;
+    g_fetchMeta = originalFetchMeta;
+    g_injA = originalInjA;
+    g_injB = originalInjB;
+    selectedTeamIds = originalSelectedTeamIds;
   }
 }
 // ========================================================
@@ -10429,7 +10466,8 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
   });
 
   // 3. Run retrospective analysis if this is a settlement (win/loss/push)
-  if (["win", "loss", "push"].includes(normalizedStatus) && updatedPick.snapshot) {
+  // Only run if snapshot has full massacreContext (old picks without it would crash)
+  if (["win", "loss", "push"].includes(normalizedStatus) && updatedPick.snapshot && updatedPick.snapshot.massacreContext) {
     (async () => {
       try {
         await runRetrospectiveAnalysis(updatedPick);
@@ -10455,7 +10493,7 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
         else if (actual < marketLine) shadowStatus = side === "under" ? "win" : "loss";
         sp.resultStatus = shadowStatus;
         sp.settledAt = new Date().toISOString();
-        if (typeof runRetrospectiveAnalysis === "function") {
+        if (typeof runRetrospectiveAnalysis === "function" && sp.snapshot && sp.snapshot.massacreContext) {
           runRetrospectiveAnalysis(sp).catch(err => engineDebug("Shadow retro error", err));
         }
       }
@@ -16432,57 +16470,143 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
 
   // SNAPSHOT STORAGE: capture all inputs for retrospective analysis
   const snapshot = (function() {
-    if (!pickRow || pickRow.pick === "NO PLAY" || !pickRow.marketKey) return null;
-    const rawInputs = {};
-    try {
-      const parsedSnapshot = {
-        aFTScored: readLooseSeries("aFTScored"),
-        bFTScored: readLooseSeries("bFTScored"),
-        a1HScored: readLooseSeries("a1HScored"),
-        b1HScored: readLooseSeries("b1HScored"),
-        a2HScored: readLooseSeries("a2HScored"),
-        b2HScored: readLooseSeries("b2HScored"),
-        aQ1Scored: readLooseSeries("aQ1Scored"), aQ2Scored: readLooseSeries("aQ2Scored"),
-        aQ3Scored: readLooseSeries("aQ3Scored"), aQ4Scored: readLooseSeries("aQ4Scored"),
-        bQ1Scored: readLooseSeries("bQ1Scored"), bQ2Scored: readLooseSeries("bQ2Scored"),
-        bQ3Scored: readLooseSeries("bQ3Scored"), bQ4Scored: readLooseSeries("bQ4Scored"),
-        aFTH2H: readLooseSeries("aFTH2H"), bFTH2H: readLooseSeries("bFTH2H"),
-        a1HH2H: readLooseSeries("a1HH2H"), b1HH2H: readLooseSeries("b1HH2H"),
-        aQ1H2H: readLooseSeries("aQ1H2H"), bQ1H2H: readLooseSeries("bQ1H2H"),
-        aQ2H2H: readLooseSeries("aQ2H2H"), bQ2H2H: readLooseSeries("bQ2H2H"),
-        aQ3H2H: readLooseSeries("aQ3H2H"), bQ3H2H: readLooseSeries("bQ3H2H"),
-        aQ4H2H: readLooseSeries("aQ4H2H"), bQ4H2H: readLooseSeries("bQ4H2H"),
-        aFTScoredHome: readLooseSeries("aFTScoredHome"), aFTAllowedHome: readLooseSeries("aFTAllowedHome"),
-        aFTScoredAway: readLooseSeries("aFTScoredAway"), aFTAllowedAway: readLooseSeries("aFTAllowedAway"),
-        bFTScoredHome: readLooseSeries("bFTScoredHome"), bFTAllowedHome: readLooseSeries("bFTAllowedHome"),
-        bFTScoredAway: readLooseSeries("bFTScoredAway"), bFTAllowedAway: readLooseSeries("bFTAllowedAway")
-      };
-      const linesSnapshot = {
-        ftLine: parseMarketLine(document.getElementById("ftMarket")?.value || ""),
-        h1Line: parseMarketLine(document.getElementById("h1Market")?.value || ""),
-        aLine: parseMarketLine(document.getElementById("teamAMarket")?.value || ""),
-        bLine: parseMarketLine(document.getElementById("teamBMarket")?.value || "")
-      };
-      const fixtureMetaSnapshot = getCurrentFixtureMeta();
-      return {
-        league,
-        marketKey: pickRow.marketKey,
-        side: getPickSideFromText(pickRow.pick),
-        parsed: parsedSnapshot,
-        lines: linesSnapshot,
-        fixtureMeta: fixtureMetaSnapshot,
-        injMultA: g_injA.scoringMult,
-        injMultB: g_injB.scoringMult,
-        configSnapshot: {
-          recencyWeights: MODEL_TUNING.recencyWeights,
-          h2hFactor: 1.0,
-          paceDampening: 0.4,
-          edgeMult: 1.0,
-          injuryMult: 1.0
-        }
-      };
-    } catch(e) { return null; }
-  })();
+  if (!pickRow || pickRow.pick === "NO PLAY" || !pickRow.marketKey) return null;
+  const rawInputs = {};
+  try {
+    const parsedSnapshot = {
+      aFTScored: readLooseSeries("aFTScored"),
+      bFTScored: readLooseSeries("bFTScored"),
+      a1HScored: readLooseSeries("a1HScored"),
+      b1HScored: readLooseSeries("b1HScored"),
+      a2HScored: readLooseSeries("a2HScored"),
+      b2HScored: readLooseSeries("b2HScored"),
+      aQ1Scored: readLooseSeries("aQ1Scored"), aQ2Scored: readLooseSeries("aQ2Scored"),
+      aQ3Scored: readLooseSeries("aQ3Scored"), aQ4Scored: readLooseSeries("aQ4Scored"),
+      bQ1Scored: readLooseSeries("bQ1Scored"), bQ2Scored: readLooseSeries("bQ2Scored"),
+      bQ3Scored: readLooseSeries("bQ3Scored"), bQ4Scored: readLooseSeries("bQ4Scored"),
+      aFTH2H: readLooseSeries("aFTH2H"), bFTH2H: readLooseSeries("bFTH2H"),
+      a1HH2H: readLooseSeries("a1HH2H"), b1HH2H: readLooseSeries("b1HH2H"),
+      aQ1H2H: readLooseSeries("aQ1H2H"), bQ1H2H: readLooseSeries("bQ1H2H"),
+      aQ2H2H: readLooseSeries("aQ2H2H"), bQ2H2H: readLooseSeries("bQ2H2H"),
+      aQ3H2H: readLooseSeries("aQ3H2H"), bQ3H2H: readLooseSeries("bQ3H2H"),
+      aQ4H2H: readLooseSeries("aQ4H2H"), bQ4H2H: readLooseSeries("bQ4H2H"),
+      aFTScoredHome: readLooseSeries("aFTScoredHome"), aFTAllowedHome: readLooseSeries("aFTAllowedHome"),
+      aFTScoredAway: readLooseSeries("aFTScoredAway"), aFTAllowedAway: readLooseSeries("aFTAllowedAway"),
+      bFTScoredHome: readLooseSeries("bFTScoredHome"), bFTAllowedHome: readLooseSeries("bFTAllowedHome"),
+      bFTScoredAway: readLooseSeries("bFTScoredAway"), bFTAllowedAway: readLooseSeries("bFTAllowedAway")
+    };
+    const linesSnapshot = {
+      ftLine: parseMarketLine(document.getElementById("ftMarket")?.value || ""),
+      h1Line: parseMarketLine(document.getElementById("h1Market")?.value || ""),
+      aLine: parseMarketLine(document.getElementById("teamAMarket")?.value || ""),
+      bLine: parseMarketLine(document.getElementById("teamBMarket")?.value || "")
+    };
+    const fixtureMetaSnapshot = getCurrentFixtureMeta();
+    // Capture full runtime context for retrospective analysis
+    const massacreContextSnapshot = {
+      league: g_massacreFetchContext.league,
+      A: {
+        overall: g_massacreFetchContext.A?.overall ? { ...g_massacreFetchContext.A.overall } : null,
+        venue: g_massacreFetchContext.A?.venue ? { ...g_massacreFetchContext.A.venue } : null,
+        ortg10: [...(g_massacreFetchContext.A?.ortg10 || [])],
+        drtg10: [...(g_massacreFetchContext.A?.drtg10 || [])],
+        pace10: [...(g_massacreFetchContext.A?.pace10 || [])],
+        restDays: g_massacreFetchContext.A?.restDays,
+        seasonBaseline: g_massacreFetchContext.A?.seasonBaseline ? { ...g_massacreFetchContext.A.seasonBaseline } : null,
+        roster: g_massacreFetchContext.A?.roster ? [...g_massacreFetchContext.A.roster] : [],
+        sos: g_massacreFetchContext.A?.sos,
+        lastGameDate: g_massacreFetchContext.A?.lastGameDate,
+        q1Scored: [...(g_massacreFetchContext.A?.q1Scored || [])],
+        q2Scored: [...(g_massacreFetchContext.A?.q2Scored || [])],
+        q3Scored: [...(g_massacreFetchContext.A?.q3Scored || [])],
+        q4Scored: [...(g_massacreFetchContext.A?.q4Scored || [])],
+        q1Allowed: [...(g_massacreFetchContext.A?.q1Allowed || [])],
+        q2Allowed: [...(g_massacreFetchContext.A?.q2Allowed || [])],
+        q3Allowed: [...(g_massacreFetchContext.A?.q3Allowed || [])],
+        q4Allowed: [...(g_massacreFetchContext.A?.q4Allowed || [])]
+      },
+      B: {
+        overall: g_massacreFetchContext.B?.overall ? { ...g_massacreFetchContext.B.overall } : null,
+        venue: g_massacreFetchContext.B?.venue ? { ...g_massacreFetchContext.B.venue } : null,
+        ortg10: [...(g_massacreFetchContext.B?.ortg10 || [])],
+        drtg10: [...(g_massacreFetchContext.B?.drtg10 || [])],
+        pace10: [...(g_massacreFetchContext.B?.pace10 || [])],
+        restDays: g_massacreFetchContext.B?.restDays,
+        seasonBaseline: g_massacreFetchContext.B?.seasonBaseline ? { ...g_massacreFetchContext.B.seasonBaseline } : null,
+        roster: g_massacreFetchContext.B?.roster ? [...g_massacreFetchContext.B.roster] : [],
+        sos: g_massacreFetchContext.B?.sos,
+        lastGameDate: g_massacreFetchContext.B?.lastGameDate,
+        q1Scored: [...(g_massacreFetchContext.B?.q1Scored || [])],
+        q2Scored: [...(g_massacreFetchContext.B?.q2Scored || [])],
+        q3Scored: [...(g_massacreFetchContext.B?.q3Scored || [])],
+        q4Scored: [...(g_massacreFetchContext.B?.q4Scored || [])],
+        q1Allowed: [...(g_massacreFetchContext.B?.q1Allowed || [])],
+        q2Allowed: [...(g_massacreFetchContext.B?.q2Allowed || [])],
+        q3Allowed: [...(g_massacreFetchContext.B?.q3Allowed || [])],
+        q4Allowed: [...(g_massacreFetchContext.B?.q4Allowed || [])]
+      },
+      h2hGames: g_massacreFetchContext.h2hGames ? [...g_massacreFetchContext.h2hGames] : [],
+      refTendency: g_massacreFetchContext.refTendency ? { ...g_massacreFetchContext.refTendency } : null
+    };
+    const fetchMetaSnapshot = {
+      A: {
+        ft: { ...(g_fetchMeta?.A?.ft || { source: "manual", venueReliable: true }) },
+        h1: { ...(g_fetchMeta?.A?.h1 || { source: "manual", venueReliable: true }) },
+        h2: { ...(g_fetchMeta?.A?.h2 || { source: "manual", venueReliable: true }) }
+      },
+      B: {
+        ft: { ...(g_fetchMeta?.B?.ft || { source: "manual", venueReliable: true }) },
+        h1: { ...(g_fetchMeta?.B?.h1 || { source: "manual", venueReliable: true }) },
+        h2: { ...(g_fetchMeta?.B?.h2 || { source: "manual", venueReliable: true }) }
+      }
+    };
+    const injuryMetaSnapshot = {
+      A: {
+        scoringMult: g_injA.scoringMult,
+        notes: g_injA.notes ? [...g_injA.notes] : [],
+        outCount: g_injA.outCount,
+        dtdCount: g_injA.dtdCount,
+        unknownImpactCount: g_injA.unknownImpactCount,
+        hasUnknownImpact: g_injA.hasUnknownImpact,
+        highUncertainty: g_injA.highUncertainty
+      },
+      B: {
+        scoringMult: g_injB.scoringMult,
+        notes: g_injB.notes ? [...g_injB.notes] : [],
+        outCount: g_injB.outCount,
+        dtdCount: g_injB.dtdCount,
+        unknownImpactCount: g_injB.unknownImpactCount,
+        hasUnknownImpact: g_injB.hasUnknownImpact,
+        highUncertainty: g_injB.highUncertainty
+      }
+    };
+    const selectedTeamIdsSnapshot = {
+      A: selectedTeamIds.A,
+      B: selectedTeamIds.B
+    };
+    return {
+      league,
+      marketKey: pickRow.marketKey,
+      side: getPickSideFromText(pickRow.pick),
+      parsed: parsedSnapshot,
+      lines: linesSnapshot,
+      fixtureMeta: fixtureMetaSnapshot,
+      injMultA: g_injA.scoringMult,
+      injMultB: g_injB.scoringMult,
+      configSnapshot: {
+        recencyWeights: MODEL_TUNING.recencyWeights,
+        h2hFactor: 1.0,
+        paceDampening: 0.4,
+        edgeMult: 1.0,
+        injuryMult: 1.0
+      },
+      massacreContext: massacreContextSnapshot,
+      fetchMeta: fetchMetaSnapshot,
+      injuryMeta: injuryMetaSnapshot,
+      selectedTeamIds: selectedTeamIdsSnapshot
+    };
+  } catch(e) { return null; }
+})();
 
   // Always save a shadow record, even for NO PLAY, but don't show it in main tracker
   const isActualPlay = !(
