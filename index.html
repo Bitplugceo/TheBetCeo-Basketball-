@@ -1,4 +1,4 @@
-D
+E
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6398,7 +6398,7 @@ function updateTrackerInsightsButton() {
   }
 
   if (copyBtn) {
-    copyBtn.style.display = isTrackerReportView() ? "" : "none";
+    copyBtn.style.display = (isTrackerReportView() || isTrackerConfigsView()) ? "" : "none";
   }
 
   if (configBtn) {
@@ -8983,8 +8983,8 @@ function renderConfigsPanel() {
 
   let html = `
     <div class="tracker-analytics-shell">
-      <div class="tracker-analytics-topbar">
-        <div class="tracker-analytics-heading">
+      <div class="tracker-analytics-topbar" style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;">
+        <div class="tracker-analytics-heading" style="flex:1;">
           <div class="tracker-analytics-kicker">Configuration Lab</div>
           <div class="tracker-analytics-title">Pick-by-Pick Config Replay</div>
           <div class="tracker-analytics-subtitle">
@@ -8993,6 +8993,7 @@ function renderConfigsPanel() {
             immediately improves future predictions.
           </div>
         </div>
+        <button id="configsCopyBtn" onclick="copyConfigsData()" title="Copy all config &amp; pick data" style="background:var(--panel);border:1px solid var(--table-border);color:var(--tracker-strong);padding:6px 10px;font-size:14px;line-height:1;cursor:pointer;flex-shrink:0;margin-top:2px;">📋</button>
       </div>
   `;
 
@@ -18537,7 +18538,10 @@ if (headerErrorBtn) {
       // if (trackerInsightsBtn) trackerInsightsBtn.addEventListener("click", toggleTrackerInsights);
 
       const trackerCopyDataBtn = document.getElementById("trackerCopyDataBtn");
-      if (trackerCopyDataBtn) trackerCopyDataBtn.addEventListener("click", copyTrackerData);
+      if (trackerCopyDataBtn) trackerCopyDataBtn.addEventListener("click", function() {
+        if (isTrackerConfigsView()) copyConfigsData();
+        else copyTrackerData();
+      });
 
       const trackerHeadTitle = document.getElementById("trackerHeadTitle");
       if (trackerHeadTitle) trackerHeadTitle.addEventListener("click", () => {
@@ -19599,6 +19603,110 @@ function copyTrackerData() {
       document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
       finish(true);
     } catch (_) { finish(false); }
+  }
+}
+
+function copyConfigsData() {
+  const lines = [];
+  lines.push('==========================================');
+  lines.push('   BB ENGINE: CONFIG LAB FULL EXPORT     ');
+  lines.push('==========================================');
+  lines.push('Generated: ' + new Date().toLocaleString());
+  lines.push('');
+
+  lines.push('--- VERIFIED CONFIGS (LOCKED & ACTIVE) ---');
+  let hasVerified = false;
+  try {
+    Object.keys(localStorage).forEach(function(k) {
+      if (k.startsWith('BB_VERIFIED_CONFIG_')) {
+        const meta = k.slice('BB_VERIFIED_CONFIG_'.length);
+        try {
+          const data = JSON.parse(localStorage.getItem(k) || '{}');
+          if (data && data.verified) {
+            hasVerified = true;
+            lines.push('League/Market : ' + meta);
+            lines.push('Config Key    : ' + (data.configKey || '—'));
+            lines.push('Net Delta     : ' + (data.netDelta || 0) + ' over ' + (data.sampleCount || '?') + ' picks');
+            lines.push('Updated       : ' + (data.updatedAt || '—'));
+            lines.push('Manual Override: ' + (data.manualOverride ? 'Yes' : 'No'));
+            lines.push('');
+          }
+        } catch(e) {}
+      }
+    });
+  } catch(e) {}
+  if (!hasVerified) lines.push('No verified configs locked yet.');
+  lines.push('');
+
+  lines.push('--- CANDIDATE CONFIGS (BEST SO FAR) ---');
+  let hasCandidates = false;
+  try {
+    Object.keys(localStorage).forEach(function(k) {
+      if (k.startsWith('BB_CANDIDATE_SCORES_')) {
+        const meta = k.slice('BB_CANDIDATE_SCORES_'.length);
+        try {
+          const scores = JSON.parse(localStorage.getItem(k) || '{}');
+          let best = null;
+          Object.entries(scores).forEach(function(entry) {
+            const ck = entry[0], d = entry[1];
+            if (!best || d.netDelta > best.netDelta) best = { configKey: ck, netDelta: d.netDelta, count: d.count || 0 };
+          });
+          if (best) {
+            hasCandidates = true;
+            lines.push('League/Market : ' + meta);
+            lines.push('Best Candidate: ' + best.configKey);
+            lines.push('Net Delta     : ' + best.netDelta + ' over ' + best.count + ' picks');
+            lines.push('');
+          }
+        } catch(e) {}
+      }
+    });
+  } catch(e) {}
+  if (!hasCandidates) lines.push('No candidate config data yet.');
+  lines.push('');
+
+  lines.push('--- SETTLED PICK REPLAY ---');
+  const settledPicks = getAllTrackedPicksForReport()
+    .filter(function(p) { return p.resultStatus === 'win' || p.resultStatus === 'loss'; })
+    .sort(function(a, b) { return getTrackedPickTimeMs(b) - getTrackedPickTimeMs(a); });
+  lines.push('Total Settled: ' + settledPicks.length);
+  lines.push('');
+  settledPicks.forEach(function(p, i) {
+    const market = String(p.marketName || p.marketKey || '—').split('<')[0].trim();
+    const match = (p.homeTeam || 'A') + ' vs ' + (p.awayTeam || 'B');
+    const pickTxt = p.predictionText || '—';
+    const lineVal = isFinite(Number(p.line)) ? p.line : '—';
+    const actual = p.actualScore != null ? String(p.actualScore) : '—';
+    const result = String(p.resultStatus || '').toUpperCase();
+    lines.push((i + 1) + '. ' + match);
+    lines.push('   ' + market + ' | ' + String(p.league || '').toUpperCase());
+    lines.push('   ' + result + ': ' + pickTxt + ' @ ' + lineVal + ' — Final: ' + actual);
+    lines.push('');
+  });
+  if (!settledPicks.length) lines.push('No settled picks yet.');
+
+  const text = lines.join('\n');
+  const btn = document.getElementById('configsCopyBtn');
+  const setFeedback = function(ok) {
+    if (!btn) return;
+    const orig = btn.textContent;
+    btn.textContent = ok ? '✅' : '❌';
+    setTimeout(function() { if (btn) btn.textContent = orig; }, 1800);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function() { setFeedback(true); }).catch(function() {
+      try {
+        const ta = Object.assign(document.createElement('textarea'), { value: text, style: 'position:fixed;opacity:0' });
+        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+        setFeedback(true);
+      } catch(_) { setFeedback(false); }
+    });
+  } else {
+    try {
+      const ta = Object.assign(document.createElement('textarea'), { value: text, style: 'position:fixed;opacity:0' });
+      document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+      setFeedback(true);
+    } catch(_) { setFeedback(false); }
   }
 }
 
