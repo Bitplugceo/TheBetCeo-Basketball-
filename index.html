@@ -1,4 +1,3 @@
-P
 
 <!DOCTYPE html>
 <html lang="en">
@@ -3262,36 +3261,7 @@ function parseSofascoreIndividual(side) {
   const st = document.getElementById("ssFetchStatus");
   if (!rawText) return;
 
-  // [FIX: TRUNCATED JSON RECOVERY] If JSON is truncated (clipboard cut off), attempt
-  // to close open arrays/objects before parsing. This prevents "Unterminated string"
-  // and "Expected '}'" crashes visible in the debug log when pasting partial API responses.
-  if (rawText.length > 0) {
-    // Count open braces/brackets to detect truncation
-    let openBraces = 0, openBrackets = 0, inString = false, escape = false;
-    for (let ci = 0; ci < rawText.length; ci++) {
-      const ch = rawText[ci];
-      if (escape) { escape = false; continue; }
-      if (ch === '\\' && inString) { escape = true; continue; }
-      if (ch === '"') { inString = !inString; continue; }
-      if (inString) continue;
-      if (ch === '{') openBraces++;
-      else if (ch === '}') openBraces--;
-      else if (ch === '[') openBrackets++;
-      else if (ch === ']') openBrackets--;
-    }
-    // If we have unclosed structures, try to close them
-    if (openBraces > 0 || openBrackets > 0) {
-      // Trim trailing comma or incomplete value
-      const truncated = rawText.replace(/,\s*$/, '').replace(/:\s*"[^"]*$/, ': null').replace(/:\s*\d*$/, ': null').replace(/:\s*$/, ': null');
-      // Close open brackets first, then braces
-      let repaired = truncated;
-      for (let b = 0; b < openBrackets; b++) repaired += ']';
-      for (let b = 0; b < openBraces; b++) repaired += '}';
-      if (st) { st.style.color = "#d98a00"; st.textContent = "⚠️ Truncated JSON detected — attempting repair..."; }
-      rawText = repaired;
-    }
-  }
-
+  // JSON truncation recovery is too brittle; fail fast to avoid silent corruption
   try {
     const parsed = JSON.parse(rawText);
     const events = parsed.events || [];
@@ -15134,48 +15104,46 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
   const _mcKey = `${mean.toFixed(4)}|${safeStdDev.toFixed(4)}|${line}|${runs}|${_distType}`;
   if (_mcCache.has(_mcKey)) return _mcCache.get(_mcKey);
 
-      // [LOCK: MONTE CARLO – normal distribution only (stable version)]
-    // Cauchy mixture removed due to edge cases producing infinite values.
-    // Historical std deviation fix already improves tail estimation.
-    const workerCode = `
-    onmessage = function(e) {
-      const { mean, safeStdDev, line, runs, useTDist, df } = e.data;
-      const safeRuns = runs % 2 === 0 ? runs : runs + 1;
-      function bm() {
-        let u1 = Math.random(), u2 = Math.random();
-        while (u1 === 0) u1 = Math.random();
-        return Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-      }
-      function tDist(dof) {
-        let chi2 = 0;
-        for (let k = 0; k < dof; k++) { const g = bm(); chi2 += g * g; }
-        return bm() / Math.sqrt(chi2 / dof);
-      }
-      let overHits = 0;
-      for (let i = 0; i < safeRuns; i += 2) {
-        const z = useTDist ? tDist(df || 7) : bm();
-        const s1 = Math.max(0, mean + safeStdDev * z);
-        const s2 = Math.max(0, mean - safeStdDev * z);
-        if (s1 > line) overHits++;
-        if (s2 > line) overHits++;
-      }
-      const overPct = (overHits / safeRuns) * 100;
-      postMessage({ overPct, underPct: 100 - overPct });
-    };
-    `;
-
-    const blob = new Blob([workerCode], { type: "application/javascript" });
-        let workerUrl, worker;
+  // Immediately attempt synchronous fallback if Worker creation might fail (CSP/Private Mode)
+  // This avoids the timeout race that can cause "DataCloneError" when terminating a resolved worker.
+  let useFallback = false;
+  let workerUrl = null, worker = null;
   try {
-    workerUrl = URL.createObjectURL(blob); 
+    const blob = new Blob([`
+      onmessage = function(e) {
+        const { mean, safeStdDev, line, runs, useTDist, df } = e.data;
+        const safeRuns = runs % 2 === 0 ? runs : runs + 1;
+        function bm() {
+          let u1 = Math.random(), u2 = Math.random();
+          while (u1 === 0) u1 = Math.random();
+          return Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+        }
+        function tDist(dof) {
+          let chi2 = 0;
+          for (let k = 0; k < dof; k++) { const g = bm(); chi2 += g * g; }
+          return bm() / Math.sqrt(chi2 / dof);
+        }
+        let overHits = 0;
+        for (let i = 0; i < safeRuns; i += 2) {
+          const z = useTDist ? tDist(df || 7) : bm();
+          const s1 = Math.max(0, mean + safeStdDev * z);
+          const s2 = Math.max(0, mean - safeStdDev * z);
+          if (s1 > line) overHits++;
+          if (s2 > line) overHits++;
+        }
+        const overPct = (overHits / safeRuns) * 100;
+        postMessage({ overPct, underPct: 100 - overPct });
+      };
+    `], { type: "application/javascript" });
+    workerUrl = URL.createObjectURL(blob);
     worker = new Worker(workerUrl);
   } catch (err) {
+    useFallback = true;
     if (workerUrl) URL.revokeObjectURL(workerUrl);
-    console.warn("[BB Engine] Worker blocked (Private Mode/CSP). Running Monte Carlo synchronously.");
-    // [LOCK: ANTITHETIC VARIATES + STUDENT-T FALLBACK — mirrors Worker logic exactly]
-    // Paired (z, -z) samples halve estimator variance at the same run count.
-    // Student-t df=7 used when sigma/line > 5% (heavy-tailed market spreads).
-    // DO NOT revert to independent Normal draws — this is the correct statistical path.
+  }
+
+  if (useFallback || !worker) {
+    // Synchronous fallback (no worker, no timeout)
     const _fbUseTDist = (safeStdDev / Math.max(line, 1)) > 0.05;
     const _fbRuns = runs % 2 === 0 ? runs : runs + 1;
     function _fbBM() {
@@ -15197,13 +15165,14 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
       if (s2 > line) overHits++;
     }
     const overPct = (overHits / _fbRuns) * 100;
-    return { overPct, underPct: 100 - overPct };
+    const result = { overPct, underPct: 100 - overPct };
+    _mcCache.set(_mcKey, result);
+    return result;
   }
 
-
+  // Worker created successfully – run with timeout but ensure cleanup doesn't cause errors
   let failsafeTimer;
   let _mcResolved = false;
-
   const workerPromise = new Promise((resolve, reject) => {
     worker.onmessage = (e) => {
       if (_mcResolved) return;
@@ -15221,17 +15190,10 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
       URL.revokeObjectURL(workerUrl);
       reject(err);
     };
-
-    // [LOCK: PASS DISTRIBUTION PARAMS TO WORKER — antithetic variates + Student-t df=7]
-    // _wUseTDist: heavy-tailed distribution when sigma/line > 5% (wide-spread markets).
-    // _wRuns must be even so paired (z, -z) samples are always complete.
-    // DO NOT revert to postMessage({ mean, safeStdDev, line, runs }) — missing params
-    // cause worker to silently use independent Normal draws, losing all variance reduction.
     const _wUseTDist = (safeStdDev / Math.max(line, 1)) > 0.05;
     const _wRuns = runs % 2 === 0 ? runs : runs + 1;
     worker.postMessage({ mean, safeStdDev, line, runs: _wRuns, useTDist: _wUseTDist, df: 7 });
   });
-
 
   const timeoutPromise = new Promise((resolve) => {
     failsafeTimer = setTimeout(() => {
@@ -15241,10 +15203,9 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
       URL.revokeObjectURL(workerUrl);
       console.warn("[BB Engine] Worker timed out. Reverting to median.");
       resolve({ overPct: 50, underPct: 50 });
-    }, 3000);
+    }, 8000);
   });
 
-  // [CLOSED: FIX 14] Await race, cache result, return.
   const _mcResult = await Promise.race([workerPromise, timeoutPromise]);
   _mcCache.set(_mcKey, _mcResult);
   return _mcResult;
@@ -15270,12 +15231,17 @@ function getHistoricalStdDev(league, marketKey) {
   return Math.sqrt(sqSum / (entries.length - 1));
 }
 
-async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
+async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta, safeContextOverride = null) {
 
 
   const marketKey = getMarketKeyFromName(pickRow?.name);
   const side = getPickSideFromText(pickRow?.pick);
   const thresholds = getMassacreThresholdBucket(league, marketKey);
+  // Use the safe context if provided, otherwise fall back to global
+  const originalContext = g_massacreFetchContext;
+  if (safeContextOverride) {
+    g_massacreFetchContext = safeContextOverride;
+  }
   const windows = getMassacreMarketWindowSet(marketKey, parsed, fixtureMeta);
 
   const isTeamMarket = marketKey === "team_a" || marketKey === "team_b";
@@ -15538,7 +15504,7 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
   if (brutalityScore < thresholds.brutality) failedReasons.push(`score ${brutalityScore.toFixed(0)}`);
   if (isFinite(modelRange) && modelRange > getMassacreModelRangeLimit(marketKey, pickRow?.line)) failedReasons.push(`range ${modelRange.toFixed(1)}`);
 
-  return {
+  const result = {
     marketKey,
     modelCount: trimmedModels.length,
     agreement,
@@ -15563,6 +15529,11 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta) {
       Math.max(0, simPct - 50) * 0.18 +
       Math.max(0, brutalityScore - 50) * 0.04
   };
+  // Restore original context if we overrode it
+  if (safeContextOverride) {
+    g_massacreFetchContext = originalContext;
+  }
+  return result;
 }
 
 function getMassacreProfile(diag, pickRow, league) {
@@ -16045,7 +16016,63 @@ function checkModelHealth(league) {
     if (isExotic) return;
 
     const originalPick = p.pick;
-    const diag = await evaluateMassacreForPick(p, league, parsed, fixtureMeta);
+    // Safely access massacre context with null checks
+    const ctxA = g_massacreFetchContext?.A || {};
+    const ctxB = g_massacreFetchContext?.B || {};
+    const overallA = ctxA.overall || {};
+    const overallB = ctxB.overall || {};
+    const venueA = ctxA.venue || {};
+    const venueB = ctxB.venue || {};
+
+    // Create a temporary safe copy of the massacre context for evaluateMassacreForPick
+    const safeContext = {
+      ...g_massacreFetchContext,
+      A: {
+        ...ctxA,
+        overall: overallA,
+        venue: venueA,
+        restDays: ctxA.restDays,
+        lastGameDate: ctxA.lastGameDate,
+        seasonBaseline: ctxA.seasonBaseline,
+        ortg10: ctxA.ortg10 || [],
+        drtg10: ctxA.drtg10 || [],
+        pace10: ctxA.pace10 || [],
+        q1Scored: ctxA.q1Scored || [],
+        q2Scored: ctxA.q2Scored || [],
+        q3Scored: ctxA.q3Scored || [],
+        q4Scored: ctxA.q4Scored || [],
+        q1Allowed: ctxA.q1Allowed || [],
+        q2Allowed: ctxA.q2Allowed || [],
+        q3Allowed: ctxA.q3Allowed || [],
+        q4Allowed: ctxA.q4Allowed || [],
+        roster: ctxA.roster || []
+      },
+      B: {
+        ...ctxB,
+        overall: overallB,
+        venue: venueB,
+        restDays: ctxB.restDays,
+        lastGameDate: ctxB.lastGameDate,
+        seasonBaseline: ctxB.seasonBaseline,
+        ortg10: ctxB.ortg10 || [],
+        drtg10: ctxB.drtg10 || [],
+        pace10: ctxB.pace10 || [],
+        q1Scored: ctxB.q1Scored || [],
+        q2Scored: ctxB.q2Scored || [],
+        q3Scored: ctxB.q3Scored || [],
+        q4Scored: ctxB.q4Scored || [],
+        q1Allowed: ctxB.q1Allowed || [],
+        q2Allowed: ctxB.q2Allowed || [],
+        q3Allowed: ctxB.q3Allowed || [],
+        q4Allowed: ctxB.q4Allowed || [],
+        roster: ctxB.roster || []
+      },
+      h2hGames: Array.isArray(g_massacreFetchContext?.h2hGames) ? g_massacreFetchContext.h2hGames : [],
+      refTendency: g_massacreFetchContext?.refTendency || null,
+      league: g_massacreFetchContext?.league || league
+    };
+
+    const diag = await evaluateMassacreForPick(p, league, parsed, fixtureMeta, safeContext);
     const winProb = computeMassacreWinProb(diag, league, p.marketKey);
     const profile = getMassacreProfile(diag, p, league);
 
@@ -19082,36 +19109,54 @@ document.addEventListener('DOMContentLoaded', function() {
       };
       window.fetchESPN._afdbPatched = true;
     }
-    if (typeof fetchScheduleCore === 'function' && !fetchScheduleCore._afdbPatched) {
-      const _origSched = fetchScheduleCore;
-      window.fetchScheduleCore = async function(base, teamId, league) {
-        try {
-          const res = await _origSched.apply(this, arguments);
-          if (!res) AFDB.log('ERROR','scheduleCore','NULL RESULT for teamId=' + teamId + ' — this blocks auto-fill!');
-          return res;
-        } catch(err) { AFDB.log('ERROR','scheduleCore','THREW for teamId=' + teamId + ': ' + err.message); throw err; }
-      };
-      window.fetchScheduleCore._afdbPatched = true;
+    // Increase wait and retry: wait up to 10 seconds, checking every 200ms
+    let _patchAttempts = 0;
+    const _maxPatchAttempts = 50; // 50 * 200ms = 10 seconds
+    function _patchIfReady() {
+      const schedReady = typeof fetchScheduleCore === 'function' && !fetchScheduleCore._afdbPatched;
+      const h2hReady = typeof fetchH2HCore === 'function' && !fetchH2HCore._afdbPatched;
+      const searchReady = typeof searchTeamFromAPI === 'function' && !searchTeamFromAPI._afdbPatched;
+      if (schedReady || h2hReady || searchReady) {
+        if (schedReady && typeof fetchScheduleCore === 'function') {
+          const _origSched = fetchScheduleCore;
+          window.fetchScheduleCore = async function(base, teamId, league) {
+            try {
+              const res = await _origSched.apply(this, arguments);
+              if (!res) AFDB.log('ERROR','scheduleCore','NULL RESULT for teamId=' + teamId + ' — this blocks auto-fill!');
+              return res;
+            } catch(err) { AFDB.log('ERROR','scheduleCore','THREW for teamId=' + teamId + ': ' + err.message); throw err; }
+          };
+          window.fetchScheduleCore._afdbPatched = true;
+        }
+        if (h2hReady && typeof fetchH2HCore === 'function') {
+          const _origH2H = fetchH2HCore;
+          window.fetchH2HCore = async function(base, teamAId, teamBId, leagueKey) {
+            try { return await _origH2H.apply(this, arguments); }
+            catch(err) { AFDB.log('ERROR','h2hCore','H2H THREW: ' + err.message); throw err; }
+          };
+          window.fetchH2HCore._afdbPatched = true;
+        }
+        if (searchReady && typeof searchTeamFromAPI === 'function') {
+          const _origSearch = searchTeamFromAPI;
+          window.searchTeamFromAPI = async function(base, name, league) {
+            try {
+              const res = await _origSearch.apply(this, arguments);
+              if (!res) AFDB.log('ERROR','searchTeam','Team ID NOT FOUND for "' + name + '" in ' + league + ' — THIS BLOCKS FETCH!');
+              return res;
+            } catch(err) { AFDB.log('ERROR','searchTeam','searchTeamFromAPI threw for "' + name + '": ' + err.message); throw err; }
+          };
+          window.searchTeamFromAPI._afdbPatched = true;
+        }
+      } else {
+        _patchAttempts++;
+        if (_patchAttempts < _maxPatchAttempts) {
+          setTimeout(_patchIfReady, 200);
+        } else {
+          AFDB.log('WARN','AFDB','Patch timeout: core functions not available after 10 seconds');
+        }
+      }
     }
-    if (typeof fetchH2HCore === 'function' && !fetchH2HCore._afdbPatched) {
-      const _origH2H = fetchH2HCore;
-      window.fetchH2HCore = async function(base, teamAId, teamBId, leagueKey) {
-        try { return await _origH2H.apply(this, arguments); }
-        catch(err) { AFDB.log('ERROR','h2hCore','H2H THREW: ' + err.message); throw err; }
-      };
-      window.fetchH2HCore._afdbPatched = true;
-    }
-    if (typeof searchTeamFromAPI === 'function' && !searchTeamFromAPI._afdbPatched) {
-      const _origSearch = searchTeamFromAPI;
-      window.searchTeamFromAPI = async function(base, name, league) {
-        try {
-          const res = await _origSearch.apply(this, arguments);
-          if (!res) AFDB.log('ERROR','searchTeam','Team ID NOT FOUND for "' + name + '" in ' + league + ' — THIS BLOCKS FETCH!');
-          return res;
-        } catch(err) { AFDB.log('ERROR','searchTeam','searchTeamFromAPI threw for "' + name + '": ' + err.message); throw err; }
-      };
-      window.searchTeamFromAPI._afdbPatched = true;
-    }
+    setTimeout(_patchIfReady, 200);
   }, 0); // end inner setTimeout
   })(); // end and invoke _tryPatchAfdb
 });
