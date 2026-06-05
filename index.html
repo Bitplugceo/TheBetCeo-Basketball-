@@ -1,4 +1,3 @@
-A
 
 <!DOCTYPE html>
 <html lang="en">
@@ -11038,7 +11037,7 @@ function handleTrackedPicksActionClick(event) {
           const _prevSettled = Number(_ckpt.settledCount || 0);
           if (_nowSettled - _prevSettled >= 25) {
             setTimeout(() => {
-              try { calibrateMassacreCoefficients(); } catch(e) {}
+              try { if (typeof window.calibrateMassacreCoefficients === 'function') window.calibrateMassacreCoefficients(); } catch(e) {}
               try { calibrateConfidenceModel(); } catch(e) {}
               try { optimizePickThresholds(); } catch(e) {}
               try { runOutOfSampleValidation(); } catch(e) {}
@@ -15161,7 +15160,8 @@ async function runMassacreMonteCarlo(mean, simStdDev, line, runs = 8000) {
     }, 8000);
   });
 
-  const _mcResult = await Promise.race([workerPromise, timeoutPromise]);
+  const _mcResult = await Promise.race([workerPromise, timeoutPromise])
+    .catch(() => ({ overPct: 50, underPct: 50 }));
   _mcCache.set(_mcKey, _mcResult);
   return _mcResult;
 }
@@ -15197,6 +15197,7 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta, saf
   if (safeContextOverride) {
     g_massacreFetchContext = safeContextOverride;
   }
+  try {
   const windows = getMassacreMarketWindowSet(marketKey, parsed, fixtureMeta);
 
   const isTeamMarket = marketKey === "team_a" || marketKey === "team_b";
@@ -15279,9 +15280,10 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta, saf
       ? projectMassacreTeam(teamSide, windows.overallA5Scored, windows.overallA5Allowed, windows.overallB5Scored, windows.overallB5Allowed)
       : projectMassacreTotal(windows.overallA5Scored, windows.overallA5Allowed, windows.overallB5Scored, windows.overallB5Allowed);
 
+  const _safeCtxForPace = safeContextOverride || g_massacreFetchContext;
   const paceMetric = (() => {
-    const pA = g_massacreFetchContext?.A?.pace10;
-    const pB = g_massacreFetchContext?.B?.pace10;
+    const pA = _safeCtxForPace?.A?.pace10;
+    const pB = _safeCtxForPace?.B?.pace10;
     if (Array.isArray(pA) && pA.length >= 2 && Array.isArray(pB) && pB.length >= 2) {
       const avgPA = avgOrNaN(pA);
       const avgPB = avgOrNaN(pB);
@@ -15484,11 +15486,12 @@ async function evaluateMassacreForPick(pickRow, league, parsed, fixtureMeta, saf
       Math.max(0, simPct - 50) * 0.18 +
       Math.max(0, brutalityScore - 50) * 0.04
   };
-  // Restore original context if we overrode it
-  if (safeContextOverride) {
-    g_massacreFetchContext = originalContext;
-  }
   return result;
+  } finally {
+    if (safeContextOverride) {
+      g_massacreFetchContext = originalContext;
+    }
+  }
 }
 
 function getMassacreProfile(diag, pickRow, league) {
@@ -15962,6 +15965,7 @@ function checkModelHealth(league) {
 }
 
   const _runOneMassacrePick = async (p) => {
+    try {
     if (!p || p.note || p.pick === "NO PLAY") return;
 
     const side = getPickSideFromText(p.pick);
@@ -16063,6 +16067,9 @@ function checkModelHealth(league) {
     } else if (winProb < 0.65) {
       p.confidence = bumpConfidenceGrade(p.confidence, -1);
     }
+    } catch (err) {
+      engineDebug("Massacre pick failed, skipping", { market: p?.marketKey, error: err?.message });
+    }
   };
 
   for (let _bi = 0; _bi < picks.length; _bi += _massacreBatchSize) {
@@ -16074,6 +16081,8 @@ function checkModelHealth(league) {
   if (leagueTrust.mode !== "block") {
     rescueBestMassacreLean(picks);
   }
+  // Expose local calibration function to module scope so the retraining pipeline can reach it
+  window.calibrateMassacreCoefficients = calibrateMassacreCoefficients;
 }
 
 
@@ -16877,6 +16886,7 @@ async function runEngine() {
   acknowledgeGlobalEngineAlert();
   renderEngineDebugPanel();
   if (runBtn) runBtn.disabled = true;
+  const _savedRecencyWeights = [...MODEL_TUNING.recencyWeights];
   engineDebug("run start", {
     trackerKey: getTrackerUserKey(),
     trackerState: getTrackerStateDebugScore(g_trackerState),
@@ -17119,7 +17129,7 @@ const h1Calc = compute1HProjection({
           h1Calc.projB1H = NaN;
         }
 
-                        const computeQ = (qKey, lineVal) => {
+                        const computeQ = (qKey, lineVal, injA = g_injA.scoringMult, injB = g_injB.scoringMult) => {
       if (!lineVal) return null;
 
       const aS = getManualSeries("A", qKey, parsed);
@@ -17137,10 +17147,6 @@ const h1Calc = compute1HProjection({
       let projA = (avgOrNaN(aS) * 0.55 + avgOrNaN(bA) * 0.45) * quarterPaceFactor;
       let projB = (avgOrNaN(bS) * 0.55 + avgOrNaN(aA) * 0.45) * quarterPaceFactor;
 
-      
-      // Apply injury multipliers (if missing, default to 1)
-      const injA = (typeof injMultA !== 'undefined') ? injMultA : 1;
-      const injB = (typeof injMultB !== 'undefined') ? injMultB : 1;
       projA *= injA;
       projB *= injB;
 
@@ -17578,9 +17584,10 @@ finalPicksForDisplay.forEach(p => {
     finalPicksForDisplay.forEach(p => {
   if (p.pick !== "NO PLAY") {
     const grade = String(p.confidence || "").replace(/[^ABCD]/g, '').charAt(0);
-    // Only allow A and B grades
+    // Only allow A and B grades; lean rescue picks bypass this gate
     const allowB = true;
-    if (grade !== "A" && (grade !== "B" || !allowB)) {
+    const isLean = p.recommendationTier === "lean";
+    if (!isLean && grade !== "A" && (grade !== "B" || !allowB)) {
       p.pick = "NO PLAY";
       p.displayPick = "NO PLAY";
       p.confidence = "—";
@@ -17861,6 +17868,7 @@ if (trackedToSave.length) {
     }
   } finally {
     window.__engineRunInProgress = false;
+    MODEL_TUNING.recencyWeights = _savedRecencyWeights;
     engineDebug("run finally", { trackerState: getTrackerStateDebugScore(g_trackerState) });
     if (runBtn) runBtn.disabled = false;
   }
