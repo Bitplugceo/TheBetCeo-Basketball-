@@ -1,4 +1,4 @@
-E
+F
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3691,15 +3691,14 @@ const MODEL_TUNING = {
 
 // ========== RETROSPECTIVE TUNING GRID ==========
 const TUNING_GRID = {
-  h2hFactors: [0.5, 0.75, 1.0, 1.25, 1.5],
+  h2hFactors: [0.75, 1.0, 1.25],
   recencyProfiles: [
     [1.35, 1.20, 1.00, 0.85, 0.70], // standard
-    [1.60, 1.30, 0.90, 0.60, 0.40], // aggressive
-    [1.00, 1.00, 1.00, 1.00, 1.00]  // flat
+    [1.60, 1.30, 0.90, 0.60, 0.40]  // aggressive
   ],
-  paceDampenings: [0.25, 0.40, 0.55],
-  edgeMults: [0.90, 1.00, 1.10],
-  injuryMults: [0.8, 1.0, 1.2]
+  paceDampenings: [0.35, 0.50],
+  edgeMults: [0.95, 1.00, 1.05],
+  injuryMults: [0.9, 1.1]
 };
 // ==============================================
 
@@ -3744,17 +3743,17 @@ function selectBestConfig(league, marketKey) {
     if (raw) scores = JSON.parse(raw);
     else return null;
   } catch(e) { return null; }
-  let bestKey = null;
-  let bestNetDelta = -Infinity;
-  for (const [key, data] of Object.entries(scores)) {
-    if (data.netDelta > bestNetDelta) {
-      bestNetDelta = data.netDelta;
-      bestKey = key;
-    }
-  }
-  if (!bestKey) return null;
-  // Parse bestKey back into config (simplified – just return the key for storage)
-  return { configKey: bestKey, netDelta: bestNetDelta, sampleCount: scores[bestKey].count };
+  // Require at least 8 tested picks; rank by efficiency (netDelta per tested pick)
+  const qualified = Object.entries(scores)
+    .filter(([, d]) => (d.count || 0) >= 8 && (d.netDelta || 0) > 0)
+    .map(([key, d]) => ({
+      key, netDelta: d.netDelta || 0, count: d.count || 0,
+      efficiency: (d.netDelta || 0) / Math.max(1, d.count || 1)
+    }))
+    .sort((a, b) => b.efficiency - a.efficiency);
+  if (!qualified.length) return null;
+  const best = qualified[0];
+  return { configKey: best.key, netDelta: best.netDelta, sampleCount: best.count };
 }
 
 function storeVerifiedConfig(league, marketKey, configKey, netDelta, sampleCount) {
@@ -3859,10 +3858,12 @@ async function runRetrospectiveAnalysis(pick) {
   }
 
   // After processing, check if we have enough settled picks to lock a config
-  const totalPicks = getTotalSettledCountForLeagueMarket(league, marketKey);
-  if (totalPicks >= 10) {
+  const _mktPicks = getTotalSettledCountForLeagueMarket(league, marketKey);
+  const _lgPicks  = getTotalSettledCountForLeague(league);
+  const _lockReady = _mktPicks >= 20 || (_lgPicks >= 40 && _mktPicks >= 8);
+  if (_lockReady) {
     const best = selectBestConfig(league, marketKey);
-    if (best && best.netDelta > 0) {
+    if (best && best.netDelta > 1.5) {
       storeVerifiedConfig(league, marketKey, best.configKey, best.netDelta, best.sampleCount);
     }
   }
@@ -11790,7 +11791,10 @@ function calibrateConfidenceModel() {
   return "D";
 }
 
-    function anchorProjection(proj, line, league, marketType) {
+    const _anchorCapCache = new Map();
+const _ANCHOR_CAP_TTL_MS = 90000;
+
+function anchorProjection(proj, line, league, marketType) {
   const enabled = !!MODEL_TUNING.anchorEnabled?.[marketType];
   if (!enabled || !isFinite(proj) || !isFinite(line) || line <= 0) return proj;
 
@@ -11810,22 +11814,30 @@ function calibrateConfidenceModel() {
   // Low MAE (accurate model) → lower cap (model trusted more, less market pull).
   // High MAE (noisy model) → higher cap (more market pull, capped at 0.55).
   // Hard ceiling 0.55 preserved. DO NOT raise above 0.60. DO NOT revert to 0.70.
-  let _dynCap = 0.55;
-  try {
-    const _accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]");
-    const _lmLogs = _accLog.filter(e =>
-      e.league === league && e.market === marketType &&
-      (e.result === "win" || e.result === "loss") && isFinite(e.error)
-    );
-    if (_lmLogs.length >= 20) {
-      const _recent = _lmLogs.slice(-50);
-      const _mae = _recent.reduce((s, e) => s + Math.abs(e.error), 0) / _recent.length;
-      const _base = LEAGUE_BASES[league] || 160;
-      _dynCap = clampNumber(0.30 + (_mae / (_base * 0.08)) * 0.25, 0.30, 0.55);
-    }
-    const _aa = JSON.parse(localStorage.getItem("BB_ANCHOR_ADJUSTMENTS") || "{}");
-    if (isFinite(_aa[league])) _dynCap = clampNumber(_aa[league], 0.30, 0.55);
-  } catch(e) {}
+  const _acKey = `${league}|${marketType}`;
+  const _acNow = Date.now();
+  let _dynCap;
+  if (_anchorCapCache.has(_acKey) && (_acNow - (_anchorCapCache.get(_acKey).ts || 0)) < _ANCHOR_CAP_TTL_MS) {
+    _dynCap = _anchorCapCache.get(_acKey).cap;
+  } else {
+    _dynCap = 0.55;
+    try {
+      const _accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]");
+      const _lmLogs = _accLog.filter(e =>
+        e.league === league && e.market === marketType &&
+        (e.result === "win" || e.result === "loss") && isFinite(e.error)
+      );
+      if (_lmLogs.length >= 20) {
+        const _recent = _lmLogs.slice(-50);
+        const _mae = _recent.reduce((s, e) => s + Math.abs(e.error), 0) / _recent.length;
+        const _base = LEAGUE_BASES[league] || 160;
+        _dynCap = clampNumber(0.30 + (_mae / (_base * 0.08)) * 0.25, 0.30, 0.55);
+      }
+      const _aa = JSON.parse(localStorage.getItem("BB_ANCHOR_ADJUSTMENTS") || "{}");
+      if (isFinite(_aa[league])) _dynCap = clampNumber(_aa[league], 0.30, 0.55);
+    } catch(e) {}
+    _anchorCapCache.set(_acKey, { cap: _dynCap, ts: _acNow });
+  }
   const weight = clampNumber(baseWeight * scale * excess, 0, _dynCap);
 
   return (proj * (1 - weight)) + (line * weight);
@@ -16200,204 +16212,9 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
   if (leagueTrust.mode !== "block") {
     rescueBestMassacreLean(picks);
   }
-  //// Expose local calibration function to module scope so the retraining pipeline can reach it
+    //// Expose local calibration function to module scope so the retraining pipeline can reach it
   window.calibrateMassacreCoefficients = calibrateMassacreCoefficients;
 }
-
-function calibrateConfidenceModel() {
-  const allPicks = getAllTrackedPicksForReport().filter(p =>
-    isFinite(Number(p.edgePct)) &&
-    (p.resultStatus === "win" || p.resultStatus === "loss")
-  );
-  if (allPicks.length < 30) return;
-
-  const buildF = (p) => ({
-    edgePct:   clampNumber(Number(p.edgePct || p.godsEyeMemory?.edgePct || 0) - 0.060, -0.06, 0.15),
-    volRatio:  clampNumber(
-                 ((Number(p.godsEyeMemory?.aVol || 0) + Number(p.godsEyeMemory?.bVol || 0)) / 2)
-                 / (LEAGUE_VOL_LIMITS[String(p.league || "")] || 12) - 1.0, -1, 2),
-    sampleFull: (String(p.godsEyeMemory?.sampleTier || "").toLowerCase() === "full") ? 1 : 0,
-    h2h:       (p.godsEyeMemory?.hasH2H) ? 1 : 0,
-    trap:      (p.godsEyeMemory?.trap) ? 1 : 0
-  });
-
-  const _gd = (data, lr, lambda) => {
-    let c = { intercept: -0.2, edgePct: 8.0, volRatio: -0.8, sampleFull: 0.4, h2h: 0.2, trap: -1.2 };
-    for (let iter = 0; iter < 400; iter++) {
-      const g = { intercept: 0, edgePct: 0, volRatio: 0, sampleFull: 0, h2h: 0, trap: 0 };
-      for (const { f, y } of data) {
-        const lo = c.intercept + c.edgePct*f.edgePct + c.volRatio*f.volRatio + c.sampleFull*f.sampleFull + c.h2h*f.h2h + c.trap*f.trap;
-        const prob = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, lo))));
-        const e = y - prob;
-        g.intercept  += e;
-        g.edgePct    += e * f.edgePct;
-        g.volRatio   += e * f.volRatio;
-        g.sampleFull += e * f.sampleFull;
-        g.h2h        += e * f.h2h;
-        g.trap       += e * f.trap;
-      }
-      c.intercept  += lr * g.intercept;
-      c.edgePct    += lr * g.edgePct    - lr * lambda * c.edgePct;
-      c.volRatio   += lr * g.volRatio   - lr * lambda * c.volRatio;
-      c.sampleFull += lr * g.sampleFull - lr * lambda * c.sampleFull;
-      c.h2h        += lr * g.h2h        - lr * lambda * c.h2h;
-      c.trap       += lr * g.trap       - lr * lambda * c.trap;
-    }
-    return c;
-  };
-
-  const runGD = (data) => {
-    if (!data || data.length < 15) return null;
-    if (data.length >= 60) {
-      const foldSize = Math.floor(data.length / 3);
-      const candidates = [
-        { lr: 0.002,  lambda: 0.005 },
-        { lr: 0.001,  lambda: 0.005 },
-        { lr: 0.002,  lambda: 0.001 },
-        { lr: 0.0005, lambda: 0.001 }
-      ];
-      let bestLoss = Infinity, bestCoeff = null;
-      candidates.forEach(({ lr, lambda }) => {
-        let totalLoss = 0;
-        for (let fold = 0; fold < 3; fold++) {
-          const val   = data.slice(fold * foldSize, (fold + 1) * foldSize);
-          const train = [...data.slice(0, fold * foldSize), ...data.slice((fold + 1) * foldSize)];
-          const coeff = _gd(train, lr, lambda);
-          val.forEach(({ f, y }) => {
-            const lo   = coeff.intercept + coeff.edgePct*f.edgePct + coeff.volRatio*f.volRatio
-                         + coeff.sampleFull*f.sampleFull + coeff.h2h*f.h2h + coeff.trap*f.trap;
-            const prob = 1 / (1 + Math.exp(-Math.min(20, Math.max(-20, lo))));
-            totalLoss -= y === 1 ? Math.log(Math.max(1e-9, prob)) : Math.log(Math.max(1e-9, 1 - prob));
-          });
-        }
-        if (totalLoss < bestLoss) { bestLoss = totalLoss; bestCoeff = _gd(data, lr, lambda); }
-      });
-      return bestCoeff;
-    }
-    return _gd(data, 0.001, 0.005);
-  };
-
-  const models = {};
-
-  const globalData = allPicks.map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
-  const globalModel = runGD(globalData);
-  if (globalModel) models["global"] = globalModel;
-  [...new Set(allPicks.map(p => p.league).filter(Boolean))].forEach(league => {
-    const ld = allPicks.filter(p => p.league === league)
-      .map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
-    const lm = runGD(ld);
-    if (lm) models[league] = lm;
-  });
-  if (Object.keys(models).length) {
-    try { localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF", JSON.stringify(models)); } catch(e) {}
-    engineDebug("Confidence model calibrated", Object.keys(models));
-  }
-}
-
-function optimizePickThresholds(league) {
-  let accLog = [];
-  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
-  const data = accLog.filter(e =>
-    (!league || e.league === league) &&
-    (e.result === "win" || e.result === "loss") &&
-    isFinite(e.proj) && isFinite(e.line) && isFinite(e.error)
-  ).map(e => ({
-    ...e,
-    edgePct: Math.abs((e.proj - e.line) / (Math.abs(e.line) || 1)),
-    outcome: e.result === "win" ? 1 : 0
-  }));
-  if (data.length < 40) return;
-
-  let bestBrier = Infinity;
-  let best = { over: 0.050, under: 0.055 };
-  for (let ot = 0; ot <= 0.070; ot += 0.0025) {
-    for (let ut = ot; ut <= 0.075; ut += 0.0025) {
-      const filtered = data.filter(e =>
-        (e.side === "over" && e.edgePct >= ot) ||
-        (e.side === "under" && e.edgePct >= ut)
-      );
-      if (filtered.length < 15) continue;
-      const avgWR = filtered.reduce((s, e) => s + e.outcome, 0) / filtered.length;
-      const brier = filtered.reduce((s, e) => s + Math.pow(avgWR - e.outcome, 2), 0) / filtered.length;
-      if (brier < bestBrier) { bestBrier = brier; best = { over: parseFloat(ot.toFixed(4)), under: parseFloat(ut.toFixed(4)) }; }
-    }
-  }
-  let stored = {};
-  try { stored = JSON.parse(localStorage.getItem("BB_OPTIMIZED_THRESHOLDS") || "{}"); } catch(e) {}
-  stored[league || "global"] = { ...best, brier: parseFloat(bestBrier.toFixed(4)), n: data.length, ts: new Date().toISOString() };
-  try { localStorage.setItem("BB_OPTIMIZED_THRESHOLDS", JSON.stringify(stored)); } catch(e) {}
-  engineDebug("Threshold optimization", { league, ...stored[league || "global"] });
-}
-
-function runOutOfSampleValidation(league) {
-  let accLog = [];
-  try { accLog = JSON.parse(localStorage.getItem("bb_engine_accuracy_log") || "[]"); } catch(e) {}
-  const leagueLogs = accLog.filter(e =>
-    (!league || e.league === league) &&
-    (e.result === "win" || e.result === "loss") &&
-    e.brierContrib !== null && isFinite(e.brierContrib)
-  );
-  if (leagueLogs.length < 30) return null;
-
-  const split = Math.floor(leagueLogs.length * 0.70);
-  const trainSet = leagueLogs.slice(0, split);
-  const testSet  = leagueLogs.slice(split);
-  const brierOf  = (s) => s.length ? s.reduce((acc, e) => acc + e.brierContrib, 0) / s.length : null;
-
-  const result = {
-    league:      league || "global",
-    trainBrier:  brierOf(trainSet) !== null ? parseFloat(brierOf(trainSet).toFixed(4)) : null,
-    testBrier:   brierOf(testSet)  !== null ? parseFloat(brierOf(testSet).toFixed(4))  : null,
-    overfit:     (brierOf(testSet) !== null && brierOf(trainSet) !== null)
-                   ? parseFloat((brierOf(testSet) - brierOf(trainSet)).toFixed(4)) : null,
-    trainN:      trainSet.length,
-    testN:       testSet.length,
-    ts:          new Date().toISOString()
-  };
-
-  try {
-    const stored = JSON.parse(localStorage.getItem("BB_OOS_VALIDATION") || "{}");
-    stored[league || "global"] = result;
-    localStorage.setItem("BB_OOS_VALIDATION", JSON.stringify(stored));
-  } catch(e) {}
-  engineDebug("Out-of-sample validation", result);
-  return result;
-}
-
-function checkModelHealth(league) {
-  const settled = getAllSettledTrackedPicks().filter(p => !league || p.league === league);
-  if (settled.length < 20) return null;
-
-  const recent = settled.slice(-20);
-  const recentWR    = recent.filter(p => p.resultStatus === "win").length / 20;
-  const historicalWR = settled.filter(p => p.resultStatus === "win").length / settled.length;
-  const drift        = historicalWR - recentWR;
-  const coldStreak   = recent.filter(p => p.resultStatus === "loss").length;
-
-  const health = {
-    league:           league || "global",
-    recentWinRate:    parseFloat(recentWR.toFixed(3)),
-    historicalWinRate: parseFloat(historicalWR.toFixed(3)),
-    drift:            parseFloat(drift.toFixed(3)),
-    coldStreakCount:  coldStreak,
-    isUnhealthy:      drift >= 0.10,
-    isSevere:         drift >= 0.18 || coldStreak >= 14,
-    totalSettled:     settled.length,
-    ts:               new Date().toISOString()
-  };
-
-  try {
-    const stored = JSON.parse(localStorage.getItem("BB_MODEL_HEALTH") || "{}");
-    stored[league || "global"] = health;
-    localStorage.setItem("BB_MODEL_HEALTH", JSON.stringify(stored));
-  } catch(e) {}
-
-  if (health.isUnhealthy) {
-    engineDebug("MODEL HEALTH WARNING", health);
-  }
-  return health;
-}
-
 
 function applyLeagueTrustToPicks(picks, league) {
   if (!Array.isArray(picks) || !picks.length) return;
