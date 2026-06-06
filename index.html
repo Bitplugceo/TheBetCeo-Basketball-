@@ -1,4 +1,4 @@
-A
+B
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4031,6 +4031,23 @@ function getLeagueUnderBlockRatio(league) {
       asia:     { ft: 0.068, h1: 0.063 },
       default:  { ft: 0.065, h1: 0.067 }
     };
+
+// Raw point thresholds (edge = projection - line)
+const LEAGUE_EDGE_POINT_THRESHOLDS = {
+  nba:      { ft: 12.0, h1: 5.0, team: 6.0 },
+  wnba:     { ft: 9.5,  h1: 5.0, team: 5.0 },
+  wnba_pre: { ft: 9.5,  h1: 5.0, team: 5.0 },
+  ncaa:     { ft: 8.0,  h1: 4.0, team: 4.0 },
+  ncaaw:    { ft: 8.0,  h1: 4.0, team: 4.0 },
+  nba_gl:   { ft: 11.0, h1: 5.0, team: 5.5 },
+  default:  { ft: 8.0,  h1: 4.0, team: 4.0 }
+};
+
+function getLeagueEdgePointThreshold(league, marketType) {
+  const lk = (league || "default").toLowerCase();
+  const thresholds = LEAGUE_EDGE_POINT_THRESHOLDS[lk] || LEAGUE_EDGE_POINT_THRESHOLDS.default;
+  return thresholds[marketType] || thresholds.ft;
+}
 
     const EUROPE_EDGE_LEAGUES = [];
 const ASIA_EDGE_LEAGUES = [];
@@ -9513,6 +9530,38 @@ function getTrackedLeagueBase(league) {
   return "";
 }
 
+function selectLock(markets) {
+  const valid = markets.filter(m =>
+    m && m.pick !== "NO PLAY" && m.pick !== "—" && !isNaN(m.edge) && m.line > 0
+    && !m.lockRestricted
+  );
+  if (valid.length === 0) return -1;
+
+  const best = [...valid].sort((a, b) => {
+    const aGrade = getConfidenceRank(a.confidenceGrade || a.confidence || "");
+    const bGrade = getConfidenceRank(b.confidenceGrade || b.confidence || "");
+    if (bGrade !== aGrade) return bGrade - aGrade;
+
+    const aEdgePct = Math.abs(a.edge / a.line) * 100;
+    const bEdgePct = Math.abs(b.edge / b.line) * 100;
+
+    const aFullModelBonus = a.fullModel ? 0.6 : 0;
+    const bFullModelBonus = b.fullModel ? 0.6 : 0;
+
+    const aMassacreBonus = isFinite(Number(a.lockStrength)) ? Number(a.lockStrength) : 0;
+    const bMassacreBonus = isFinite(Number(b.lockStrength)) ? Number(b.lockStrength) : 0;
+
+    const aLockScore = aEdgePct + aFullModelBonus + aMassacreBonus;
+    const bLockScore = bEdgePct + bFullModelBonus + bMassacreBonus;
+
+    if (Math.abs(bLockScore - aLockScore) > 0.0001) return bLockScore - aLockScore;
+    if (Math.abs(bEdgePct - aEdgePct) > 0.0001) return bEdgePct - aEdgePct;
+    return Math.abs(b.edge) - Math.abs(a.edge);
+  })[0];
+
+  return markets.findIndex(m => m === best);
+}
+
 function isTrackerSupportedLeague(league) {
   return !!getTrackedLeagueBase(String(league || "").toLowerCase());
 }
@@ -10464,11 +10513,19 @@ function probTeamOverThreshold(teamScores, threshold) {
 }
 
 function getPick(edge, line, league, marketType, context = {}) {
-  // [FIX: SIMPLIFIED PICK DECISION — OVER if projection > line, UNDER if projection < line]
-  // Spec: remove percentage thresholds for pick direction. Keep edge % only for grade/display.
-  // Edge of exactly 0 is still NO PLAY (no conviction either way).
   if (!line || isNaN(edge) || isNaN(line) || line <= 0) return "NO PLAY";
   if (edge === 0) return "NO PLAY";
+
+  let mType = marketType;
+  if (marketType === "team") mType = "team";
+  else if (marketType === "h1") mType = "h1";
+  else mType = "ft";
+
+  const pointThreshold = getLeagueEdgePointThreshold(league, mType);
+  const absEdge = Math.abs(edge);
+
+  if (absEdge < pointThreshold) return "NO PLAY";
+
   return edge > 0 ? "OVER " + displayLine(line) : "UNDER " + displayLine(line);
 }
 
