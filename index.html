@@ -1,4 +1,4 @@
-B
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6425,8 +6425,18 @@ function getRawMarketInputMap() {
       return clean.length ? clean.reduce((a, b) => a + b, 0) / clean.length : NaN;
     }
 
-    function weightedRecentAverage(arr, weights) {
-  return avg(Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : []);
+    function weightedRecentAverage(arr, weights = MODEL_TUNING.recencyWeights) {
+  const clean = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
+  if (!clean.length) return NaN;
+  if (!Array.isArray(weights) || weights.length === 0) return avg(clean);
+  const len = Math.min(clean.length, weights.length);
+  let weightedSum = 0, weightTotal = 0;
+  for (let i = 0; i < len; i++) {
+    const w = weights[i];
+    weightedSum += clean[i] * w;
+    weightTotal += w;
+  }
+  return weightTotal ? weightedSum / weightTotal : avg(clean);
 }
 
 
@@ -6434,16 +6444,11 @@ function getRawMarketInputMap() {
 function trimmedAvg(arr) {
   const work = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
   if (!work.length) return NaN;
-  if (work.length <= 2) return avg(work);
-
-  if (work.length >= 5) {
-    const indexed = work.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
-    const trimIndices = new Set([indexed[0].i, indexed[indexed.length - 1].i]);
-    const trimmed = work.filter((_, i) => !trimIndices.has(i));
-    return avg(trimmed);
-  }
-
-  return avg(work);
+  if (work.length <= 2) return weightedRecentAverage(work);
+  // Remove one highest and one lowest
+  const sorted = [...work].sort((a, b) => a - b);
+  const trimmed = sorted.slice(1, -1);
+  return weightedRecentAverage(trimmed);
 }
 
     function stdDev(arr) {
@@ -12711,7 +12716,7 @@ DEFAULT AUDIT ACTION: CLOSED — DO NOT TOUCH.
 
 
 function avgOrNaN(arr) {
-  return Array.isArray(arr) && arr.length ? avg(arr) : NaN;
+  return Array.isArray(arr) && arr.length ? trimmedAvg(arr) : NaN;
 }
 
 function avgFinite(values = []) {
@@ -12720,7 +12725,22 @@ function avgFinite(values = []) {
 }
 
 function getFixtureSideRole(side) {
-  // getFixtureSideRole removed per spec – always return empty string (no venue adjustment)
+  const fixtureMeta = getCurrentFixtureMeta();
+  const teamId = String(selectedTeamIds?.[side] || "");
+  const homeId = String(fixtureMeta?.homeId || "");
+  const awayId = String(fixtureMeta?.awayId || "");
+  if (teamId && homeId && teamId === homeId) return "home";
+  if (teamId && awayId && teamId === awayId) return "away";
+
+  const teamName = normalizeTeamName(document.getElementById(side === "A" ? "teamAName" : "teamBName")?.value || "");
+  if (teamName && normalizeTeamName(fixtureMeta?.homeTeam || "") === teamName) return "home";
+  if (teamName && normalizeTeamName(fixtureMeta?.awayTeam || "") === teamName) return "away";
+
+  // Manual leagues: Team A = Home, Team B = Away when no fixture is linked
+  const league = document.getElementById("leagueSelect")?.value || "";
+  const isManual = league && league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa" && league !== "ncaaw" && league !== "nba_gl";
+  if (isManual) return side === "A" ? "home" : "away";
+
   return "";
 }
 
@@ -12735,6 +12755,24 @@ function getFetchedSeries(side, scope, marketKey, metric) {
 
 function getManualSeries(side, marketKey, parsed) {
   if (!parsed) return [];
+  // Venue split: if checkbox is checked and venue data exists (≥2 games), replace overall series.
+  if (marketKey === "ft") {
+    const role = getFixtureSideRole(side);
+    if (side === "A") {
+      const homeEnabled = document.getElementById("aVenueSplitEnabled")?.checked === true;
+      if (homeEnabled) {
+        const homeScored = safeArr(parsed.aFTScoredHome);
+        if (homeScored && homeScored.length >= 2) return homeScored;
+      }
+    }
+    if (side === "B") {
+      const awayEnabled = document.getElementById("bVenueSplitEnabled")?.checked === true;
+      if (awayEnabled) {
+        const awayScored = safeArr(parsed.bFTScoredAway);
+        if (awayScored && awayScored.length >= 2) return awayScored;
+      }
+    }
+  }
   if (side === "A" && marketKey === "ft") return safeArr(parsed.aFTScored) || [];
   if (side === "B" && marketKey === "ft") return safeArr(parsed.bFTScored) || [];
   if (side === "A" && marketKey === "h1") return safeArr(parsed.a1HScored) || [];
@@ -12936,42 +12974,51 @@ function getMarketKeyFromName(name, marketKeyOverride) {
 function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
   // Simplified projection: average of team’s own FT scored (manual or fetched)
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
-  const aFTS = getManualSeries("A", "ft", parsed);
-  const bFTS = getManualSeries("B", "ft", parsed);
-  const ftSampleTier = getSampleTier(aFTS, bFTS);
-  if (ftSampleTier === "insufficient") {
-    return { ftProj: NaN, ftEdge: NaN, ftNote: "Insufficient sample", ftSampleTier };
-  }
-  const aS = avgOrNaN(aFTS);
-  const bS = avgOrNaN(bFTS);
-  let projAFT = isFinite(aS) ? aS : NaN;
-  let projBFT = isFinite(bS) ? bS : NaN;
-  // Fixed 65/35 blend for H2H if enabled and enough games
-  const aH2H = getH2HSeries("A", "ft", parsed);
-  const bH2H = getH2HSeries("B", "ft", parsed);
-  const ftHasH2H = maybeReadH2HEnabled("ft") && aH2H.length >= 2 && bH2H.length >= 2;
-  if (ftHasH2H) {
-    const hw = 0.35;
-    projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgOrNaN(aH2H) * hw) : avgOrNaN(aH2H);
-    projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(bH2H) * hw) : avgOrNaN(bH2H);
-  }
-  let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
+      // Determine which series to use: venue split or overall
+    const aVenueEnabled = document.getElementById("aVenueSplitEnabled")?.checked === true;
+    const bVenueEnabled = document.getElementById("bVenueSplitEnabled")?.checked === true;
+    let aFTS = getManualSeries("A", "ft", parsed);
+    let bFTS = getManualSeries("B", "ft", parsed);
+    if (aVenueEnabled) {
+      const aHomeScored = readLooseSeries("aFTScoredHome");
+      if (aHomeScored && aHomeScored.length >= 2) aFTS = aHomeScored;
+    }
+    if (bVenueEnabled) {
+      const bAwayScored = readLooseSeries("bFTScoredAway");
+      if (bAwayScored && bAwayScored.length >= 2) bFTS = bAwayScored;
+    }
+    const ftSampleTier = getSampleTier(aFTS, bFTS);
+    if (ftSampleTier === "insufficient") {
+      return { ftProj: NaN, ftEdge: NaN, ftNote: "Insufficient sample", ftSampleTier };
+    }
+    let aS = avgOrNaN(aFTS);
+    let bS = avgOrNaN(bFTS);
+    // Fixed 65/35 blend for H2H if enabled and enough games
+    const aH2H = getH2HSeries("A", "ft", parsed);
+    const bH2H = getH2HSeries("B", "ft", parsed);
+    const ftHasH2H = maybeReadH2HEnabled("ft") && aH2H.length >= 2 && bH2H.length >= 2;
+    let projAFT = aS;
+    let projBFT = bS;
+    if (ftHasH2H) {
+      const hw = 0.35;
+      projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgOrNaN(aH2H) * hw) : avgOrNaN(aH2H);
+      projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(bH2H) * hw) : avgOrNaN(bH2H);
+    }
+    let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
   const ftEdge = (isFinite(ftProj) && isFinite(lines.ftLine) && lines.ftLine > 0) ? ftProj - lines.ftLine : NaN;
   const aEdge = (isFinite(projAFT) && isFinite(lines.aLine) && lines.aLine > 0) ? projAFT - lines.aLine : NaN;
   const bEdge = (isFinite(projBFT) && isFinite(lines.bLine) && lines.bLine > 0) ? projBFT - lines.bLine : NaN;
-  return {
-    eb, projAFT, projBFT, ftProj, pace: NaN, ftSampleTier,
-    ftHasH2H, ftEdge, aEdge, bEdge,
-    aVol: 0, bVol: 0,
-    ftFullModel: ftSampleTier === "full",
-    teamFullModel: ftSampleTier === "full",
-    ftProjectionOnly: !ftHasH2H && ftSampleTier === "thin",
-    blowoutGap: Math.abs((projAFT||0) - (projBFT||0)),
-    paceGapRisk: false,
-    defensiveFloorFlag: false,
-    aS, bS, aScores: aFTS, bScores: bFTS,
-    possProjection: ftProj, pppEdge: NaN, anchorPull: 0
-  };
+      return {
+      eb, projAFT, projBFT, ftProj, ftSampleTier,
+      ftHasH2H, ftEdge, aEdge, bEdge,
+      ftFullModel: ftSampleTier === "full",
+      teamFullModel: ftSampleTier === "full",
+      ftProjectionOnly: !ftHasH2H && ftSampleTier === "thin",
+      blowoutGap: Math.abs((projAFT||0) - (projBFT||0)),
+      aS, bS, aScores: aFTS, bScores: bFTS,
+      aVenueEnabled: document.getElementById("aVenueSplitEnabled")?.checked === true,
+      bVenueEnabled: document.getElementById("bVenueSplitEnabled")?.checked === true
+    };
 }
 
 function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
@@ -14596,7 +14643,11 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     pick: ftPick,
     confidence: ftConfidence,
     note: ftNote,
-    fullModel: ftCalc.ftFullModel
+    fullModel: ftCalc.ftFullModel,
+    sampleTier: ftCalc.ftSampleTier,
+    hasH2H: ftCalc.ftHasH2H,
+    aVenueEnabled: ftCalc.aVenueEnabled,
+    bVenueEnabled: ftCalc.bVenueEnabled
   },
   {
     _idx: 1,
@@ -14611,12 +14662,14 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     pick: h1Pick,
     confidence: h1ConfidenceFinal,
     note: h1Note,
-    fullModel: h1Calc.h1FullModel
+    fullModel: h1Calc.h1FullModel,
+    sampleTier: h1Calc.h1SampleTier,
+    hasH2H: h1Calc.h1HasH2H
   },
-      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: false, lockStrength: Math.abs((q1?.edge||0)/(parseMarketLine(document.getElementById("q1Market")?.value)||1))*10 },
-      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: false, lockStrength: Math.abs((q2?.edge||0)/(parseMarketLine(document.getElementById("q2Market")?.value)||1))*10 },
-      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: false, lockStrength: Math.abs((q3?.edge||0)/(parseMarketLine(document.getElementById("q3Market")?.value)||1))*10 },
-      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: false, lockStrength: Math.abs((q4?.edge||0)/(parseMarketLine(document.getElementById("q4Market")?.value)||1))*10 },
+      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: false, sampleTier: q1?.tier, hasH2H: q1?.hasH2H },
+      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: false, sampleTier: q2?.tier, hasH2H: q2?.hasH2H },
+      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: false, sampleTier: q3?.tier, hasH2H: q3?.hasH2H },
+      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: false, sampleTier: q4?.tier, hasH2H: q4?.hasH2H },
   {
     _idx: 3,
     name: "Team A Total" + aBadge,
@@ -14630,7 +14683,10 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     pick: aPick,
     confidence: aConfidence,
     note: ftNote,
-    fullModel: ftCalc.teamFullModel
+    fullModel: ftCalc.teamFullModel,
+    sampleTier: ftCalc.ftSampleTier,
+    hasH2H: ftCalc.ftHasH2H,
+    aVenueEnabled: ftCalc.aVenueEnabled
   },
   {
     _idx: 4,
@@ -14645,67 +14701,10 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     pick: bPick,
     confidence: bConfidence,
     note: ftNote,
-    fullModel: ftCalc.teamFullModel
-  },
-    {
-    _idx: 44,
-    name: "Team A Q1",
-    marketKey: "q1_team_a",
-    marketType: "team",
-    league,
-    context: {},
-    line: finalLines.q1aLine,
-    proj: q1?.projA,
-    edge: finalLines.q1aLine && isFinite(q1?.projA) ? q1.projA - finalLines.q1aLine : NaN,
-    pick: (!finalLines.q1aLine || !isFinite(q1?.projA)) ? "NO PLAY" : getPick(q1.projA - finalLines.q1aLine, finalLines.q1aLine, league, "team", {}),
-    confidence: (!finalLines.q1aLine || !isFinite(q1?.projA)) ? "—" : (q1?.confidence || "—"),
-    note: null,
-    fullModel: false
-  },
-  {
-    _idx: 45,
-    name: "Team B Q1",
-    marketKey: "q1_team_b",
-    marketType: "team",
-    league,
-    context: {},
-    line: finalLines.q1bLine,
-    proj: q1?.projB,
-    edge: finalLines.q1bLine && isFinite(q1?.projB) ? q1.projB - finalLines.q1bLine : NaN,
-    pick: (!finalLines.q1bLine || !isFinite(q1?.projB)) ? "NO PLAY" : getPick(q1.projB - finalLines.q1bLine, finalLines.q1bLine, league, "team", {}),
-    confidence: (!finalLines.q1bLine || !isFinite(q1?.projB)) ? "—" : (q1?.confidence || "—"),
-    note: null,
-    fullModel: false
-  },
-  {
-    _idx: 48,
-    name: "Team A 1H",
-    marketKey: "h1_team_a",
-    marketType: "team",
-    league,
-    context: { teamSc: h1Calc.aS1 },
-    line: finalLines.h1aLine,
-    proj: h1Calc.projA1H,
-    edge: finalLines.h1aLine && isFinite(h1Calc.projA1H) ? h1Calc.projA1H - finalLines.h1aLine : NaN,
-    pick: (!finalLines.h1aLine || !isFinite(h1Calc.projA1H)) ? "NO PLAY" : getPick(h1Calc.projA1H - finalLines.h1aLine, finalLines.h1aLine, league, "team", { teamSc: h1Calc.aS1 }),
-    confidence: (!finalLines.h1aLine || !isFinite(h1Calc.projA1H)) ? "—" : h1Confidence,
-    note: h1Note,
-    fullModel: h1Calc.h1FullModel
-  },
-  {
-    _idx: 49,
-    name: "Team B 1H",
-    marketKey: "h1_team_b",
-    marketType: "team",
-    league,
-    context: { teamSc: h1Calc.bS1 },
-    line: finalLines.h1bLine,
-    proj: h1Calc.projB1H,
-    edge: finalLines.h1bLine && isFinite(h1Calc.projB1H) ? h1Calc.projB1H - finalLines.h1bLine : NaN,
-    pick: (!finalLines.h1bLine || !isFinite(h1Calc.projB1H)) ? "NO PLAY" : getPick(h1Calc.projB1H - finalLines.h1bLine, finalLines.h1bLine, league, "team", { teamSc: h1Calc.bS1 }),
-    confidence: (!finalLines.h1bLine || !isFinite(h1Calc.projB1H)) ? "—" : h1Confidence,
-    note: h1Note,
-    fullModel: h1Calc.h1FullModel
+    fullModel: ftCalc.teamFullModel,
+    sampleTier: ftCalc.ftSampleTier,
+    hasH2H: ftCalc.ftHasH2H,
+    bVenueEnabled: ftCalc.bVenueEnabled
   }
     ];
 
@@ -14811,9 +14810,8 @@ const markets = finalPicksForDisplay.map(p => ({
           <span>SYNDICATE INSIGHT (LEVEL 2)</span>
           <span style="color: ${ftCalc.ftFullModel ? '#4CAF50' : '#ffa500'}">${ftCalc.ftFullModel ? '🟢 FULL MODEL' : '🟡 LIMITED DATA'}</span>
         </div>
-        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; padding: 12px; text-align: center; gap: 5px;">
+        <div style="display: grid; grid-template-columns: 1fr 1fr; padding: 12px; text-align: center; gap: 5px;">
           <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team A Net</div><div style="font-size: 18px; font-weight: 900; color: ${netA >= 0 ? '#3a9c35' : '#c91920'}">${netA.toFixed(1)}</div></div>
-          <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Exp. Pace</div><div style="font-size: 18px; font-weight: 900; color: var(--text);">${isFinite(ftCalc.pace) ? ftCalc.pace.toFixed(1) + ' ' + paceIcon : '—'}</div></div>
           <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team B Net</div><div style="font-size: 18px; font-weight: 900; color: ${netB >= 0 ? '#3a9c35' : '#c91920'}">${netB.toFixed(1)}</div></div>
         </div>`;
 
@@ -14974,16 +14972,23 @@ window.__LAST_AUDIT_STATE = {
   calcSummary: {
     ftProj: ftCalc.ftProj, ftEdge: ftCalc.ftEdge, ftSampleTier: ftCalc.ftSampleTier,
     h1Proj: h1Calc.h1Proj, h1Edge: h1Calc.h1Edge, h1SampleTier: h1Calc.h1SampleTier,
-    pace: ftCalc.pace, aVol: ftCalc.aVol, bVol: ftCalc.bVol,
-    blowoutGap: ftCalc.blowoutGap, paceGapRisk: ftCalc.paceGapRisk
+    blowoutGap: ftCalc.blowoutGap, paceGapRisk: ftCalc.paceGapRisk,
+    ftHasH2H: ftCalc.ftHasH2H,
+    h1HasH2H: h1Calc.h1HasH2H,
+    aVenueEnabled: ftCalc.aVenueEnabled,
+    bVenueEnabled: ftCalc.bVenueEnabled
   },
-  picks: finalPicksForDisplay.map(p => ({
+      picks: finalPicksForDisplay.map(p => ({
     market: p.marketKey,
     pick: p.pick,
     edge: p.edge,
     line: p.displayLineUsed ?? p.line,
     confidence: p.confidence,
     note: p.note,
+    proj: p.proj,
+    sampleTier: p.sampleTier,
+    hasH2H: p.hasH2H,
+    venueEnabled: p.aVenueEnabled || p.bVenueEnabled,
     massacreDiag: p.massacre ? {
       simPct: p.massacre.simPct,
       brutalityScore: p.massacre.brutalityScore,
@@ -15680,7 +15685,18 @@ try {
             return;
           }
           
-          const auditData = JSON.stringify(window.__LAST_AUDIT_STATE, null, 2);
+          // Enhance audit state with raw fetched data and blend weights
+    if (window.__LAST_AUDIT_STATE && typeof g_massacreFetchContext !== 'undefined') {
+      window.__LAST_AUDIT_STATE.rawFetchedData = {
+        A_overall: g_massacreFetchContext.A?.overall ? { scored10: g_massacreFetchContext.A.overall.ftScored10, allowed10: g_massacreFetchContext.A.overall.ftAllowed10 } : null,
+        B_overall: g_massacreFetchContext.B?.overall ? { scored10: g_massacreFetchContext.B.overall.ftScored10, allowed10: g_massacreFetchContext.B.overall.ftAllowed10 } : null,
+        A_venue: g_massacreFetchContext.A?.venue ? { scored10: g_massacreFetchContext.A.venue.ftScored10, allowed10: g_massacreFetchContext.A.venue.ftAllowed10 } : null,
+        B_venue: g_massacreFetchContext.B?.venue ? { scored10: g_massacreFetchContext.B.venue.ftScored10, allowed10: g_massacreFetchContext.B.venue.ftAllowed10 } : null,
+        h2hGames: g_massacreFetchContext.h2hGames?.map(g => ({ scoreA: g.scoreA, scoreB: g.scoreB, date: g.date })) || [],
+        blendWeights: { ftH2HWeight: 0.35, overallVsVenue: "Venue replaces overall when enabled" }
+      };
+    }
+    const auditData = JSON.stringify(window.__LAST_AUDIT_STATE, null, 2);
           
           if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(auditData).then(() => {
