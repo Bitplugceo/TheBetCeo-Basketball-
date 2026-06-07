@@ -3108,16 +3108,33 @@ function ssProcessTeamEvents(events, teamId, label) {
   const q1ScoredList = [], q2ScoredList = [], q3ScoredList = [], q4ScoredList = [];
   const q1AllowedList = [], q2AllowedList = [], q3AllowedList = [], q4AllowedList = [];
 
-  // LOCK: Filter to basketball events ONLY before any processing.
-  // ssIsBasketballEvent checks sport slug, sport id, and score shape.
-  // This prevents football/soccer results from contaminating basketball projections.
+  // 1. Basic basketball event filter
   const basketballEvents = events.filter(ev => ssIsBasketballEvent(ev));
   const blockedCount = events.length - basketballEvents.length;
   if (blockedCount > 0) {
     engineDebug("ssProcessTeamEvents: blocked " + blockedCount + " non-basketball events", { label, total: events.length, kept: basketballEvents.length });
   }
 
-  const completedAll = basketballEvents.filter(e => {
+  // 2. Exclude reserve / development tournaments (e.g., Rapid League) and extremely low-scoring games
+  const isExcludedTournament = (ev) => {
+    const tourn = ev.tournament;
+    const name = (tourn?.name || "").toLowerCase();
+    const uniqueId = tourn?.uniqueTournament?.id;
+    if (name.includes("rapid")) return true;
+    if (uniqueId === 25483) return true; // Rapid League fixed ID
+    return false;
+  };
+
+  const isLowQualityGame = (ev) => {
+    const home = ev.homeScore?.normaltime ?? ev.homeScore?.current ?? 0;
+    const away = ev.awayScore?.normaltime ?? ev.awayScore?.current ?? 0;
+    // Professional basketball rarely has a team score below 60 points
+    return home < 60 || away < 60;
+  };
+
+  const qualityEvents = basketballEvents.filter(ev => !isExcludedTournament(ev) && !isLowQualityGame(ev));
+
+  const completedAll = qualityEvents.filter(e => {
     const _sType = e.status?.type ?? "";
     const _isDone = _sType === "finished" || _sType === "afterExtraTime" || _sType === "afterPenalties" || e.status?.finished === true;
     if (!_isDone) return false;
@@ -3125,6 +3142,46 @@ function ssProcessTeamEvents(events, teamId, label) {
     const aId = String(e.awayTeam?.id || "");
     return hId === String(teamId) || aId === String(teamId);
   }).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
+
+  if (!allCompleted.length) {
+    engineDebug("ssProcessTeamEvents: no completed games found", { label });
+    return { scoredList, allowedList, homeScoredList, homeAllowedList, awayScoredList, awayAllowedList,
+             h1ScoredList, h1AllowedList,
+             q1ScoredList, q2ScoredList, q3ScoredList, q4ScoredList,
+             q1AllowedList, q2AllowedList, q3AllowedList, q4AllowedList };
+  }
+
+  // 3. Determine the primary competition (most frequent tournament among recent games)
+  const tournamentCounts = new Map();
+  const recentGames = allCompleted.slice(0, 20); // consider last 20 games
+  recentGames.forEach(g => {
+    const tid = g.tournament?.uniqueTournament?.id;
+    if (tid) tournamentCounts.set(tid, (tournamentCounts.get(tid) || 0) + 1);
+  });
+
+  // If no tournament IDs found, fallback to all games
+  let targetTournamentId = null;
+  if (tournamentCounts.size) {
+    // Pick the tournament with highest frequency; tie → most recent
+    let maxCount = 0;
+    for (const [tid, count] of tournamentCounts.entries()) {
+      if (count > maxCount) {
+        maxCount = count;
+        targetTournamentId = tid;
+      } else if (count === maxCount && targetTournamentId) {
+        // tie – keep the one that appears more recent? simpler: keep existing
+      }
+    }
+    engineDebug("ssProcessTeamEvents: primary tournament ID = " + targetTournamentId + " (" + maxCount + " games)", { label });
+  }
+
+  let completedAll = allCompleted;
+  if (targetTournamentId) {
+    completedAll = allCompleted.filter(e => e.tournament?.uniqueTournament?.id === targetTournamentId);
+    engineDebug("ssProcessTeamEvents: filtered to tournament " + targetTournamentId, { label, kept: completedAll.length, total: allCompleted.length });
+  } else {
+    engineDebug("ssProcessTeamEvents: no tournament ID found, using all games", { label });
+  }
 
   engineDebug("ssProcessTeamEvents completed overall count: " + completedAll.length, { label });
 
@@ -3430,10 +3487,18 @@ function parseSofascoreIndividual(side) {
       const mergedDisplay5A = mergedStats.allowedList.slice(0, 5);
       const _currentField = document.getElementById(side === "A" ? "aFTScored" : "bFTScored");
       const currentCount = (_currentField?.value || "").split(",").filter(v => v.trim()).length;
-      if (mergedDisplay5S.length > currentCount) {
+      // Always update overall stats if the merged data has at least 2 games (to replace polluted data)
+      const forceUpdate = mergedDisplay5S.length >= 2;
+      if (forceUpdate || mergedDisplay5S.length > currentCount) {
         if (side === "A") {
           if (mergedDisplay5S.length) document.getElementById("aFTScored").value = mergedDisplay5S.join(",");
           if (mergedDisplay5A.length) document.getElementById("aFTAllowed").value = mergedDisplay5A.join(",");
+          if (mergedStats.homeScoredList.length >= 2) {
+            document.getElementById("aFTScoredHome").value = mergedStats.homeScoredList.slice(0, 5).join(",");
+            document.getElementById("aFTAllowedHome").value = mergedStats.homeAllowedList.slice(0, 5).join(",");
+            document.getElementById("aVenueSplitEnabled").checked = true;
+            document.getElementById("aVenueSplitFields").style.display = "block";
+          }
           if (mergedStats.h1ScoredList?.length >= 2) {
             document.getElementById("a1HScored").value = mergedStats.h1ScoredList.slice(0, 5).join(",");
             document.getElementById("a1HAllowed").value = mergedStats.h1AllowedList.slice(0, 5).join(",");
@@ -3454,9 +3519,20 @@ function parseSofascoreIndividual(side) {
           g_massacreFetchContext.A.overall.allowed10 = mergedStats.allowedList;
           g_massacreFetchContext.A.overall.scored = mergedDisplay5S;
           g_massacreFetchContext.A.overall.allowed = mergedDisplay5A;
+          if (mergedStats.homeScoredList.length >= 2) {
+            if (!g_massacreFetchContext.A.venue) g_massacreFetchContext.A.venue = {};
+            g_massacreFetchContext.A.venue.ftScored10 = mergedStats.homeScoredList;
+            g_massacreFetchContext.A.venue.ftAllowed10 = mergedStats.homeAllowedList;
+          }
         } else {
           if (mergedDisplay5S.length) document.getElementById("bFTScored").value = mergedDisplay5S.join(",");
           if (mergedDisplay5A.length) document.getElementById("bFTAllowed").value = mergedDisplay5A.join(",");
+          if (mergedStats.awayScoredList.length >= 2) {
+            document.getElementById("bFTScoredAway").value = mergedStats.awayScoredList.slice(0, 5).join(",");
+            document.getElementById("bFTAllowedAway").value = mergedStats.awayAllowedList.slice(0, 5).join(",");
+            document.getElementById("bVenueSplitEnabled").checked = true;
+            document.getElementById("bVenueSplitFields").style.display = "block";
+          }
           if (mergedStats.h1ScoredList?.length >= 2) {
             document.getElementById("b1HScored").value = mergedStats.h1ScoredList.slice(0, 5).join(",");
             document.getElementById("b1HAllowed").value = mergedStats.h1AllowedList.slice(0, 5).join(",");
@@ -3477,8 +3553,13 @@ function parseSofascoreIndividual(side) {
           g_massacreFetchContext.B.overall.allowed10 = mergedStats.allowedList;
           g_massacreFetchContext.B.overall.scored = mergedDisplay5S;
           g_massacreFetchContext.B.overall.allowed = mergedDisplay5A;
+          if (mergedStats.awayScoredList.length >= 2) {
+            if (!g_massacreFetchContext.B.venue) g_massacreFetchContext.B.venue = {};
+            g_massacreFetchContext.B.venue.ftScored10 = mergedStats.awayScoredList;
+            g_massacreFetchContext.B.venue.ftAllowed10 = mergedStats.awayAllowedList;
+          }
         }
-        if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " updated to " + mergedDisplay5S.length + " games from merged JSON!"; }
+        if (st) { st.style.color = "#2f8f4a"; st.textContent = "✅ Team " + side + " stats refreshed from merged JSON (filtered)!"; }
       } else {
         if (st) { st.style.color = "#d98a00"; st.textContent = "⚠️ No additional games found beyond current " + currentCount + " — H2H updated only."; }
       }
@@ -3558,7 +3639,7 @@ function extractH2HFromPastedEvents() {
   });
 
   // Strict H2H filter: only games where the two exact team IDs match
-  // Exclude Rapid League (low quality) and games where any team scored below 40 points
+  // Exclude Rapid League (low quality) and games where any team scored below 60 points
   let h2hMatches = uniqueEvents.filter(ev => {
     const sType = ev.status?.type ?? "";
     const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
@@ -3571,10 +3652,10 @@ function extractH2HFromPastedEvents() {
     const tournamentName = ev.tournament?.name || "";
     if (tournamentName.toLowerCase().includes("rapid")) return false;
 
-    // Filter out games where either team scored below 40 points (likely non-competitive or youth)
+    // Filter out games where either team scored below 60 points (clearly non-competitive)
     const homeScore = ev.homeScore?.normaltime ?? ev.homeScore?.current ?? 0;
     const awayScore = ev.awayScore?.normaltime ?? ev.awayScore?.current ?? 0;
-    if (homeScore < 40 || awayScore < 40) return false;
+    if (homeScore < 60 || awayScore < 60) return false;
 
     return true;
   }).sort((a, b) => {
