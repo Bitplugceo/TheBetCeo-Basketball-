@@ -1,4 +1,3 @@
-V
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10684,14 +10683,22 @@ function probTeamOverThreshold(teamScores, threshold) {
   return (overCount + PRIOR_GAMES * PRIOR_RATE) / (scores.length + PRIOR_GAMES);
 }
 
+const UNDER_EDGE_FACTOR = 1.2;
+
 function getPick(edge, line, league, marketKey, context = {}) {
   if (!line || isNaN(edge) || isNaN(line) || line <= 0) return "NO PLAY";
   if (edge === 0) return "NO PLAY";
 
   const pointThreshold = getLeagueEdgePointThreshold(league, marketKey);
   const absEdge = Math.abs(edge);
+  let required = pointThreshold;
 
-  if (absEdge < pointThreshold) return "NO PLAY";
+  // Apply higher threshold for UNDER picks
+  if (edge < 0) {
+    required = pointThreshold * UNDER_EDGE_FACTOR;
+  }
+
+  if (absEdge < required) return "NO PLAY";
 
   return edge > 0 ? "OVER " + displayLine(line) : "UNDER " + displayLine(line);
 }
@@ -13196,59 +13203,90 @@ function getMarketKeyFromName(name, marketKeyOverride) {
 }
 
 function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
-  // Simplified projection: average of team’s own FT scored (manual or fetched)
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
-      // Determine which series to use: venue split or overall
-    const aVenueEnabled = document.getElementById("aVenueSplitEnabled")?.checked === true;
-    const bVenueEnabled = document.getElementById("bVenueSplitEnabled")?.checked === true;
-    let aFTS = getManualSeries("A", "ft", parsed);
-    let bFTS = getManualSeries("B", "ft", parsed);
-    if (aVenueEnabled) {
-      const aHomeScored = readLooseSeries("aFTScoredHome");
-      if (aHomeScored && aHomeScored.length >= 2) aFTS = aHomeScored;
+  const aVenueEnabled = document.getElementById("aVenueSplitEnabled")?.checked === true;
+  const bVenueEnabled = document.getElementById("bVenueSplitEnabled")?.checked === true;
+  let aFTS = getManualSeries("A", "ft", parsed);
+  let bFTS = getManualSeries("B", "ft", parsed);
+  if (aVenueEnabled) {
+    const aHomeScored = readLooseSeries("aFTScoredHome");
+    if (aHomeScored && aHomeScored.length >= 2) aFTS = aHomeScored;
+  }
+  if (bVenueEnabled) {
+    const bAwayScored = readLooseSeries("bFTScoredAway");
+    if (bAwayScored && bAwayScored.length >= 2) bFTS = bAwayScored;
+  }
+  const ftSampleTier = getSampleTier(aFTS, bFTS);
+  if (ftSampleTier === "insufficient") {
+    return { ftProj: NaN, ftEdge: NaN, ftNote: "Insufficient sample", ftSampleTier };
+  }
+  let aS = avgOrNaN(aFTS);
+  let bS = avgOrNaN(bFTS);
+
+  // --- ADVANCED STATS BLEND (ESPN auto-fetch leagues) ---
+  const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(league);
+  let paceAdjust = 1.0;
+  let netAdjustA = 0, netAdjustB = 0;
+  let usedAdvanced = false;
+  if (isEspnLeague) {
+    const ctxA = g_massacreFetchContext?.A || {};
+    const ctxB = g_massacreFetchContext?.B || {};
+    const avgPaceA = avgOrNaN(ctxA.pace10);
+    const avgPaceB = avgOrNaN(ctxB.pace10);
+    const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
+    if (isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0) {
+      const avgPace = (avgPaceA + avgPaceB) / 2;
+      paceAdjust = avgPace / leaguePaceBase;
+      paceAdjust = clampNumber(paceAdjust, 0.85, 1.15);
+      usedAdvanced = true;
     }
-    if (bVenueEnabled) {
-      const bAwayScored = readLooseSeries("bFTScoredAway");
-      if (bAwayScored && bAwayScored.length >= 2) bFTS = bAwayScored;
+    const netA = avgOrNaN(ctxA.ortg10) - avgOrNaN(ctxA.drtg10);
+    const netB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
+    if (isFinite(netA) && isFinite(netB)) {
+      netAdjustA = netA / 100;
+      netAdjustB = netB / 100;
+      netAdjustA = clampNumber(netAdjustA, -0.15, 0.15);
+      netAdjustB = clampNumber(netAdjustB, -0.15, 0.15);
+      usedAdvanced = true;
     }
-    const ftSampleTier = getSampleTier(aFTS, bFTS);
-    if (ftSampleTier === "insufficient") {
-      return { ftProj: NaN, ftEdge: NaN, ftNote: "Insufficient sample", ftSampleTier };
+    if (usedAdvanced) {
+      aS = aS * paceAdjust * (1 + netAdjustA);
+      bS = bS * paceAdjust * (1 + netAdjustB);
     }
-    let aS = avgOrNaN(aFTS);
-    let bS = avgOrNaN(bFTS);
-    // Fixed 65/35 blend for H2H if enabled and enough games
-    const aH2H = getH2HSeries("A", "ft", parsed);
-    const bH2H = getH2HSeries("B", "ft", parsed);
-    const ftHasH2H = maybeReadH2HEnabled("ft") && aH2H.length >= 2 && bH2H.length >= 2;
-    let projAFT = aS;
-    let projBFT = bS;
-    if (ftHasH2H) {
-      const hw = 0.35;
-      projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgOrNaN(aH2H) * hw) : avgOrNaN(aH2H);
-      projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(bH2H) * hw) : avgOrNaN(bH2H);
-    }
-    let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
+  }
+
+  const aH2H = getH2HSeries("A", "ft", parsed);
+  const bH2H = getH2HSeries("B", "ft", parsed);
+  const ftHasH2H = maybeReadH2HEnabled("ft") && aH2H.length >= 2 && bH2H.length >= 2;
+  let projAFT = aS;
+  let projBFT = bS;
+  if (ftHasH2H) {
+    const hw = 0.35;
+    projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgOrNaN(aH2H) * hw) : avgOrNaN(aH2H);
+    projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(bH2H) * hw) : avgOrNaN(bH2H);
+  }
+  let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
   const ftEdge = (isFinite(ftProj) && isFinite(lines.ftLine) && lines.ftLine > 0) ? ftProj - lines.ftLine : NaN;
   const aEdge = (isFinite(projAFT) && isFinite(lines.aLine) && lines.aLine > 0) ? projAFT - lines.aLine : NaN;
   const bEdge = (isFinite(projBFT) && isFinite(lines.bLine) && lines.bLine > 0) ? projBFT - lines.bLine : NaN;
-      return {
-      eb, projAFT, projBFT, ftProj, ftSampleTier,
-      ftHasH2H, ftEdge, aEdge, bEdge,
-      ftFullModel: ftSampleTier === "full",
-      teamFullModel: ftSampleTier === "full",
-      ftProjectionOnly: !ftHasH2H && ftSampleTier === "thin",
-      blowoutGap: Math.abs((projAFT||0) - (projBFT||0)),
-      aS, bS, aScores: aFTS, bScores: bFTS,
-      aVenueEnabled: document.getElementById("aVenueSplitEnabled")?.checked === true,
-      bVenueEnabled: document.getElementById("bVenueSplitEnabled")?.checked === true
-    };
+  return {
+    eb, projAFT, projBFT, ftProj, ftSampleTier,
+    ftHasH2H, ftEdge, aEdge, bEdge,
+    ftFullModel: ftSampleTier === "full",
+    teamFullModel: ftSampleTier === "full",
+    ftProjectionOnly: !ftHasH2H && ftSampleTier === "thin",
+    blowoutGap: Math.abs((projAFT||0) - (projBFT||0)),
+    aS, bS, aScores: aFTS, bScores: bFTS,
+    aVenueEnabled, bVenueEnabled,
+    pace: paceAdjust,
+    usedAdvanced
+  };
 }
 
 function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
-  const aS1 = getManualSeries("A", "h1", parsed);
-  const bS1 = getManualSeries("B", "h1", parsed);
+  let aS1 = getManualSeries("A", "h1", parsed);
+  let bS1 = getManualSeries("B", "h1", parsed);
   const h1SampleTier = getSampleTier(aS1, bS1);
   if (h1SampleTier === "insufficient") {
     return {
@@ -13260,6 +13298,29 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
   let projA1H = avgOrNaN(aS1);
   let projB1H = avgOrNaN(bS1);
+
+  // Advanced stats blend for 1H (half of full-game pace/net effect)
+  const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(league);
+  if (isEspnLeague) {
+    const ctxA = g_massacreFetchContext?.A || {};
+    const ctxB = g_massacreFetchContext?.B || {};
+    const avgPaceA = avgOrNaN(ctxA.pace10);
+    const avgPaceB = avgOrNaN(ctxB.pace10);
+    const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
+    if (isFinite(avgPaceA) && isFinite(avgPaceB) && avgPaceA > 0 && avgPaceB > 0) {
+      const avgPace = (avgPaceA + avgPaceB) / 2;
+      const paceAdjust = clampNumber(avgPace / leaguePaceBase, 0.85, 1.15);
+      projA1H *= paceAdjust;
+      projB1H *= paceAdjust;
+    }
+    const netA = avgOrNaN(ctxA.ortg10) - avgOrNaN(ctxA.drtg10);
+    const netB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
+    if (isFinite(netA) && isFinite(netB)) {
+      projA1H *= (1 + clampNumber(netA / 200, -0.10, 0.10));
+      projB1H *= (1 + clampNumber(netB / 200, -0.10, 0.10));
+    }
+  }
+
   const aH2H = getH2HSeries("A", "h1", parsed);
   const bH2H = getH2HSeries("B", "h1", parsed);
   const h1HasH2H = maybeReadH2HEnabled("h1") && aH2H.length >= 2 && bH2H.length >= 2;
