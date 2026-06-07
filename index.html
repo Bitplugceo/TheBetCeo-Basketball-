@@ -2521,6 +2521,22 @@ body.dark-mode .tracker-analytics-section-head {
 <div class="section" id="sofascoreManualSection" style="display:none;">
   <h3>🔍 Player Lookup <span style="font-size:11px;color:#aaa;">(Manual leagues — SofaScore)</span></h3>
 
+  <div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px dashed var(--panel-border);">
+    <label style="font-size:11px;font-weight:800;">Step 1 — Fixture JSON <span style="color:var(--muted);font-weight:600;">(paste Sofascore event JSON → sets tournament ID + team IDs)</span></label>
+    <div style="display:flex;gap:6px;align-items:center;margin-top:3px;">
+      <input id="ssFixturePaste" placeholder="Paste fixture event JSON here" oninput="parseSofascoreFixture()" style="margin-bottom:0;font-size:10px;padding:6px 8px;flex:1;background:var(--input-bg);color:var(--text);border:1px solid var(--input-border);" />
+      <button type="button" onclick="clearFixturePaste()" title="Clear fixture" style="background:#d91f26;color:#fff;border:none;margin:0;padding:4px 8px;font-size:12px;font-weight:900;cursor:pointer;flex-shrink:0;line-height:1;">✕</button>
+    </div>
+    <div id="ssFixtureStatus" style="font-size:10px;min-height:14px;margin-top:3px;"></div>
+    <div style="margin-top:6px;">
+      <label style="font-size:11px;font-weight:800;">Tournament ID <span style="color:var(--muted);font-weight:600;">(auto-filled by fixture paste · override if needed)</span></label>
+      <div style="display:flex;gap:6px;align-items:center;margin-top:2px;">
+        <input id="ssTournamentId" placeholder="e.g. 12345" oninput="onTournamentIdInput()" style="margin-bottom:0;font-size:11px;padding:4px 6px;width:140px;flex-shrink:0;" />
+        <span id="ssTournamentName" style="font-size:10px;font-weight:800;color:var(--muted);"></span>
+      </div>
+    </div>
+  </div>
+
   <div style="margin-bottom:12px;border-bottom:1px dashed var(--panel-border);padding-bottom:10px;">
     <label>Player A Name (Home)</label>
     <div style="display:flex;gap:6px;margin-bottom:4px;">
@@ -2550,7 +2566,14 @@ body.dark-mode .tracker-analytics-section-head {
     </div>
   </div>
 
-  <div id="ssFetchStatus" style="font-size:10px;min-height:16px;"></div>
+  <div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--panel-border);">
+    <label style="font-size:11px;font-weight:800;margin-bottom:3px;">Fixture Tournament ID <span style="color:var(--muted);font-weight:600;">(auto-detected · override if wrong)</span></label>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+      <input id="ssTournamentId" placeholder="Auto-detected from first paste" style="margin-bottom:0;font-size:11px;padding:4px 6px;width:180px;flex-shrink:0;" oninput="onTournamentIdInput()" />
+      <span id="ssTournamentName" style="font-size:10px;font-weight:800;color:var(--muted);"></span>
+    </div>
+  </div>
+  <div id="ssFetchStatus" style="font-size:10px;min-height:16px;margin-top:6px;"></div>
 </div>
 
 <div class="section" id="espnSection">
@@ -3100,7 +3123,7 @@ function ssIsBasketballEvent(ev) {
   return true;
 }
 
-function ssProcessTeamEvents(events, teamId, label) {
+function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
   const scoredList = [], allowedList = [];
   const homeScoredList = [], homeAllowedList = [];
   const awayScoredList = [], awayAllowedList = [];
@@ -3117,7 +3140,27 @@ function ssProcessTeamEvents(events, teamId, label) {
     engineDebug("ssProcessTeamEvents: blocked " + blockedCount + " non-basketball events", { label, total: events.length, kept: basketballEvents.length });
   }
 
-  const completedAll = basketballEvents.filter(e => {
+  // LOCK: Filter to the fixture's competition ONLY using uniqueTournament.id.
+  // fixtureTournamentId is the sole source of truth. It comes from (in priority order):
+  //   1. Fixture JSON paste (parseSofascoreFixture) — authoritative, no inference
+  //   2. Manual ssTournamentId entry
+  //   3. Intersection detection after both teams pasted
+  // No hardcoded names. No score thresholds. Works for every competition globally.
+  // When null, filter is a no-op — preserves backward compatibility.
+  let competitionEvents = basketballEvents;
+  if (fixtureTournamentId != null) {
+    const tidStr = String(fixtureTournamentId);
+    competitionEvents = basketballEvents.filter(ev => {
+      const evTid = ev?.tournament?.uniqueTournament?.id;
+      return evTid != null && String(evTid) === tidStr;
+    });
+    const crossBlocked = basketballEvents.length - competitionEvents.length;
+    if (crossBlocked > 0) {
+      engineDebug("ssProcessTeamEvents: blocked " + crossBlocked + " cross-competition events", { label, fixtureTournamentId, kept: competitionEvents.length });
+    }
+  }
+
+  const completedAll = competitionEvents.filter(e => {
     const _sType = e.status?.type ?? "";
     const _isDone = _sType === "finished" || _sType === "afterExtraTime" || _sType === "afterPenalties" || e.status?.finished === true;
     if (!_isDone) return false;
@@ -3245,6 +3288,132 @@ function updateSofascoreLinks(side) {
 window.__lastEventsA = null;
 window.__lastEventsB = null;
 window.__h2hEntryCache = [];
+window.__fixtureTournamentId = null;
+
+// Priority: manual input field → fixture-paste-detected global → null (no filter).
+function getFixtureTournamentId() {
+  const manualVal = (document.getElementById("ssTournamentId")?.value || "").trim();
+  if (manualVal && /^\d+$/.test(manualVal)) return manualVal;
+  return window.__fixtureTournamentId != null ? String(window.__fixtureTournamentId) : null;
+}
+
+// Intersection-based detection: finds tournaments present in BOTH teams' completed
+// basketball histories, sorted by combined game count descending.
+// Returns array of { id, name, countA, countB, combined } — empty if no overlap.
+// This is categorically safer than modal (single-team) detection because it requires
+// the competition to exist in BOTH histories, dramatically narrowing the candidate set.
+function detectTournamentIdIntersection(eventsA, eventsB) {
+  function countByTournament(events) {
+    const counts = {};
+    events.forEach(ev => {
+      if (!ssIsBasketballEvent(ev)) return;
+      const sType = ev.status?.type ?? "";
+      const done = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
+      if (!done) return;
+      const tid = ev?.tournament?.uniqueTournament?.id;
+      if (tid == null) return;
+      const key = String(tid);
+      if (!counts[key]) counts[key] = { id: key, name: ev?.tournament?.name || "", count: 0 };
+      counts[key].count++;
+    });
+    return counts;
+  }
+  const cA = countByTournament(eventsA);
+  const cB = countByTournament(eventsB);
+  const result = [];
+  Object.keys(cA).forEach(tid => {
+    if (cB[tid]) {
+      result.push({
+        id: tid,
+        name: cA[tid].name || cB[tid].name,
+        countA: cA[tid].count,
+        countB: cB[tid].count,
+        combined: cA[tid].count + cB[tid].count
+      });
+    }
+  });
+  return result.sort((a, b) => b.combined - a.combined);
+}
+
+// Parses a Sofascore fixture event JSON (from /api/v1/event/{eventId}).
+// Extracts: tournament.uniqueTournament.id (primary source of truth),
+// homeTeam.id, awayTeam.id, team names.
+// This is the authoritative path — no inference, no heuristics.
+function parseSofascoreFixture() {
+  const el = document.getElementById("ssFixturePaste");
+  const statusEl = document.getElementById("ssFixtureStatus");
+  const rawText = (el?.value || "").trim();
+  if (!rawText) return;
+  try {
+    const parsed = JSON.parse(rawText);
+    // Handle both { event: {...} } and a raw event object.
+    // Also handle { events: [...] } (team history paste) — extract first scheduled game.
+    let ev = parsed.event || parsed;
+    if (parsed.events && Array.isArray(parsed.events)) {
+      const scheduled = parsed.events.find(e => {
+        const st = e.status?.type ?? "";
+        return st === "notstarted" || st === "scheduled" || st === "inprogress";
+      });
+      ev = scheduled || parsed.events[0];
+    }
+
+    const tid = ev?.tournament?.uniqueTournament?.id;
+    const tName = ev?.tournament?.name || "";
+    const homeId = ev?.homeTeam?.id;
+    const awayId = ev?.awayTeam?.id;
+    const homeName = ev?.homeTeam?.name || ev?.homeTeam?.shortName || "";
+    const awayName = ev?.awayTeam?.name || ev?.awayTeam?.shortName || "";
+
+    if (!tid) throw new Error("No uniqueTournament.id found in fixture JSON — check the pasted content.");
+
+    // Set tournament ID as the single source of truth.
+    window.__fixtureTournamentId = String(tid);
+    const tidEl = document.getElementById("ssTournamentId");
+    const tNameEl = document.getElementById("ssTournamentName");
+    if (tidEl) tidEl.value = String(tid);
+    if (tNameEl) tNameEl.textContent = tName ? "(" + tName + ")" : "";
+
+    // Auto-fill team IDs and names if not already entered.
+    if (homeId) {
+      const aIdEl = document.getElementById("ssTeamAId");
+      if (aIdEl && !aIdEl.value.trim()) { aIdEl.value = String(homeId); updateSofascoreLinks("A"); }
+    }
+    if (awayId) {
+      const bIdEl = document.getElementById("ssTeamBId");
+      if (bIdEl && !bIdEl.value.trim()) { bIdEl.value = String(awayId); updateSofascoreLinks("B"); }
+    }
+    if (homeName) {
+      const aNameEl = document.getElementById("ssTeamAName");
+      if (aNameEl && !aNameEl.value.trim()) aNameEl.value = homeName;
+    }
+    if (awayName) {
+      const bNameEl = document.getElementById("ssTeamBName");
+      if (bNameEl && !bNameEl.value.trim()) bNameEl.value = awayName;
+    }
+
+    if (statusEl) { statusEl.style.color = "#2f8f4a"; statusEl.textContent = "✅ Tournament: " + (tName || tid) + " (ID: " + tid + ")"; }
+    if (el) el.value = "";
+    engineDebug("parseSofascoreFixture: tournament set from fixture JSON", { tid, tName, homeId, awayId });
+  } catch (err) {
+    if (statusEl) { statusEl.style.color = "#d92d2a"; statusEl.textContent = "❌ Fixture parse failed: " + err.message; }
+    engineDebug("parseSofascoreFixture failed", { error: err.message });
+  }
+}
+
+function clearFixturePaste() {
+  const el = document.getElementById("ssFixturePaste");
+  if (el) el.value = "";
+  const statusEl = document.getElementById("ssFixtureStatus");
+  if (statusEl) { statusEl.style.color = ""; statusEl.textContent = ""; }
+}
+
+// Called when user manually edits the ssTournamentId field.
+function onTournamentIdInput() {
+  const nameEl = document.getElementById("ssTournamentName");
+  if (nameEl) nameEl.textContent = "";
+  const val = (document.getElementById("ssTournamentId")?.value || "").trim();
+  if (!val) window.__fixtureTournamentId = null;
+}
 
 function getLeagueGender() {
   const league = document.getElementById("leagueSelect")?.value || "";
@@ -3286,6 +3455,22 @@ function parseSofascoreIndividual(side) {
       return;
     }
 
+    // Auto-detect fixture tournament ID from this paste.
+    // Only fires when no tournament ID has been set yet (no manual override, no prior detection).
+    // Uses modal detection (most-frequent tournament) — robust against interleaved cross-competition events.
+    // The ssTournamentId field displays the result and the user can override it at any time.
+    if (getFixtureTournamentId() == null) {
+      const detected = detectTournamentIdFromEvents(events);
+      if (detected) {
+        window.__fixtureTournamentId = detected.id;
+        const tidEl = document.getElementById("ssTournamentId");
+        const tNameEl = document.getElementById("ssTournamentName");
+        if (tidEl && !tidEl.value.trim()) tidEl.value = detected.id;
+        if (tNameEl) tNameEl.textContent = detected.name ? "(" + detected.name + ")" : "";
+        engineDebug("Auto-detected fixture tournament ID: " + detected.id + " (" + detected.name + ")", { side });
+      }
+    }
+
     const prevEvents = side === "A" ? (window.__lastEventsA || []) : (window.__lastEventsB || []);
     const mergedMap = new Map();
     [...prevEvents, ...events].forEach(ev => { if (ev.id != null) mergedMap.set(ev.id, ev); });
@@ -3295,6 +3480,33 @@ function parseSofascoreIndividual(side) {
 
     if (side === "A") { window.__jsonPasteCountA = (window.__jsonPasteCountA || 0) + 1; }
     else { window.__jsonPasteCountB = (window.__jsonPasteCountB || 0) + 1; }
+
+    // Intersection-based tournament detection — only after BOTH teams are pasted.
+    // Intentionally deferred: single-team modal detection can select the wrong competition
+    // when reserve/development leagues dominate a team's recent history.
+    // Fixture JSON paste (parseSofascoreFixture) takes priority and skips this entirely.
+    if (getFixtureTournamentId() == null) {
+      const _evA = window.__lastEventsA || [];
+      const _evB = window.__lastEventsB || [];
+      if (_evA.length > 0 && _evB.length > 0) {
+        const _candidates = detectTournamentIdIntersection(_evA, _evB);
+        if (_candidates.length >= 1) {
+          const _best = _candidates[0];
+          window.__fixtureTournamentId = _best.id;
+          const _tidEl = document.getElementById("ssTournamentId");
+          const _tNameEl = document.getElementById("ssTournamentName");
+          if (_tidEl && !_tidEl.value.trim()) _tidEl.value = _best.id;
+          if (_tNameEl) _tNameEl.textContent = _best.name
+            ? "(" + _best.name + (_candidates.length > 1 ? " · override if wrong" : "") + ")"
+            : "";
+          engineDebug("Tournament auto-detected via intersection: " + _best.id + " (" + _best.name + ")", { side, candidates: _candidates.length });
+        } else {
+          const _tNameEl = document.getElementById("ssTournamentName");
+          if (_tNameEl) _tNameEl.textContent = "(no shared tournament found — paste fixture JSON or enter ID)";
+          engineDebug("Intersection detection: no shared tournament between both teams", { side });
+        }
+      }
+    }
 
     // Determine if this is the first paste for this side (stats fields are empty)
     const isFirstPaste = (side === "A")
@@ -3321,7 +3533,7 @@ function parseSofascoreIndividual(side) {
 
     // Only load full stats (FT, 1H, quarters, venue splits) if this is the first paste
     if (isFirstPaste) {
-      const stats = ssProcessTeamEvents(events, idVal, "Team " + side);
+      const stats = ssProcessTeamEvents(events, idVal, "Team " + side, getFixtureTournamentId());
       const display5S = stats.scoredList.slice(0, 5);
       const display5A = stats.allowedList.slice(0, 5);
 
@@ -3425,7 +3637,7 @@ function parseSofascoreIndividual(side) {
         if (!g_massacreFetchContext.B.overall) g_massacreFetchContext.B.overall = {};
         window.__lastEventsB = mergedEvents;
       }
-      const mergedStats = ssProcessTeamEvents(mergedEvents, idVal, "Team " + side + " (merged)");
+      const mergedStats = ssProcessTeamEvents(mergedEvents, idVal, "Team " + side + " (merged)", getFixtureTournamentId());
       const mergedDisplay5S = mergedStats.scoredList.slice(0, 5);
       const mergedDisplay5A = mergedStats.allowedList.slice(0, 5);
       const _currentField = document.getElementById(side === "A" ? "aFTScored" : "bFTScored");
@@ -3559,7 +3771,7 @@ function extractH2HFromPastedEvents() {
 
   // Strict H2H filter: only games where the two exact team IDs match
   // Exclude Rapid League (low quality) and games where any team scored below 40 points
-  let h2hMatches = uniqueEvents.filter(ev => {
+    let h2hMatches = uniqueEvents.filter(ev => {
     const sType = ev.status?.type ?? "";
     const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
     if (!isTerminal) return false;
@@ -3567,14 +3779,14 @@ function extractH2HFromPastedEvents() {
     const aId = String(ev.awayTeam?.id ?? "");
     if (!((hId === idA && aId === idB) || (hId === idB && aId === idA))) return false;
 
-    // Filter out Rapid League games (tournament name contains "Rapid")
-    const tournamentName = ev.tournament?.name || "";
-    if (tournamentName.toLowerCase().includes("rapid")) return false;
-
-    // Filter out games where either team scored below 40 points (likely non-competitive or youth)
-    const homeScore = ev.homeScore?.normaltime ?? ev.homeScore?.current ?? 0;
-    const awayScore = ev.awayScore?.normaltime ?? ev.awayScore?.current ?? 0;
-    if (homeScore < 40 || awayScore < 40) return false;
+    // LOCK: Filter H2H to the fixture's competition ONLY via uniqueTournament.id.
+    // Replaces ALL prior hardcoded filters (name strings, score thresholds).
+    // Generic — works for every competition globally. No-op when fixtureTid is null.
+    const fixtureTid = getFixtureTournamentId();
+    if (fixtureTid != null) {
+      const evTid = ev?.tournament?.uniqueTournament?.id;
+      if (evTid == null || String(evTid) !== fixtureTid) return false;
+    }
 
     return true;
   }).sort((a, b) => {
@@ -15268,12 +15480,20 @@ if (trackedToSave.length) {
       accordionOpen("leagueSection");
       validateFetchSection();
 
-      // Reset SofaScore manual section
-      const ssInputs = ["ssTeamAName", "ssTeamAId", "ssPasteA", "ssTeamBName", "ssTeamBId", "ssPasteB"];
+            // Reset SofaScore manual section
+      const ssInputs = ["ssTeamAName", "ssTeamAId", "ssPasteA", "ssTeamBName", "ssTeamBId", "ssPasteB", "ssFixturePaste", "ssTournamentId"];
       ssInputs.forEach(id => {
         const el = document.getElementById(id);
         if (el) el.value = "";
       });
+      window.__fixtureTournamentId = null;
+      window.__lastEventsA = null;
+      window.__lastEventsB = null;
+      window.__h2hEntryCache = [];
+      const _ssTournamentName = document.getElementById("ssTournamentName");
+      if (_ssTournamentName) _ssTournamentName.textContent = "";
+      const _ssFixtureStatus = document.getElementById("ssFixtureStatus");
+      if (_ssFixtureStatus) { _ssFixtureStatus.style.color = ""; _ssFixtureStatus.textContent = ""; }
       const ssStatus = document.getElementById("ssFetchStatus");
       if (ssStatus) ssStatus.textContent = "";
 
