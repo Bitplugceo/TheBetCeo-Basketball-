@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6371,6 +6370,54 @@ function buildCompactFetchStatus(messages = [], fetchAuditIssues = []) {
 
       engineDebug("fetch start", { request: fetchLabel, timeoutMs });
             async function fetchJson(requestUrl, label) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+        let _proxyAbortHandler = null;
+        if (window.__abortSignal && !window.__abortSignal.aborted) {
+          _proxyAbortHandler = () => ctrl.abort();
+          window.__abortSignal.addEventListener('abort', _proxyAbortHandler, { once: true });
+        }
+        try {
+          const res = await fetch(requestUrl, { 
+            signal: ctrl.signal, 
+            cache: "no-store" 
+          });
+
+          if (!res.ok) throw new Error(`${label} HTTP ${res.status}: ${res.statusText}`);
+
+          const text = await res.text();
+          try { return JSON.parse(text); } catch (e) { throw new Error(`${label} bad JSON (Length: ${text.length})`); }
+        } catch (e) {
+          if (e.name === 'AbortError') throw new Error(`${label} Timeout after ${timeoutMs/1000}s`);
+          throw e;
+        } finally {
+          clearTimeout(timer);
+          if (window.__abortSignal && _proxyAbortHandler) {
+            window.__abortSignal.removeEventListener('abort', _proxyAbortHandler);
+            _proxyAbortHandler = null;
+          }
+        }
+      }
+
+      if (String(url).includes("sofascore.com")) {
+        const _SOFA_FALLBACKS = [
+          u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+          u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+          u => `https://thingproxy.freeboard.io/fetch/${encodeURIComponent(u)}`
+        ];
+        let sofaError = null;
+        for (let i = 0; i < _SOFA_FALLBACKS.length; i++) {
+          try {
+            const data = await fetchJson(_SOFA_FALLBACKS[i](url), `SofaProxy-${i + 1}`);
+            _proxyFetchCache.set(cacheKey, { data, timestamp: Date.now() });
+            return data;
+          } catch (err) {
+            sofaError = err;
+          }
+        }
+        engineDebug("SofaScore fetch failed completely — all non-Cloudflare proxies exhausted", { url, error: sofaError?.message || String(sofaError) });
+        throw sofaError;
+      }
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), timeoutMs);
         let _proxyAbortHandler = null;
