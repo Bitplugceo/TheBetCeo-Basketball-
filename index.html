@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6636,7 +6635,7 @@ function getRawMarketInputMap() {
 
       const parts = raw.split(",").map(x => x.trim()).filter(Boolean);
       if (!parts.length) return null;
-      if (parts.length > 5) return { err: "maximum 5 values allowed" };
+      if (parts.length > 10) return { err: "maximum 10 values allowed" };
 
       const out = [];
       for (let i = 0; i < parts.length; i++) {
@@ -11058,7 +11057,7 @@ function readLooseSeries(id) {
     
     out.push(value);
     
-    if (out.length === 5) break;
+    if (out.length === 10) break;
   }
 
   return out;
@@ -12920,19 +12919,6 @@ async function fetchESPN() {
       } catch(_) { return null; }
     }
 
-      async     async function fetchESPNNewsAlerts(teamId, base) {
-      try {
-        const data = await proxyFetch(base + "/news?limit=10").catch(() => null);
-        if (!data || !Array.isArray(data.articles)) return null;
-        const tid = String(teamId);
-        const relevant = data.articles.filter(a => {
-          const cats = a.categories || [];
-          return cats.some(c => String(c.id) === tid || String(c.teamId) === tid);
-        }).slice(0, 3);
-        return relevant.length ? relevant.map(a => a.headline || "").filter(Boolean) : null;
-      } catch(e) { return null; }
-    }
-
     const [injA, injB, rostA, rostB, liveBaseA, liveBaseB] = await Promise.all([
       fetchInjuryMeta(espnBase, teamAId, aAvg, league),
       fetchInjuryMeta(espnBase, teamBId, bAvg, league),
@@ -13603,13 +13589,25 @@ function meanFromList(values) {
 // Cache lives on window._mcCache (Map). Cleared on every page reload — zero stale data risk.
 // DO NOT add TTL or size limits — session scope is sufficient; inputs change with each new fixture.
 const _mcCache = new Map();
-async function runMassacreMonteCarlo(teamSeriesFiltered, iterations) {
+async function runMassacreMonteCarlo(teamSeriesFiltered, iterations, marketLine) {
   const series = normalizeIntelSeries(teamSeriesFiltered);
   const runs = Math.max(500, Math.min(Number(iterations) || getMassacreRuns(), 10000));
   if (series.length < 5) return { overPct: 50, underPct: 50 };
   const mean = avg(series);
   const sigma = Math.max(stdDev(series), 1.0);
-  return { overPct: 50, underPct: 50, mean, sigma, n: series.length };
+  const line = isFinite(Number(marketLine)) && Number(marketLine) > 0 ? Number(marketLine) : mean;
+  let overCount = 0;
+  for (let i = 0; i < runs; i += 2) {
+    const u1 = Math.random() || 1e-12;
+    const u2 = Math.random() || 1e-12;
+    const z1 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    const z2 = Math.sqrt(-2 * Math.log(u1)) * Math.sin(2 * Math.PI * u2);
+    if (mean + z1 * sigma > line) overCount++;
+    if ((i + 1) < runs && mean + z2 * sigma > line) overCount++;
+  }
+  const actualRuns = runs % 2 === 0 ? runs : runs - 1;
+  const overPct = parseFloat(((overCount / actualRuns) * 100).toFixed(1));
+  return { overPct, underPct: parseFloat((100 - overPct).toFixed(1)), mean, sigma, n: series.length };
 }
 function getHistoricalStdDev(teamSeriesArray) {
   const series = normalizeIntelSeries(teamSeriesArray);
@@ -15257,6 +15255,19 @@ for (const p of finalPicksForDisplay) {
 // replace the original array (though reference is fine)
 finalPicksForDisplay.length = 0;
 finalPicksForDisplay.push(...safePicks);
+
+// Compute Monte Carlo win probability for each actionable A/B pick
+{
+  const _wpSrcA = getOverallSeries("A", 10);
+  const _wpSrcB = getOverallSeries("B", 10);
+  const _wpVol = Math.max(stdDev(_wpSrcA), stdDev(_wpSrcB), 8);
+  finalPicksForDisplay.forEach(p => {
+    if (p.pick !== "NO PLAY" && isFinite(p.proj) && isFinite(p.line) && p.line > 0) {
+      const _wpSide = getPickSideFromText(p.pick);
+      if (_wpSide) p.winProbability = quickMCWinProb(p.proj, p.line, _wpVol, 500, _wpSide);
+    }
+  });
+}
 
 // persistLineMemoryFromFinalPicks removed per spec
 
@@ -17073,9 +17084,9 @@ window.ENGINE_TEST_SUITE = (() => {
     const t = trimmedAvg([60,80,90,95,120]);
     expectTrue("trimmedAvg drops outliers (75–100)", isFinite(t) && t > 75 && t < 100);
     expectApprox("stdDev uniform = 0", stdDev([10,10,10,10]), 0, 0.001);
-    expectApprox("stdDev always 0 (removed per spec)", stdDev([80,90,100,110,120]), 0, 0.001);
+    expectApprox("stdDev of varied arr ≈ 14.14", stdDev([80,90,100,110,120]), 14.14, 0.1);
     const w = weightedRecentAverage([100,90,80,70,60]);
-    expectApprox("weightedRecentAverage = simple avg (recency removed)", w, 80, 0.001);
+    expectApprox("weightedRecentAverage is recency-weighted (>80)", w, 83.2, 2.0);
   });
 
   suite("getPick — simplified direction", () => {
