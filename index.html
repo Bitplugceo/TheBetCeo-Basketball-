@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13192,32 +13191,63 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   // Advanced stats blend (ESPN auto-fetch leagues)
   const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
+  const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
   let paceAdjust = 1.0;
   let netAdjustA = 0, netAdjustB = 0;
   let usedAdvanced = false;
-  if (isEspnLeague) {
-    const ctxA = g_massacreFetchContext?.A || {};
-    const ctxB = g_massacreFetchContext?.B || {};
-    const avgPaceA = avgOrNaN(ctxA.pace10);
-    const avgPaceB = avgOrNaN(ctxB.pace10);
-    const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
-    const clamp = getEffectivePaceClamp(league);
-    if (isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0) {
-      const avgPace = (avgPaceA + avgPaceB) / 2;
-      paceAdjust = clampNumber(avgPace / leaguePaceBase, clamp.min, clamp.max);
-      usedAdvanced = true;
+  let synNetA = 0, synNetB = 0;
+  let synPace = leaguePaceBase;
+
+  const ctxA = g_massacreFetchContext?.A || {};
+  const ctxB = g_massacreFetchContext?.B || {};
+  const avgPaceA = avgOrNaN(ctxA.pace10);
+  const avgPaceB = avgOrNaN(ctxB.pace10);
+  const clamp = getEffectivePaceClamp(league);
+
+  let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
+  let hasRealNet = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10));
+
+  if (hasRealPace) {
+    const avgPace = (avgPaceA + avgPaceB) / 2;
+    paceAdjust = clampNumber(avgPace / leaguePaceBase, clamp.min, clamp.max);
+    synPace = avgPace;
+    usedAdvanced = true;
+  } else {
+    // Synthetic Pace Fallback
+    const totalA = avgOrNaN(aFTS) + avgOrNaN(aFTA);
+    const totalB = avgOrNaN(bFTS) + avgOrNaN(bFTA);
+    if (isFinite(totalA) && isFinite(totalB)) {
+      const synPaceA = (totalA / eb) * leaguePaceBase;
+      const synPaceB = (totalB / eb) * leaguePaceBase;
+      const avgSynPace = (synPaceA + synPaceB) / 2;
+      paceAdjust = clampNumber(avgSynPace / leaguePaceBase, clamp.min, clamp.max);
+      synPace = avgSynPace;
     }
+  }
+
+  if (hasRealNet) {
     const netA = avgOrNaN(ctxA.ortg10) - avgOrNaN(ctxA.drtg10);
     const netB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
-    if (isFinite(netA) && isFinite(netB)) {
-      netAdjustA = clampNumber(netA / 100, -0.15, 0.15);
-      netAdjustB = clampNumber(netB / 100, -0.15, 0.15);
-      usedAdvanced = true;
+    netAdjustA = clampNumber(netA / 100, -0.15, 0.15);
+    netAdjustB = clampNumber(netB / 100, -0.15, 0.15);
+    synNetA = netA;
+    synNetB = netB;
+    usedAdvanced = true;
+  } else {
+    // Synthetic Net Rating Fallback
+    const diffA = avgOrNaN(aFTS) - avgOrNaN(aFTA);
+    const diffB = avgOrNaN(bFTS) - avgOrNaN(bFTA);
+    if (isFinite(diffA) && isFinite(diffB) && isFinite(synPace) && synPace > 0) {
+      synNetA = (diffA / synPace) * 100;
+      synNetB = (diffB / synPace) * 100;
+      netAdjustA = clampNumber(synNetA / 100, -0.15, 0.15);
+      netAdjustB = clampNumber(synNetB / 100, -0.15, 0.15);
     }
-    if (usedAdvanced) {
-      aS = aS * paceAdjust * (1 + netAdjustA);
-      bS = bS * paceAdjust * (1 + netAdjustB);
-    }
+  }
+
+  if (isEspnLeague) {
+    aS = aS * paceAdjust * (1 + netAdjustA);
+    bS = bS * paceAdjust * (1 + netAdjustB);
   }
 
   // Intelligence pack adjustment
@@ -13252,6 +13282,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     aS, bS, aScores: aFTS, bScores: bFTS,
     aVenueEnabled: false, bVenueEnabled: false,
     pace: paceAdjust,
+    synNetA, synNetB,
     usedAdvanced
   };
 }
