@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13961,7 +13960,11 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
     if (isFinite(p.edge)) {
       const oldEdge = p.edge;
       p.edge *= edgeMult;
-      if (isFinite(p.proj)) p.proj += (p.edge - oldEdge);
+      // Throttler: Cap Massacre bonus to prevent "Hallucinations" from outliers
+      const maxBonus = (league === 'nba' ? 6.5 : 4.5);
+      const bonus = Math.min(p.edge - oldEdge, maxBonus);
+      p.edge = oldEdge + bonus;
+      if (isFinite(p.proj)) p.proj += bonus;
     }
     if (p.confidence && confBoost > 0) p.confidence = bumpConfidenceGrade(p.confidence, confBoost);
     p.massacreDecision = "applied";
@@ -15374,6 +15377,37 @@ applyIntelligenceLayerToPicks(finalPicksForDisplay, intelligencePack, league);
 applyLeagueTrustToPicks(finalPicksForDisplay, league);
 await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtureMeta);
 
+// FINAL RECONCILIATION (Last Step: Robust Alignment) 
+const fP = finalPicksForDisplay.find(x => x.marketKey = 'ft'); 
+if (fP && isFinite(fP.proj)) { 
+const qPicks = finalPicksForDisplay.filter(x => ['q1','q2','q3','q4'].includes(x.marketKey) && isFinite(x.proj)); 
+const h1P = finalPicksForDisplay.find(x => x.marketKey = 'h1'); 
+const rawQSum = qPicks.reduce((s, x) => s + x.proj, 0);
+
+if (rawQSum > 50) { 
+// Robust Scaling: scale based on actual game coverage (e.g. if Q4 is missing, scale to 75%) 
+const gameCoverageShare = qPicks.length / 4; 
+const scale = (fP.proj * gameCoverageShare) / rawQSum;
+
+qPicks.forEach(q => {
+  q.proj *= scale;
+  q.edge = q.proj - q.line;
+  q.pick = getPick(q.edge, q.line, league, "h1", {});
+});
+
+}
+
+if (h1P) { 
+const q1P = qPicks.find(x => x.marketKey = 'q1'); 
+const q2P = qPicks.find(x => x.marketKey = 'q2'); 
+if (q1P && q2P) { 
+h1P.proj = q1P.proj + q2P.proj; 
+h1P.edge = h1P.proj - h1P.line; 
+h1P.pick = getPick(h1P.edge, h1P.line, league, "h1", {}); 
+} 
+} 
+} 
+
 
 
 finalPicksForDisplay.forEach(p => {
@@ -15609,13 +15643,13 @@ window.__LAST_AUDIT_STATE = {
     blowoutGap: ftCalc.blowoutGap, paceGapRisk: ftCalc.paceGapRisk,
     ftHasH2H: ftCalc.ftHasH2H,
     h1HasH2H: h1Calc.h1HasH2H,
-    diagnosticMath: {
-      rawForm: (ftCalc.aS + ftCalc.bS).toFixed(1),
-      h2hAdjust: (ftCalc.ftHasH2H ? (ftCalc.ftProj - (ftCalc.aS + ftCalc.bS)) : 0).toFixed(1),
-      periodDrift: (ftCalc.ftProj - ((q1?.proj||0)+(q2?.proj||0)+(q3?.proj||0)+(q4?.proj||0))).toFixed(4),
-      h1Ratio: (h1Calc.h1Proj / ftCalc.ftProj).toFixed(3),
-      qAlignment: (h1Calc.h1Proj - ((q1?.proj||0)+(q2?.proj||0))).toFixed(2)
-    },
+    diagnosticMath: { 
+rawForm: (ftCalc.aS + ftCalc.bS).toFixed(1), 
+h2hAdjust: (ftCalc.ftHasH2H ? (ftCalc.ftProj - (ftCalc.aS + ftCalc.bS)) : 0).toFixed(1), 
+h1Ratio: (finalPicksForDisplay.find(x=>x.marketKey='h1')?.proj / finalPicksForDisplay.find(x=>x.marketKey='ft')?.proj).toFixed(3), 
+hallucinationGuard: (finalPicksForDisplay.find(x=>x.marketKey='h1')?.proj / finalPicksForDisplay.find(x=>x.marketKey='ft')?.proj > 0.58) ? "WARNING" : "Stable", 
+qAlignment: (finalPicksForDisplay.find(x=>x.marketKey='h1')?.proj - (finalPicksForDisplay.find(x=>x.marketKey='q1')?.proj + finalPicksForDisplay.find(x=>x.marketKey='q2')?.proj)).toFixed(2) 
+},
     aVenueEnabled: ftCalc.aVenueEnabled,
     bVenueEnabled: ftCalc.bVenueEnabled
   },
