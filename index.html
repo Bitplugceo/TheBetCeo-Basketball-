@@ -11885,58 +11885,62 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
   const gameRefs = [];
   const currentSeason = getCurrentSeasonYear(leagueKey);
 
+  const _schedJobList = [];
   for (let i = 0; i < rules.recentSeasons; i++) {
     const season = String(currentSeason - i);
-
     for (const stype of rules.scheduleTypes) {
-      try {
-        const key = `${base}:sched:${teamId}:${season}:${stype}`;
-        const r = await (_schedCache.has(key)
-          ? _schedCache.get(key)
-          : (() => {
-              const p = proxyFetch(`${base}/teams/${teamId}/schedule?season=${season}&seasontype=${stype}`).catch(err => {
-                _schedCache.delete(key);
-                throw err;
-              });
-              cacheSet(_schedCache, key, p);
-              return p;
-            })());
-
-        const events = r?.events || r?.team?.schedule?.events || [];
-        for (const ev of events) {
-          if (!ev?.id) continue;
-
-          const comp = ev?.competitions?.[0];
-          if (!comp) continue;
-
-          const done =
-            comp?.status?.type?.completed ||
-            comp?.status?.type?.name === "STATUS_FINAL" ||
-            comp?.status?.type?.state === "post";
-
-          if (!done || (comp?.competitors || []).length < 2) continue;
-
-          const competitors = comp.competitors;
-          const mine = competitors.find(x => matchesTeam(x, tId)) || competitors[0];
-          const opp = competitors.find(x => !matchesTeam(x, tId)) || competitors[1];
-          const ps = s => typeof s === "object" ? parseFloat(s.value ?? s.displayValue ?? 0) : parseFloat(s);
-
-          // [CLOSED: FIX 23 — SOS] oppId captured for opponent win% cross-reference at return time.
-          // DO NOT remove oppId — it is the key used to look up opponent records in standings cache.
-          gameRefs.push({
-            id: String(ev.id),
-            date: ev.date || "",
-            rawS: ps(mine?.score),
-            rawA: ps(opp?.score),
-            venue: mine?.homeAway || "",
-            oppId: String(opp?.team?.id || "")
-          });
-        }
-      } catch (e) {
-        logDebug("fetchScheduleCore failed", e);
-      }
+      const key = `${base}:sched:${teamId}:${season}:${stype}`;
+      const req = _schedCache.has(key)
+        ? _schedCache.get(key)
+        : (() => {
+            const p = proxyFetch(`${base}/teams/${teamId}/schedule?season=${season}&seasontype=${stype}`).catch(err => {
+              _schedCache.delete(key);
+              throw err;
+            });
+            cacheSet(_schedCache, key, p);
+            return p;
+          })();
+      _schedJobList.push(req);
     }
   }
+  const _schedPayloads = await Promise.allSettled(_schedJobList);
+  _schedPayloads.forEach(result => {
+    if (result.status !== 'fulfilled') {
+      logDebug("fetchScheduleCore schedule fetch failed", result.reason);
+      return;
+    }
+    const r = result.value;
+    const events = r?.events || r?.team?.schedule?.events || [];
+    for (const ev of events) {
+      if (!ev?.id) continue;
+
+      const comp = ev?.competitions?.[0];
+      if (!comp) continue;
+
+      const done =
+        comp?.status?.type?.completed ||
+        comp?.status?.type?.name === "STATUS_FINAL" ||
+        comp?.status?.type?.state === "post";
+
+      if (!done || (comp?.competitors || []).length < 2) continue;
+
+      const competitors = comp.competitors;
+      const mine = competitors.find(x => matchesTeam(x, tId)) || competitors[0];
+      const opp = competitors.find(x => !matchesTeam(x, tId)) || competitors[1];
+      const ps = s => typeof s === "object" ? parseFloat(s.value ?? s.displayValue ?? 0) : parseFloat(s);
+
+      // [CLOSED: FIX 23 — SOS] oppId captured for opponent win% cross-reference at return time.
+      // DO NOT remove oppId — it is the key used to look up opponent records in standings cache.
+      gameRefs.push({
+        id: String(ev.id),
+        date: ev.date || "",
+        rawS: ps(mine?.score),
+        rawA: ps(opp?.score),
+        venue: mine?.homeAway || "",
+        oppId: String(opp?.team?.id || "")
+      });
+    }
+  });
 
   if (!gameRefs.length) return null;
 
@@ -11969,7 +11973,7 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
   const qS = { q1:[], q2:[], q3:[], q4:[] };
   const qA = { q1:[], q2:[], q3:[], q4:[] };
 
-    const _chosenForSummary = chosen.slice(0, 10);
+    const _chosenForSummary = chosen.slice(0, Math.min(chosen.length, 15));
     const summaries = await Promise.all(_chosenForSummary.map(async ref => {
       let ms = ref.rawS;
       let os = ref.rawA;
@@ -12610,7 +12614,6 @@ function pickSofaScoreFixture(homeName, homeId, awayName, awayId, tournamentId) 
 async function fetchSofaScoreData() {
   const teamAId = document.getElementById("ssTeamAId")?.value.trim();
   const teamBId = document.getElementById("ssTeamBId")?.value.trim();
-  const tournamentId = document.getElementById("ssTournamentId")?.value.trim();
 
   if (!teamAId || !teamBId) {
     setStatusText("❌ Enter both SofaScore Team IDs first.", "err");
@@ -12618,13 +12621,29 @@ async function fetchSofaScoreData() {
   }
 
   setStatusHTML('<span class="spinner"></span>Fetching SofaScore team events...', "loading");
-  const urlA = `https://api.sofascore.com/api/v1/team/${teamAId}/events/last/0`;
-  const urlB = `https://api.sofascore.com/api/v1/team/${teamBId}/events/last/0`;
+
+  async function _fetchTeamAllPages(teamId) {
+    const pages = await Promise.allSettled([
+      proxyFetch(`https://api.sofascore.com/api/v1/team/${teamId}/events/last/0`, 8000),
+      proxyFetch(`https://api.sofascore.com/api/v1/team/${teamId}/events/last/1`, 8000)
+    ]);
+    const seen = new Set();
+    const merged = [];
+    pages.forEach(r => {
+      if (r.status !== 'fulfilled') return;
+      (r.value?.events || []).forEach(ev => {
+        if (!ev?.id || seen.has(String(ev.id))) return;
+        seen.add(String(ev.id));
+        merged.push(ev);
+      });
+    });
+    return { events: merged };
+  }
 
   try {
     const [dataA, dataB] = await Promise.all([
-      proxyFetch(urlA, 8000),
-      proxyFetch(urlB, 8000)
+      _fetchTeamAllPages(teamAId),
+      _fetchTeamAllPages(teamBId)
     ]);
 
     const pA = document.getElementById("ssPasteA");
