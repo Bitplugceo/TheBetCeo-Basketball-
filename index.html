@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3748,24 +3747,45 @@ function buildGlobalModelState({ league, parsed, lines, injMultA = 1, injMultB =
   const volLimit = getMarketVolLimit(league, "ft");
   const useVenueA = document.getElementById("aVenueSplitEnabled")?.checked;
   const useVenueB = document.getElementById("bVenueSplitEnabled")?.checked;
-  const aFTS = useVenueA ? getFetchedSeries("A", "venue", "ft", "scored") : getOverallSeries("A", 10);
-  const bFTS = useVenueB ? getFetchedSeries("B", "venue", "ft", "scored") : getOverallSeries("B", 10);
+  const aFTS = useVenueA ? getFetchedSeries("A", "venue", "ft", "scored") : getOverallSeries("A", 25);
+  const bFTS = useVenueB ? getFetchedSeries("B", "venue", "ft", "scored") : getOverallSeries("B", 25);
   const volState = getUnifiedVolatilityState(aFTS, bFTS, volLimit);
   const intel = computeIntelligencePack(league);
-  return { league, eb, volLimit, volState, intel, injMultA, injMultB, aFTS, bFTS, lines };
+  const ftCalc = computeFTProjection({ league, parsed, lines, injMultA, injMultB });
+  return { league, eb, volLimit, volState, intel, injMultA, injMultB, aFTS, bFTS, lines, usedAdvanced: ftCalc.usedAdvanced };
 }
 
 function getDynamicEdgeThreshold(league, marketKey, context = null) {
-  let basePct = EDGE_RULES_V1.default;
+  const lKey = String(league || "").toLowerCase();
+  let rules = EDGE_RULES_V1;
+  if (EDGE_RULES_V1[lKey] !== undefined) {
+    rules = EDGE_RULES_V1[lKey];
+  }
+
   let key = String(marketKey || "default").toLowerCase();
   if (key === "team_a" || key === "team_b") key = "team";
   else if (key && key.startsWith("q") && key.length === 2) key = "q";
   
-  if (EDGE_RULES_V1[key] !== undefined) {
-    basePct = EDGE_RULES_V1[key];
-  }
-
+  let basePct = rules[key] !== undefined ? rules[key] : (rules.default || EDGE_RULES_V1.default);
   let thresholdPct = basePct;
+---// Volatility does NOT shift projected points (FIX #4).
+function applyVolatility(proj, series, leagueVolLimit) {
+  // Volatility does NOT shift projected points (FIX #4).
+  // It returns proj unchanged but computes and caches the vol ratio
+  // so getConfidenceGrade can consume it via the shared diagnostics object.
+  if (!isFinite(proj)) return proj;
+  return proj;
+}
+function applyVolatility(proj, series, leagueVolLimit, league = "unknown") {
+  if (!isFinite(proj) || !Array.isArray(series) || !series.length) return proj;
+  const sd = stdDev(series);
+  const limit = Number(leagueVolLimit) || 12;
+  const ratio = sd / limit;
+  const factor = ratio - 0.5;
+  const mult = String(league).toLowerCase().includes("wnba") ? 0.25 : 0.20;
+  const adjustment = clampNumber(factor * mult, -0.08, 0.08);
+  return proj * (1 + adjustment);
+}
 
   if (context) {
     const volRatio = context.volRatio ?? 1.0;
@@ -10799,13 +10819,14 @@ function getVolatilityRatioForSeries(series, leagueVolLimit) {
 
 
     function getSampleTier(...arrays) {
-      if (!arrays.length) return "insufficient";
-      const lens = arrays.map(a => Array.isArray(a) ? a.length : 0);
-      const minLen = Math.min(...lens);
-      if (minLen >= 5) return "full";
-      if (minLen >= 2) return "thin";
-      return "insufficient";
-    }
+  if (!arrays.length) return "insufficient";
+  const lens = arrays.map(a => Array.isArray(a) ? a.length : 0);
+  const minLen = Math.min(...lens);
+  if (minLen >= 15) return "full";
+  if (minLen >= 12) return "medium";
+  if (minLen >= 5) return "thin";
+  return "insufficient";
+}
     // [DELETED] hasMinGames – unused function
         // [LOCK: WIDENED PACE CLAMP RANGES — previously too restrictive (±15-25%)]
     // New limits allow ±35% for NBA/NCAA and ±30% for other leagues, reducing
@@ -10869,7 +10890,7 @@ function getVolatilityRatioForSeries(series, leagueVolLimit) {
 
 // Helper: get overall 10-game scored series for a team side
 function getOverallSeries(side, limit) {
-  const n = Math.max(2, Math.min(Number(limit) || 10, 10));
+  const n = Math.max(2, Math.min(Number(limit) || 25, 25));
   const ctx = g_massacreFetchContext?.[side]?.overall;
   const fetched = Array.isArray(ctx?.ftScored10) ? ctx.ftScored10.map(Number).filter(v => isFinite(v) && v > 0) : [];
   if (fetched.length >= 2) return fetched.slice(0, n);
@@ -11065,13 +11086,21 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
   h2: 0.035,      // 3.5%
   team: 0.035,    // 3.5%
   q: 0.030,       // 3.0%
-  default: 0.035  // 3.5%
+  default: 0.035, // 3.5%
+  // WNBA Edge Threshold Relaxation (Issue 3)
+  wnba: {
+    ft: 0.035,    // ~6 points at line 168 (6/168 = 0.0357)
+    h1: 0.035,    // ~3 points at line 84 (3/84 = 0.0357)
+    team: 0.035,  // ~3 points at line 84 (3/84 = 0.0357)
+    q: 0.070      // ~3 points at line 42 (3/42 = 0.0714)
+  }
 };
 
 function getConfidenceGrade(params) {
   const {
     pick, note, line, edge, sampleTier, projectionOnly, fullModel, trap,
-    hasH2H, volatility, volLimit, marketKey = "", modelState = null
+    hasH2H, volatility, volLimit, marketKey = "", modelState = null,
+    q4Edge = null, q2Edge = null
   } = params || {};
 
   let score = 0;
@@ -11089,20 +11118,36 @@ function getConfidenceGrade(params) {
     else score -= 4.0;
     if (projectionOnly) score -= 3.0;
 
-    // 2. Edge signal
+    // 2. Edge signal (Issue 2: Boost edge -> score translation)
     const edgeFloor = isH2 ? 0.060 : 0.050;
-    score += clampNumber((edgePct - edgeFloor) / 0.048, -1.0, 2.0);
+    score += clampNumber((edgePct - edgeFloor) / 0.03, -1.0, 2.0);
 
-    // 3. H2H Presence
+    // Cross-market edge weight contributions
+    if (marketKey === "ft" && isFinite(q4Edge)) {
+      score += Math.abs(q4Edge) * 0.20;
+    }
+    if (marketKey === "h1" && isFinite(q2Edge)) {
+      score += Math.abs(q2Edge) * 0.10;
+    }
+
+    // 3. H2H Presence (Issue 5 Penalty Balance)
     if (hasH2H) score += 1.0;
-    else if (isH2) score -= 1.0;
+    else {
+      score -= 0.15; // Balanced H2H missing penalty
+      if (isH2) score -= 1.0;
+    }
 
     // 4. Trap (Symmetric, calibrated)
     if (trap) score -= 3.0;
     if (isH2) score -= 1.0;
 
-    // 5. Context-Aware Unified State adjustments (Issues 1, 2, 6, 10)
+    // 5. Context-Aware Unified State adjustments
     if (modelState) {
+      // Balanced Advanced Stats missing penalty
+      if (!modelState.usedAdvanced) {
+        score -= 0.25;
+      }
+
       const combinedVol = modelState.volState?.combinedVolRatio ?? 0.5;
       if (combinedVol > 0.85) {
         score -= 1.5;
@@ -13621,9 +13666,9 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let aAllowed = avgOrNaN(aFTA);
   let bAllowed = avgOrNaN(bFTA);
 
-  // Apply volatility adjustment (FIX #4: now a no-op for projections, affects confidence only)
-  aS_pre = applyVolatility(aS_pre, aFTS, volLimit);
-  bS_pre = applyVolatility(bS_pre, bFTS, volLimit);
+  // Apply volatility adjustment (Issue 4 Volatility Response)
+  aS_pre = applyVolatility(aS_pre, aFTS, volLimit, league);
+  bS_pre = applyVolatility(bS_pre, bFTS, volLimit, league);
 
   // Advanced stats blend (ESPN auto-fetch leagues)
   const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
@@ -13745,8 +13790,8 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const leagueBase1H = (eb / 2) * 0.5;
   let aS_pre = anchorProjection(avgOrNaN(aS1), sampleSize, leagueBase1H);
   let bS_pre = anchorProjection(avgOrNaN(bS1), sampleSize, leagueBase1H);
-  aS_pre = applyVolatility(aS_pre, aS1, volLimit);
-  bS_pre = applyVolatility(bS_pre, bS1, volLimit);
+  aS_pre = applyVolatility(aS_pre, aS1, volLimit, league);
+  bS_pre = applyVolatility(bS_pre, bS1, volLimit, league);
 
   let aAllowed = avgOrNaN(aA1);
   let bAllowed = avgOrNaN(bA1);
@@ -14021,14 +14066,27 @@ function evaluateMassacreForPick(pickRow, profileA, profileB) {
   const pick = pickRow?.pick || "";
   const side = getPickSideFromText(pick);
   if (!side) return { isMassacre: false };
+  
   let isMassacre = false;
   let severity = "none";
   let direction = "";
-  if (profileA && profileA.streakLength >= 3 && profileA.avgMargin > 15 && side === "over") {
-    isMassacre = true; severity = profileA.severity; direction = "hot";
-  } else if (profileB && profileB.streakLength >= 3 && profileB.avgMargin < -15 && side === "under") {
-    isMassacre = true; severity = profileB.severity; direction = "cold";
+  
+  // Streak activation logic (Issue 7 Massacre Activation)
+  if (profileA && (Math.abs(profileA.avgMargin) > 10 || profileA.streakLength >= 4)) {
+    if (side === "over") {
+      isMassacre = true;
+      severity = Math.abs(profileA.avgMargin) >= 20 ? "nuclear" : "heavy";
+      direction = "hot";
+    }
   }
+  if (profileB && (Math.abs(profileB.avgMargin) > 10 || profileB.streakLength >= 4)) {
+    if (side === "under") {
+      isMassacre = true;
+      severity = Math.abs(profileB.avgMargin) >= 20 ? "nuclear" : "heavy";
+      direction = "cold";
+    }
+  }
+  
   return { isMassacre, severity, direction };
 }
 
@@ -14279,7 +14337,7 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
     const result = evaluateMassacreForPick(p, profileA, profileB);
     if (!result.isMassacre) return;
     const severity = result.severity;
-    const edgeMult = severity === "nuclear" ? 1.20 : severity === "heavy" ? 1.10 : 1.05;
+    const edgeMult = severity === "nuclear" ? 1.08 : severity === "heavy" ? 1.05 : 1.03;
     const confBoost = severity === "nuclear" ? 2 : severity === "heavy" ? 1 : 0;
     if (isFinite(p.edge)) {
       const oldEdge = p.edge;
@@ -15828,7 +15886,9 @@ finalPicksForDisplay.forEach(p => {
           hasH2H: p.hasH2H,
           volLimit: 12,
           marketKey: p.marketKey,
-          modelState: globalModelState
+          modelState: globalModelState,
+          q4Edge: q4?.edge ?? null,
+          q2Edge: q2?.edge ?? null
         });
       } else {
         p.confidence = "—";
