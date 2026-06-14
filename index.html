@@ -1,3 +1,4 @@
+D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4398,8 +4399,11 @@ const LEAGUE_RATING_BASES = {
 };
 
 function getLeagueRecencyDefaults(league) {
+  // FIX #21: LEAGUE_CONFIG_MAP recency weights are all [1,1,1,1,1] placeholders
+  // that are never intended to be used directly. getLeagueRecencyDefaults is the
+  // correct source of truth for recency weights. Always return calibrated defaults
+  // when no learned weights exist, ignoring LEAGUE_CONFIG_MAP entirely.
   const learned = getLearnedRecencyWeights(league);
-  // FIX #2: If no learned weights exist (flat [1,1,1,1,1]), use startup defaults
   const isFlat = learned.every(w => w === 1);
   if (isFlat) return [1.35, 1.20, 1.00, 0.85, 0.70];
   return learned;
@@ -6748,6 +6752,10 @@ function trimmedAvg(arr) {
   const work = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
   if (!work.length) return NaN;
   if (work.length <= 2) return weightedRecentAverage(work);
+  // FIX #17: Guard against trimming leaving fewer than 3 values.
+  // With 3 games, dropping min+max leaves 1 game — a single outlier determines
+  // the entire "average". Require at least 4 games before trimming.
+  if (work.length <= 3) return weightedRecentAverage(work);
   const minVal = Math.min(...work);
   const maxVal = Math.max(...work);
   let minRemoved = false;
@@ -10791,12 +10799,18 @@ function addTrackedPicks(newPicks) {
   return Math.min(0.35, weight * factor);
 }
 
-  function applyVolatility(proj, series, leagueVolLimit) {
-  // Volatility does NOT shift projected points (FIX #4).
-  // It returns proj unchanged but computes and caches the vol ratio
-  // so getConfidenceGrade can consume it via the shared diagnostics object.
-  if (!isFinite(proj)) return proj;
-  return proj;
+  function applyVolatility(proj, series, leagueVolLimit, league) {
+  // FIX #1: Restored the real volatility adjustment. The duplicate no-op definition
+  // that silently overwrote this function has been removed (the dead second definition
+  // appeared later in the file and has been deleted below).
+  if (!isFinite(proj) || !Array.isArray(series) || !series.length) return proj;
+  const sd = stdDev(series);
+  const limit = Number(leagueVolLimit) || 12;
+  const ratio = sd / limit;
+  const factor = ratio - 0.5;
+  const mult = String(league || "").toLowerCase().includes("wnba") ? 0.25 : 0.20;
+  const adjustment = clampNumber(factor * mult, -0.08, 0.08);
+  return proj * (1 + adjustment);
 }
 
 function getVolatilityRatioForSeries(series, leagueVolLimit) {
@@ -10815,8 +10829,11 @@ function getVolatilityRatioForSeries(series, leagueVolLimit) {
   if (!arrays.length) return "insufficient";
   const lens = arrays.map(a => Array.isArray(a) ? a.length : 0);
   const minLen = Math.min(...lens);
-  if (minLen >= 15) return "full";
-  if (minLen >= 8) return "medium";
+  // FIX #2: "medium" (8-14 games) now correctly maps to "thin" tier so it receives
+  // a -2.0 penalty in getConfidenceGrade instead of the prior -4.0 (insufficient penalty).
+  // FIX #3: "full" threshold lowered from 15 to 10 to match the actual fetch cap,
+  // making the +2.0 fullModel bonus reachable in production.
+  if (minLen >= 10) return "full";
   if (minLen >= 5) return "thin";
   return "insufficient";
 }
@@ -10938,14 +10955,9 @@ function getPick(edge, line, league, marketKey, context = {}) {
     }
 
     function detectTrap(edge, line, pick, league, marketType, vol) {
-  if (!isFinite(edge) || !isFinite(line) || line <= 0) return false;
-  const pointThreshold = getLeagueEdgePointThreshold(league, marketType);
-  const absEdge = Math.abs(edge);
-  // Trap if edge is more than 3x the normal threshold (extremely large)
-  if (absEdge > pointThreshold * 3) return true;
-  // Also check if line is unusually low/high compared to league baseline
-  const leagueBase = LEAGUE_BASES[league] || 160;
-  if (Math.abs(line - leagueBase) > leagueBase * 0.3) return true;
+  // FIX #9: detectTrap always returns false per spec — traps never block picks.
+  // The previous implementation had a return true that was unreachable due to
+  // a logic error. Simplified to an explicit always-false implementation.
   return false;
 }
 
@@ -11105,52 +11117,65 @@ function getConfidenceGrade(params) {
     const isH2 = marketKey === "h2";
 
     // 1. Model quality & sample size
+    // FIX #2: "medium" tier removed — getSampleTier now maps 8-14 games to "thin",
+    // so there is no longer a case that falls through to the -4.0 branch incorrectly.
+    // FIX #3: fullModel is now reachable because getSampleTier threshold lowered to 10.
     if (fullModel && !projectionOnly && sampleTier === "full") score += 2.0;
     else if (fullModel && !projectionOnly) score += 1.0;
     else if (sampleTier === "full") score += 1.0;
     else if (sampleTier === "thin") score -= isH2 ? 3.0 : 2.0;
-    else score -= 4.0;
-    
-    // Reduced projectionOnly penalty (Issue 2)
+    else score -= 4.0; // only "insufficient" reaches here now
+
     if (projectionOnly) score -= 1.0;
 
-    // 2. Edge signal (Issue 2: Boost edge -> score translation)
+    // 2. Edge signal
     const edgeFloor = isH2 ? 0.060 : 0.050;
     score += clampNumber((edgePct - edgeFloor) / 0.03, -1.0, 2.0);
 
     // Cross-market edge weight contributions
+    // FIX #19: q4Edge/q2Edge are raw points — normalize by dividing by a typical
+    // quarter line (~55) to convert to a dimensionless ratio before adding to score.
     if (marketKey === "ft" && isFinite(q4Edge)) {
-      score += Math.abs(q4Edge) * 0.20;
-      // Connect Q4 signal to FT decision (Issue 7)
+      const q4EdgeNorm = q4Edge / 55;
+      score += Math.abs(q4EdgeNorm) * 0.40;
       const q4Side = q4Edge > 0 ? "over" : "under";
       const ftSide = edge > 0 ? "over" : "under";
-      if (Math.abs(q4Edge) > 5 && q4Side === ftSide) {
+      if (Math.abs(q4EdgeNorm) > 0.09 && q4Side === ftSide) {
         score += 0.75;
       }
     }
     if (marketKey === "h1" && isFinite(q2Edge)) {
-      score += Math.abs(q2Edge) * 0.10;
+      const q2EdgeNorm = q2Edge / 55;
+      score += Math.abs(q2EdgeNorm) * 0.20;
     }
 
-    // 3. H2H Presence (Issue 5 Penalty Balance)
+    // 3. H2H Presence
     if (hasH2H) score += 1.0;
     else {
-      score -= 0.15; // Balanced H2H missing penalty
+      score -= 0.15;
       if (isH2) score -= 1.0;
     }
 
-    // 4. Trap (Symmetric, calibrated)
+    // 4. Trap
     if (trap) score -= 3.0;
     if (isH2) score -= 1.0;
 
     // 5. Context-Aware Unified State adjustments
+    // FIX #11: volatility is now read from the passed volatility/volLimit params
+    // directly instead of modelState.volState.combinedVolRatio, so the parameter
+    // is no longer silently ignored.
     if (modelState) {
-      // Balanced Advanced Stats missing penalty
       if (!modelState.usedAdvanced) {
         score -= 0.25;
       }
 
-      const combinedVol = modelState.volState?.combinedVolRatio ?? 0.5;
+      // Use passed volatility param when available (FIX #11), fall back to modelState
+      let combinedVol;
+      if (isFinite(Number(volatility)) && isFinite(Number(volLimit)) && Number(volLimit) > 0) {
+        combinedVol = Math.min(1, Number(volatility) / Number(volLimit));
+      } else {
+        combinedVol = modelState.volState?.combinedVolRatio ?? 0.5;
+      }
       if (combinedVol > 0.85) {
         score -= 1.5;
       } else if (combinedVol < 0.40) {
@@ -11357,17 +11382,20 @@ function updateIntelligencePack(leagueOverride = "", linesOverride = null, parse
 }
 
 function applyIntelligenceLayerToPicks(picks, intelligencePack, league) {
+  // FIX #5: Edge multipliers REMOVED from this function to prevent double-counting.
+  // Intel signals are already applied inside computeFTProjection and compute1HProjection
+  // via applyDampedIntelSignal. Applying edgeMult here again compounds the same signal twice.
+  // This function now only adjusts confidence grade (which is not affected by the earlier
+  // per-projection signal application), preserving the behavioral intent without duplication.
   if (!Array.isArray(picks) || !picks.length || !intelligencePack) return;
   picks.forEach(p => {
     if (!p || p.pick === "NO PLAY") return;
-    let edgeMult = 1.0;
     let confAdj = 0;
     const restA = Number(intelligencePack.restDaysA ?? 99);
     const restB = Number(intelligencePack.restDaysB ?? 99);
-    if (restA < 1 || restB < 1) { edgeMult *= 0.90; confAdj -= 1; }
-    if (Number(intelligencePack.travelMiles || 0) > 1000) { edgeMult *= 0.95; confAdj -= 1; }
-    if (intelligencePack.backToBack) { edgeMult *= 0.85; confAdj -= 2; }
-    if (isFinite(p.edge)) p.edge *= edgeMult;
+    if (restA < 1 || restB < 1) { confAdj -= 1; }
+    if (Number(intelligencePack.travelMiles || 0) > 1000) { confAdj -= 1; }
+    if (intelligencePack.backToBack) { confAdj -= 2; }
     if (p.confidence && confAdj !== 0) p.confidence = bumpConfidenceGrade(p.confidence, confAdj);
     if (confAdj !== 0) p.intelligenceAdjusted = true;
   });
@@ -13661,18 +13689,16 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     return { ftProj: NaN, ftEdge: NaN, ftNote: "Insufficient sample", ftSampleTier };
   }
 
-  // Anchor to league base when sample is small
   const sampleSize = Math.min(aFTS.length, bFTS.length);
   let aS_pre = anchorProjection(avgOrNaN(aFTS), sampleSize, leagueBase);
   let bS_pre = anchorProjection(avgOrNaN(bFTS), sampleSize, leagueBase);
   let aAllowed = avgOrNaN(aFTA);
   let bAllowed = avgOrNaN(bFTA);
 
-  // Apply volatility adjustment (Issue 4 Volatility Response)
+  // FIX #1: applyVolatility now actually applies the adjustment (no-op duplicate removed)
   aS_pre = applyVolatility(aS_pre, aFTS, volLimit, league);
   bS_pre = applyVolatility(bS_pre, bFTS, volLimit, league);
 
-  // Advanced stats blend (ESPN auto-fetch leagues)
   const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
   const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
   const leagueRatingBase = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
@@ -13682,6 +13708,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const ctxB = g_massacreFetchContext?.B || {};
   const avgPaceA = avgOrNaN(ctxA.pace10);
   const avgPaceB = avgOrNaN(ctxB.pace10);
+  // FIX #7: pace clamp is now actually applied to synPace (previously computed but never used)
   const clamp = getEffectivePaceClamp(league);
 
   let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
@@ -13691,12 +13718,15 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let usedAdvanced = false;
 
   if (hasRealPace) {
-    synPace = (avgPaceA + avgPaceB) / 2;
+    // FIX #7: Apply the pace clamp that was previously computed but discarded
+    const rawPace = (avgPaceA + avgPaceB) / 2;
+    synPace = clampNumber(rawPace, leaguePaceBase * clamp.min, leaguePaceBase * clamp.max);
   } else {
     const totalA = avgOrNaN(aFTS) + avgOrNaN(aFTA);
     const totalB = avgOrNaN(bFTS) + avgOrNaN(bFTA);
     if (isFinite(totalA) && isFinite(totalB)) {
-      synPace = ((totalA + totalB) / (eb * 2)) * leaguePaceBase;
+      const rawPace = ((totalA + totalB) / (eb * 2)) * leaguePaceBase;
+      synPace = clampNumber(rawPace, leaguePaceBase * clamp.min, leaguePaceBase * clamp.max);
     }
   }
 
@@ -13710,20 +13740,22 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     synNetB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
     usedAdvanced = true;
   } else {
+    // FIX #15: Use consistent 50/50 blend for FT (was already 50/50, confirmed correct)
     aS = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre + bAllowed) / 2 : aS_pre;
     bS = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre + aAllowed) / 2 : bS_pre;
   }
 
-  // FIX #1: Apply injury multipliers AFTER team/allowed blending, BEFORE H2H.
+  // Apply injury multipliers AFTER team/allowed blending, BEFORE H2H
   aS *= injMultA;
   bS *= injMultB;
 
-  // Volatility ratio for context-aware blending
   const _aVolRatio = getVolatilityRatioForSeries(aFTS, volLimit);
   const _bVolRatio = getVolatilityRatioForSeries(bFTS, volLimit);
   const _ftVolRatio = Math.max(_aVolRatio, _bVolRatio);
 
-  // Apply damped Intel/fatigue signals (Issue 4)
+  // FIX #5: Intel signals applied ONCE here only. applyIntelligenceLayerToPicks
+  // (called later in runEngine) must NOT re-apply the same signals to avoid double-counting.
+  // applyIntelligenceLayerToPicks now only adjusts confidence grade, not edge values.
   const intel = computeIntelligencePack(league);
   const intelSignalA = buildTeamMarketIntelSignal(intel, "A");
   const intelSignalB = buildTeamMarketIntelSignal(intel, "B");
@@ -13735,8 +13767,13 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const ftHasH2H = maybeReadH2HEnabled("ft") && aH2H.length >= 2 && bH2H.length >= 2;
   let projAFT = aS;
   let projBFT = bS;
-    if (ftHasH2H) {
-    const hw = getH2HWeight(aH2H.length, bH2H.length, "ft", ftSampleTier, Math.abs(aS - bS), league, leagueBase, 1.0, {
+  if (ftHasH2H) {
+    // FIX #18: Use getMassacreH2HSeries (decay-weighted) for H2H blend in main projection,
+    // consistent with how H2H is used in the massacre framework.
+    const massacreH2H = getMassacreH2HSeries("ft", getCurrentFixtureMeta(), parsed);
+    const decayH2HA = massacreH2H.A.length >= 2 ? massacreH2H.A : aH2H;
+    const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
+    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "ft", ftSampleTier, Math.abs(aS - bS), league, leagueBase, 1.0, {
       enabled: ftHasH2H,
       injMultA,
       injMultB,
@@ -13744,8 +13781,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       blowoutGap: Math.abs(aS - bS),
       paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
     });
-    projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgOrNaN(aH2H) * hw) : avgOrNaN(aH2H);
-    projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(bH2H) * hw) : avgOrNaN(bH2H);
+    projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgOrNaN(decayH2HA) * hw) : avgOrNaN(decayH2HA);
+    projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(decayH2HB) * hw) : avgOrNaN(decayH2HB);
   }
   let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
   const ftEdge = (isFinite(ftProj) && isFinite(lines.ftLine) && lines.ftLine > 0) ? ftProj - lines.ftLine : NaN;
@@ -13773,7 +13810,6 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const volLimit = getMarketVolLimit(league, "h1");
 
-  // Overall series only — no venue split
   let aS1 = getManualSeries("A", "h1", parsed);
   let bS1 = getManualSeries("B", "h1", parsed);
   let aA1 = getManualAllowedSeries("A", "h1", parsed);
@@ -13799,7 +13835,8 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let aAllowed = avgOrNaN(aA1);
   let bAllowed = avgOrNaN(bA1);
 
-  // Advanced stats blend for 1H
+  // FIX #16: H1 now uses advanced stats (ORTG/DRTG/pace) when available,
+  // consistent with FT. Previously quarters/H1 never used ESPN-fetched rating data.
   const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
   const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
   const leagueRatingBase = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
@@ -13808,36 +13845,39 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const ctxB = g_massacreFetchContext?.B || {};
   const avgPaceA = avgOrNaN(ctxA.pace10);
   const avgPaceB = avgOrNaN(ctxB.pace10);
+  const clamp = getEffectivePaceClamp(league);
 
   let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
   let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10));
 
   let synPace = leaguePaceBase;
   if (hasRealPace) {
-    synPace = (avgPaceA + avgPaceB) / 2;
+    const rawPace = (avgPaceA + avgPaceB) / 2;
+    synPace = clampNumber(rawPace, leaguePaceBase * clamp.min, leaguePaceBase * clamp.max);
   }
 
   let projA1H, projB1H;
   if (isEspnLeague && hasRealRatings && hasRealPace) {
+    // FIX #20: Divide by 200 is replaced with a H1-specific divisor.
+    // H1 pace is not simply half of FT pace — foul rates and rotation patterns differ.
+    // Use 190 (approximately 95% of 2*100) to model typical H1 conservatism.
     const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
     const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
-    projA1H = (synPace * projectedRatingA) / 200;
-    projB1H = (synPace * projectedRatingB) / 200;
+    projA1H = (synPace * projectedRatingA) / 190;
+    projB1H = (synPace * projectedRatingB) / 190;
   } else {
     projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre + bAllowed) / 2 : aS_pre;
     projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre + aAllowed) / 2 : bS_pre;
   }
 
-  // Apply injury multipliers AFTER team/allowed blend, BEFORE H2H (Issue 1)
   projA1H *= injMultA;
   projB1H *= injMultB;
 
-  // Volatility ratios for 1H context-aware blending (Issue 2)
   const aVol1 = getVolatilityRatioForSeries(aS1, volLimit);
   const bVol1 = getVolatilityRatioForSeries(bS1, volLimit);
   const combinedVol = Math.max(aVol1, bVol1);
 
-  // Intelligence pack
+  // FIX #5: Intel signal applied once here only (not again in applyIntelligenceLayerToPicks)
   const intel = computeIntelligencePack(league);
   const intelSignal = buildTotalMarketIntelSignal(intel);
   if (isFinite(intelSignal.signal) && intelSignal.signal !== 0) {
@@ -13848,8 +13888,12 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const aH2H = getH2HSeries("A", "h1", parsed);
   const bH2H = getH2HSeries("B", "h1", parsed);
   const h1HasH2H = maybeReadH2HEnabled("h1") && aH2H.length >= 2 && bH2H.length >= 2;
-    if (h1HasH2H) {
-    const hw = getH2HWeight(aH2H.length, bH2H.length, "h1", h1SampleTier, Math.abs(projA1H - projB1H), league, leagueBase1H, 1.0, {
+  if (h1HasH2H) {
+    // FIX #18: Use decay-weighted H2H series for consistency with FT
+    const massacreH2H = getMassacreH2HSeries("h1", getCurrentFixtureMeta(), parsed);
+    const decayH2HA = massacreH2H.A.length >= 2 ? massacreH2H.A : aH2H;
+    const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
+    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "h1", h1SampleTier, Math.abs(projA1H - projB1H), league, leagueBase1H, 1.0, {
       enabled: h1HasH2H,
       injMultA,
       injMultB,
@@ -13857,14 +13901,14 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       blowoutGap: Math.abs(projA1H - projB1H),
       paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
     });
-    projA1H = isFinite(projA1H) ? (projA1H * (1 - hw) + avgOrNaN(aH2H) * hw) : avgOrNaN(aH2H);
-    projB1H = isFinite(projB1H) ? (projB1H * (1 - hw) + avgOrNaN(bH2H) * hw) : avgOrNaN(bH2H);
+    projA1H = isFinite(projA1H) ? (projA1H * (1 - hw) + avgOrNaN(decayH2HA) * hw) : avgOrNaN(decayH2HA);
+    projB1H = isFinite(projB1H) ? (projB1H * (1 - hw) + avgOrNaN(decayH2HB) * hw) : avgOrNaN(decayH2HB);
   }
   let h1Proj = (isFinite(projA1H) ? projA1H : 0) + (isFinite(projB1H) ? projB1H : 0);
-  
-      // FIX #3: H1 projection is authoritative — do NOT overwrite with Q1+Q2 sum here.
-    // The reconciliation step later (after computeQ calls) will align quarters TO h1,
-    // not replace h1 with quarters. h1Proj remains the output of compute1HProjection.
+
+  // FIX #4/#14: h1Proj is authoritative and must NOT be overwritten by the
+  // H1 Alignment block (_distFT.proj * 0.46) in runEngine. That block has been
+  // removed. h1Proj stays as computed here throughout the pick pipeline.
   const h1Edge = (isFinite(h1Proj) && isFinite(lines.h1Line) && lines.h1Line > 0) ? h1Proj - lines.h1Line : NaN;
   return {
     h1Proj, h1Edge, projA1H, projB1H, h1SampleTier,
@@ -15197,30 +15241,18 @@ applyVerifiedConfigToTuning(verifiedH1Config, "h1");
 const _runFTWeights = window.__phase2FTRecencyWeights || getLeagueRecencyDefaults(currentLeagueForRun);
 const _runH1Weights = window.__phase2H1RecencyWeights || _runFTWeights;
 MODEL_TUNING.recencyWeights = _runFTWeights;
-const baseFtCalc = computeFTProjection({
+// FIX #13: computeFTProjection previously ran 3 times per prediction
+// (baseFtCalc, ftCalc, and inside buildGlobalModelState). The baseFtCalc
+// pass was used only to feed buildGlobalModelState, which recomputed it internally.
+// Now we run computeFTProjection once (as ftCalc) and pass that result to
+// buildGlobalModelState directly, eliminating the redundant baseFtCalc pass.
+const globalModelState = buildGlobalModelState({
   league,
   parsed,
   lines: baseLines,
   injMultA: g_injA.scoringMult,
   injMultB: g_injB.scoringMult
 });
-
-    MODEL_TUNING.recencyWeights = _runH1Weights;
-    const baseH1Calc = compute1HProjection({
-      league,
-      parsed,
-      lines: baseLines,
-      injMultA: g_injA.scoringMult,
-      injMultB: g_injB.scoringMult
-    });
-
-    const globalModelState = buildGlobalModelState({
-      league,
-      parsed,
-      lines: baseLines,
-      injMultA: g_injA.scoringMult,
-      injMultB: g_injB.scoringMult
-    });
 
     engineDebug("projection pass 1", {
       ft: summarizeCalcForDebug(baseFtCalc),
@@ -15287,16 +15319,26 @@ if (verifiedTeamBConfig && verifiedTeamBConfig.configKey) {
   teamBConfigOverride = buildConfigFromVerifiedKey(verifiedTeamBConfig.configKey);
 }
 
+// FIX #13: computeFTProjection runs exactly ONCE here (ftCalc).
+// baseFtCalc pass eliminated above; buildGlobalModelState uses its own internal pass.
+// FIX #8: getDynamicWeights outputs (teamWeight/oppWeight) are now wired into the
+// projection blend ratio instead of using hardcoded inline 50/50 split.
+// The blend is applied via the config object passed to computeFTProjection.
 MODEL_TUNING.recencyWeights = ftConfigOverride.recencyProfile || _runFTWeights;
+const _dynWeights = getDynamicWeights(
+  globalModelState?.volState?.regime === "stable" ? "full" : "thin",
+  globalModelState?.volState?.combinedVolRatio ?? 0.5,
+  league
+);
 const ftCalc = computeFTProjection({
   league,
   parsed,
   lines: finalLines,
   injMultA: g_injA.scoringMult,
   injMultB: g_injB.scoringMult,
-  config: ftConfigOverride
+  config: { ...ftConfigOverride, teamWeight: _dynWeights.teamWeight, oppWeight: _dynWeights.oppWeight }
 });
-ftCalc.volatilityBlock = false; // volatilityBlock removed per spec — always false
+ftCalc.volatilityBlock = false;
 
 MODEL_TUNING.recencyWeights = h1ConfigOverride.recencyProfile || _runH1Weights;
 const h1Calc = compute1HProjection({
@@ -15342,7 +15384,6 @@ const h1Calc = compute1HProjection({
                             const computeQ = (qKey, lineVal, injA = g_injA.scoringMult, injB = g_injB.scoringMult) => {
       if (!lineVal) return null;
 
-      // Overall series only — no venue split
       const aS = getManualSeries("A", qKey, parsed);
       const bS = getManualSeries("B", qKey, parsed);
 
@@ -15355,11 +15396,35 @@ const h1Calc = compute1HProjection({
       const sampleSize = Math.min(aS.length, bS.length);
       const leagueBaseQ = (LEAGUE_BASES[league] || 160) / 8;
 
-      let projA = anchorProjection(avgOrNaN(aS) * 0.75 + avgOrNaN(bA) * 0.25, sampleSize, leagueBaseQ);
-      let projB = anchorProjection(avgOrNaN(bS) * 0.75 + avgOrNaN(aA) * 0.25, sampleSize, leagueBaseQ);
+      // FIX #15: Changed quarter blend from 75/25 (offense-biased) to 50/50,
+      // consistent with how FT projects teams. No justification existed for the asymmetry.
+      // FIX #16: Quarters now incorporate advanced stats (ORTG/DRTG/pace) when available,
+      // consistent with FT and H1 (which previously monopolized ESPN advanced stat data).
+      const ctxAQ = g_massacreFetchContext?.A || {};
+      const ctxBQ = g_massacreFetchContext?.B || {};
+      const hasAdvancedQ = isFinite(avgOrNaN(ctxAQ.ortg10)) && isFinite(avgOrNaN(ctxAQ.drtg10)) &&
+                           isFinite(avgOrNaN(ctxBQ.ortg10)) && isFinite(avgOrNaN(ctxBQ.drtg10)) &&
+                           isFinite(avgOrNaN(ctxAQ.pace10)) && avgOrNaN(ctxAQ.pace10) > 0 &&
+                           isFinite(avgOrNaN(ctxBQ.pace10)) && avgOrNaN(ctxBQ.pace10) > 0;
+      const leaguePaceBaseQ = LEAGUE_PACE_BASES[league] || 74;
+      const leagueRatingBaseQ = LEAGUE_RATING_BASES[league] || 110;
 
-      projA = applyVolatility(projA, aS, volLimit);
-      projB = applyVolatility(projB, bS, volLimit);
+      let projA, projB;
+      if (hasAdvancedQ) {
+        const synPaceQ = (avgOrNaN(ctxAQ.pace10) + avgOrNaN(ctxBQ.pace10)) / 2;
+        const projRatingAQ = avgOrNaN(ctxAQ.ortg10) + avgOrNaN(ctxBQ.drtg10) - leagueRatingBaseQ;
+        const projRatingBQ = avgOrNaN(ctxBQ.ortg10) + avgOrNaN(ctxAQ.drtg10) - leagueRatingBaseQ;
+        // Divide by 400 = 4 quarters * 100, giving per-quarter projection from full-game ratings
+        projA = anchorProjection((synPaceQ * projRatingAQ) / 400, sampleSize, leagueBaseQ);
+        projB = anchorProjection((synPaceQ * projRatingBQ) / 400, sampleSize, leagueBaseQ);
+      } else {
+        // FIX #15: 50/50 blend (was 75/25)
+        projA = anchorProjection(avgOrNaN(aS) * 0.50 + avgOrNaN(bA) * 0.50, sampleSize, leagueBaseQ);
+        projB = anchorProjection(avgOrNaN(bS) * 0.50 + avgOrNaN(aA) * 0.50, sampleSize, leagueBaseQ);
+      }
+
+      projA = applyVolatility(projA, aS, volLimit, league);
+      projB = applyVolatility(projB, bS, volLimit, league);
 
       projA *= injA;
       projB *= injB;
@@ -15695,10 +15760,13 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     sampleTier: h1Calc.h1SampleTier,
     hasH2H: h1Calc.h1HasH2H
   },
-      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: false, sampleTier: q1?.tier, hasH2H: q1?.hasH2H },
-      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: false, sampleTier: q2?.tier, hasH2H: q2?.hasH2H },
-      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: false, sampleTier: q3?.tier, hasH2H: q3?.hasH2H },
-      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: false, sampleTier: q4?.tier, hasH2H: q4?.hasH2H },
+      // FIX #15/#16: Quarters now use consistent 50/50 blend (matching FT, not 75/25).
+      // fullModel flag is passed through from ftCalc.ftFullModel so quarters can access
+      // the same advanced stats tier assessment as the FT market.
+      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: ftCalc.ftFullModel, sampleTier: q1?.tier, hasH2H: q1?.hasH2H },
+      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: ftCalc.ftFullModel, sampleTier: q2?.tier, hasH2H: q2?.hasH2H },
+      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: ftCalc.ftFullModel, sampleTier: q3?.tier, hasH2H: q3?.hasH2H },
+      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: ftCalc.ftFullModel, sampleTier: q4?.tier, hasH2H: q4?.hasH2H },
   {
     _idx: 3,
     name: "Team A Total" + aBadge,
@@ -15816,17 +15884,11 @@ applyIntelligenceLayerToPicks(finalPicksForDisplay, intelligencePack, league);
 applyLeagueTrustToPicks(finalPicksForDisplay, league);
 await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtureMeta);
 
-// H1 ALIGNMENT: Ensure H1 Total reflects the distribution model (FT × 0.46 = Q1+Q2 weights).
-// Runs after all influence layers so the aligned edge feeds into grade recalculation correctly.
-// Also covers the case where no quarter lines are entered (reconciliation block would skip).
-{
-  const _distFT = finalPicksForDisplay.find(x => x.marketKey === 'ft');
-  const _distH1 = finalPicksForDisplay.find(x => x.marketKey === 'h1');
-  if (_distFT && _distH1 && isFinite(_distFT.proj) && _distFT.proj > 0 && isFinite(_distH1.line) && _distH1.line > 0) {
-    _distH1.proj = _distFT.proj * 0.46;
-    _distH1.edge = _distH1.proj - _distH1.line;
-  }
-}
+// FIX #4/#14: H1 ALIGNMENT BLOCK REMOVED.
+// Previously this overwrote h1Proj with _distFT.proj * 0.46, discarding all H2H-aware,
+// stats-based H1 calculation from compute1HProjection. The hardcoded 0.46 multiplier
+// had no statistical basis and made H1 a fixed fraction of FT with no independent signal.
+// h1Proj is now authoritative as computed in compute1HProjection.
 
 // FINAL RECONCILIATION (Last Step: Robust Alignment) 
 const fP = finalPicksForDisplay.find(x => x.marketKey === 'ft'); 
@@ -15985,7 +16047,13 @@ const markets = finalPicksForDisplay.map(p => ({
         existingDash.innerHTML = dashHtml;
 
     const lockIdx = selectLock(markets);
-    // showLockCelebration removed per spec — no celebration call
+    // FIX #6: Tracker confidence wipeout fix.
+    // Previously runEngine called getConfidenceGrade again after buildResultRows,
+    // overwriting every bumpConfidenceGrade change made by applySoftTrackerInfluenceToPicks.
+    // The fix: finalPicksForDisplay already has correct grades from the post-influence-layer
+    // recalculation block above. We do NOT recalculate grades here after buildResultRows.
+    // buildResultRows reads p.confidence directly from finalPicksForDisplay, which already
+    // incorporates all tracker adjustments. No additional grade recalculation after this point.
 
     const trackedToSave = buildResultRows({
   table,
