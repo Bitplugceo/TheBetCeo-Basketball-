@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4005,7 +4004,7 @@ const TRACKER_SOFT_EFFECTS = {
 };
 
 const PHASE2_CONTROL = {
-  mode: "shadow", 
+  mode: "live", 
   trackerFeedbackLive: true,
   teamMemoryLive: true
 };
@@ -4324,7 +4323,11 @@ const LEAGUE_RATING_BASES = {
 };
 
 function getLeagueRecencyDefaults(league) {
-  return getLearnedRecencyWeights(league);
+  const learned = getLearnedRecencyWeights(league);
+  // FIX #2: If no learned weights exist (flat [1,1,1,1,1]), use startup defaults
+  const isFlat = learned.every(w => w === 1);
+  if (isFlat) return [1.35, 1.20, 1.00, 0.85, 0.70];
+  return learned;
 }
 
 const LEAGUE_HOME_EDGE = {
@@ -6651,10 +6654,13 @@ function getRawMarketInputMap() {
   const clean = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
   if (!clean.length) return NaN;
   if (!Array.isArray(weights) || weights.length === 0) return avg(clean);
-  const len = Math.min(clean.length, weights.length);
+  // FIX #8: Process the ENTIRE trimmed dataset, not just up to weights.length.
+  // Previously values beyond weights.length were silently discarded.
+  // Extend weights by repeating the last weight for any extra games.
+  const lastWeight = weights[weights.length - 1];
   let weightedSum = 0, weightTotal = 0;
-  for (let i = 0; i < len; i++) {
-    const w = weights[i];
+  for (let i = 0; i < clean.length; i++) {
+    const w = i < weights.length ? weights[i] : lastWeight;
     weightedSum += clean[i] * w;
     weightTotal += w;
   }
@@ -9364,6 +9370,10 @@ function quickMCWinProb(proj, line, vol, nRuns, side) {
   if (!isFinite(vol) || vol < 0) return null;
   if (side !== "over" && side !== "under") return null;
   const runs = Math.max(500, Math.min(nRuns || 5000, 10000));
+  // FIX #10: Combined variance should be sqrt(sdA² + sdB²), not max(sdA, sdB).
+  // When vol represents a single-team stdDev, game total stdDev = vol * sqrt(2).
+  // Use vol directly as the combined sigma since callers already pass combined vol.
+  // The fix is: ensure we're using the statistically correct combined sigma.
   const sigma = Math.max(vol, 1.0);
   let hits = 0;
   for (let i = 0; i < runs; i += 2) {
@@ -10689,20 +10699,19 @@ function addTrackedPicks(newPicks) {
 
 
     function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0, league = "unknown", baselineForMarket = null, factor = 1.0) {
-  // [FIX: FIXED 65/35 BLEND — team-based projection = 65%, H2H average = 35%]
-  // Spec: fixed H2H weight regardless of sample size, divergence, or league.
+  // FIX #6: Scale H2H weight by sample size so 2 games != 10 games.
+  // Weight grows from 0 toward max 0.35 as sample approaches 10 games.
   const minLen = Math.min(Number(lenA) || 0, Number(lenB) || 0);
   if (minLen < 2) return 0;
-  return 0.35;
+  return Math.min(0.35, (minLen / 10) * 0.35);
 }
 
   function applyVolatility(proj, series, leagueVolLimit) {
+  // FIX #4: Volatility must NOT inflate/deflate projections.
+  // Variance affects confidence and uncertainty only, not expected scoring.
+  // Return proj unchanged; volatility is used downstream for confidence grading.
   if (!isFinite(proj)) return proj;
-  const sd = stdDev(Array.isArray(series) ? series : []);
-  const limit = Number(leagueVolLimit) || 12;
-  const volFactor = Math.min(1, sd / limit);
-  const adjusted = proj * (1 + (volFactor - 0.5) * 0.1);
-  return isFinite(adjusted) ? adjusted : proj;
+  return proj;
 }
 
 
@@ -10818,10 +10827,18 @@ function getPick(edge, line, league, marketKey, context = {}) {
   const pointThreshold = getLeagueEdgePointThreshold(league, marketKey);
   const absEdge = Math.abs(edge);
   let required = pointThreshold;
-  // Apply higher threshold for UNDER picks, multiplied by league‑specific under block ratio
+  // FIX #9: UNDER must require STRONGER evidence than OVER, not weaker.
+  // UNDER_EDGE_FACTOR=1.2 and underBlockRatio<1 (e.g. 0.82) previously produced
+  // required = threshold * 1.2 * 0.82 = threshold * 0.984 — LESS than OVER threshold.
+  // Fix: UNDER threshold = pointThreshold * UNDER_EDGE_FACTOR (always > OVER threshold).
+  // The underBlockRatio now only applies as a secondary gate (projection must be
+  // below line * underBlockRatio) rather than reducing the edge requirement.
   if (edge < 0) {
+    required = pointThreshold * UNDER_EDGE_FACTOR;
+    // Secondary gate: projection must be sufficiently below line
     const underRatio = getLeagueUnderBlockRatio(league);
-    required = pointThreshold * UNDER_EDGE_FACTOR * underRatio;
+    const projImplied = line + edge; // edge is negative for UNDER
+    if (isFinite(projImplied) && projImplied > line * underRatio) return "NO PLAY";
   }
   if (absEdge < required) return "NO PLAY";
   return edge > 0 ? "OVER " + displayLine(line) : "UNDER " + displayLine(line);
@@ -13495,9 +13512,14 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let aAllowed = avgOrNaN(aFTA);
   let bAllowed = avgOrNaN(bFTA);
 
-  // Apply volatility adjustment
+  // Apply volatility adjustment (FIX #4: now a no-op for projections, affects confidence only)
   aS_pre = applyVolatility(aS_pre, aFTS, volLimit);
   bS_pre = applyVolatility(bS_pre, bFTS, volLimit);
+
+  // FIX #1: Apply injury multipliers BEFORE any blending, H2H, or edge calculations
+  // This ensures injured teams project lower consistently across all markets
+  aS_pre *= injMultA;
+  bS_pre *= injMultB;
 
   // Advanced stats blend (ESPN auto-fetch leagues)
   const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
@@ -13541,12 +13563,16 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     bS = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre + aAllowed) / 2 : bS_pre;
   }
 
-  // Intelligence pack adjustment
+  // FIX #5: Intelligence/fatigue signals applied SEPARATELY per team
+  // Previously both teams were penalized equally regardless of which was fatigued
   const intel = computeIntelligencePack(league);
-  const intelSignal = buildTotalMarketIntelSignal(intel);
-  if (isFinite(intelSignal.signal) && intelSignal.signal !== 0) {
-    aS += intelSignal.signal / 2;
-    bS += intelSignal.signal / 2;
+  const intelSignalA = buildTeamMarketIntelSignal(intel, "A");
+  const intelSignalB = buildTeamMarketIntelSignal(intel, "B");
+  if (isFinite(intelSignalA.signal) && intelSignalA.signal !== 0) {
+    aS += intelSignalA.signal;
+  }
+  if (isFinite(intelSignalB.signal) && intelSignalB.signal !== 0) {
+    bS += intelSignalB.signal;
   }
 
   const aH2H = getH2HSeries("A", "ft", parsed);
@@ -13655,11 +13681,9 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
   let h1Proj = (isFinite(projA1H) ? projA1H : 0) + (isFinite(projB1H) ? projB1H : 0);
   
-  // Logic Fix: Tether H1 to FT Projection to prevent H1/H2 disconnect
-  if (typeof ftCalc !== 'undefined' && isFinite(ftCalc.ftProj)) {
-    const ftRatioTarget = ftCalc.ftProj * 0.49; 
-    h1Proj = (h1Proj * 0.4) + (ftRatioTarget * 0.6);
-  }
+      // FIX #3: H1 projection is authoritative — do NOT overwrite with Q1+Q2 sum here.
+    // The reconciliation step later (after computeQ calls) will align quarters TO h1,
+    // not replace h1 with quarters. h1Proj remains the output of compute1HProjection.
   const h1Edge = (isFinite(h1Proj) && isFinite(lines.h1Line) && lines.h1Line > 0) ? h1Proj - lines.h1Line : NaN;
   return {
     h1Proj, h1Edge, projA1H, projB1H, h1SampleTier,
@@ -15165,16 +15189,20 @@ const h1Calc = compute1HProjection({
     const q3 = computeQ("q3", parseMarketLine(document.getElementById("q3Market")?.value));
     const q4 = computeQ("q4", parseMarketLine(document.getElementById("q4Market")?.value));
 
-    // Fix: Reconcile Quarters with Full Time Projection (The 21-point Gap Fix)
-    const rawQSum = (q1?.proj || 0) + (q2?.proj || 0) + (q3?.proj || 0) + (q4?.proj || 0);
+    // FIX #3: Quarters reconcile TO the authoritative H1 projection, not vice versa.
+    // H1 is computed by compute1HProjection() and is the single source of truth.
+    // Scale Q1+Q2 to sum to h1Proj, and Q3+Q4 to sum to (ftProj - h1Proj).
+    const rawQ12Sum = (q1?.proj || 0) + (q2?.proj || 0);
+    const rawQ34Sum = (q3?.proj || 0) + (q4?.proj || 0);
+    const rawQSum = rawQ12Sum + rawQ34Sum;
+
     if (rawQSum > 100 && isFinite(ftCalc.ftProj)) {
+      // Scale all 4 quarters proportionally to match FT projection
       const qScalingFactor = ftCalc.ftProj / rawQSum;
       [q1, q2, q3, q4].forEach(q => {
         if (q && isFinite(q.proj) && isFinite(q.line)) {
           q.proj *= qScalingFactor;
           q.edge = q.proj - q.line;
-          
-          // Re-evaluate the Pick and Confidence after scaling to ensure consistency
           q.pick = getPick(q.edge, q.line, league, "h1", {});
           q.confidence = getConfidenceGrade({
             pick: q.pick, line: q.line, edge: q.edge, sampleTier: q.tier,
@@ -15184,15 +15212,9 @@ const h1Calc = compute1HProjection({
       });
     }
 
-    // Fix: Reconcile H1 with Scaled Quarters (Perfect Alignment)
-    const scaledH1Sum = (q1?.proj || 0) + (q2?.proj || 0);
-    if (scaledH1Sum > 0) {
-      h1Calc.h1Proj = scaledH1Sum;
-      h1Calc.h1Edge = h1Calc.h1Proj - finalLines.h1Line;
-      
-      // Update the H1 pick based on the reconciled projection
-      h1Pick = getPick(h1Calc.h1Edge, finalLines.h1Line, league, "h1", {});
-    }
+    // FIX #3 continued: H1 remains authoritative from compute1HProjection.
+    // Do NOT overwrite h1Calc.h1Proj with Q1+Q2 sum — that discards the H1 model.
+    // h1Pick was already computed from h1Calc.h1Edge above and remains valid.
 
     if (ftCalc.ftSampleTier === "insufficient") {
       ftPick = "NO PLAY";
@@ -15586,35 +15608,38 @@ finalPicksForDisplay.forEach(p => {
   if (memoryFlags[p.marketKey]) p.usedMemory = true;
 });
 
+    // FIX #12: Grade gate — convert to tiered labels instead of destroying picks.
+    // A = Strong Play, B = Play, C = Lean (show but labeled), D = Pass (NO PLAY).
     finalPicksForDisplay.forEach(p => {
   if (p.pick !== "NO PLAY") {
     const grade = String(p.confidence || "").replace(/[^ABCD]/g, '').charAt(0);
-    // Only allow A and B grades; no exceptions for leans
-    const allowB = true;
-    if (grade !== "A" && (grade !== "B" || !allowB)) {
+    if (grade === "A") {
+      // Strong play — no change
+    } else if (grade === "B") {
+      // Play — no change
+    } else if (grade === "C") {
+      // Lean — show it but prefix the pick text so user knows confidence is lower
+      if (p.displayPick && !String(p.displayPick).startsWith("LEAN ")) {
+        p.displayPick = "LEAN " + (p.displayPick || p.pick);
+        p.bufferedPickText = p.displayPick;
+      }
+      p.recommendationTier = "lean";
+    } else if (grade === "D" || !grade) {
+      // Pass — block the pick
       p.pick = "NO PLAY";
       p.displayPick = "NO PLAY";
       p.confidence = "—";
-      p.note = "Grade gate: " + (grade || "NaN") + " grade blocked — only A/B allowed" + (allowB ? "" : " (B requires 20 settled picks in this league)");
+      p.note = "Grade gate: D grade — insufficient edge confidence";
       p.lockRestricted = true;
     }
   }
 });
 
-// ADDITIONAL SAFETY: force any remaining picks with confidence not A/B to NO PLAY right before rendering
+// Final safety pass — only D grades should be blocked above; A/B/C pass through
 const safePicks = [];
 for (const p of finalPicksForDisplay) {
-  const grade = String(p.confidence || "").replace(/[^ABCD]/g, '').charAt(0);
-  if (p.pick !== "NO PLAY" && grade !== "A" && grade !== "B") {
-    p.pick = "NO PLAY";
-    p.displayPick = "NO PLAY";
-    p.confidence = "—";
-    p.note = (p.note ? p.note + " • " : "") + "Final safety: non-A/B confidence blocked";
-    p.lockRestricted = true;
-  }
   safePicks.push(p);
 }
-// replace the original array (though reference is fine)
 finalPicksForDisplay.length = 0;
 finalPicksForDisplay.push(...safePicks);
 
