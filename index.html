@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3721,6 +3720,58 @@ const BB_CONFIG = {
     function getDynamicWeights(sampleTier, volatility, league) {
   // getDynamicWeights stubbed per spec — fixed weights, no volatility logic
   return { teamWeight: 0.65, oppWeight: 0.35 };
+}
+
+function getUnifiedVolatilityState(aSeries, bSeries, volLimit) {
+  const aVol = getVolatilityRatioForSeries(aSeries, volLimit);
+  const bVol = getVolatilityRatioForSeries(bSeries, volLimit);
+  const combinedVol = Math.max(aVol, bVol);
+  let regime = "stable";
+  if (combinedVol > 0.85) regime = "extreme";
+  else if (combinedVol > 0.65) regime = "volatile";
+  else if (combinedVol > 0.45) regime = "moderate";
+  return { aVolRatio: aVol, bVolRatio: bVol, combinedVolRatio: combinedVol, regime, isHighVol: combinedVol > 0.75 };
+}
+
+function applyDampedIntelSignal(baseProj, rawSignal, opponentVolRatio) {
+  if (!isFinite(rawSignal) || rawSignal === 0) return baseProj;
+  const dampening = Math.max(0.3, 1.0 - (opponentVolRatio || 0.5) * 0.5);
+  const sign = Math.sign(rawSignal);
+  const absSig = Math.abs(rawSignal);
+  const scaledSignal = sign * Math.log1p(absSig) * 1.5;
+  return baseProj + (scaledSignal * dampening);
+}
+
+function buildGlobalModelState({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
+  const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
+  const volLimit = getMarketVolLimit(league, "ft");
+  const useVenueA = document.getElementById("aVenueSplitEnabled")?.checked;
+  const useVenueB = document.getElementById("bVenueSplitEnabled")?.checked;
+  const aFTS = useVenueA ? getFetchedSeries("A", "venue", "ft", "scored") : getOverallSeries("A", 10);
+  const bFTS = useVenueB ? getFetchedSeries("B", "venue", "ft", "scored") : getOverallSeries("B", 10);
+  const volState = getUnifiedVolatilityState(aFTS, bFTS, volLimit);
+  const intel = computeIntelligencePack(league);
+  return { league, eb, volLimit, volState, intel, injMultA, injMultB, aFTS, bFTS, lines };
+}
+
+function getDynamicEdgeThreshold(league, marketKey, context = null) {
+  const baseThreshold = getLeagueEdgePointThreshold(league, marketKey);
+  let threshold = baseThreshold;
+  if (context) {
+    const volRatio = context.volRatio ?? 1.0;
+    if (volRatio > 0.85) {
+      threshold *= 1.25;
+    } else if (volRatio < 0.40) {
+      threshold *= 0.85;
+    }
+    const sampleTier = context.sampleTier || "thin";
+    if (sampleTier === "thin") {
+      threshold *= 1.15;
+    } else if (sampleTier === "insufficient") {
+      threshold *= 1.5;
+    }
+  }
+  return threshold;
 }
 
    const MODEL_CONFIG = {
@@ -10698,14 +10749,23 @@ function addTrackedPicks(newPicks) {
 }
 
 
-    function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0, league = "unknown", baselineForMarket = null, factor = 1.0) {
-  // FIX #6: Scale H2H weight by sample size — logarithmic to avoid early saturation.
-  // At n=2: ~0.10, n=5: ~0.24, n=10: full 0.35. Log curve is more conservative than linear.
+    function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0, league = "unknown", baselineForMarket = null, factor = 1.0, context = null) {
   const minLen = Math.min(Number(lenA) || 0, Number(lenB) || 0);
   if (minLen < 2) return 0;
-  // log1p(n-1)/log1p(9) gives 0 at n=1, 1.0 at n=10 — soft curve
-  const scaleFactor = Math.log1p(minLen - 1) / Math.log1p(9);
-  return Math.min(0.35, scaleFactor * 0.35);
+  let weight = (Math.log1p(minLen - 1) / Math.log1p(9)) * 0.35;
+  if (context) {
+    const injA = context.injMultA ?? 1.0;
+    const injB = context.injMultB ?? 1.0;
+    const injuryGap = Math.abs(injA - injB);
+    weight *= Math.max(0.4, 1.0 - injuryGap * 1.5);
+    const volRatio = context.volRatio ?? 1.0;
+    weight *= Math.max(0.5, 1.2 - volRatio * 0.4);
+    const blowoutGap = context.blowoutGap ?? 0;
+    if (blowoutGap > 15) weight *= 0.8;
+    const paceGapRisk = context.paceGapRisk ?? false;
+    if (paceGapRisk) weight *= 0.85;
+  }
+  return Math.min(0.35, weight * factor);
 }
 
   function applyVolatility(proj, series, leagueVolLimit) {
@@ -10832,12 +10892,8 @@ const UNDER_EDGE_FACTOR = 1.2;
 function getPick(edge, line, league, marketKey, context = {}) {
   if (!line || isNaN(edge) || isNaN(line) || line <= 0) return "NO PLAY";
   if (edge === 0) return "NO PLAY";
-  const pointThreshold = getLeagueEdgePointThreshold(league, marketKey);
+  const pointThreshold = getDynamicEdgeThreshold(league, marketKey, context);
   const absEdge = Math.abs(edge);
-  // FIX #9: Symmetric edge gating — UNDER uses UNDER_EDGE_FACTOR multiplier on
-  // the same base threshold as OVER. Both gates are purely edge-based so the system
-  // is internally consistent. The old underBlockRatio was multiplied in and reduced
-  // the threshold below the OVER threshold — that bug is now fully removed.
   const required = edge < 0
     ? pointThreshold * UNDER_EDGE_FACTOR
     : pointThreshold;
@@ -10987,12 +11043,12 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
     // simulation has not run at this point in the execution order.
     // DO NOT add more uncalibrated integer increments to this function.
     // DO NOT lower the trap penalty (-3) without a win-rate analysis of trap-flagged picks.
-    function getConfidenceGrade({
-  pick, note, line, edge, sampleTier, projectionOnly, fullModel, trap,
-  hasH2H, volatility, volLimit, injuryNotes = [],
-  paceGapRisk = false, defensiveFloorFlag = false, blowoutGap = NaN, marketKey = "",
-  lineupQuality = null
-}) {
+    function getConfidenceGrade(params) {
+  const {
+    pick, note, line, edge, sampleTier, projectionOnly, fullModel, trap,
+    hasH2H, volatility, volLimit, marketKey = "", modelState = null
+  } = params;
+
   if (!pick || pick === "NO PLAY" || note || line === null || isNaN(line) || !isFinite(line) || line <= 0 || isNaN(edge)) return "NaN";
 
   let score = 0;
@@ -11015,10 +11071,32 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
   if (hasH2H) score += 1.0;
   else if (isH2) score -= 1.0;
 
-  // Trap
+  // Trap (calibrated)
   if (trap) score -= 3.0;
-
   if (isH2) score -= 1.0;
+
+  // Context-Aware Unified State adjustments (Issue 2 & 6)
+  if (modelState) {
+    const combinedVol = modelState.volState?.combinedVolRatio ?? 0.5;
+    if (combinedVol > 0.85) {
+      score -= 1.5;
+    } else if (combinedVol < 0.40) {
+      score += 0.5;
+    }
+
+    const injA = modelState.injMultA ?? 1.0;
+    const injB = modelState.injMultB ?? 1.0;
+    const worstInjury = Math.min(injA, injB);
+    if (worstInjury < 0.82) {
+      score -= 1.5;
+    } else if (worstInjury < 0.92) {
+      score -= 0.5;
+    }
+
+    if (modelState.intel?.backToBack) {
+      score -= 1.0;
+    }
+  }
 
   const _gt = getConfidenceGradeThresholds();
   if (isH2 && score >= _gt.aThresh) return "B";
@@ -13517,8 +13595,6 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   aS_pre = applyVolatility(aS_pre, aFTS, volLimit);
   bS_pre = applyVolatility(bS_pre, bFTS, volLimit);
 
-  // (injury multipliers applied AFTER team vs allowed blending, BEFORE H2H — see below)
-
   // Advanced stats blend (ESPN auto-fetch leagues)
   const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
   const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
@@ -13562,26 +13638,20 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
   // FIX #1: Apply injury multipliers AFTER team/allowed blending, BEFORE H2H.
-  // This is the correct order: baseline → opponent blend → injury → H2H → signals.
-  // H2H values already reflect real game totals so they are not injury-adjusted again.
   aS *= injMultA;
   bS *= injMultB;
 
-  // FIX #5: Intel/fatigue signals applied SEPARATELY per team (not shared split).
-  const intel = computeIntelligencePack(league);
-  const intelSignalA = buildTeamMarketIntelSignal(intel, "A");
-  const intelSignalB = buildTeamMarketIntelSignal(intel, "B");
-  if (isFinite(intelSignalA.signal) && intelSignalA.signal !== 0) {
-    aS += intelSignalA.signal;
-  }
-  if (isFinite(intelSignalB.signal) && intelSignalB.signal !== 0) {
-    bS += intelSignalB.signal;
-  }
-
-  // Volatility ratio for confidence grading — does NOT shift projections
+  // Volatility ratio for context-aware blending
   const _aVolRatio = getVolatilityRatioForSeries(aFTS, volLimit);
   const _bVolRatio = getVolatilityRatioForSeries(bFTS, volLimit);
   const _ftVolRatio = Math.max(_aVolRatio, _bVolRatio);
+
+  // Apply damped Intel/fatigue signals (Issue 4)
+  const intel = computeIntelligencePack(league);
+  const intelSignalA = buildTeamMarketIntelSignal(intel, "A");
+  const intelSignalB = buildTeamMarketIntelSignal(intel, "B");
+  aS = applyDampedIntelSignal(aS, intelSignalA.signal, _bVolRatio);
+  bS = applyDampedIntelSignal(bS, intelSignalB.signal, _aVolRatio);
 
   const aH2H = getH2HSeries("A", "ft", parsed);
   const bH2H = getH2HSeries("B", "ft", parsed);
@@ -13589,7 +13659,13 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let projAFT = aS;
   let projBFT = bS;
   if (ftHasH2H) {
-    const hw = getH2HWeight(aH2H.length, bH2H.length, "ft", ftSampleTier, Math.abs(aS - bS), league, leagueBase);
+    const hw = getH2HWeight(aH2H.length, bH2H.length, "ft", ftSampleTier, Math.abs(aS - bS), league, leagueBase, 1.0, {
+      injMultA,
+      injMultB,
+      volRatio: _ftVolRatio,
+      blowoutGap: Math.abs(aS - bS),
+      paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
+    });
     projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgOrNaN(aH2H) * hw) : avgOrNaN(aH2H);
     projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(bH2H) * hw) : avgOrNaN(bH2H);
   }
@@ -13674,19 +13750,34 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre + aAllowed) / 2 : bS_pre;
   }
 
+  // Apply injury multipliers AFTER team/allowed blend, BEFORE H2H (Issue 1)
+  projA1H *= injMultA;
+  projB1H *= injMultB;
+
+  // Volatility ratios for 1H context-aware blending (Issue 2)
+  const aVol1 = getVolatilityRatioForSeries(aS1, volLimit);
+  const bVol1 = getVolatilityRatioForSeries(bS1, volLimit);
+  const combinedVol = Math.max(aVol1, bVol1);
+
   // Intelligence pack
   const intel = computeIntelligencePack(league);
   const intelSignal = buildTotalMarketIntelSignal(intel);
   if (isFinite(intelSignal.signal) && intelSignal.signal !== 0) {
-    projA1H += intelSignal.signal / 4;
-    projB1H += intelSignal.signal / 4;
+    projA1H = applyDampedIntelSignal(projA1H, intelSignal.signal / 4, bVol1);
+    projB1H = applyDampedIntelSignal(projB1H, intelSignal.signal / 4, aVol1);
   }
 
   const aH2H = getH2HSeries("A", "h1", parsed);
   const bH2H = getH2HSeries("B", "h1", parsed);
   const h1HasH2H = maybeReadH2HEnabled("h1") && aH2H.length >= 2 && bH2H.length >= 2;
   if (h1HasH2H) {
-    const hw = getH2HWeight(aH2H.length, bH2H.length, "h1", h1SampleTier, Math.abs(projA1H - projB1H), league, leagueBase1H);
+    const hw = getH2HWeight(aH2H.length, bH2H.length, "h1", h1SampleTier, Math.abs(projA1H - projB1H), league, leagueBase1H, 1.0, {
+      injMultA,
+      injMultB,
+      volRatio: combinedVol,
+      blowoutGap: Math.abs(projA1H - projB1H),
+      paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
+    });
     projA1H = isFinite(projA1H) ? (projA1H * (1 - hw) + avgOrNaN(aH2H) * hw) : avgOrNaN(aH2H);
     projB1H = isFinite(projB1H) ? (projB1H * (1 - hw) + avgOrNaN(bH2H) * hw) : avgOrNaN(bH2H);
   }
@@ -13701,7 +13792,7 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     h1HasH2H, h1ProjectionOnly: !h1HasH2H && h1SampleTier === "thin",
     h1FullModel: h1SampleTier === "full",
     paceGapRisk: false, defensiveFloorFlag: false,
-    aVol1: 0, bVol1: 0, aS1: avgOrNaN(aS1), bS1: avgOrNaN(bS1)
+    aVol1, bVol1, aS1: avgOrNaN(aS1), bS1: avgOrNaN(bS1)
   };
 }
 
@@ -14314,12 +14405,14 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
   })();
 
   // Always save a shadow record, even for NO PLAY, but don't show it in main tracker
+  // C-grade picks are NOT sent to tracker as full active plays (Issue 7 Leak Protection)
   const isActualPlay = !(
     !pickRow ||
     pickRow.pick === "NO PLAY" ||
     ((pickRow.note && !isExoticNoLine) && !isSavablePick) ||
     (!isFinite(pickRow.line) && !isExoticNoLine) ||
-    !fixtureMeta?.eventId
+    !fixtureMeta?.eventId ||
+    String(pickRow.confidence || "—").toUpperCase() === "C"
   );
 
   if (!isActualPlay && !fixtureMeta?.eventId) return null;
@@ -15020,16 +15113,22 @@ const baseFtCalc = computeFTProjection({
   injMultB: g_injB.scoringMult
 });
 
-MODEL_TUNING.recencyWeights = _runH1Weights;
-const baseH1Calc = compute1HProjection({
-  league,
-  parsed,
-  lines: baseLines,
-  injMultA: g_injA.scoringMult,
-  injMultB: g_injB.scoringMult
-});
+    MODEL_TUNING.recencyWeights = _runH1Weights;
+    const baseH1Calc = compute1HProjection({
+      league,
+      parsed,
+      lines: baseLines,
+      injMultA: g_injA.scoringMult,
+      injMultB: g_injB.scoringMult
+    });
 
-
+    const globalModelState = buildGlobalModelState({
+      league,
+      parsed,
+      lines: baseLines,
+      injMultA: g_injA.scoringMult,
+      injMultB: g_injB.scoringMult
+    });
 
     engineDebug("projection pass 1", {
       ft: summarizeCalcForDebug(baseFtCalc),
@@ -15209,35 +15308,59 @@ const h1Calc = compute1HProjection({
     const h1Target = isFinite(h1Calc.h1Proj) && h1Calc.h1Proj > 0 ? h1Calc.h1Proj : rawQ12Sum;
     const h2Target = isFinite(ftCalc.ftProj) && h1Target > 0 ? ftCalc.ftProj - h1Target : rawQ34Sum;
 
-    if (rawQ12Sum > 0 && isFinite(h1Target)) {
-      const q12Scale = h1Target / rawQ12Sum;
-      [q1, q2].forEach(q => {
-        if (q && isFinite(q.proj) && isFinite(q.line)) {
-          q.proj *= q12Scale;
-          q.edge = q.proj - q.line;
-          q.pick = getPick(q.edge, q.line, league, "h1", {});
-          q.confidence = getConfidenceGrade({
-            pick: q.pick, line: q.line, edge: q.edge, sampleTier: q.tier,
-            volLimit: 12, marketKey: "h1", hasH2H: q.hasH2H
-          });
-        }
-      });
-    }
+            if (rawQ12Sum > 0 && isFinite(h1Target)) {
+          const q1Weight = 1.0;
+          const q2Weight = 1.03; // Accounting for Q2 rotation pacing shifts
+          const totalWeightedRaw = (q1?.proj || 0) * q1Weight + (q2?.proj || 0) * q2Weight;
+          const q1Scale = (h1Target * (q1?.proj || 0) * q1Weight) / (totalWeightedRaw || 1) / (q1?.proj || 1);
+          const q2Scale = (h1Target * (q2?.proj || 0) * q2Weight) / (totalWeightedRaw || 1) / (q2?.proj || 1);
 
-    if (rawQ34Sum > 0 && isFinite(h2Target) && h2Target > 0) {
-      const q34Scale = h2Target / rawQ34Sum;
-      [q3, q4].forEach(q => {
-        if (q && isFinite(q.proj) && isFinite(q.line)) {
-          q.proj *= q34Scale;
-          q.edge = q.proj - q.line;
-          q.pick = getPick(q.edge, q.line, league, "h1", {});
-          q.confidence = getConfidenceGrade({
-            pick: q.pick, line: q.line, edge: q.edge, sampleTier: q.tier,
-            volLimit: 12, marketKey: "h1", hasH2H: q.hasH2H
-          });
+          if (q1 && isFinite(q1.proj) && isFinite(q1.line)) {
+            q1.proj *= q1Scale;
+            q1.edge = q1.proj - q1.line;
+            q1.pick = getPick(q1.edge, q1.line, league, "h1", {});
+            q1.confidence = getConfidenceGrade({
+              pick: q1.pick, line: q1.line, edge: q1.edge, sampleTier: q1.tier,
+              volLimit: 12, marketKey: "h1", hasH2H: q1.hasH2H, modelState: globalModelState
+            });
+          }
+          if (q2 && isFinite(q2.proj) && isFinite(q2.line)) {
+            q2.proj *= q2Scale;
+            q2.edge = q2.proj - q2.line;
+            q2.pick = getPick(q2.edge, q2.line, league, "h1", {});
+            q2.confidence = getConfidenceGrade({
+              pick: q2.pick, line: q2.line, edge: q2.edge, sampleTier: q2.tier,
+              volLimit: 12, marketKey: "h1", hasH2H: q2.hasH2H, modelState: globalModelState
+            });
+          }
         }
-      });
-    }
+
+        if (rawQ34Sum > 0 && isFinite(h2Target) && h2Target > 0) {
+          const q3Weight = 1.0;
+          const q4Weight = 1.08; // 8% fouling inflation premium modeled for Q4
+          const totalWeightedRaw = (q3?.proj || 0) * q3Weight + (q4?.proj || 0) * q4Weight;
+          const q3Scale = (h2Target * (q3?.proj || 0) * q3Weight) / (totalWeightedRaw || 1) / (q3?.proj || 1);
+          const q4Scale = (h2Target * (q4?.proj || 0) * q4Weight) / (totalWeightedRaw || 1) / (q4?.proj || 1);
+
+          if (q3 && isFinite(q3.proj) && isFinite(q3.line)) {
+            q3.proj *= q3Scale;
+            q3.edge = q3.proj - q3.line;
+            q3.pick = getPick(q3.edge, q3.line, league, "h1", {});
+            q3.confidence = getConfidenceGrade({
+              pick: q3.pick, line: q3.line, edge: q3.edge, sampleTier: q3.tier,
+              volLimit: 12, marketKey: "h1", hasH2H: q3.hasH2H, modelState: globalModelState
+            });
+          }
+          if (q4 && isFinite(q4.proj) && isFinite(q4.line)) {
+            q4.proj *= q4Scale;
+            q4.edge = q4.proj - q4.line;
+            q4.pick = getPick(q4.edge, q4.line, league, "h1", {});
+            q4.confidence = getConfidenceGrade({
+              pick: q4.pick, line: q4.line, edge: q4.edge, sampleTier: q4.tier,
+              volLimit: 12, marketKey: "h1", hasH2H: q4.hasH2H, modelState: globalModelState
+            });
+          }
+        }
     // H1 pick and projection remain authoritative — do NOT overwrite here.
 
     if (ftCalc.ftSampleTier === "insufficient") {
@@ -15306,14 +15429,16 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       defensiveFloorFlag: false,
       blowoutGap: 0,
       marketKey: "ft",
-      lineupQuality: 0.5
+      lineupQuality: 0.5,
+      modelState: globalModelState
     });
 
         const h1Confidence = getConfidenceGrade({
       pick: h1Pick, note: h1Note, line: h1Line, edge: h1Calc.h1Edge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: false, hasH2H: h1Calc.h1HasH2H,
-      marketKey: "h1"
+      marketKey: "h1",
+      modelState: globalModelState
     });
 
     const h1ConfidenceFinal = h1Confidence;
@@ -15332,7 +15457,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       volLimit: 12,
       injuryNotes: [],
       marketKey: "team_a",
-      lineupQuality: 0.5
+      lineupQuality: 0.5,
+      modelState: globalModelState
     });
 
     const bConfidence = getConfidenceGrade({
@@ -15349,19 +15475,22 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       volLimit: 12,
       injuryNotes: [],
       marketKey: "team_b",
-      lineupQuality: 0.5
+      lineupQuality: 0.5,
+      modelState: globalModelState
     });
     const h1aConfidence = getConfidenceGrade({
       pick: h1aPick, note: h1Note, line: finalLines.h1aLine, edge: h1aEdge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: false, hasH2H: h1Calc.h1HasH2H,
-      marketKey: "h1"
+      marketKey: "h1",
+      modelState: globalModelState
     });
     const h1bConfidence = getConfidenceGrade({
       pick: h1bPick, note: h1Note, line: finalLines.h1bLine, edge: h1bEdge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: false, hasH2H: h1Calc.h1HasH2H,
-      marketKey: "h1"
+      marketKey: "h1",
+      modelState: globalModelState
     });
 
     const phase2Activation = (typeof getPhase2ActivationState === "function") ? getPhase2ActivationState() : null;
