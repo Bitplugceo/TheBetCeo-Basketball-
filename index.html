@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6407,7 +6406,20 @@ _proxyFetchCache.delete(cacheKey);
   }
 
   if (String(url).includes("sofascore.com")) {
+    // Try Cloudflare Worker FIRST — server-side fetch, bypasses SofaScore CORS and bot-detection entirely
+    try {
+      const _sofaWorkerData = await fetchJson(WORKER_URL + "?url=" + encodeURIComponent(url), "SofaWorker");
+      if (_sofaWorkerData && typeof _sofaWorkerData === "object") {
+        _proxyFetchCache.set(cacheKey, { data: _sofaWorkerData, timestamp: Date.now() });
+        return _sofaWorkerData;
+      }
+    } catch (_sofaWErr) {
+      // Worker failed or returned bad data — cascade to public proxies
+      engineDebug("SofaWorker failed, trying public proxies", { url: getEngineFetchLabel(url), error: _sofaWErr?.message });
+    }
+
     const _SOFA_FALLBACKS = [
+      u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
       u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
       u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
       u => `https://thingproxy.freeboard.io/fetch/${encodeURIComponent(u)}`
@@ -6416,14 +6428,16 @@ _proxyFetchCache.delete(cacheKey);
     for (let i = 0; i < _SOFA_FALLBACKS.length; i++) {
       try {
         const data = await fetchJson(_SOFA_FALLBACKS[i](url), `SofaProxy-${i + 1}`);
-        _proxyFetchCache.set(cacheKey, { data, timestamp: Date.now() });
-        return data;
+        if (data && typeof data === "object") {
+          _proxyFetchCache.set(cacheKey, { data, timestamp: Date.now() });
+          return data;
+        }
       } catch (err) {
         sofaError = err;
       }
     }
-    engineDebug("SofaScore fetch failed completely — all non-Cloudflare proxies exhausted", { url, error: sofaError?.message || String(sofaError) });
-    throw sofaError;
+    engineDebug("SofaScore fetch failed — all proxies exhausted", { url: getEngineFetchLabel(url), error: sofaError?.message || String(sofaError) });
+    throw sofaError || new Error("All SofaScore proxies failed");
   }
 
   // [CLOSED: FIX 3 — PROXY SEQUENTIAL FALLBACK] Worker is primary. On failure cascades through
@@ -12676,50 +12690,103 @@ function pickSofaScoreFixture(homeName, homeId, awayName, awayId, tournamentId) 
 async function fetchSofaScoreData() {
   const teamAId = document.getElementById("ssTeamAId")?.value.trim();
   const teamBId = document.getElementById("ssTeamBId")?.value.trim();
+  const teamAName = document.getElementById("ssTeamAName")?.value.trim() || "Team A";
+  const teamBName = document.getElementById("ssTeamBName")?.value.trim() || "Team B";
 
   if (!teamAId || !teamBId) {
-    setStatusText("❌ Enter both SofaScore Team IDs first.", "err");
+    setStatusText("❌ Both team IDs required. Select a fixture or use 🔍 to find them.", "err");
     return;
   }
 
-  setStatusHTML('<span class="spinner"></span>Fetching SofaScore team events...', "loading");
-
-  async function _fetchTeamAllPages(teamId) {
-    const pages = await Promise.allSettled([
-      proxyFetch(`https://api.sofascore.com/api/v1/team/${teamId}/events/last/0`, 8000),
-      proxyFetch(`https://api.sofascore.com/api/v1/team/${teamId}/events/last/1`, 8000)
-    ]);
+  // SEQUENTIAL fetch per page with delay — prevents SofaScore rate-limiting
+  // Old code did 4 simultaneous requests (2 teams × 2 pages) which always got blocked
+  async function _fetchTeamSequential(teamId, label) {
     const seen = new Set();
     const merged = [];
-    pages.forEach(r => {
-      if (r.status !== 'fulfilled') return;
-      (r.value?.events || []).forEach(ev => {
-        if (!ev?.id || seen.has(String(ev.id))) return;
-        seen.add(String(ev.id));
-        merged.push(ev);
-      });
-    });
+    for (let page = 0; page <= 1; page++) {
+      const url = `https://api.sofascore.com/api/v1/team/${teamId}/events/last/${page}`;
+      try {
+        const data = await proxyFetch(url, 18000);
+        (data?.events || []).forEach(ev => {
+          if (!ev?.id || seen.has(String(ev.id))) return;
+          seen.add(String(ev.id));
+          merged.push(ev);
+        });
+        setStatusHTML(
+          `<span class="spinner"></span>${escapeHtml(label)}: ${merged.length} events (page ${page + 1}/2)...`,
+          "loading"
+        );
+      } catch (err) {
+        engineDebug(`SofaScore page ${page} failed for ${label} (${teamId})`, err.message);
+        // Continue — one failed page is not fatal, we may still have page 0
+      }
+      // Mandatory delay between pages — SofaScore rate-limits rapid consecutive requests
+      if (page === 0) await new Promise(r => setTimeout(r, 800));
+    }
     return { events: merged };
   }
 
   try {
-    const [dataA, dataB] = await Promise.all([
-      _fetchTeamAllPages(teamAId),
-      _fetchTeamAllPages(teamBId)
-    ]);
+    setStatusHTML(`<span class="spinner"></span>Fetching ${escapeHtml(teamAName)} stats...`, "loading");
+    const dataA = await _fetchTeamSequential(teamAId, teamAName);
 
+    if (!dataA.events.length) {
+      throw new Error(
+        `No events returned for ${teamAName} (ID: ${teamAId}). ` +
+        `Check the team ID is correct and the league season is active.`
+      );
+    }
+
+    // Delay between teams — critical to avoid being rate-limited
+    await new Promise(r => setTimeout(r, 1000));
+
+    setStatusHTML(`<span class="spinner"></span>Fetching ${escapeHtml(teamBName)} stats...`, "loading");
+    const dataB = await _fetchTeamSequential(teamBId, teamBName);
+
+    if (!dataB.events.length) {
+      throw new Error(
+        `No events returned for ${teamBName} (ID: ${teamBId}). ` +
+        `Check the team ID is correct and the league season is active.`
+      );
+    }
+
+    // Feed into paste fields and parse — same pipeline as manual paste
     const pA = document.getElementById("ssPasteA");
     const pB = document.getElementById("ssPasteB");
     if (pA) pA.value = JSON.stringify(dataA);
     if (pB) pB.value = JSON.stringify(dataB);
 
+    setStatusHTML(`<span class="spinner"></span>Processing stats...`, "loading");
     parseSofascoreIndividual("A");
+    await new Promise(r => setTimeout(r, 300));
     parseSofascoreIndividual("B");
 
-    setStatusText("✅ SofaScore auto-fetch completed successfully!", "ok");
+    const aGames = (document.getElementById("aFTScored")?.value || "").split(",").filter(Boolean).length;
+    const bGames = (document.getElementById("bFTScored")?.value || "").split(",").filter(Boolean).length;
+
+    if (!aGames && !bGames) {
+      setStatusHTML(
+        `⚠️ Events fetched but no completed games found in the correct competition.<br>` +
+        `<small style="color:#d98a00;">Tournament filter may be filtering everything. Try clearing the Tournament ID field and re-fetching.</small>`,
+        "err"
+      );
+      return;
+    }
+
+    setStatusText(
+      `✅ Done! ${teamAName}: ${aGames} games · ${teamBName}: ${bGames} games`,
+      "ok"
+    );
+
   } catch (err) {
-    setStatusText("❌ SofaScore fetch failed: " + err.message, "err");
-    engineDebug("SofaScore auto-fetch failed", err);
+    setStatusHTML(
+      `❌ ${escapeHtml(err.message)}<br>` +
+      `<small style="color:#d98a00;">` +
+      `If this keeps failing: use 🔍 to find the team ID → open the 🔗 JSON link → copy all text → paste into the Paste JSON field above.` +
+      `</small>`,
+      "err"
+    );
+    engineDebug("SofaScore auto-fetch failed", { error: err.message, teamAId, teamBId });
   }
 }
 
