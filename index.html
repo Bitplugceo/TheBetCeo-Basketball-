@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3768,13 +3769,33 @@ function getDynamicEdgeThreshold(league, marketKey, context = null) {
   
   let basePct = rules[key] !== undefined ? rules[key] : (rules.default || EDGE_RULES_V1.default);
   let thresholdPct = basePct;
----// Volatility does NOT shift projected points (FIX #4).
-function applyVolatility(proj, series, leagueVolLimit) {
-  // Volatility does NOT shift projected points (FIX #4).
-  // It returns proj unchanged but computes and caches the vol ratio
-  // so getConfidenceGrade can consume it via the shared diagnostics object.
-  if (!isFinite(proj)) return proj;
-  return proj;
+
+  if (context) {
+    const volRatio = context.volRatio ?? 1.0;
+    if (volRatio > 0.85) {
+      thresholdPct *= 1.20;
+    } else if (volRatio < 0.40) {
+      thresholdPct *= 0.85;
+    }
+    const sampleTier = context.sampleTier || "thin";
+    if (sampleTier === "thin") {
+      thresholdPct *= 1.15;
+    } else if (sampleTier === "insufficient") {
+      thresholdPct *= 1.5;
+    }
+  }
+  return thresholdPct;
+}
+
+function applyVolatility(proj, series, leagueVolLimit, league = "unknown") {
+  if (!isFinite(proj) || !Array.isArray(series) || !series.length) return proj;
+  const sd = stdDev(series);
+  const limit = Number(leagueVolLimit) || 12;
+  const ratio = sd / limit;
+  const factor = ratio - 0.5;
+  const mult = String(league).toLowerCase().includes("wnba") ? 0.25 : 0.20;
+  const adjustment = clampNumber(factor * mult, -0.08, 0.08);
+  return proj * (1 + adjustment);
 }
 function applyVolatility(proj, series, leagueVolLimit, league = "unknown") {
   if (!isFinite(proj) || !Array.isArray(series) || !series.length) return proj;
@@ -13733,8 +13754,9 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const ftHasH2H = maybeReadH2HEnabled("ft") && aH2H.length >= 2 && bH2H.length >= 2;
   let projAFT = aS;
   let projBFT = bS;
-  if (ftHasH2H) {
+    if (ftHasH2H) {
     const hw = getH2HWeight(aH2H.length, bH2H.length, "ft", ftSampleTier, Math.abs(aS - bS), league, leagueBase, 1.0, {
+      enabled: ftHasH2H,
       injMultA,
       injMultB,
       volRatio: _ftVolRatio,
@@ -13845,8 +13867,9 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const aH2H = getH2HSeries("A", "h1", parsed);
   const bH2H = getH2HSeries("B", "h1", parsed);
   const h1HasH2H = maybeReadH2HEnabled("h1") && aH2H.length >= 2 && bH2H.length >= 2;
-  if (h1HasH2H) {
+    if (h1HasH2H) {
     const hw = getH2HWeight(aH2H.length, bH2H.length, "h1", h1SampleTier, Math.abs(projA1H - projB1H), league, leagueBase1H, 1.0, {
+      enabled: h1HasH2H,
       injMultA,
       injMultB,
       volRatio: combinedVol,
@@ -16374,24 +16397,24 @@ window.__LAST_AUDIT_STATE = {
       }
     },
 
-    H1_TOTAL: {
-      STEP1_rawSeries:    { teamA: safeArr(parsed.a1HScored) || [], teamB: safeArr(parsed.b1HScored) || [] },
-      STEP1_allowedSeries:{ teamA: safeArr(parsed.a1HAllowed) || [], teamB: safeArr(parsed.b1HAllowed) || [] },
-      STEP1_sampleSizes:  { teamA: safeArr(parsed.a1HScored)?.length || 0, teamB: safeArr(parsed.b1HScored)?.length || 0 },
-      STEP2_averages:     { teamA_scoredAvg: h1Calc.aS1, teamB_scoredAvg: h1Calc.bS1 },
-      STEP3_leagueBase1H: _aud_lBase / 4,
-      STEP4_advancedBlend:{ used: ftCalc.usedAdvanced, pace: ftCalc.pace },
-      STEP5_h2hBlend: {
-        enabled: h1Calc.h1HasH2H,
-        seriesA: _aud_h2hH1A, seriesB: _aud_h2hH1B,
-        avgA: avgOrNaN(_aud_h2hH1A), avgB: avgOrNaN(_aud_h2hH1B)
-      },
-      STEP6_untetheredH1Calculation: {
-        formulaNote: "h1Proj is calculated untethered from FT, based strictly on H1 scored/allowed averages and league base"
-      },
-      STEP7_finalProjections: { teamA: h1Calc.projA1H, teamB: h1Calc.projB1H, total: h1Calc.h1Proj },
-      STEP8_edgeCalc:         { marketLine: h1Line, edge: h1Calc.h1Edge },
-      diagnostics: {
+            H1_TOTAL: {
+          STEP1_rawSeries:    { teamA: safeArr(parsed.a1HScored) || [], teamB: safeArr(parsed.b1HScored) || [] },
+          STEP1_allowedSeries:{ teamA: safeArr(parsed.a1HAllowed) || [], teamB: safeArr(parsed.b1HAllowed) || [] },
+          STEP1_sampleSizes:  { teamA: safeArr(parsed.a1HScored)?.length || 0, teamB: safeArr(parsed.b1HScored)?.length || 0 },
+          STEP2_averages:     { teamA_scoredAvg: h1Calc.aS1, teamB_scoredAvg: h1Calc.bS1 },
+          STEP3_leagueBase1H: _aud_lBase / 4,
+          STEP4_advancedBlend:{ used: ftCalc.usedAdvanced, pace: ftCalc.pace },
+          STEP5_h2hBlend: {
+            enabled: h1Calc.h1HasH2H,
+            seriesA: _aud_h2hH1A, seriesB: _aud_h2hH1B,
+            avgA: avgOrNaN(_aud_h2hH1A), avgB: avgOrNaN(_aud_h2hH1B)
+          },
+          STEP6_untetheredH1Calculation: {
+            formulaNote: "h1Proj is calculated untethered from FT, based strictly on H1 scored/allowed averages and league base"
+          },
+          STEP7_finalProjections: { teamA: h1Calc.projA1H, teamB: h1Calc.projB1H, total: h1Calc.h1Proj },
+          STEP8_edgeCalc:         { marketLine: h1Line, edge: h1Calc.h1Edge },
+          diagnostics: {
         sampleTier:          h1Calc.h1SampleTier,
         h1FullModel:         h1Calc.h1FullModel,
         h1ProjectionOnly:    h1Calc.h1ProjectionOnly,
