@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6603,9 +6604,21 @@ function trimmedAvg(arr) {
   const work = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
   if (!work.length) return NaN;
   if (work.length <= 2) return weightedRecentAverage(work);
-  // Remove one highest and one lowest
-  const sorted = [...work].sort((a, b) => a - b);
-  const trimmed = sorted.slice(1, -1);
+  const minVal = Math.min(...work);
+  const maxVal = Math.max(...work);
+  let minRemoved = false;
+  let maxRemoved = false;
+  const trimmed = work.filter(v => {
+    if (v === minVal && !minRemoved) {
+      minRemoved = true;
+      return false;
+    }
+    if (v === maxVal && !maxRemoved) {
+      maxRemoved = true;
+      return false;
+    }
+    return true;
+  });
   return weightedRecentAverage(trimmed);
 }
 
@@ -13325,16 +13338,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   aS_pre = applyVolatility(aS_pre, aFTS, volLimit);
   bS_pre = applyVolatility(bS_pre, bFTS, volLimit);
 
-  let aS = isFinite(aS_pre) && isFinite(bAllowed) ? aS_pre * 0.55 + bAllowed * 0.45 : aS_pre;
-  let bS = isFinite(bS_pre) && isFinite(aAllowed) ? bS_pre * 0.55 + aAllowed * 0.45 : bS_pre;
-
   // Advanced stats blend (ESPN auto-fetch leagues)
   const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
   const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
-  let paceAdjust = 1.0;
-  let netAdjustA = 0, netAdjustB = 0;
-  let usedAdvanced = false;
-  let synNetA = 0, synNetB = 0;
+  const leagueRatingBase = 110; 
   let synPace = leaguePaceBase;
 
   const ctxA = g_massacreFetchContext?.A || {};
@@ -13344,49 +13351,33 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const clamp = getEffectivePaceClamp(league);
 
   let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
-  let hasRealNet = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10));
+  let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10));
+
+  let synNetA = 0, synNetB = 0;
+  let usedAdvanced = false;
 
   if (hasRealPace) {
-    const avgPace = (avgPaceA + avgPaceB) / 2;
-    paceAdjust = clampNumber(avgPace / leaguePaceBase, clamp.min, clamp.max);
-    synPace = avgPace;
-    usedAdvanced = true;
+    synPace = (avgPaceA + avgPaceB) / 2;
   } else {
-    // Synthetic Pace Fallback
     const totalA = avgOrNaN(aFTS) + avgOrNaN(aFTA);
     const totalB = avgOrNaN(bFTS) + avgOrNaN(bFTA);
     if (isFinite(totalA) && isFinite(totalB)) {
-      const synPaceA = (totalA / eb) * leaguePaceBase;
-      const synPaceB = (totalB / eb) * leaguePaceBase;
-      const avgSynPace = (synPaceA + synPaceB) / 2;
-      paceAdjust = clampNumber(avgSynPace / leaguePaceBase, clamp.min, clamp.max);
-      synPace = avgSynPace;
+      synPace = ((totalA + totalB) / (eb * 2)) * leaguePaceBase;
     }
   }
 
-  if (hasRealNet) {
-    const netA = avgOrNaN(ctxA.ortg10) - avgOrNaN(ctxA.drtg10);
-    const netB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
-    netAdjustA = clampNumber(netA / 100, -0.15, 0.15);
-    netAdjustB = clampNumber(netB / 100, -0.15, 0.15);
-    synNetA = netA;
-    synNetB = netB;
+  let aS, bS;
+  if (isEspnLeague && hasRealRatings && hasRealPace) {
+    const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
+    const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
+    aS = (synPace * projectedRatingA) / 100;
+    bS = (synPace * projectedRatingB) / 100;
+    synNetA = avgOrNaN(ctxA.ortg10) - avgOrNaN(ctxA.drtg10);
+    synNetB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
     usedAdvanced = true;
   } else {
-    // Synthetic Net Rating Fallback
-    const diffA = avgOrNaN(aFTS) - avgOrNaN(aFTA);
-    const diffB = avgOrNaN(bFTS) - avgOrNaN(bFTA);
-    if (isFinite(diffA) && isFinite(diffB) && isFinite(synPace) && synPace > 0) {
-      synNetA = (diffA / synPace) * 100;
-      synNetB = (diffB / synPace) * 100;
-      netAdjustA = clampNumber(synNetA / 100, -0.15, 0.15);
-      netAdjustB = clampNumber(synNetB / 100, -0.15, 0.15);
-    }
-  }
-
-  if (isEspnLeague) {
-    aS = aS * paceAdjust * (1 + netAdjustA);
-    bS = bS * paceAdjust * (1 + netAdjustB);
+    aS = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre + bAllowed) / 2 : aS_pre;
+    bS = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre + aAllowed) / 2 : bS_pre;
   }
 
   // Intelligence pack adjustment
@@ -13403,7 +13394,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let projAFT = aS;
   let projBFT = bS;
   if (ftHasH2H) {
-    const hw = 0.15;
+    const hw = getH2HWeight(aH2H.length, bH2H.length, "ft", ftSampleTier, Math.abs(aS - bS), league, leagueBase);
     projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgOrNaN(aH2H) * hw) : avgOrNaN(aH2H);
     projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(bH2H) * hw) : avgOrNaN(bH2H);
   }
@@ -13455,8 +13446,35 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   let aAllowed = avgOrNaN(aA1);
   let bAllowed = avgOrNaN(bA1);
-  let projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? aS_pre * 0.55 + bAllowed * 0.45 : aS_pre;
-  let projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? bS_pre * 0.55 + aAllowed * 0.45 : bS_pre;
+
+  // Advanced stats blend for 1H
+  const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
+  const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
+  const leagueRatingBase = 110;
+
+  const ctxA = g_massacreFetchContext?.A || {};
+  const ctxB = g_massacreFetchContext?.B || {};
+  const avgPaceA = avgOrNaN(ctxA.pace10);
+  const avgPaceB = avgOrNaN(ctxB.pace10);
+
+  let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
+  let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10));
+
+  let synPace = leaguePaceBase;
+  if (hasRealPace) {
+    synPace = (avgPaceA + avgPaceB) / 2;
+  }
+
+  let projA1H, projB1H;
+  if (isEspnLeague && hasRealRatings && hasRealPace) {
+    const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
+    const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
+    projA1H = (synPace * projectedRatingA) / 200;
+    projB1H = (synPace * projectedRatingB) / 200;
+  } else {
+    projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre + bAllowed) / 2 : aS_pre;
+    projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre + aAllowed) / 2 : bS_pre;
+  }
 
   // Intelligence pack
   const intel = computeIntelligencePack(league);
@@ -13466,34 +13484,11 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projB1H += intelSignal.signal / 4;
   }
 
-  // Advanced stats blend for 1H
-  const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
-  if (isEspnLeague) {
-    const ctxA = g_massacreFetchContext?.A || {};
-    const ctxB = g_massacreFetchContext?.B || {};
-    const avgPaceA = avgOrNaN(ctxA.pace10);
-    const avgPaceB = avgOrNaN(ctxB.pace10);
-    const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
-    const clamp = getEffectivePaceClamp(league);
-    if (isFinite(avgPaceA) && isFinite(avgPaceB) && avgPaceA > 0 && avgPaceB > 0) {
-      const avgPace = (avgPaceA + avgPaceB) / 2;
-      const paceAdjust = clampNumber(avgPace / leaguePaceBase, clamp.min, clamp.max);
-      projA1H *= paceAdjust;
-      projB1H *= paceAdjust;
-    }
-    const netA = avgOrNaN(ctxA.ortg10) - avgOrNaN(ctxA.drtg10);
-    const netB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
-    if (isFinite(netA) && isFinite(netB)) {
-      projA1H *= (1 + clampNumber(netA / 200, -0.10, 0.10));
-      projB1H *= (1 + clampNumber(netB / 200, -0.10, 0.10));
-    }
-  }
-
   const aH2H = getH2HSeries("A", "h1", parsed);
   const bH2H = getH2HSeries("B", "h1", parsed);
   const h1HasH2H = maybeReadH2HEnabled("h1") && aH2H.length >= 2 && bH2H.length >= 2;
   if (h1HasH2H) {
-    const hw = 0.15;
+    const hw = getH2HWeight(aH2H.length, bH2H.length, "h1", h1SampleTier, Math.abs(projA1H - projB1H), league, leagueBase1H);
     projA1H = isFinite(projA1H) ? (projA1H * (1 - hw) + avgOrNaN(aH2H) * hw) : avgOrNaN(aH2H);
     projB1H = isFinite(projB1H) ? (projB1H * (1 - hw) + avgOrNaN(bH2H) * hw) : avgOrNaN(bH2H);
   }
