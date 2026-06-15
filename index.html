@@ -1,3 +1,4 @@
+F
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -14826,7 +14827,24 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
   
   finalPicks.forEach((p, idx) => {
     const isLock = idx === lockIdx && p.pick !== "NO PLAY" && p.pick !== "NaN";
-    const confText = (p.pick === "NO PLAY") ? "NaN" : (p.confidence === "—" ? "NaN" : (p.confidence || "D"));
+    const isNoPlay = p.pick === "NO PLAY" || p.pick === "NaN" || !p.pick;
+    const isLean = !isNoPlay && (
+      String(p.displayPick || p.pick || "").startsWith("LEAN ") ||
+      p.recommendationTier === "lean"
+    );
+
+    // Only render rows that have an actionable A or B grade play
+    // NO PLAY rows and LEAN (C grade) rows are silently skipped
+    if (isNoPlay || isLean) {
+      // Still build tracked payload for shadow tracking even if not displayed
+      const marketKeyFromLogic = getMarketKeyFromName(p.name, p.marketKey);
+      const pickWithCorrectKey = { ...p, marketKey: marketKeyFromLogic };
+      const payload = buildTrackedPickPayload({ pickRow: pickWithCorrectKey, isLock: false, fixtureMeta, league, diagnostics });
+      if (payload) tracked.push(payload);
+      return; // skip rendering this row
+    }
+
+    const confText = p.confidence === "—" ? "NaN" : (p.confidence || "D");
     const shownLine = isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line;
     const shownEdge = isFinite(p.displayEdge) ? p.displayEdge : p.edge;
     
@@ -14838,7 +14856,7 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     if (_badgeIdx !== -1) {
       tdPick.appendChild(document.createTextNode(_nameStr.slice(0, _badgeIdx)));
       const _badgeEl = document.createElement("span");
-      _badgeEl.innerHTML = _nameStr.slice(_badgeIdx); // badge HTML is engine-generated only, not user input
+      _badgeEl.innerHTML = _nameStr.slice(_badgeIdx);
       tdPick.appendChild(_badgeEl);
     } else {
       tdPick.textContent = _nameStr;
@@ -14846,14 +14864,10 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     if (p.usedMemory) tdPick.appendChild(document.createTextNode(' 🧠'));
     row.appendChild(tdPick);
 
-    // LOCK: displayLine returns "—" for NaN/undefined/null — the raw string "NaN" must
-    // never be shown to the user in the results table. It also serializes into debug logs
-    // and triggered false red-screen alerts via the (now-removed) "nan" check in getDebugSeverity.
     const tdProj = document.createElement("td");
     tdProj.textContent = displayLine(p.proj);
     row.appendChild(tdProj);
 
-    // LOCK: Edge display uses "—" fallback, not "NaN" — keeps the table clean for NO PLAY rows.
     const tdEdge = document.createElement("td");
     tdEdge.textContent = (isFinite(shownEdge) && isFinite(shownLine) && shownLine > 0)
       ? formatEdge(shownEdge, shownLine)
@@ -14869,7 +14883,7 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     tdPred.className = getPredictionClass(p.pick);
     tdPred.style.whiteSpace = "nowrap";
     tdPred.style.fontSize = "11px";
-    tdPred.textContent = (p.pick === "NO PLAY") ? "NO PLAY" : (p.bufferedPickText || p.displayPick || p.pick);
+    tdPred.textContent = p.bufferedPickText || p.displayPick || p.pick;
     if (isLock) {
       const lockSpan = document.createElement("span");
       lockSpan.className = "lock";
@@ -14880,31 +14894,42 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     row.appendChild(tdPred);
 
     const marketKeyFromLogic = getMarketKeyFromName(p.name, p.marketKey);
-    // Audit Log: Catch the hijack in the console if it attempts to happen
     if (p.marketKey === 'ft' && marketKeyFromLogic !== 'ft') {
       console.warn("MARKET HIJACK ATTEMPT:", { name: p.name, original: p.marketKey, new: marketKeyFromLogic });
     }
     const pickWithCorrectKey = { ...p, marketKey: marketKeyFromLogic };
     const payload = buildTrackedPickPayload({ pickRow: pickWithCorrectKey, isLock, fixtureMeta, league, diagnostics });
     if (payload) tracked.push(payload);
-      if (p.pick !== "NO PLAY" && !p.note && isFinite(p.line) && p.line > 0 && fixtureMeta?.eventId) {
-    const _snapSide = getPickSideFromText(p.pick);
-    if (_snapSide) {
-      recordLiveCalculationSnapshot({
-        eventId: fixtureMeta.eventId,
-        league,
-        marketKey: marketKeyFromLogic,
-        side: _snapSide,
-        line: Number(p.displayLineUsed ?? p.line),
-        predictionText: p.displayPick || p.pick,
-        confidence: p.confidence || "—",
-        eventDate: fixtureMeta.eventDate || "",
-        homeTeam: fixtureMeta.homeTeam || "",
-        awayTeam: fixtureMeta.awayTeam || ""
-      });
+    if (!isNoPlay && isFinite(p.line) && p.line > 0 && fixtureMeta?.eventId) {
+      const _snapSide = getPickSideFromText(p.pick);
+      if (_snapSide) {
+        recordLiveCalculationSnapshot({
+          eventId: fixtureMeta.eventId,
+          league,
+          marketKey: marketKeyFromLogic,
+          side: _snapSide,
+          line: Number(p.displayLineUsed ?? p.line),
+          predictionText: p.displayPick || p.pick,
+          confidence: p.confidence || "—",
+          eventDate: fixtureMeta.eventDate || "",
+          homeTeam: fixtureMeta.homeTeam || "",
+          awayTeam: fixtureMeta.awayTeam || ""
+        });
+      }
     }
+  });
+
+  // If nothing passed, show a clean empty-state row instead of a blank table
+  const dataRows = table.rows.length - 1; // subtract header
+  if (dataRows === 0) {
+    const emptyRow = table.insertRow();
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.style.cssText = "text-align:center;padding:14px;color:var(--muted);font-size:12px;font-weight:700;";
+    td.textContent = "No A/B grade plays found for this matchup.";
+    emptyRow.appendChild(td);
   }
-});
+
   return tracked;
 }
 
