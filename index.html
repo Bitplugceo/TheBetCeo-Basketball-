@@ -1,4 +1,3 @@
-I
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6646,7 +6645,7 @@ function trimmedAvg(arr) {
     }
 
     function displayLine(val) {
-  if (val === null || val === undefined || isNaN(val) || !isFinite(val)) return "—";
+  if (val === null || val === undefined || isNaN(val) || !isFinite(val)) return "NaN";
   const rounded = Math.round(val * 2) / 2;
   // Always output .5 – if the rounded value is an integer, add .5
   if (Math.abs(rounded - Math.round(rounded)) < 0.01) {
@@ -12597,7 +12596,7 @@ const cls =
       const url = `${RAPID_API_BASE}/games?league=${leagueId}&season=${getCurrentSeasonYear(league)}&date=${dateStr}&timezone=UTC`;
       try {
         if (myToken !== _fixtureLoadToken) return;
-        const data = await proxyFetch(url, 12000);
+        const data = await apiBasketballFetch(url, 12000);
         if (myToken !== _fixtureLoadToken) return;
         const games = data?.response || [];
         if (!games.length) {
@@ -13374,7 +13373,7 @@ function getConfidenceClass(conf) {
 }
 
     function formatEdge(edge, line) {
-      if (!isFinite(edge) || !isFinite(line) || line <= 0) return "—";
+      if (!isFinite(edge) || !isFinite(line) || line <= 0) return "NaN";
       const edgeRounded = Math.round(edge * 10) / 10;
       return (edgeRounded > 0 ? "+" : "") + edgeRounded.toFixed(1);
     }
@@ -14561,7 +14560,7 @@ async function executeRetrospectiveBacktest(gameId) {
   } catch(e) { return null; }
 }
 
-function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diagnostics }) {
+    function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diagnostics }) {
   const tracked = [];
   table.style.display = "table";
   table.innerHTML = "<tr><th>Pick</th><th>Projection</th><th>Edge</th><th>Model Grade</th><th>Prediction</th></tr>";
@@ -14614,11 +14613,6 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
 
     const row = table.insertRow();
 
-    // Dim NO PLAY rows slightly so actionable rows stand out
-    if (isNoPlay) {
-      row.style.opacity = "0.55";
-    }
-
     const tdPick = document.createElement("td");
     const _nameStr = String(p.name || "");
     const _badgeIdx = _nameStr.indexOf('<span');
@@ -14634,13 +14628,13 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     row.appendChild(tdPick);
 
     const tdProj = document.createElement("td");
-    tdProj.textContent = isNoPlay ? "—" : displayLine(p.proj);
+    tdProj.textContent = displayLine(p.proj);
     row.appendChild(tdProj);
 
     const tdEdge = document.createElement("td");
     tdEdge.textContent = (isFinite(shownEdge) && isFinite(shownLine) && shownLine > 0)
       ? formatEdge(shownEdge, shownLine)
-      : "—";
+      : "NaN";
     row.appendChild(tdEdge);
 
     const tdConf = document.createElement("td");
@@ -14654,6 +14648,8 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
       tdPred.style.whiteSpace = "nowrap";
       tdPred.style.fontSize = "11px";
       tdPred.textContent = "NO PLAY";
+      // Make only the text faint, not the whole row
+      tdPred.style.opacity = "0.55";
     } else {
       tdPred.className = getPredictionClass(p.pick);
       tdPred.style.whiteSpace = "nowrap";
@@ -16465,6 +16461,40 @@ if (trackedToSave.length) {
   const RAPID_API_HOST = "api-basketball.p.rapidapi.com";
   const RAPID_API_BASE = "https://api-basketball.p.rapidapi.com";
 
+  // Dedicated fetch for API Basketball – bypasses worker/proxy chain and adds required headers
+  async function apiBasketballFetch(url, timeoutMs = 12000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        headers: {
+          "X-RapidAPI-Key": RAPID_API_KEY,
+          "X-RapidAPI-Host": RAPID_API_HOST
+        },
+        signal: controller.signal,
+        cache: "no-store"
+      });
+      clearTimeout(timer);
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      const text = await response.text();
+      try { return JSON.parse(text); } catch(e) { throw new Error("Invalid JSON response"); }
+    } catch (err) {
+      clearTimeout(timer);
+      engineDebug("API Basketball fetch failed", { url, error: err.message });
+      throw err;
+    }
+  }
+
+  // Keep original proxyFetch for ESPN etc.
+  const originalProxyFetch = proxyFetch;
+  window.proxyFetch = async function(url, timeoutMs = 12000) {
+    const isApiBasketball = url.includes(RAPID_API_HOST);
+    if (isApiBasketball) {
+      return apiBasketballFetch(url, timeoutMs);
+    }
+    return originalProxyFetch(url, timeoutMs);
+  };
+
   // Map dropdown league keys to API Basketball league IDs
   // Expanded with more manual leagues for auto‑fetch support
   const LEAGUE_ID_MAP = {
@@ -16497,7 +16527,7 @@ if (trackedToSave.length) {
     const leagueId = LEAGUE_ID_MAP[league];
     if (!leagueId) return null;
     const url = `${RAPID_API_BASE}/teams?search=${encodeURIComponent(teamName)}&league=${leagueId}&season=${getCurrentSeasonYear(league)}`;
-    const data = await proxyFetch(url, 12000);
+    const data = await apiBasketballFetch(url, 12000);
     const teams = data?.response || [];
     if (!teams.length) return null;
     // pick the first match (best match by name)
@@ -16510,10 +16540,11 @@ if (trackedToSave.length) {
     if (!leagueId) return null;
     const season = getCurrentSeasonYear(league);
     const url = `${RAPID_API_BASE}/games?team=${teamId}&league=${leagueId}&season=${season}&timezone=UTC`;
-    const data = await proxyFetch(url, 12000);
-    const games = data?.response || [];
-    const completed = games.filter(g => g.status.long === "Finished");
-    completed.sort((a, b) => new Date(b.date.start) - new Date(a.date.start));
+    const data = await apiBasketballFetch(url, 12000);
+    // Handle possible nested response
+    const games = data?.response || (Array.isArray(data) ? data : []);
+    const completed = games.filter(g => g?.status?.long === "Finished");
+    completed.sort((a, b) => new Date(b?.date?.start || 0) - new Date(a?.date?.start || 0));
     const recent = completed.slice(0, limit);
     const scored = [], allowed = [], h1Scored = [], h1Allowed = [], h2Scored = [], h2Allowed = [];
     const q1Scored = [], q2Scored = [], q3Scored = [], q4Scored = [];
@@ -16560,7 +16591,7 @@ if (trackedToSave.length) {
     if (!leagueId) return [];
     const season = getCurrentSeasonYear(league);
     const url = `${RAPID_API_BASE}/games?league=${leagueId}&season=${season}&team=${teamAId}&opponent=${teamBId}`;
-    const data = await proxyFetch(url, 12000);
+    const data = await apiBasketballFetch(url, 12000);
     const games = data?.response || [];
     const completed = games.filter(g => g.status.long === "Finished");
     completed.sort((a, b) => new Date(b.date.start) - new Date(a.date.start));
