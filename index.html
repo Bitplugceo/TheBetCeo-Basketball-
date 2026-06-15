@@ -1,4 +1,3 @@
-C
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2517,16 +2516,12 @@ body.dark-mode .tracker-analytics-section-head {
       <option value="unknown">Other / Mixed League</option>
     </optgroup>
   </select>
-  <div style="margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--panel-border);">
-    <label>API-Basketball Key</label>
-    <div style="display: flex; gap: 6px;">
-      <input type="password" id="apibKeyInput" value="313ff1c1c400e65f8dfd48126aca176a" placeholder="Paste your API-Sports key here" style="margin-bottom:0; flex:1;" onchange="saveApibKey()" />
-      <select id="apibEndpointSelect" style="font-size: 11px; padding: 4px; background: var(--input-bg); color: var(--text); border: 1px solid var(--input-border);" onchange="saveApibKey()">
-        <option value="https://v1.basketball.api-sports.io">Direct (api-sports.io)</option>
-        <option value="https://basketball.api-sports.io">RapidAPI Host</option>
-      </select>
-    </div>
-    <small style="color:var(--muted); font-size:10px; display:block; margin-top:4px;">Retrieve your key from dashboard.api-sports.io</small>
+  <div style="display:none;" aria-hidden="true">
+    <input type="password" id="apibKeyInput" value="313ff1c1c400e65f8dfd48126aca176a" />
+    <select id="apibEndpointSelect">
+      <option value="https://v1.basketball.api-sports.io">Direct (api-sports.io)</option>
+      <option value="https://basketball.api-sports.io">RapidAPI Host</option>
+    </select>
   </div>
 </div>
 
@@ -3006,25 +3001,16 @@ window.__BETCEO_ENGINE_BOOT_SEEN = true;
 window.__BETCEO_ENGINE_PARSE_OK = true;
 window.__BETCEO_SESSION_ID = "sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 9);
 
-function saveApibKey() {
-  const keyInput = document.getElementById("apibKeyInput");
-  const endpointSelect = document.getElementById("apibEndpointSelect");
-  if (keyInput && endpointSelect) {
-    localStorage.setItem("apib_key", keyInput.value.trim());
-    localStorage.setItem("apib_endpoint", endpointSelect.value);
-    engineDebug("API-Basketball settings saved locally.");
-  }
-}
+const APIB_FIXED_KEY = "313ff1c1c400e65f8dfd48126aca176a";
+const APIB_FIXED_ENDPOINT = "https://v1.basketball.api-sports.io";
+
+function saveApibKey() {}
 
 function loadApibKey() {
   const keyInput = document.getElementById("apibKeyInput");
   const endpointSelect = document.getElementById("apibEndpointSelect");
-  if (keyInput && endpointSelect) {
-    const savedKey = localStorage.getItem("apib_key") || "313ff1c1c400e65f8dfd48126aca176a";
-    const savedEndpoint = localStorage.getItem("apib_endpoint") || "https://v1.basketball.api-sports.io";
-    keyInput.value = savedKey;
-    endpointSelect.value = savedEndpoint;
-  }
+  if (keyInput) keyInput.value = APIB_FIXED_KEY;
+  if (endpointSelect) endpointSelect.value = APIB_FIXED_ENDPOINT;
 }
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -3149,20 +3135,14 @@ const APIB_LEAGUE_MAP = {
 };
 
 async function fetchAPIB(endpoint, params = {}) {
-  const key = localStorage.getItem("apib_key") || "313ff1c1c400e65f8dfd48126aca176a";
-  const baseUrl = localStorage.getItem("apib_endpoint") || "https://v1.basketball.api-sports.io";
-  
+  const key = APIB_FIXED_KEY;
+  const baseUrl = APIB_FIXED_ENDPOINT;
+
   const urlObj = new URL(`${baseUrl}/${endpoint}`);
   Object.entries(params).forEach(([k, v]) => urlObj.searchParams.set(k, v));
-  
-  const headers = {};
-  if (baseUrl.includes("rapidapi.com")) {
-    headers["x-rapidapi-key"] = key;
-    headers["x-rapidapi-host"] = "api-basketball.p.rapidapi.com";
-  } else {
-    headers["x-apisports-key"] = key;
-  }
-  
+
+  const headers = { "x-apisports-key": key };
+
   try {
     const res = await fetch(urlObj.toString(), { method: "GET", headers });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -3174,21 +3154,39 @@ async function fetchAPIB(endpoint, params = {}) {
 }
 
 async function proxyFetchWithHeaders(url, headers) {
-  try {
-    const workerUrl = WORKER_URL + "?url=" + encodeURIComponent(url);
-    const res = await fetch(workerUrl, {
-      method: "GET",
-      headers: { ...headers, "x-forward-headers": JSON.stringify(headers) }
-    });
-    if (res.ok) return await res.json();
-  } catch (e) {}
-  
-  try {
-    const corsUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
-    const res = await fetch(corsUrl, { method: "GET", headers });
-    if (res.ok) return await res.json();
-  } catch (e) {}
-  
+  const proxies = [
+    async () => {
+      const workerUrl = WORKER_URL + "?url=" + encodeURIComponent(url);
+      const res = await fetch(workerUrl, {
+        method: "GET",
+        headers: { ...headers, "x-forward-headers": JSON.stringify(headers) }
+      });
+      if (!res.ok) throw new Error(`Worker HTTP ${res.status}`);
+      return await res.json();
+    },
+    async () => {
+      const corsUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+      const res = await fetch(corsUrl, { method: "GET", headers });
+      if (!res.ok) throw new Error(`corsproxy HTTP ${res.status}`);
+      return await res.json();
+    },
+    async () => {
+      const allOriginsUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+      const res = await fetch(allOriginsUrl, { method: "GET" });
+      if (!res.ok) throw new Error(`allorigins HTTP ${res.status}`);
+      return await res.json();
+    }
+  ];
+
+  for (const proxy of proxies) {
+    try {
+      const data = await proxy();
+      if (data && typeof data === "object") return data;
+    } catch (e) {
+      engineDebug("APIB proxy attempt failed", { error: e.message, url });
+    }
+  }
+
   throw new Error("All proxies failed for API-Basketball");
 }
 
@@ -3342,13 +3340,20 @@ function pickAPIBFixture(homeName, homeId, awayName, awayId) {
   clearH2HFields();
   const _pFlds = ["ftMarket","h1Market","h2Market","teamAMarket","teamBMarket","q1Market","q2Market","q3Market","q4Market","h1TeamAMarket","h1TeamBMarket","highQTotalMarket","lowQTotalMarket"];
   _pFlds.forEach(id => { const el = document.getElementById(id); if (el) el.value = ""; });
-  
-  document.getElementById("teamAName").value = homeName;
-  document.getElementById("teamBName").value = awayName;
-  document.getElementById("ssTeamAName").value = homeName;
-  document.getElementById("ssTeamBName").value = awayName;
-  document.getElementById("ssTeamAId").value = homeId;
-  document.getElementById("ssTeamBId").value = awayId;
+
+  const teamAEl = document.getElementById("teamAName");
+  const teamBEl = document.getElementById("teamBName");
+  const ssTeamANameEl = document.getElementById("ssTeamAName");
+  const ssTeamBNameEl = document.getElementById("ssTeamBName");
+  const ssTeamAIdEl = document.getElementById("ssTeamAId");
+  const ssTeamBIdEl = document.getElementById("ssTeamBId");
+
+  if (teamAEl) teamAEl.value = homeName;
+  if (teamBEl) teamBEl.value = awayName;
+  if (ssTeamANameEl) ssTeamANameEl.value = homeName;
+  if (ssTeamBNameEl) ssTeamBNameEl.value = awayName;
+  if (ssTeamAIdEl) ssTeamAIdEl.value = homeId;
+  if (ssTeamBIdEl) ssTeamBIdEl.value = awayId;
 
   selectedTeamIds.A = String(homeId || "");
   selectedTeamIds.B = String(awayId || "");
@@ -3359,44 +3364,45 @@ function pickAPIBFixture(homeName, homeId, awayName, awayId) {
 }
 
 async function fetchAPIBData() {
-  const teamAId = document.getElementById("ssTeamAId")?.value.trim();
-  const teamBId = document.getElementById("ssTeamBId")?.value.trim();
-  const teamAName = document.getElementById("ssTeamAName")?.value.trim() || "Team A";
-  const teamBName = document.getElementById("ssTeamBName")?.value.trim() || "Team B";
+  const teamAIdEl = document.getElementById("ssTeamAId");
+  const teamBIdEl = document.getElementById("ssTeamBId");
+  const teamANameEl = document.getElementById("ssTeamAName");
+  const teamBNameEl = document.getElementById("ssTeamBName");
+
+  const teamAId = teamAIdEl?.value?.trim() || selectedTeamIds.A || "";
+  const teamBId = teamBIdEl?.value?.trim() || selectedTeamIds.B || "";
+  const teamAName = teamANameEl?.value?.trim() || document.getElementById("teamAName")?.value?.trim() || "Team A";
+  const teamBName = teamBNameEl?.value?.trim() || document.getElementById("teamBName")?.value?.trim() || "Team B";
   const league = document.getElementById("leagueSelect")?.value || "";
   const map = APIB_LEAGUE_MAP[league];
 
   if (!teamAId || !teamBId) {
-    setStatusText("❌ Both team IDs are required to fetch.", "err");
+    setStatusText("❌ Both team IDs are required. Select a fixture first.", "err");
     return;
   }
   if (!map) {
-    setStatusText("❌ League configuration is missing from mapping.", "err");
+    setStatusText("❌ League not mapped — please select a supported league.", "err");
     return;
   }
 
-  setStatusHTML('<span class="spinner"></span>Fetching Team A stats from API-Basketball...', "loading");
-  
+  const btn = document.getElementById("fetchBtn");
+  if (btn) btn.disabled = true;
+
   try {
-    const dataA = await fetchAPIB("games", {
-      team: teamAId,
-      season: map.season
-    });
-    
-    await new Promise(r => setTimeout(r, 200));
-    
-    setStatusHTML('<span class="spinner"></span>Fetching Team B stats from API-Basketball...', "loading");
-    const dataB = await fetchAPIB("games", {
-      team: teamBId,
-      season: map.season
-    });
+    setStatusHTML(`<span class="spinner"></span>Fetching ${escapeHtml(teamAName)} from API-Basketball...`, "loading");
+    const dataA = await fetchAPIB("games", { team: teamAId, league: map.id, season: map.season });
+    await new Promise(r => setTimeout(r, 350));
 
-    await new Promise(r => setTimeout(r, 200));
+    setStatusHTML(`<span class="spinner"></span>Fetching ${escapeHtml(teamBName)} from API-Basketball...`, "loading");
+    const dataB = await fetchAPIB("games", { team: teamBId, league: map.id, season: map.season });
+    await new Promise(r => setTimeout(r, 350));
 
-    setStatusHTML('<span class="spinner"></span>Scanning H2H records from API-Basketball...', "loading");
-    const dataH2H = await fetchAPIB("games/h2h", {
+    setStatusHTML(`<span class="spinner"></span>Scanning H2H records...`, "loading");
+    const dataH2H = await fetchAPIB("games", {
+      league: map.id,
+      season: map.season,
       h2h: `${teamAId}-${teamBId}`
-    });
+    }).catch(() => ({ response: [] }));
 
     const statsA = mapApibGamesToEngineStats(dataA?.response || [], teamAId);
     const statsB = mapApibGamesToEngineStats(dataB?.response || [], teamBId);
@@ -3405,148 +3411,148 @@ async function fetchAPIBData() {
     g_injA = defaultInjuryMeta();
     g_injB = defaultInjuryMeta();
     g_fetchMeta = defaultFetchMeta();
-    
+
+    function setVal(id, val) {
+      const el = document.getElementById(id);
+      if (el && val !== undefined && val !== null) el.value = Array.isArray(val) ? val.join(",") : val;
+    }
+
     if (statsA.scored.length > 0) {
-      document.getElementById("aFTScored").value = statsA.scored.join(",");
-      document.getElementById("aFTAllowed").value = statsA.allowed.join(",");
-      document.getElementById("a1HScored").value = statsA.h1Scored.join(",");
-      document.getElementById("a1HAllowed").value = statsA.h1Allowed.join(",");
-      
-      document.getElementById("aQ1Scored").value = statsA.q1Scored.join(",");
-      document.getElementById("aQ2Scored").value = statsA.q2Scored.join(",");
-      document.getElementById("aQ3Scored").value = statsA.q3Scored.join(",");
-      document.getElementById("aQ4Scored").value = statsA.q4Scored.join(",");
-      document.getElementById("aQ1Allowed").value = statsA.q1Allowed.join(",");
-      document.getElementById("aQ2Allowed").value = statsA.q2Allowed.join(",");
-      document.getElementById("aQ3Allowed").value = statsA.q3Allowed.join(",");
-      document.getElementById("aQ4Allowed").value = statsA.q4Allowed.join(",");
-      
-      document.getElementById("aAutoTag").style.display = "inline";
+      setVal("aFTScored",  statsA.scored);
+      setVal("aFTAllowed", statsA.allowed);
+      setVal("a1HScored",  statsA.h1Scored);
+      setVal("a1HAllowed", statsA.h1Allowed);
+      setVal("aQ1Scored",  statsA.q1Scored);
+      setVal("aQ2Scored",  statsA.q2Scored);
+      setVal("aQ3Scored",  statsA.q3Scored);
+      setVal("aQ4Scored",  statsA.q4Scored);
+      setVal("aQ1Allowed", statsA.q1Allowed);
+      setVal("aQ2Allowed", statsA.q2Allowed);
+      setVal("aQ3Allowed", statsA.q3Allowed);
+      setVal("aQ4Allowed", statsA.q4Allowed);
+      const aTag = document.getElementById("aAutoTag");
+      if (aTag) aTag.style.display = "inline";
     }
 
     if (statsB.scored.length > 0) {
-      document.getElementById("bFTScored").value = statsB.scored.join(",");
-      document.getElementById("bFTAllowed").value = statsB.allowed.join(",");
-      document.getElementById("b1HScored").value = statsB.h1Scored.join(",");
-      document.getElementById("b1HAllowed").value = statsB.h1Allowed.join(",");
-      
-      document.getElementById("bQ1Scored").value = statsB.q1Scored.join(",");
-      document.getElementById("bQ2Scored").value = statsB.q2Scored.join(",");
-      document.getElementById("bQ3Scored").value = statsB.q3Scored.join(",");
-      document.getElementById("bQ4Scored").value = statsB.q4Scored.join(",");
-      document.getElementById("bQ1Allowed").value = statsB.q1Allowed.join(",");
-      document.getElementById("bQ2Allowed").value = statsB.q2Allowed.join(",");
-      document.getElementById("bQ3Allowed").value = statsB.q3Allowed.join(",");
-      document.getElementById("bQ4Allowed").value = statsB.q4Allowed.join(",");
-      
-      document.getElementById("bAutoTag").style.display = "inline";
+      setVal("bFTScored",  statsB.scored);
+      setVal("bFTAllowed", statsB.allowed);
+      setVal("b1HScored",  statsB.h1Scored);
+      setVal("b1HAllowed", statsB.h1Allowed);
+      setVal("bQ1Scored",  statsB.q1Scored);
+      setVal("bQ2Scored",  statsB.q2Scored);
+      setVal("bQ3Scored",  statsB.q3Scored);
+      setVal("bQ4Scored",  statsB.q4Scored);
+      setVal("bQ1Allowed", statsB.q1Allowed);
+      setVal("bQ2Allowed", statsB.q2Allowed);
+      setVal("bQ3Allowed", statsB.q3Allowed);
+      setVal("bQ4Allowed", statsB.q4Allowed);
+      const bTag = document.getElementById("bAutoTag");
+      if (bTag) bTag.style.display = "inline";
     }
 
     if (h2hGames.length >= 2) {
       clearH2HFields();
-      const h2hA = [], h2hB = [];
-      const h2hA1H = [], h2hB1H = [];
+      const h2hA = [], h2hB = [], h2hA1H = [], h2hB1H = [];
       const q1A = [], q1B = [], q2A = [], q2B = [], q3A = [], q3B = [], q4A = [], q4B = [];
 
       h2hGames.slice(0, 5).forEach(g => {
         const isHome = String(g.teams?.home?.id) === String(teamAId);
         const myScores = isHome ? g.scores?.home : g.scores?.away;
         const oppScores = isHome ? g.scores?.away : g.scores?.home;
+        if (!myScores || !oppScores) return;
 
-        if (myScores && oppScores) {
-          const myFT = Number(myScores.total ?? 0) - Number(myScores.over_time ?? 0);
-          const oppFT = Number(oppScores.total ?? 0) - Number(oppScores.over_time ?? 0);
-          
-          h2hA.push(myFT);
-          h2hB.push(oppFT);
+        const myFT  = Number(myScores.total  ?? 0) - Number(myScores.over_time  ?? 0);
+        const oppFT = Number(oppScores.total ?? 0) - Number(oppScores.over_time ?? 0);
+        if (myFT <= 0 || oppFT <= 0) return;
 
-          const q1M = Number(myScores.quarter_1 ?? 0);
-          const q2M = Number(myScores.quarter_2 ?? 0);
-          const q3M = Number(myScores.quarter_3 ?? 0);
-          const q4M = Number(myScores.quarter_4 ?? 0);
-
-          const q1O = Number(oppScores.quarter_1 ?? 0);
-          const q2O = Number(oppScores.quarter_2 ?? 0);
-          const q3O = Number(oppScores.quarter_3 ?? 0);
-          const q4O = Number(oppScores.quarter_4 ?? 0);
-
-          h2hA1H.push(q1M + q2M);
-          h2hB1H.push(q1O + q2O);
-
-          q1A.push(q1M); q1B.push(q1O);
-          q2A.push(q2M); q2B.push(q2O);
-          q3A.push(q3M); q3B.push(q3O);
-          q4A.push(q4M); q4B.push(q4O);
-        }
+        h2hA.push(myFT); h2hB.push(oppFT);
+        const q1M = Number(myScores.quarter_1  ?? 0), q2M = Number(myScores.quarter_2  ?? 0);
+        const q3M = Number(myScores.quarter_3  ?? 0), q4M = Number(myScores.quarter_4  ?? 0);
+        const q1O = Number(oppScores.quarter_1 ?? 0), q2O = Number(oppScores.quarter_2 ?? 0);
+        const q3O = Number(oppScores.quarter_3 ?? 0), q4O = Number(oppScores.quarter_4 ?? 0);
+        h2hA1H.push(q1M + q2M); h2hB1H.push(q1O + q2O);
+        q1A.push(q1M); q1B.push(q1O);
+        q2A.push(q2M); q2B.push(q2O);
+        q3A.push(q3M); q3B.push(q3O);
+        q4A.push(q4M); q4B.push(q4O);
       });
 
       if (h2hA.length >= 2) {
-        document.getElementById("aFTH2H").value = h2hA.join(",");
-        document.getElementById("bFTH2H").value = h2hB.join(",");
-        document.getElementById("a1HH2H").value = h2hA1H.join(",");
-        document.getElementById("b1HH2H").value = h2hB1H.join(",");
-        
-        document.getElementById("aQ1H2H").value = q1A.join(",");
-        document.getElementById("bQ1H2H").value = q1B.join(",");
-        document.getElementById("aQ2H2H").value = q2A.join(",");
-        document.getElementById("bQ2H2H").value = q2B.join(",");
-        document.getElementById("aQ3H2H").value = q3A.join(",");
-        document.getElementById("bQ3H2H").value = q3B.join(",");
-        document.getElementById("aQ4H2H").value = q4A.join(",");
-        document.getElementById("bQ4H2H").value = q4B.join(",");
-
-        document.getElementById("h2hAutoTag").style.display = "inline";
+        setVal("aFTH2H", h2hA); setVal("bFTH2H", h2hB);
+        setVal("a1HH2H", h2hA1H); setVal("b1HH2H", h2hB1H);
+        setVal("aQ1H2H", q1A); setVal("bQ1H2H", q1B);
+        setVal("aQ2H2H", q2A); setVal("bQ2H2H", q2B);
+        setVal("aQ3H2H", q3A); setVal("bQ3H2H", q3B);
+        setVal("aQ4H2H", q4A); setVal("bQ4H2H", q4B);
+        const h2hTag = document.getElementById("h2hAutoTag");
+        if (h2hTag) h2hTag.style.display = "inline";
         syncAllH2HCheckboxes(true);
         queueH2HCheckboxSync(true);
       }
     }
 
+    // Build full massacre context so Run engine has all data
     g_massacreFetchContext = {
       league,
       eventDate: "",
       A: {
         overall: {
-          scored: statsA.scored,
-          allowed: statsA.allowed,
-          h1Scored: statsA.h1Scored,
-          h1Allowed: statsA.h1Allowed,
-          ftScored10: statsA.scored,
+          scored:      statsA.scored,
+          allowed:     statsA.allowed,
+          h1Scored:    statsA.h1Scored,
+          h1Allowed:   statsA.h1Allowed,
+          ftScored10:  statsA.scored,
           ftAllowed10: statsA.allowed,
-          h1Scored10: statsA.h1Scored,
+          h1Scored10:  statsA.h1Scored,
           h1Allowed10: statsA.h1Allowed
         },
-        q1Scored: statsA.q1Scored, q2Scored: statsA.q2Scored, q3Scored: statsA.q3Scored, q4Scored: statsA.q4Scored,
-        q1Allowed: statsA.q1Allowed, q2Allowed: statsA.q2Allowed, q3Allowed: statsA.q3Allowed, q4Allowed: statsA.q4Allowed,
-        roster: []
+        q1Scored: statsA.q1Scored, q2Scored: statsA.q2Scored,
+        q3Scored: statsA.q3Scored, q4Scored: statsA.q4Scored,
+        q1Allowed: statsA.q1Allowed, q2Allowed: statsA.q2Allowed,
+        q3Allowed: statsA.q3Allowed, q4Allowed: statsA.q4Allowed,
+        ortg10: [], drtg10: [], pace10: [], roster: []
       },
       B: {
         overall: {
-          scored: statsB.scored,
-          allowed: statsB.allowed,
-          h1Scored: statsB.h1Scored,
-          h1Allowed: statsB.h1Allowed,
-          ftScored10: statsB.scored,
+          scored:      statsB.scored,
+          allowed:     statsB.allowed,
+          h1Scored:    statsB.h1Scored,
+          h1Allowed:   statsB.h1Allowed,
+          ftScored10:  statsB.scored,
           ftAllowed10: statsB.allowed,
-          h1Scored10: statsB.h1Scored,
+          h1Scored10:  statsB.h1Scored,
           h1Allowed10: statsB.h1Allowed
         },
-        q1Scored: statsB.q1Scored, q2Scored: statsB.q2Scored, q3Scored: statsB.q3Scored, q4Scored: statsB.q4Scored,
-        q1Allowed: statsB.q1Allowed, q2Allowed: statsB.q2Allowed, q3Allowed: statsB.q3Allowed, q4Allowed: statsB.q4Allowed,
-        roster: []
+        q1Scored: statsB.q1Scored, q2Scored: statsB.q2Scored,
+        q3Scored: statsB.q3Scored, q4Scored: statsB.q4Scored,
+        q1Allowed: statsB.q1Allowed, q2Allowed: statsB.q2Allowed,
+        q3Allowed: statsB.q3Allowed, q4Allowed: statsB.q4Allowed,
+        ortg10: [], drtg10: [], pace10: [], roster: []
       },
       h2hGames: h2hGames
     };
+
+    // Set fetch meta so Run knows these came from API-Basketball
+    g_fetchMeta.A = { ft: { source: "apib", venueReliable: false }, h1: { source: "apib", venueReliable: false }, h2: { source: "apib", venueReliable: false } };
+    g_fetchMeta.B = { ft: { source: "apib", venueReliable: false }, h1: { source: "apib", venueReliable: false }, h2: { source: "apib", venueReliable: false } };
 
     openSection("marketSection");
     openSection("teamASection");
     openSection("teamBSection");
     openSection("h2hSection");
 
-    setStatusText(`✅ Done! ${teamAName}: ${statsA.scored.length} games · ${teamBName}: ${statsB.scored.length} games`, "ok");
-    
+    const aGames = statsA.scored.length;
+    const bGames = statsB.scored.length;
+    const statusClass = (aGames >= 5 && bGames >= 5) ? "ok" : "err";
+    setStatusText(`✅ ${escapeHtml(teamAName)}: ${aGames} games · ${escapeHtml(teamBName)}: ${bGames} games`, statusClass);
+
   } catch (err) {
-    setStatusHTML(`❌ API-Basketball fetch failed: ${escapeHtml(err.message)}`, "err");
-    engineDebug("API-Basketball full fetch sequence failed", err);
+    setStatusHTML(`❌ API-Basketball fetch failed: ${escapeHtml(err.message)}<br><small style="color:#d98a00;">Check your network connection and try again.</small>`, "err");
+    engineDebug("API-Basketball full fetch sequence failed", { error: err.message });
+  } finally {
+    if (btn) btn.disabled = false;
+    unlockFetchBtn();
   }
 }
 
@@ -12106,9 +12112,9 @@ function clearH2HFields() {
 
 
 
-    function updateSectionLocks() { 
-const league = document.getElementById("leagueSelect")?.value || ""; 
-const isNbaOrNcaa = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(league) || !!SOFASCORE_LEAGUE_MAP[league];
+    function updateSectionLocks() {
+const league = document.getElementById("leagueSelect")?.value || "";
+const isNbaOrNcaa = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(league) || !!APIB_LEAGUE_MAP[league];
 
 if (!league) { 
     // LOCK: "intelSection" removed — this element does not exist in the HTML.
@@ -13522,8 +13528,9 @@ async function fetchESPN() {
   const teamAName = document.getElementById("teamAName").value.trim();
   const teamBName = document.getElementById("teamBName").value.trim();
 
-  const isManualLeagueWithAPIB = !["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(league) && !!APIB_LEAGUE_MAP[league];
-  if (isManualLeagueWithAPIB) {
+  // Route all non-ESPN leagues to API-Basketball
+  const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(league);
+  if (!isEspnLeague && APIB_LEAGUE_MAP[league]) {
     return fetchAPIBData();
   }
 
@@ -17439,9 +17446,15 @@ if (ssSection) ssSection.style.display = "none";
         }
 
         updateSectionLocks();
-              if (isEspnLeague) { accordionOpen("espnSection"); loadFixtures(0); }
-      else if (APIB_LEAGUE_MAP[league]) { accordionOpen("espnSection"); loadFixtures(0); }
-      else accordionOpen("marketSection");
+              if (isEspnLeague) {
+        accordionOpen("espnSection");
+        loadFixtures(0);
+      } else if (APIB_LEAGUE_MAP[league]) {
+        accordionOpen("espnSection");
+        loadFixtures(0);
+      } else {
+        accordionOpen("marketSection");
+      }
         validateFetchSection();
     }
 
