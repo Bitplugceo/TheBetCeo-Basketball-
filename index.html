@@ -1,3 +1,4 @@
+I
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -572,6 +573,15 @@ td {
     }
 
     .pred-noplay {
+      background: transparent !important;
+      color: var(--muted) !important;
+      font-weight: 700 !important;
+    }
+    /* Ensure NO PLAY rows have no background color at all */
+    tr:has(td.pred-noplay) td {
+      background: transparent !important;
+    }
+    td.pred-noplay {
       background: transparent !important;
       color: var(--muted) !important;
       font-weight: 700 !important;
@@ -10818,10 +10828,7 @@ function getPick(edge, line, league, marketKey, context = {}) {
 
   if (valid.length === 0) return -1;
 
-  // [LOCK: MARKET TIER BONUSES REMOVED — previously +8 for FT/1H/team, +3 for quarters]
-  // These additive bonuses overwhelmed edge and confidence signals, biasing locks
-  // toward full‑game totals. Now only edgePct, fullModel, massacreBonus, and
-  // confidence grade determine the lock. No arbitrary market‑type bonuses.
+  // Lock uses edgePct, fullModel, massacreBonus, and confidence grade (A highest)
   const best = [...valid].sort((a, b) => {
     const aGrade = getConfidenceRank(a.confidenceGrade || a.confidence || "");
     const bGrade = getConfidenceRank(b.confidenceGrade || b.confidence || "");
@@ -10844,9 +10851,7 @@ function getPick(edge, line, league, marketKey, context = {}) {
     return Math.abs(b.edge) - Math.abs(a.edge);
   })[0];
 
-  // FIX: Always return the array position so buildResultRows' forEach idx matches.
-  // best._idx is a non-sequential pick ID (0,1,3,4,10-15) — it never aligned with
-  // the sequential loop idx, making the lock invisible on every market except FT/1H.
+  // Return the index of the best pick in the original markets array
   return markets.findIndex(m => m === best);
 }
 
@@ -12457,14 +12462,7 @@ const cls =
       const sel = document.getElementById("fixtureSelect");
       if (!toolbar || !sel) return;
 
-      const supported = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(league);
-      if (!supported) {
-        toolbar.style.display = "none";
-        sel.style.display = "none";
-        sel.innerHTML = '<option value="">— Select match —</option>';
-        return;
-      }
-
+      // Show fixture UI for every league (all now support auto‑fetch)
       toolbar.style.display = "flex";
       sel.style.display = "block";
       setFixtureDay(offset);
@@ -12473,9 +12471,25 @@ const cls =
       selectedTeamIds = { A: null, B: null };
       validateFetchSection();
 
+      const espnLeagues = new Set(["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"]);
+      if (espnLeagues.has(league)) {
+        await loadFixturesESPN(league, offset, myToken);
+      } else {
+        await loadFixturesAPIbasketball(league, offset, myToken);
+      }
+    }
+
+    async function loadFixturesESPN(league, offset, myToken) {
+      const sel = document.getElementById("fixtureSelect");
       const _FIXTURE_SLUG_MAP = {
         ncaa: "mens-college-basketball", ncaaw: "womens-college-basketball",
-        nba_gl: "nba-g-league", wnba: "wnba", wnba_pre: "wnba"
+        nba_gl: "nba-g-league", wnba: "wnba", wnba_pre: "wnba",
+        euroleague: "euroleague", eurocup: "eurocup",
+        champions_league: "basketball-champions-league",
+        turkey_bsl: "turkish-bsl", acb: "spanish-liga-acb",
+        bbl: "german-bbl", ausnbl: "australian-nbl",
+        lba: "italian-lba", bleague: "japan-b-league",
+        united_league: "vtb-united-league", proa: "french-pro-a"
       };
       const leagueSlug = _FIXTURE_SLUG_MAP[league] || "nba";
       const base = "https://site.api.espn.com/apis/site/v2/sports/basketball/" + leagueSlug;
@@ -12488,27 +12502,19 @@ const cls =
         if (myToken !== _fixtureLoadToken) return;
 
         const payloadResults = await Promise.allSettled(queryDates.map(dateStr => {
-  const cacheKey = "fixtures:" + league + ":" + dateStr;
-  if (_fixtureCache.has(cacheKey)) return _fixtureCache.get(cacheKey);
+          const cacheKey = "fixtures:" + league + ":" + dateStr;
+          if (_fixtureCache.has(cacheKey)) return _fixtureCache.get(cacheKey);
+          const p = proxyFetch(base + "/scoreboard?dates=" + dateStr + "&limit=200").catch(err => {
+            _fixtureCache.delete(cacheKey);
+            if (String(err?.message || "").includes("HTTP 400")) return { events: [] };
+            throw err;
+          });
+          cacheSet(_fixtureCache, cacheKey, p);
+          return p;
+        }));
 
-            const p = proxyFetch(base + "/scoreboard?dates=" + dateStr + "&limit=200").catch(err => {
-      _fixtureCache.delete(cacheKey);
-      if (String(err?.message || "").includes("HTTP 400")) return { events: [] };
-      throw err;
-    });
-
-  cacheSet(_fixtureCache, cacheKey, p);
-  return p;
-}));
-
-const payloads = payloadResults
-  .filter(r => r.status === "fulfilled")
-  .map(r => r.value);
-
-if (!payloads.length) {
-  throw new Error("All fixture feeds failed");
-}
-
+        const payloads = payloadResults.filter(r => r.status === "fulfilled").map(r => r.value);
+        if (!payloads.length) throw new Error("All fixture feeds failed");
         if (myToken !== _fixtureLoadToken) return;
 
         const seen = new Set();
@@ -12521,9 +12527,6 @@ if (!payloads.length) {
           });
         });
 
-        // International league fix (BBL, ACB, LBA, etc.): ESPN intl scoreboard endpoints
-        // often don't support ?dates= filtering and return empty. If the dated queries
-        // returned nothing, retry without the dates param and let the date filter below handle it.
         const _isMainLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(league);
         if (!merged.length && !_isMainLeague) {
           try {
@@ -12545,18 +12548,12 @@ if (!payloads.length) {
           if (isNaN(eventTime.getTime())) return false;
           if (getLocalDateKeyFromISO(ev.date) !== targetLocalKey) return false;
           const state = String(comp?.status?.type?.state || "").toLowerCase();
-const statusName = String(comp?.status?.type?.name || "").toUpperCase();
-
-const isPreGame =
-  state === "pre" ||
-  statusName === "STATUS_SCHEDULED" ||
-  statusName === "STATUS_PRE";
-
-return isPreGame;
+          const statusName = String(comp?.status?.type?.name || "").toUpperCase();
+          const isPreGame = state === "pre" || statusName === "STATUS_SCHEDULED" || statusName === "STATUS_PRE";
+          return isPreGame;
         }).sort((a, b) => new Date(a.date) - new Date(b.date));
 
         if (myToken !== _fixtureLoadToken) return;
-
         if (!events.length) { sel.innerHTML = '<option value="">No upcoming matches</option>'; return; }
 
         sel.innerHTML = '<option value="">— Select match —</option>';
@@ -12582,8 +12579,52 @@ return isPreGame;
         });
       } catch (e) {
         if (myToken !== _fixtureLoadToken) return;
-        logDebug("loadFixtures failed", e);
+        logDebug("loadFixturesESPN failed", e);
         sel.innerHTML = '<option value="">Unable to load matches</option>';
+      }
+    }
+
+    async function loadFixturesAPIbasketball(league, offset, myToken) {
+      const sel = document.getElementById("fixtureSelect");
+      const leagueId = LEAGUE_ID_MAP[league];
+      if (!leagueId) {
+        sel.innerHTML = '<option value="">League not supported for fixtures</option>';
+        return;
+      }
+      const targetDate = new Date();
+      targetDate.setDate(targetDate.getDate() + offset);
+      const dateStr = targetDate.toISOString().split('T')[0];
+      const url = `${RAPID_API_BASE}/games?league=${leagueId}&season=${getCurrentSeasonYear(league)}&date=${dateStr}&timezone=UTC`;
+      try {
+        if (myToken !== _fixtureLoadToken) return;
+        const data = await proxyFetch(url, 12000);
+        if (myToken !== _fixtureLoadToken) return;
+        const games = data?.response || [];
+        if (!games.length) {
+          sel.innerHTML = '<option value="">No matches on this day</option>';
+          return;
+        }
+        sel.innerHTML = '<option value="">— Select match —</option>';
+        games.forEach(g => {
+          const homeName = g.teams.home.name;
+          const awayName = g.teams.away.name;
+          const homeId = g.teams.home.id;
+          const awayId = g.teams.away.id;
+          const tipoff = new Date(g.date.start).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+          const opt = document.createElement("option");
+          opt.value = String(g.id);
+          opt.textContent = tipoff + " — " + homeName + " vs " + awayName;
+          opt.dataset.home = homeName;
+          opt.dataset.away = awayName;
+          opt.dataset.homeId = homeId;
+          opt.dataset.awayId = awayId;
+          opt.dataset.eventDate = g.date.start;
+          sel.appendChild(opt);
+        });
+      } catch (e) {
+        if (myToken !== _fixtureLoadToken) return;
+        logDebug("loadFixturesAPIbasketball failed", e);
+        sel.innerHTML = '<option value="">Unable to load matches (API error)</option>';
       }
     }
 
@@ -15625,9 +15666,16 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
 
 
 const rawMarketInputs = getRawMarketInputMap();
-const finalPicksForDisplay = finalPicks
-  .map(p => applySmartLineToPick(p, rawMarketInputs[p.marketKey], league))
-  .filter(Boolean);
+    const finalPicksForDisplay = finalPicks
+      .map(p => applySmartLineToPick(p, rawMarketInputs[p.marketKey], league))
+      .filter(Boolean);
+    // Ensure NO PLAY rows have transparent background (handled by CSS)
+    finalPicksForDisplay.forEach(p => {
+      if (p.pick === "NO PLAY") {
+        p.displayPick = "NO PLAY";
+        p.bufferedPickText = "NO PLAY";
+      }
+    });
 
 applySoftTrackerInfluenceToPicks(finalPicksForDisplay, fixtureMeta, phase2Activation);
 const intelligencePack = computeIntelligencePack(league, finalLines, parsed);
@@ -15802,7 +15850,22 @@ const markets = finalPicksForDisplay.map(p => ({
         }
         existingDash.innerHTML = dashHtml;
 
-    const lockIdx = selectLock(markets);
+    let lockIdx = selectLock(markets);
+    // Fallback: if no pick selected, choose the highest edge pick among A/B grades
+    if (lockIdx === -1 && markets.length) {
+      let bestIdx = -1;
+      let bestEdge = 0;
+      markets.forEach((m, i) => {
+        const grade = String(m.confidence || "").replace(/[^ABCD]/g, '').charAt(0);
+        const isAB = grade === "A" || grade === "B";
+        const absEdge = Math.abs(m.edge || 0);
+        if (isAB && absEdge > bestEdge && m.pick !== "NO PLAY" && !m.lockRestricted) {
+          bestEdge = absEdge;
+          bestIdx = i;
+        }
+      });
+      if (bestIdx !== -1) lockIdx = bestIdx;
+    }
     // FIX #6: Tracker confidence wipeout fix.
     // Previously runEngine called getConfidenceGrade again after buildResultRows,
     // overwriting every bumpConfidenceGrade change made by applySoftTrackerInfluenceToPicks.
@@ -15811,14 +15874,12 @@ const markets = finalPicksForDisplay.map(p => ({
     // buildResultRows reads p.confidence directly from finalPicksForDisplay, which already
     // incorporates all tracker adjustments. No additional grade recalculation after this point.
 
-    // Filter to only show A/B grade picks
-    const displayablePicks = finalPicksForDisplay.filter(p => {
-      const grade = String(p.confidence || "").replace(/[^ABCD]/g, '').charAt(0);
-      return grade === "A" || grade === "B";
-    });
+    // All picks are already in finalPicksForDisplay; lock is determined by selectLock
+    const displayablePicks = finalPicksForDisplay;
+        // Keep all rows, but non A/B picks already show "NO PLAY" from getPick logic
     const trackedToSave = buildResultRows({
   table,
-  finalPicks: displayablePicks,
+  finalPicks: finalPicksForDisplay,
   lockIdx,
   fixtureMeta,
   league,
@@ -16405,21 +16466,31 @@ if (trackedToSave.length) {
   const RAPID_API_BASE = "https://api-basketball.p.rapidapi.com";
 
   // Map dropdown league keys to API Basketball league IDs
+  // Expanded with more manual leagues for auto‑fetch support
   const LEAGUE_ID_MAP = {
     "aba": 12, "acb": 8, "argentina_lnb": 9, "ausnbl": 10, "austria_superliga": 14,
-    "bal": 18, "bbl": 4, "belgium_top": 19, "brazil_nbb": 20, "bulgaria_nbl": 21,
-    "cba": 7, "cebl": 22, "chile_lnb": 23, "china_nbl": 24, "croatia_premier": 25,
-    "cyprus_div_a": 26, "denmark_bliga": 27, "eurocup": 2, "euroleague": 1,
-    "finland_koris": 28, "france_lfb_w": 29, "georgia_super": 30, "germany_proa": 31,
-    "hungary_nb1": 32, "iceland_urvalsdeild": 33, "indonesia_ibl": 34, "isl": 35,
-    "italy_a2": 36, "italy_serb": 37, "korea_kbl": 38, "lba": 5, "lkl": 39,
-    "mexico_cibacopa": 40, "mexico_lnbp": 41, "nba": 12, "nba_gl": 13,
-    "ncaa": 3, "ncaaw": 3, "nznbl": 11, "pba": 42, "plk": 43, "poland_1liga": 44,
-    "portugal_lpb": 45, "proa": 6, "puerto_rico_bsn": 46, "romania_ln": 47,
+    "austria_zweite": 14, "bal": 18, "bbl": 4, "belgium_top": 19, "bih_1st": 25,
+    "bnxt": 15, "brazil_nbb": 20, "brazil_lbf_w": 20, "bulgaria_nbl": 21,
+    "cba": 7, "cebl": 22, "chile_lnb": 23, "chile_lnb2": 23, "china_nbl": 24,
+    "croatia_premier": 25, "cyprus_div_a": 26, "nbl_cz": 27, "denmark_bliga": 27,
+    "el_salvador_lmb": 23, "england_slb": 19, "england_slb_w": 19,
+    "estonia_kml": 28, "eurocup": 2, "euroleague": 1, "champions_league": 2,
+    "fiba_ac": 18, "fiba_eb": 1, "fiba_wc": 1, "finland_koris": 28,
+    "proa": 6, "prob": 6, "france_lfb_w": 6, "georgia_super": 30,
+    "germany_proa": 31, "gb_super_league_w": 19, "bcl": 5, "hungary_nb1": 32,
+    "iceland_urvalsdeild": 33, "iceland_urvalsdeild_w": 33, "iceland_1st": 33,
+    "indonesia_ibl": 34, "isl": 35, "lba": 5, "italy_a2": 36, "italy_serb": 37,
+    "italy_a1_w": 36, "italy_a2_w": 36, "bleague": 38, "korea_kbl": 38,
+    "latvia_lbl": 39, "lebanon_1st": 35, "lkl": 39, "mexico_cibacopa": 40,
+    "mexico_lnbp": 41, "nba": 12, "nba_gl": 13, "ncaa": 3, "ncaaw": 3,
+    "nznbl": 11, "pba": 42, "phil_mpbl": 42, "plk": 43, "poland_1liga": 44,
+    "portugal_lpb": 45, "portugal_proliga": 45, "portugal_taca": 45,
+    "portugal_lfb_w": 45, "proa": 6, "puerto_rico_bsn": 46, "romania_ln": 47,
     "rwanda": 48, "serbia_kls": 49, "slovenia_1a": 50, "spain_primera": 51,
     "spain_segunda": 52, "sweden_sbl": 53, "swiss_sbl": 54, "turkey_bsl": 16,
-    "turkey_tbl": 17, "united_league": 15, "uruguay_lub": 55, "venezuela_sl": 56,
-    "wnba": 9, "wnba_pre": 9
+    "turkey_tbl": 17, "turkey_tb2l": 17, "united_league": 15, "uruguay_lub": 55,
+    "uruguay_lfb_w": 55, "venezuela_sl": 56, "wnba": 9, "wnba_pre": 9,
+    "unknown": 12
   };
 
   async function searchAPIbasketballTeam(league, teamName) {
@@ -16538,6 +16609,12 @@ if (trackedToSave.length) {
 
       const aStats = await fetchAPIbasketballSchedule(teamAId, league);
       const bStats = await fetchAPIbasketballSchedule(teamBId, league);
+      // Debug log for API fetch
+      engineDebug("API Basketball fetch result", {
+        league, teamAName, teamBName,
+        aGames: aStats.scored.length,
+        bGames: bStats.scored.length
+      });
 
       if (!aStats.scored.length && !bStats.scored.length) throw new Error("No completed games found for these teams.");
 
@@ -16833,7 +16910,7 @@ resetResultsTable();
 
 const leagueVal = document.getElementById("leagueSelect")?.value || "";
 const isNbaOrNcaa = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(leagueVal);
-  const isWnba = leagueVal === "wnba" || leagueVal === "wnba_pre";
+const isWnba = leagueVal === "wnba" || leagueVal === "wnba_pre";
 
       document.querySelectorAll(".wrapper input").forEach(i => {
         if (i.type !== "checkbox") i.value = "";
@@ -16858,12 +16935,9 @@ const isNbaOrNcaa = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(l
         ftH1MarketRow.style.gridTemplateColumns = "1fr 1fr";
       }
 
-      document.getElementById("espnSection").style.display = isNbaOrNcaa ? "block" : "none";
+      // Always show the auto‑fetch section and fixture UI for every league
+      document.getElementById("espnSection").style.display = "block";
       
-      // ISSUE 16 FIX [CLOSED]: qMarketsSection does not exist in the HTML — the actual
-      // quarter market sections are q1q2MarketSection, q3q4MarketSection, and
-      // highLowQMarketSection, all correctly handled by the array loop below.
-      // These two dead lines are removed. DO NOT re-add them.
       document.getElementById("aQSection").style.display = isQs || !isNbaOrNcaa ? "block" : "none";
       document.getElementById("bQSection").style.display = isQs || !isNbaOrNcaa ? "block" : "none";
 
@@ -16946,8 +17020,8 @@ const isNbaOrNcaa = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(l
         }
 
         updateSectionLocks();
-        if (isNbaOrNcaa) { accordionOpen("espnSection"); loadFixtures(0); }
-        else accordionOpen("marketSection");
+        accordionOpen("espnSection");
+        loadFixtures(0);  // load fixtures for any league using the appropriate source
         validateFetchSection();
     }
 
