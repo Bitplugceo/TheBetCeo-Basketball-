@@ -3652,11 +3652,33 @@ function applyVolatility(proj, series, leagueVolLimit, league = "unknown") {
   return proj * (1 + adjustment);
 }
 
-   const MODEL_CONFIG = {
+       const MODEL_CONFIG = {
       H2H_DIVERGE_THRESHOLD: 0.20,
       LINE_ANCHOR_NBA: 0.65,
       LINE_ANCHOR_OTHER: 0.50
     };
+
+// ── Issue 5: Centralized magic numbers ──────────────────────────────────────
+const BB_MAGIC_NUMBERS = {
+  INJURY_OUT_FACTOR:      0.65,  // scoring-impact multiplier for OUT players
+  INJURY_DTD_FACTOR:      0.30,  // scoring-impact multiplier for DTD players
+  INJURY_PLAYER_CAP:      0.22,  // per-player impact cap
+  INJURY_MAX_CAP_NBA:     0.25,  // total injury reduction cap for NBA
+  INJURY_MAX_CAP_OTHER:   0.20,  // total injury reduction cap, other leagues
+  INJURY_DEF_MULT:        0.20,  // opponent scoring boost when key defender is OUT
+  INJURY_UNKNOWN_OUT:     0.02,  // fallback penalty when OUT player PPG is unknown
+  INJURY_UNKNOWN_DTD:     0.01,  // fallback penalty when DTD player PPG is unknown
+  H2H_WEIGHT_MAX:         0.35,  // max H2H blend weight
+  TEAM_WEIGHT_DEFAULT:    0.65,  // default own-scoring blend weight
+  OPP_WEIGHT_DEFAULT:     0.35,  // default opponent-allowed blend weight
+  UNDER_EDGE_FACTOR:      1.20,  // under bets require this multiplier more edge than over
+  SAMPLE_FULL_THRESHOLD:  10,    // min games for "full" sample tier
+  SAMPLE_THIN_THRESHOLD:  5,     // min games for "thin" sample tier
+  Q4_GARBAGE_THRESHOLD:   15,    // blowout gap (pts) above which Q4 gets garbage-time adj
+  Q4_GARBAGE_LEADING:     0.85,  // leading-team Q4 score multiplier in a blowout
+  Q4_GARBAGE_TRAILING:    1.10   // trailing-team Q4 score multiplier in a blowout
+};
+// ────────────────────────────────────────────────────────────────────────────
 
 const MODEL_TUNING = {
   anchorEnabled: { ft: true, h1: true, h2: true, team: true },
@@ -5560,7 +5582,8 @@ function engineDebug(message, extra = null) {
     if (!isIgnoredEngineWatchLine(line) && getDebugSeverity(line) === "error") {
       triggerGlobalEngineAlert(line);
     }
-    renderEngineDebugPanel();
+    // Issue 7: renderEngineDebugPanel() removed from engineDebug — it triggered a full tracker
+    // modal re-render on every log entry. Debug view is accessible via the AFDB overlay (🔬).
     updateTrackerInsightsButton();
   } catch (err) {
     console.error("[BB Engine] engineDebug failed", err);
@@ -6491,27 +6514,35 @@ _proxyFetchCache.delete(cacheKey);
     u => `https://thingproxy.freeboard.io/fetch/${encodeURIComponent(u)}`
   ];
   let lastError = null;
-  try {
-    const workerData = await fetchJson(WORKER_URL + "?url=" + encodeURIComponent(url), "Worker");
-    if (String(url).includes("/summary?event=")) {
-      trackerDebug("summary fetch ok via worker", { event: String(url).split("event=")[1]?.split("&")[0] || "", source: "worker" });
-    }
-    _proxyFetchCache.set(cacheKey, { data: workerData, timestamp: Date.now() });
-    return workerData;
-  } catch (workerErr) {
-    lastError = workerErr;
-    for (let _fbi = 0; _fbi < _PROXY_FALLBACKS.length; _fbi++) {
-      try {
-        const _fbData = await fetchJson(_PROXY_FALLBACKS[_fbi](url), `Fallback-${_fbi + 1}`);
-        _proxyFetchCache.set(cacheKey, { data: _fbData, timestamp: Date.now() });
-        return _fbData;
-      } catch (_fbErr) {
-        // Silently try next fallback
+  // Issue 2: Retry the worker up to 3 times (0 ms, 1 s, 2 s) before falling through to proxies
+  const _workerRetryDelays = [0, 1000, 2000];
+  for (let _wRetry = 0; _wRetry < _workerRetryDelays.length; _wRetry++) {
+    if (_workerRetryDelays[_wRetry] > 0) await new Promise(r => setTimeout(r, _workerRetryDelays[_wRetry]));
+    try {
+      const workerData = await fetchJson(WORKER_URL + "?url=" + encodeURIComponent(url), "Worker");
+      if (String(url).includes("/summary?event=")) {
+        trackerDebug("summary fetch ok via worker", { event: String(url).split("event=")[1]?.split("&")[0] || "", source: "worker" });
+      }
+      _proxyFetchCache.set(cacheKey, { data: workerData, timestamp: Date.now() });
+      return workerData;
+    } catch (_wRetryErr) {
+      lastError = _wRetryErr;
+      if (_wRetry < _workerRetryDelays.length - 1) {
+        engineDebug(`worker retry ${_wRetry + 1}/${_workerRetryDelays.length - 1}`, { request: fetchLabel, error: _wRetryErr.message });
       }
     }
-    engineDebug("fetch failed completely — all proxies exhausted", { request: fetchLabel, error: lastError?.message || workerErr.message });
-    throw lastError || workerErr;
   }
+  for (let _fbi = 0; _fbi < _PROXY_FALLBACKS.length; _fbi++) {
+    try {
+      const _fbData = await fetchJson(_PROXY_FALLBACKS[_fbi](url), `Fallback-${_fbi + 1}`);
+      _proxyFetchCache.set(cacheKey, { data: _fbData, timestamp: Date.now() });
+      return _fbData;
+    } catch (_fbErr) {
+      // Silently try next fallback
+    }
+  }
+  engineDebug("fetch failed completely — all proxies exhausted", { request: fetchLabel, error: lastError?.message });
+  throw lastError;
 }
 
     function openSection(id) {
@@ -11994,18 +12025,31 @@ btn.addEventListener("click", () => { section.classList.toggle("collapsed"); });
       if (isDTD) result.dtdCount++;
 
       let ppg = 0;
+      let minPG = 0;
+      let plusMinus = 0;
+      const pos = String(athlete?.position?.abbreviation || athlete?.position?.name || "G").toUpperCase();
+      const isPrimaryDefender = pos === "C" || pos === "PF";
 
       for (const cat of (athlete?.statistics?.splits?.categories || [])) {
         for (const stat of (cat.stats || [])) {
           if (stat.name === "avgPoints" || stat.abbreviation === "PPG") {
             ppg = parseFloat(stat.value) || 0;
           }
+          if (stat.name === "avgMinutes" || stat.abbreviation === "MIN") {
+            minPG = parseFloat(stat.value) || 0;
+          }
+          if (stat.name === "plusMinus" || stat.abbreviation === "+/-") {
+            plusMinus = parseFloat(stat.value) || 0;
+          }
         }
       }
 
+      // Usage weight: high-minute players have proportionally larger game impact
+      const usageWeight = minPG > 0 ? Math.min(1.25, minPG / 26) : 1.0;
+
       if (ppg <= 0) {
         result.unknownImpactCount++;
-        const unknownPenalty = isOut ? 0.02 : 0.01; 
+        const unknownPenalty = isOut ? BB_MAGIC_NUMBERS.INJURY_UNKNOWN_OUT : BB_MAGIC_NUMBERS.INJURY_UNKNOWN_DTD;
         totalReduction += unknownPenalty;
         result.notes.push({
           type: isOut ? "out" : "dtd",
@@ -12014,17 +12058,28 @@ btn.addEventListener("click", () => { section.classList.toggle("collapsed"); });
         continue;
       }
 
-      const share = ppg / avgPPG;
-      const impact = Math.min(isOut ? share * 0.65 : share * 0.30, 0.22);
+      const share = (ppg * usageWeight) / avgPPG;
+      const impact = Math.min(isOut ? share * BB_MAGIC_NUMBERS.INJURY_OUT_FACTOR : share * BB_MAGIC_NUMBERS.INJURY_DTD_FACTOR, BB_MAGIC_NUMBERS.INJURY_PLAYER_CAP);
       totalReduction += impact;
+
+      // Defensive gap: losing a primary big man opens the opponent's paint (Issue 1)
+      if (isOut && isPrimaryDefender && plusMinus < 0) {
+        if (!result.defensiveImpact) result.defensiveImpact = 0;
+        const defImpact = Math.min(0.06, share * 0.12);
+        result.defensiveImpact += defImpact;
+        result.notes.push({
+          type: "dtd",
+          text: `${playerName} (${pos}, ${ppg.toFixed(1)} ppg) — ${tag}: defensive gap → +${(defImpact * 100).toFixed(1)}% opp`
+        });
+      }
 
       result.notes.push({
         type: isOut ? "out" : "dtd",
-        text: `${playerName} (${ppg.toFixed(1)} ppg) — ${tag} → -${(impact * 100).toFixed(1)}% offense`
+        text: `${playerName} (${ppg.toFixed(1)} ppg${minPG > 0 ? ", " + minPG.toFixed(0) + " min" : ""}) — ${tag} → -${(impact * 100).toFixed(1)}% offense`
       });
     }
 
-    const maxInjCap = league === "nba" ? 0.25 : 0.20;
+    const maxInjCap = league === "nba" ? BB_MAGIC_NUMBERS.INJURY_MAX_CAP_NBA : BB_MAGIC_NUMBERS.INJURY_MAX_CAP_OTHER;
     result.scoringMult = 1 - Math.min(totalReduction, maxInjCap);
     result.hasUnknownImpact = result.unknownImpactCount > 0;
 
@@ -12343,7 +12398,8 @@ q1Allowed: qA.q1.slice(0, 10), q2Allowed: qA.q2.slice(0, 10), q3Allowed: qA.q3.s
 
 }
 
-async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
+// Issue 4: Added optional fixtureTid — when provided, limits H2H to that competition only
+async function fetchH2HCore(base, teamAId, teamBId, leagueKey, fixtureTid = null) {
   const rules = LEAGUE_FETCH_RULES[leagueKey];
   if (!rules) return [];
 
@@ -12414,6 +12470,12 @@ async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
         const hasA = competitors.some(c => matchesTeam(c, tA));
         const hasB = competitors.some(c => matchesTeam(c, tB));
         if (!hasA || !hasB) return;
+
+        // Issue 4: If fixtureTid is provided, filter to that competition; otherwise include all
+        if (fixtureTid != null) {
+          const evStype = String(comp?.season?.type?.id ?? comp?.season?.type ?? "");
+          if (evStype && evStype !== String(fixtureTid)) return;
+        }
 
         const rawDate = ev?.date || comp?.date || "";
         const gameTs = rawDate ? Date.parse(rawDate) : NaN;
@@ -13638,10 +13700,11 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
   const sampleSize = Math.min(aFTS.length, bFTS.length);
-  let aS_pre = anchorProjection(avgOrNaN(aFTS), sampleSize, leagueBase);
-  let bS_pre = anchorProjection(avgOrNaN(bFTS), sampleSize, leagueBase);
-  let aAllowed = avgOrNaN(aFTA);
-  let bAllowed = avgOrNaN(bFTA);
+  // Issue 3: safeAverage prevents NaN from cascading into NO PLAY when allowed series is sparse
+  let aS_pre = anchorProjection(safeAverage(aFTS, leagueBase), sampleSize, leagueBase);
+  let bS_pre = anchorProjection(safeAverage(bFTS, leagueBase), sampleSize, leagueBase);
+  let aAllowed = safeAverage(aFTA, leagueBase);
+  let bAllowed = safeAverage(bFTA, leagueBase);
 
   // Issue 2: Volatility applied AFTER both branches set aS/bS — early pre-value calls removed
   // to prevent double-application when advanced stats are used.
@@ -13784,13 +13847,14 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const sampleSize = Math.min(aS1.length, bS1.length);
   const leagueBase1H = (eb / 2) * 0.5;
-  let aS_pre = anchorProjection(avgOrNaN(aS1), sampleSize, leagueBase1H);
-  let bS_pre = anchorProjection(avgOrNaN(bS1), sampleSize, leagueBase1H);
+  // Issue 3: safeAverage for 1H series prevents NaN from cascading into NO PLAY
+  let aS_pre = anchorProjection(safeAverage(aS1, leagueBase1H), sampleSize, leagueBase1H);
+  let bS_pre = anchorProjection(safeAverage(bS1, leagueBase1H), sampleSize, leagueBase1H);
   aS_pre = applyVolatility(aS_pre, aS1, volLimit, league);
   bS_pre = applyVolatility(bS_pre, bS1, volLimit, league);
 
-  let aAllowed = avgOrNaN(aA1);
-  let bAllowed = avgOrNaN(bA1);
+  let aAllowed = safeAverage(aA1, leagueBase1H);
+  let bAllowed = safeAverage(bA1, leagueBase1H);
 
   // FIX #16: H1 now uses advanced stats (ORTG/DRTG/pace) when available,
   // consistent with FT. Previously quarters/H1 never used ESPN-fetched rating data.
@@ -13831,6 +13895,10 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   projA1H *= injMultA;
   projB1H *= injMultB;
+
+  // Issue 1: Defensive multiplier — losing a key defender allows opponent to score more in 1H too
+  if (injMultA < 1) projB1H *= (1 + (1 - injMultA) * BB_MAGIC_NUMBERS.INJURY_DEF_MULT);
+  if (injMultB < 1) projA1H *= (1 + (1 - injMultB) * BB_MAGIC_NUMBERS.INJURY_DEF_MULT);
 
   const aVol1 = getVolatilityRatioForSeries(aS1, volLimit);
   const bVol1 = getVolatilityRatioForSeries(bS1, volLimit);
@@ -15425,9 +15493,9 @@ const h1Calc = compute1HProjection({
         projA = anchorProjection((synPaceQ * projRatingAQ) / 400, sampleSize, leagueBaseQ);
         projB = anchorProjection((synPaceQ * projRatingBQ) / 400, sampleSize, leagueBaseQ);
       } else {
-        // FIX #15: 50/50 blend (was 75/25)
-        projA = anchorProjection(avgOrNaN(aS) * 0.50 + avgOrNaN(bA) * 0.50, sampleSize, leagueBaseQ);
-        projB = anchorProjection(avgOrNaN(bS) * 0.50 + avgOrNaN(aA) * 0.50, sampleSize, leagueBaseQ);
+        // FIX #15: 50/50 blend (was 75/25); Issue 3: safeAverage guards quarter projections too
+        projA = anchorProjection(safeAverage(aS, leagueBaseQ) * 0.50 + safeAverage(bA, leagueBaseQ) * 0.50, sampleSize, leagueBaseQ);
+        projB = anchorProjection(safeAverage(bS, leagueBaseQ) * 0.50 + safeAverage(aA, leagueBaseQ) * 0.50, sampleSize, leagueBaseQ);
       }
 
       projA = applyVolatility(projA, aS, volLimit, league);
@@ -15465,10 +15533,10 @@ const h1Calc = compute1HProjection({
 
     // Issue 19: Q4 garbage time adjustment — blowout projected margin distorts Q4 scoring.
     if (q4 && isFinite(q4.projA) && isFinite(q4.projB) && q4.line &&
-        isFinite(ftCalc.blowoutGap) && ftCalc.blowoutGap > 15) {
+        isFinite(ftCalc.blowoutGap) && ftCalc.blowoutGap > BB_MAGIC_NUMBERS.Q4_GARBAGE_THRESHOLD) {
       const isFavorA = ftCalc.projAFT > ftCalc.projBFT;
-      q4.projA = isFavorA ? q4.projA * 0.85 : q4.projA * 1.10;
-      q4.projB = isFavorA ? q4.projB * 1.10 : q4.projB * 0.85;
+      q4.projA = isFavorA ? q4.projA * BB_MAGIC_NUMBERS.Q4_GARBAGE_LEADING : q4.projA * BB_MAGIC_NUMBERS.Q4_GARBAGE_TRAILING;
+      q4.projB = isFavorA ? q4.projB * BB_MAGIC_NUMBERS.Q4_GARBAGE_TRAILING : q4.projB * BB_MAGIC_NUMBERS.Q4_GARBAGE_LEADING;
       q4.proj = q4.projA + q4.projB;
       q4.edge = q4.proj - q4.line;
       q4.pick = getPick(q4.edge, q4.line, league, "q4", {});
@@ -16689,10 +16757,8 @@ if (trackedToSave.length) {
   const RAPID_API_BASE = "https://api-basketball.p.rapidapi.com";
 
   // Dedicated fetch for API Basketball – bypasses worker/proxy chain and adds required headers
+  // Issue 2: apiBasketballFetch with exponential-backoff retry (3 attempts: 0 s, 1 s, 2 s)
   async function apiBasketballFetch(url, timeoutMs = 12000) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
     const isDirect = String(RAPID_API_KEY || "").trim().length === 32;
     let finalUrl = url;
     const headers = {};
@@ -16707,26 +16773,37 @@ if (trackedToSave.length) {
 
     engineDebug("API Basketball Outbound Request", { url: finalUrl });
 
-    try {
-      const response = await fetch(finalUrl, {
-        headers: headers,
-        signal: controller.signal,
-        cache: "no-store"
-      });
-      clearTimeout(timer);
-      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      const text = await response.text();
-      try { 
-        const parsed = JSON.parse(text);
-        const resultsCount = Array.isArray(parsed?.response) ? parsed.response.length : (parsed?.results || 0);
-        engineDebug("API Basketball Response Success", { url: finalUrl, status: response.status, resultsCount });
-        return parsed;
-      } catch(e) { throw new Error("Invalid JSON response"); }
-    } catch (err) {
-      clearTimeout(timer);
-      engineDebug("API Basketball fetch failed", { url: finalUrl, error: err.message });
-      throw err;
+    const _abRetryDelays = [0, 1000, 2000];
+    let _abLastErr;
+    for (let _abAttempt = 0; _abAttempt < _abRetryDelays.length; _abAttempt++) {
+      if (_abRetryDelays[_abAttempt] > 0) await new Promise(r => setTimeout(r, _abRetryDelays[_abAttempt]));
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(finalUrl, {
+          headers: headers,
+          signal: controller.signal,
+          cache: "no-store"
+        });
+        clearTimeout(timer);
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        const text = await response.text();
+        try {
+          const parsed = JSON.parse(text);
+          const resultsCount = Array.isArray(parsed?.response) ? parsed.response.length : (parsed?.results || 0);
+          engineDebug("API Basketball Response Success", { url: finalUrl, status: response.status, resultsCount });
+          return parsed;
+        } catch(e) { throw new Error("Invalid JSON response"); }
+      } catch (err) {
+        clearTimeout(timer);
+        _abLastErr = err;
+        if (_abAttempt < _abRetryDelays.length - 1) {
+          engineDebug(`API Basketball retry ${_abAttempt + 1}/${_abRetryDelays.length - 1}`, { url: finalUrl, error: err.message });
+        }
+      }
     }
+    engineDebug("API Basketball fetch failed after retries", { url: finalUrl, error: _abLastErr?.message });
+    throw _abLastErr;
   }
 
   // Keep original proxyFetch for ESPN etc.
@@ -17752,7 +17829,8 @@ try {
         });
       }
 
-  const godModeCopyBtn = document.getElementById("godModeCopyBtn");
+  // Issue 8: Godfather Dump button and downloadGodfatherFile helper removed per spec.
+  const godModeCopyBtn = null; // button no longer present in HTML
   if (godModeCopyBtn) {
     godModeCopyBtn.addEventListener("click", () => {
       const fullHTML = "<!DOCTYPE html>\n<html lang=\"en\">\n" + document.documentElement.innerHTML + "\n</html>";
@@ -18790,6 +18868,127 @@ window.ENGINE_TEST_SUITE = (() => {
     expect("3 games = thin",        getSampleTier([1,2,3],[1,2,3]),         "thin");
     expect("1 game = insufficient", getSampleTier([1],[1]),                 "insufficient");
     expect("empty = insufficient",  getSampleTier([],[]),                   "insufficient");
+  });
+
+  // Issue 6: Expanded test coverage for core projection logic, massacre framework, and injury model
+
+  suite("computeFTProjection — smoke test", () => {
+    const _savedCtx = g_massacreFetchContext;
+    try {
+      g_massacreFetchContext = defaultMassacreFetchContext();
+      g_massacreFetchContext.A.overall = {
+        ftScored10: [90,88,92,86,91,89,87,93,85,90],
+        ftAllowed10: [82,80,84,79,83,81,78,85,77,82],
+        scored10: [90,88,92,86,91,89,87,93,85,90],
+        allowed10: [82,80,84,79,83,81,78,85,77,82],
+        scored: [90,88,92,86,91], allowed: [82,80,84,79,83]
+      };
+      g_massacreFetchContext.B.overall = {
+        ftScored10: [85,83,87,81,86,84,82,88,80,85],
+        ftAllowed10: [86,84,88,82,87,85,83,89,81,86],
+        scored10: [85,83,87,81,86,84,82,88,80,85],
+        allowed10: [86,84,88,82,87,85,83,89,81,86],
+        scored: [85,83,87,81,86], allowed: [86,84,88,82,87]
+      };
+      const r = computeFTProjection({
+        league: "nba",
+        parsed: {
+          aFTScored: [90,88,92,86,91,89,87,93,85,90],
+          aFTAllowed: [82,80,84,79,83,81,78,85,77,82],
+          bFTScored: [85,83,87,81,86,84,82,88,80,85],
+          bFTAllowed: [86,84,88,82,87,85,83,89,81,86],
+          aFTH2H: null, bFTH2H: null
+        },
+        lines: { ftLine: 225, aLine: 113, bLine: 112 },
+        injMultA: 1, injMultB: 1
+      });
+      expect("ftSampleTier is full with 10 games", r.ftSampleTier, "full");
+      if (isFinite(r.ftProj)) {
+        expectTrue("ftProj in realistic NBA range (170–280)", r.ftProj > 170 && r.ftProj < 280);
+        expectTrue("projAFT > 0", r.projAFT > 0);
+        expectTrue("projBFT > 0", r.projBFT > 0);
+        expectApprox("projAFT + projBFT ≈ ftProj", r.projAFT + r.projBFT, r.ftProj, 0.5);
+        expectTrue("ftEdge is finite when line is given", isFinite(r.ftEdge));
+      }
+      // Injury multiplier sanity
+      const rInj = computeFTProjection({
+        league: "nba",
+        parsed: { aFTScored: [90,88,92,86,91,89,87,93,85,90], aFTAllowed: [82,80,84,79,83,81,78,85,77,82], bFTScored: [85,83,87,81,86,84,82,88,80,85], bFTAllowed: [86,84,88,82,87,85,83,89,81,86], aFTH2H: null, bFTH2H: null },
+        lines: { ftLine: 225, aLine: 113, bLine: 112 },
+        injMultA: 0.85, injMultB: 1
+      });
+      if (isFinite(r.projAFT) && isFinite(rInj.projAFT)) {
+        expectTrue("injury mult reduces Team A projection", rInj.projAFT < r.projAFT);
+        expectTrue("injury mult boosts Team B projection (defensive gap)", rInj.projBFT > r.projBFT);
+      }
+    } catch(e) {
+      _f++; _fails.push("CRASH [computeFTProjection smoke]: " + e.message);
+    } finally {
+      g_massacreFetchContext = _savedCtx;
+    }
+  });
+
+  suite("injury model math", () => {
+    // defaultInjuryMeta shape
+    const meta = defaultInjuryMeta();
+    expect("default scoringMult = 1",    meta.scoringMult,      1);
+    expect("default outCount = 0",       meta.outCount,         0);
+    expect("default dtdCount = 0",       meta.dtdCount,         0);
+    expectTrue("no highUncertainty by default", !meta.highUncertainty);
+    expectTrue("empty notes by default",  meta.notes.length === 0);
+
+    // PPG share math
+    const ppg = 20, avgPPG = 80;
+    const share = ppg / avgPPG; // 0.25
+    const impactOut = Math.min(share * BB_MAGIC_NUMBERS.INJURY_OUT_FACTOR, BB_MAGIC_NUMBERS.INJURY_PLAYER_CAP);
+    const impactDTD = Math.min(share * BB_MAGIC_NUMBERS.INJURY_DTD_FACTOR, BB_MAGIC_NUMBERS.INJURY_PLAYER_CAP);
+    expectApprox("OUT impact for 25% scorer ≈ 0.1625", impactOut, 0.1625, 0.001);
+    expectApprox("DTD impact for 25% scorer ≈ 0.075",  impactDTD, 0.075,  0.001);
+    expectTrue("DTD impact < OUT impact",               impactDTD < impactOut);
+    expectTrue("OUT impact ≤ per-player cap",           impactOut <= BB_MAGIC_NUMBERS.INJURY_PLAYER_CAP);
+
+    // Usage weight
+    const minPG = 32;
+    const usageWeight = Math.min(1.25, minPG / 26);
+    expectTrue("32-min player usage weight > 1",    usageWeight > 1.0);
+    expectTrue("usage weight capped at 1.25",        usageWeight <= 1.25);
+
+    // Defensive multiplier used in computeFTProjection + compute1HProjection
+    const injMultA = 0.85;
+    const defBoost = 1 + (1 - injMultA) * BB_MAGIC_NUMBERS.INJURY_DEF_MULT;
+    expectApprox("15% injury → 3% opp boost", defBoost, 1.03, 0.001);
+
+    // NBA vs other cap
+    expectTrue("NBA max cap > other leagues cap",
+      BB_MAGIC_NUMBERS.INJURY_MAX_CAP_NBA > BB_MAGIC_NUMBERS.INJURY_MAX_CAP_OTHER);
+  });
+
+  suite("evaluateMassacreForPick", () => {
+    const _overPick  = { pick: "OVER 220.5",  edge: 10,  line: 220, marketKey: "ft", league: "nba" };
+    const _underPick = { pick: "UNDER 215.5", edge: -10, line: 216, marketKey: "ft", league: "nba" };
+    const _noPick    = { pick: "NO PLAY",     edge: 2,   line: 220, marketKey: "ft", league: "nba" };
+    const _hot  = { streakLength: 5, avgMargin:  15, severity: "heavy",   rescueEligible: true,  streakDirection: "hot"  };
+    const _cold = { streakLength: 5, avgMargin: -15, severity: "heavy",   rescueEligible: true,  streakDirection: "cold" };
+    const _mild = { streakLength: 2, avgMargin:   3, severity: "none",    rescueEligible: false, streakDirection: "cold" };
+    const _nuke = { streakLength: 6, avgMargin:  35, severity: "nuclear", rescueEligible: true,  streakDirection: "hot"  };
+
+    const r1 = evaluateMassacreForPick(_overPick, _hot, _mild);
+    expectTrue("OVER + hot streak → massacre",    r1.isMassacre);
+    expect("heavy severity at 15-pt margin",      r1.severity,   "heavy");
+    expect("direction is hot",                    r1.direction,  "hot");
+
+    const r2 = evaluateMassacreForPick(_underPick, _mild, _cold);
+    expectTrue("UNDER + cold streak → massacre",  r2.isMassacre);
+
+    const r3 = evaluateMassacreForPick(_noPick, _hot, _cold);
+    expectTrue("NO PLAY never triggers massacre",  !r3.isMassacre);
+
+    const r4 = evaluateMassacreForPick(_overPick, _mild, _mild);
+    expectTrue("mild profiles → no massacre",     !r4.isMassacre);
+
+    const r5 = evaluateMassacreForPick(_overPick, _nuke, _mild);
+    expectTrue("nuclear severity at 35-pt margin", r5.isMassacre);
+    expect("severity is nuclear",                  r5.severity, "nuclear");
   });
 
   function run() {
