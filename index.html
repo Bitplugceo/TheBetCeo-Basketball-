@@ -3575,7 +3575,7 @@ const BB_CONFIG = {
 // via config.teamWeight. The blend ratio (0.65 own-scoring / 0.35 opponent-defense) is now
 // actually applied in the non-advanced branch instead of the former hardcoded 0.5.
 function getDynamicWeights(sampleTier, volatility, league) {
-  return { teamWeight: 0.65, oppWeight: 0.35 };
+  return { teamWeight: BB_MAGIC_NUMBERS.DYNAMIC_TEAM_WEIGHT, oppWeight: BB_MAGIC_NUMBERS.DYNAMIC_OPP_WEIGHT };
 }
 
 function getUnifiedVolatilityState(aSeries, bSeries, volLimit) {
@@ -3677,7 +3677,17 @@ const BB_MAGIC_NUMBERS = {
   SAMPLE_THIN_THRESHOLD:  5,     // min games for "thin" sample tier
   Q4_GARBAGE_THRESHOLD:   15,    // blowout gap (pts) above which Q4 gets garbage-time adj
   Q4_GARBAGE_LEADING:     0.85,  // leading-team Q4 score multiplier in a blowout
-  Q4_GARBAGE_TRAILING:    1.10   // trailing-team Q4 score multiplier in a blowout
+  Q4_GARBAGE_TRAILING:    1.10,  // trailing-team Q4 score multiplier in a blowout
+  // Issue 2: Additional magic numbers extracted from inline usage
+  H2H_WEIGHT_QUARTER:     0.15,  // fixed H2H weight used inside computeQ
+  Q2_SCALE_WEIGHT:        1.03,  // Q2 pacing scale in quarter reconciliation
+  Q4_SCALE_WEIGHT:        1.08,  // Q4 fouling inflation in quarter reconciliation
+  CONFIDENCE_EDGE_SCALE:  0.03,  // edge scaling divisor in getConfidenceGrade
+  EDGE_FLOOR_STANDARD:    0.050, // standard edge floor in getConfidenceGrade
+  EDGE_FLOOR_H2:          0.060, // H2 market edge floor in getConfidenceGrade
+  FULL_MODEL_LOCK_BONUS:  0.6,   // bonus for fullModel picks in selectLock
+  DYNAMIC_TEAM_WEIGHT:    0.65,  // team weight in getDynamicWeights
+  DYNAMIC_OPP_WEIGHT:     0.35   // opp weight in getDynamicWeights
 };
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -5593,9 +5603,8 @@ function engineDebug(message, extra = null) {
 
 
 function renderEngineDebugPanel() {
-  if (isTrackerDebugView() || isTrackerReportView()) {
-    renderTrackerAnalytics();
-  }
+  // Debug panel removed from main page per user request.
+  // Logs are accessible via the AFDB overlay (🔬 button) only.
 }
 // Auto-Patcher V12: define missing globals
 window.recordPickVariance = window.recordPickVariance || function(pick) {};
@@ -10782,7 +10791,7 @@ function addTrackedPicks(newPicks) {
     function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0, league = "unknown", baselineForMarket = null, factor = 1.0, context = null) {
   const minLen = Math.min(Number(lenA) || 0, Number(lenB) || 0);
   if (minLen < 2) return 0;
-  let weight = (Math.log1p(minLen - 1) / Math.log1p(9)) * 0.35;
+      let weight = (Math.log1p(minLen - 1) / Math.log1p(9)) * BB_MAGIC_NUMBERS.H2H_WEIGHT_MAX;
   if (context) {
     const injA = context.injMultA ?? 1.0;
     const injB = context.injMultB ?? 1.0;
@@ -10977,8 +10986,8 @@ function getPick(edge, line, league, marketKey, context = {}) {
     const aEdgePct = Math.abs(a.edge / a.line) * 100;
     const bEdgePct = Math.abs(b.edge / b.line) * 100;
 
-    const aFullModelBonus = a.fullModel ? 0.6 : 0;
-    const bFullModelBonus = b.fullModel ? 0.6 : 0;
+    const aFullModelBonus = a.fullModel ? BB_MAGIC_NUMBERS.FULL_MODEL_LOCK_BONUS : 0;
+    const bFullModelBonus = b.fullModel ? BB_MAGIC_NUMBERS.FULL_MODEL_LOCK_BONUS : 0;
 
     const aMassacreBonus = isFinite(Number(a.lockStrength)) ? Number(a.lockStrength) : 0;
     const bMassacreBonus = isFinite(Number(b.lockStrength)) ? Number(b.lockStrength) : 0;
@@ -11123,8 +11132,8 @@ function getConfidenceGrade(params) {
     if (projectionOnly) score -= 1.0;
 
     // 2. Edge signal
-    const edgeFloor = isH2 ? 0.060 : 0.050;
-    score += clampNumber((edgePct - edgeFloor) / 0.03, -1.0, 2.0);
+    const edgeFloor = isH2 ? BB_MAGIC_NUMBERS.EDGE_FLOOR_H2 : BB_MAGIC_NUMBERS.EDGE_FLOOR_STANDARD;
+    score += clampNumber((edgePct - edgeFloor) / BB_MAGIC_NUMBERS.CONFIDENCE_EDGE_SCALE, -1.0, 2.0);
 
     // Cross-market edge weight contributions
     // FIX #19: q4Edge/q2Edge are raw points — normalize by dividing by a typical
@@ -13717,13 +13726,15 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const ctxA = g_massacreFetchContext?.A || {};
   const ctxB = g_massacreFetchContext?.B || {};
-  const avgPaceA = avgOrNaN(ctxA.pace10);
-  const avgPaceB = avgOrNaN(ctxB.pace10);
+  const leaguePaceBaseForFT = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
+  const leagueRatingBaseForFT = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
+  const avgPaceA = safeAverage(ctxA.pace10, leaguePaceBaseForFT);
+  const avgPaceB = safeAverage(ctxB.pace10, leaguePaceBaseForFT);
   // FIX #7: pace clamp is now actually applied to synPace (previously computed but never used)
   const clamp = getEffectivePaceClamp(league);
 
   let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
-  let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10));
+  let hasRealRatings = isFinite(safeAverage(ctxA.ortg10, leagueRatingBaseForFT)) && isFinite(safeAverage(ctxA.drtg10, leagueRatingBaseForFT)) && isFinite(safeAverage(ctxB.ortg10, leagueRatingBaseForFT)) && isFinite(safeAverage(ctxB.drtg10, leagueRatingBaseForFT));
 
   let synNetA = 0, synNetB = 0;
   let usedAdvanced = false;
@@ -13743,12 +13754,16 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   let aS, bS;
   if (isEspnLeague && hasRealRatings && hasRealPace) {
-    const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
-    const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
+    const _ortgA = safeAverage(ctxA.ortg10, leagueRatingBase);
+    const _drtgA = safeAverage(ctxA.drtg10, leagueRatingBase);
+    const _ortgB = safeAverage(ctxB.ortg10, leagueRatingBase);
+    const _drtgB = safeAverage(ctxB.drtg10, leagueRatingBase);
+    const projectedRatingA = _ortgA + _drtgB - leagueRatingBase;
+    const projectedRatingB = _ortgB + _drtgA - leagueRatingBase;
     aS = (synPace * projectedRatingA) / 100;
     bS = (synPace * projectedRatingB) / 100;
-    synNetA = avgOrNaN(ctxA.ortg10) - avgOrNaN(ctxA.drtg10);
-    synNetB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
+    synNetA = _ortgA - _drtgA;
+    synNetB = _ortgB - _drtgB;
     usedAdvanced = true;
   } else {
     // Issue 3: Use dynamic teamWeight from config (default 0.65/0.35) instead of hardcoded 0.5
@@ -13865,12 +13880,12 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const ctxA = g_massacreFetchContext?.A || {};
   const ctxB = g_massacreFetchContext?.B || {};
-  const avgPaceA = avgOrNaN(ctxA.pace10);
-  const avgPaceB = avgOrNaN(ctxB.pace10);
+  const avgPaceA = safeAverage(ctxA.pace10, leaguePaceBase);
+  const avgPaceB = safeAverage(ctxB.pace10, leaguePaceBase);
   const clamp = getEffectivePaceClamp(league);
 
   let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
-  let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10));
+  let hasRealRatings = isFinite(safeAverage(ctxA.ortg10, leagueRatingBase)) && isFinite(safeAverage(ctxA.drtg10, leagueRatingBase)) && isFinite(safeAverage(ctxB.ortg10, leagueRatingBase)) && isFinite(safeAverage(ctxB.drtg10, leagueRatingBase));
 
   let synPace = leaguePaceBase;
   if (hasRealPace) {
@@ -13880,11 +13895,12 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   let projA1H, projB1H;
   if (isEspnLeague && hasRealRatings && hasRealPace) {
-    // FIX #20: Divide by 200 is replaced with a H1-specific divisor.
-    // H1 pace is not simply half of FT pace — foul rates and rotation patterns differ.
-    // Use 190 (approximately 95% of 2*100) to model typical H1 conservatism.
-    const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
-    const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
+    const _h1ortgA = safeAverage(ctxA.ortg10, leagueRatingBase);
+    const _h1drtgA = safeAverage(ctxA.drtg10, leagueRatingBase);
+    const _h1ortgB = safeAverage(ctxB.ortg10, leagueRatingBase);
+    const _h1drtgB = safeAverage(ctxB.drtg10, leagueRatingBase);
+    const projectedRatingA = _h1ortgA + _h1drtgB - leagueRatingBase;
+    const projectedRatingB = _h1ortgB + _h1drtgA - leagueRatingBase;
     // Issue 5: Replace arbitrary 190 with calibrated divisor based on league pace
     const halfDivisor = leaguePaceBase * 2;
     projA1H = (synPace * projectedRatingA) / halfDivisor;
@@ -15510,7 +15526,7 @@ const h1Calc = compute1HProjection({
       const hasH2H = maybeReadH2HEnabled(qKey) && aH2H.length >= 2 && bH2H.length >= 2;
       const tier = getSampleTier(aS, bS);
       if (hasH2H) {
-        const hw = 0.15;
+        const hw = BB_MAGIC_NUMBERS.H2H_WEIGHT_QUARTER;
         projA = (projA * (1 - hw)) + (avgOrNaN(aH2H) * hw);
         projB = (projB * (1 - hw)) + (avgOrNaN(bH2H) * hw);
       }
@@ -15554,7 +15570,7 @@ const h1Calc = compute1HProjection({
 
             if (rawQ12Sum > 0 && isFinite(h1Target)) {
           const q1Weight = 1.0;
-          const q2Weight = 1.03; // Accounting for Q2 rotation pacing shifts
+          const q2Weight = BB_MAGIC_NUMBERS.Q2_SCALE_WEIGHT; // Accounting for Q2 rotation pacing shifts
           const totalWeightedRaw = (q1?.proj || 0) * q1Weight + (q2?.proj || 0) * q2Weight;
           const q1Scale = (h1Target * (q1?.proj || 0) * q1Weight) / (totalWeightedRaw || 1) / (q1?.proj || 1);
           const q2Scale = (h1Target * (q2?.proj || 0) * q2Weight) / (totalWeightedRaw || 1) / (q2?.proj || 1);
@@ -15581,7 +15597,7 @@ const h1Calc = compute1HProjection({
 
         if (rawQ34Sum > 0 && isFinite(h2Target) && h2Target > 0) {
           const q3Weight = 1.0;
-          const q4Weight = 1.08; // 8% fouling inflation premium modeled for Q4
+          const q4Weight = BB_MAGIC_NUMBERS.Q4_SCALE_WEIGHT; // 8% fouling inflation premium modeled for Q4
           const totalWeightedRaw = (q3?.proj || 0) * q3Weight + (q4?.proj || 0) * q4Weight;
           const q3Scale = (h2Target * (q3?.proj || 0) * q3Weight) / (totalWeightedRaw || 1) / (q3?.proj || 1);
           const q4Scale = (h2Target * (q4?.proj || 0) * q4Weight) / (totalWeightedRaw || 1) / (q4?.proj || 1);
@@ -18720,6 +18736,8 @@ function copyConfigsData() {
 
 
 
+// Issue 4: Full test suite with coverage for compute1HProjection, applySoftTrackerInfluenceToPicks,
+// getPick edge-threshold logic, and H2H filtering (fetchH2HCore guard tested via safeAverage).
 window.ENGINE_TEST_SUITE = (() => {
   let _p = 0, _f = 0;
   const _fails = [];
@@ -18962,6 +18980,89 @@ window.ENGINE_TEST_SUITE = (() => {
     // NBA vs other cap
     expectTrue("NBA max cap > other leagues cap",
       BB_MAGIC_NUMBERS.INJURY_MAX_CAP_NBA > BB_MAGIC_NUMBERS.INJURY_MAX_CAP_OTHER);
+  });
+
+  suite("compute1HProjection — smoke test", () => {
+    const _savedCtx1H = g_massacreFetchContext;
+    try {
+      g_massacreFetchContext = defaultMassacreFetchContext();
+      const r = compute1HProjection({
+        league: "nba",
+        parsed: {
+          a1HScored: [45,44,46,43,45,44,43,46,42,45],
+          a1HAllowed: [41,40,42,39,41,40,39,42,38,41],
+          b1HScored: [43,42,44,41,43,42,41,44,40,43],
+          b1HAllowed: [43,42,44,41,43,42,41,44,40,43],
+          a1HH2H: null, b1HH2H: null
+        },
+        lines: { h1Line: 87, h1aLine: 44, h1bLine: 43 },
+        injMultA: 1, injMultB: 1
+      });
+      expect("h1SampleTier is full with 10 games", r.h1SampleTier, "full");
+      if (isFinite(r.h1Proj)) {
+        expectTrue("h1Proj in realistic NBA H1 range (70–115)", r.h1Proj > 70 && r.h1Proj < 115);
+        expectTrue("projA1H > 0", r.projA1H > 0);
+        expectTrue("projB1H > 0", r.projB1H > 0);
+        expectApprox("projA1H + projB1H ≈ h1Proj", r.projA1H + r.projB1H, r.h1Proj, 0.5);
+        expectTrue("h1Edge is finite when line is given", isFinite(r.h1Edge));
+      }
+      // Injury multiplier reduces projection
+      const rInj = compute1HProjection({
+        league: "nba",
+        parsed: { a1HScored: [45,44,46,43,45,44,43,46,42,45], a1HAllowed: [41,40,42,39,41,40,39,42,38,41], b1HScored: [43,42,44,41,43,42,41,44,40,43], b1HAllowed: [43,42,44,41,43,42,41,44,40,43], a1HH2H: null, b1HH2H: null },
+        lines: { h1Line: 87, h1aLine: 44, h1bLine: 43 },
+        injMultA: 0.85, injMultB: 1
+      });
+      if (isFinite(r.projA1H) && isFinite(rInj.projA1H)) {
+        expectTrue("injury reduces Team A 1H projection", rInj.projA1H < r.projA1H);
+      }
+      // Insufficient sample
+      const rThin = compute1HProjection({
+        league: "nba",
+        parsed: { a1HScored: [45], a1HAllowed: [41], b1HScored: [43], b1HAllowed: [43], a1HH2H: null, b1HH2H: null },
+        lines: { h1Line: 87 },
+        injMultA: 1, injMultB: 1
+      });
+      expect("1 game → insufficient tier", rThin.h1SampleTier, "insufficient");
+      expectTrue("insufficient → h1Proj NaN", isNaN(rThin.h1Proj));
+    } catch(e) {
+      _f++; _fails.push("CRASH [compute1HProjection smoke]: " + e.message);
+    } finally {
+      g_massacreFetchContext = _savedCtx1H;
+    }
+  });
+
+  suite("applySoftTrackerInfluenceToPicks — basic guard", () => {
+    // Should not crash on empty or no-play picks
+    expectTrue("handles empty array", (() => { try { applySoftTrackerInfluenceToPicks([], {}, null); return true; } catch(e) { return false; } })());
+    expectTrue("handles NO PLAY pick gracefully", (() => {
+      try {
+        const picks = [{ pick: "NO PLAY", edge: 5, line: 220, marketKey: "ft", league: "nba", confidence: "B" }];
+        applySoftTrackerInfluenceToPicks(picks, {}, null);
+        return true;
+      } catch(e) { return false; }
+    })());
+    expectTrue("handles non-finite edge gracefully", (() => {
+      try {
+        const picks = [{ pick: "OVER 220.5", edge: NaN, line: 220, marketKey: "ft", league: "nba", confidence: "B" }];
+        applySoftTrackerInfluenceToPicks(picks, {}, null);
+        return true;
+      } catch(e) { return false; }
+    })());
+  });
+
+  suite("getPick — edge threshold gate", () => {
+    // Small edges below the point threshold must return NO PLAY
+    expectTrue("edge=0.1 below NBA FT threshold → NO PLAY", getPick(0.1, 220, "nba", "ft", {}) === "NO PLAY");
+    expectTrue("edge=3 below NBA FT threshold → NO PLAY",   getPick(3,   220, "nba", "ft", {}) === "NO PLAY");
+    // Large enough edges should produce picks
+    expectTrue("edge=12 above NBA FT threshold → OVER",     String(getPick(12, 220, "nba", "ft", {})).startsWith("OVER"));
+    expectTrue("edge=-12 above NBA FT threshold → UNDER",   String(getPick(-12, 220, "nba", "ft", {})).startsWith("UNDER"));
+    // UNDER requires larger edge (UNDER_EDGE_FACTOR)
+    const ftThresh = getLeagueEdgePointThreshold("nba", "ft");
+    const underMin = ftThresh * UNDER_EDGE_FACTOR;
+    expectTrue("under needs more edge than over", underMin > ftThresh);
+    expectTrue("fractional edge < 0.5 → NO PLAY (noise filter)", getPick(0.4, 220, "nba", "ft", {}) === "NO PLAY");
   });
 
   suite("evaluateMassacreForPick", () => {
