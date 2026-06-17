@@ -13856,7 +13856,140 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   };
 }
 
-  function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) { 
+  const sampleSize = Math.min(aFTS.length, bFTS.length);
+  // Issue 3: safeAverage prevents NaN from cascading into NO PLAY when allowed series is sparse
+  let aS_pre = anchorProjection(safeAverage(aFTS, leagueBase), sampleSize, leagueBase);
+  let bS_pre = anchorProjection(safeAverage(bFTS, leagueBase), sampleSize, leagueBase);
+  let aAllowed = safeAverage(aFTA, leagueBase);
+  let bAllowed = safeAverage(bFTA, leagueBase);
+
+  // Issue 2: Volatility applied AFTER both branches set aS/bS — early pre-value calls removed
+  // to prevent double-application when advanced stats are used.
+
+  const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
+  const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
+  const leagueRatingBase = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
+  let synPace = leaguePaceBase;
+
+  const ctxA = g_massacreFetchContext?.A || {};
+  const ctxB = g_massacreFetchContext?.B || {};
+  const leaguePaceBaseForFT = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
+  const leagueRatingBaseForFT = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
+  const avgPaceA = safeAverage(ctxA.pace10, leaguePaceBaseForFT);
+  const avgPaceB = safeAverage(ctxB.pace10, leaguePaceBaseForFT);
+  // FIX #7: pace clamp is now actually applied to synPace (previously computed but never used)
+  const clamp = getEffectivePaceClamp(league);
+
+  let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
+  let hasRealRatings = isFinite(safeAverage(ctxA.ortg10, leagueRatingBaseForFT)) && isFinite(safeAverage(ctxA.drtg10, leagueRatingBaseForFT)) && isFinite(safeAverage(ctxB.ortg10, leagueRatingBaseForFT)) && isFinite(safeAverage(ctxB.drtg10, leagueRatingBaseForFT));
+
+  let synNetA = 0, synNetB = 0;
+  let usedAdvanced = false;
+
+  if (hasRealPace) {
+    // FIX #7: Apply the pace clamp that was previously computed but discarded
+    const rawPace = (avgPaceA + avgPaceB) / 2;
+    synPace = clampNumber(rawPace, leaguePaceBase * clamp.min, leaguePaceBase * clamp.max);
+  } else {
+    const totalA = avgOrNaN(aFTS) + avgOrNaN(aFTA);
+    const totalB = avgOrNaN(bFTS) + avgOrNaN(bFTA);
+    if (isFinite(totalA) && isFinite(totalB)) {
+      const rawPace = ((totalA + totalB) / (eb * 2)) * leaguePaceBase;
+      synPace = clampNumber(rawPace, leaguePaceBase * clamp.min, leaguePaceBase * clamp.max);
+    }
+  }
+
+  let aS, bS;
+  if (isEspnLeague && hasRealRatings && hasRealPace) {
+    const _ortgA = safeAverage(ctxA.ortg10, leagueRatingBase);
+    const _drtgA = safeAverage(ctxA.drtg10, leagueRatingBase);
+    const _ortgB = safeAverage(ctxB.ortg10, leagueRatingBase);
+    const _drtgB = safeAverage(ctxB.drtg10, leagueRatingBase);
+    const projectedRatingA = _ortgA + _drtgB - leagueRatingBase;
+    const projectedRatingB = _ortgB + _drtgA - leagueRatingBase;
+    aS = (synPace * projectedRatingA) / 100;
+    bS = (synPace * projectedRatingB) / 100;
+    synNetA = _ortgA - _drtgA;
+    synNetB = _ortgB - _drtgB;
+    usedAdvanced = true;
+  } else {
+    // Issue 3: Use dynamic teamWeight from config (default 0.65/0.35) instead of hardcoded 0.5
+    const _tw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+    const _ow = 1 - _tw;
+    aS = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw + bAllowed * _ow) : aS_pre;
+    bS = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw + aAllowed * _ow) : bS_pre;
+  }
+
+  // Issue 2: Apply volatility AFTER both branches so it always impacts the final projection.
+  aS = applyVolatility(aS, aFTS, volLimit, league);
+  bS = applyVolatility(bS, bFTS, volLimit, league);
+
+  // Apply injury multipliers AFTER team/allowed blending, BEFORE H2H
+  aS *= injMultA;
+  bS *= injMultB;
+
+  // Issue 23: Injuries reduce a team's defense — the opponent scores slightly more.
+  if (injMultA < 1) bS *= (1 + (1 - injMultA) * 0.2);
+  if (injMultB < 1) aS *= (1 + (1 - injMultB) * 0.2);
+
+  const _aVolRatio = getVolatilityRatioForSeries(aFTS, volLimit);
+  const _bVolRatio = getVolatilityRatioForSeries(bFTS, volLimit);
+  const _ftVolRatio = Math.max(_aVolRatio, _bVolRatio);
+
+  // FIX #5: Intel signals applied ONCE here only. applyIntelligenceLayerToPicks
+  // (called later in runEngine) must NOT re-apply the same signals to avoid double-counting.
+  // applyIntelligenceLayerToPicks now only adjusts confidence grade, not edge values.
+  const intel = computeIntelligencePack(league);
+  const intelSignalA = buildTeamMarketIntelSignal(intel, "A");
+  const intelSignalB = buildTeamMarketIntelSignal(intel, "B");
+  aS = applyDampedIntelSignal(aS, intelSignalA.signal, _bVolRatio);
+  bS = applyDampedIntelSignal(bS, intelSignalB.signal, _aVolRatio);
+
+  const aH2H = getH2HSeries("A", "ft", parsed);
+  const bH2H = getH2HSeries("B", "ft", parsed);
+  const ftHasH2H = maybeReadH2HEnabled("ft") && aH2H.length >= 2 && bH2H.length >= 2;
+  let projAFT = aS;
+  let projBFT = bS;
+  if (ftHasH2H) {
+    // FIX #18: Use getMassacreH2HSeries (decay-weighted) for H2H blend in main projection,
+    // consistent with how H2H is used in the massacre framework.
+    const massacreH2H = getMassacreH2HSeries("ft", getCurrentFixtureMeta(), parsed);
+    const decayH2HA = massacreH2H.A.length >= 2 ? massacreH2H.A : aH2H;
+    const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
+    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "ft", ftSampleTier, Math.abs(aS - bS), league, leagueBase, 1.0, {
+      enabled: ftHasH2H,
+      injMultA,
+      injMultB,
+      volRatio: _ftVolRatio,
+      blowoutGap: Math.abs(aS - bS),
+      paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
+    });
+    projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgOrNaN(decayH2HA) * hw) : avgOrNaN(decayH2HA);
+    projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(decayH2HB) * hw) : avgOrNaN(decayH2HB);
+  }
+  let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
+  const ftEdge = (isFinite(ftProj) && isFinite(lines.ftLine) && lines.ftLine > 0) ? ftProj - lines.ftLine : NaN;
+  const aEdge = (isFinite(projAFT) && isFinite(lines.aLine) && lines.aLine > 0) ? projAFT - lines.aLine : NaN;
+  const bEdge = (isFinite(projBFT) && isFinite(lines.bLine) && lines.bLine > 0) ? projBFT - lines.bLine : NaN;
+  return {
+    eb, projAFT, projBFT, ftProj, ftSampleTier,
+    ftHasH2H, ftEdge, aEdge, bEdge,
+    ftFullModel: ftSampleTier === "full",
+    teamFullModel: ftSampleTier === "full",
+    ftProjectionOnly: !ftHasH2H && ftSampleTier === "thin",
+    blowoutGap: Math.abs((projAFT||0) - (projBFT||0)),
+    aS, bS, aScores: aFTS, bScores: bFTS,
+    aVenueEnabled: false, bVenueEnabled: false,
+    pace: synPace,
+    synNetA, synNetB,
+    usedAdvanced,
+    aVol: _aVolRatio * volLimit,
+    bVol: _bVolRatio * volLimit,
+    ftVolRatio: _ftVolRatio
+  };
+}
+
+function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const volLimit = getMarketVolLimit(league, "h1");
 
@@ -13874,6 +14007,210 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       aVol1: 0, bVol1: 0, aS1: NaN, bS1: NaN
     };
   }
+
+  const sampleSize = Math.min(aS1.length, bS1.length);
+  const leagueBase1H = (eb / 2) * 0.5;
+  let aS_pre = anchorProjection(safeAverage(aS1, leagueBase1H), sampleSize, leagueBase1H);
+  let bS_pre = anchorProjection(safeAverage(bS1, leagueBase1H), sampleSize, leagueBase1H);
+  aS_pre = applyVolatility(aS_pre, aS1, volLimit, league);
+  bS_pre = applyVolatility(bS_pre, bS1, volLimit, league);
+
+  let aAllowed = safeAverage(aA1, leagueBase1H);
+  let bAllowed = safeAverage(bA1, leagueBase1H);
+
+  const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
+  const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
+  const leagueRatingBase = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
+
+  const ctxA = g_massacreFetchContext?.A || {};
+  const ctxB = g_massacreFetchContext?.B || {};
+  const avgPaceA = safeAverage(ctxA.pace10, leaguePaceBase);
+  const avgPaceB = safeAverage(ctxB.pace10, leaguePaceBase);
+  const clamp = getEffectivePaceClamp(league);
+
+  // FIX: Only consider real pace if the array actually has data, not when default is returned
+  let hasRealPace = ctxA.pace10?.length > 0 && isFinite(avgOrNaN(ctxA.pace10)) && ctxA.pace10.length > 0 && isFinite(avgOrNaN(ctxA.pace10)) &&
+                    ctxB.pace10?.length > 0 && isFinite(avgOrNaN(ctxB.pace10)) && ctxB.pace10.length > 0 && isFinite(avgOrNaN(ctxB.pace10));
+  let hasRealRatings = ctxA.ortg10?.length > 0 && isFinite(avgOrNaN(ctxA.ortg10)) &&
+                       ctxA.drtg10?.length > 0 && isFinite(avgOrNaN(ctxA.drtg10)) &&
+                       ctxB.ortg10?.length > 0 && isFinite(avgOrNaN(ctxB.ortg10)) &&
+                       ctxB.drtg10?.length > 0 && isFinite(avgOrNaN(ctxB.drtg10));
+
+  let synPace = leaguePaceBase;
+  if (hasRealPace) {
+    const rawPace = (avgPaceA + avgPaceB) / 2;
+    synPace = clampNumber(rawPace, leaguePaceBase * clamp.min, leaguePaceBase * clamp.max);
+  }
+
+  let projA1H, projB1H;
+  if (isEspnLeague && hasRealRatings && hasRealPace) {
+    const _h1ortgA = avgOrNaN(ctxA.ortg10);
+    const _h1drtgA = avgOrNaN(ctxA.drtg10);
+    const _h1ortgB = avgOrNaN(ctxB.ortg10);
+    const _h1drtgB = avgOrNaN(ctxB.drtg10);
+    const projectedRatingA = _h1ortgA + _h1drtgB - leagueRatingBase;
+    const projectedRatingB = _h1ortgB + _h1drtgA - leagueRatingBase;
+    const halfDivisor = leaguePaceBase * 2;
+    projA1H = (synPace * projectedRatingA) / halfDivisor;
+    projB1H = (synPace * projectedRatingB) / halfDivisor;
+  } else {
+    projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre + bAllowed) / 2 : aS_pre;
+    projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre + aAllowed) / 2 : bS_pre;
+  }
+
+  projA1H *= injMultA;
+  projB1H *= injMultB;
+
+  if (injMultA < 1) projB1H *= (1 + (1 - injMultA) * BB_MAGIC_NUMBERS.INJURY_DEF_MULT);
+  if (injMultB < 1) projA1H *= (1 + (1 - injMultB) * BB_MAGIC_NUMBERS.INJURY_DEF_MULT);
+
+  const aVol1 = getVolatilityRatioForSeries(aS1, volLimit);
+  const bVol1 = getVolatilityRatioForSeries(bS1, volLimit);
+  const combinedVol = Math.max(aVol1, bVol1);
+
+  const intel = computeIntelligencePack(league);
+  const intelSignal = buildTotalMarketIntelSignal(intel);
+  if (isFinite(intelSignal.signal) && intelSignal.signal !== 0) {
+    projA1H = applyDampedIntelSignal(projA1H, intelSignal.signal / 4, bVol1);
+    projB1H = applyDampedIntelSignal(projB1H, intelSignal.signal / 4, aVol1);
+  }
+
+  // Use decay-weighted H2H consistently
+  const aH2H = getH2HSeries("A", "h1", parsed);
+  const bH2H = getH2HSeries("B", "h1", parsed);
+  const h1HasH2H = maybeReadH2HEnabled("h1") && aH2H.length >= 2 && bH2H.length >= 2;
+  if (h1HasH2H) {
+    const massacreH2H = getMassacreH2HSeries("h1", getCurrentFixtureMeta(), parsed);
+    const decayH2HA = massacreH2H.A.length >= 2 ? massacreH2H.A : aH2H;
+    const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
+    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "h1", h1SampleTier, Math.abs(projA1H - projB1H), league, leagueBase1H, 1.0, {
+      enabled: h1HasH2H,
+      injMultA,
+      injMultB,
+      volRatio: combinedVol,
+      blowoutGap: Math.abs(projA1H - projB1H),
+      paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
+    });
+    projA1H = isFinite(projA1H) ? (projA1H * (1 - hw) + avgOrNaN(decayH2HA) * hw) : avgOrNaN(decayH2HA);
+    projB1H = isFinite(projB1H) ? (projB1H * (1 - hw) + avgOrNaN(decayH2HB) * hw) : avgOrNaN(decayH2HB);
+  }
+  let h1Proj = (isFinite(projA1H) ? projA1H : 0) + (isFinite(projB1H) ? projB1H : 0);
+
+  const h1Edge = (isFinite(h1Proj) && isFinite(lines.h1Line) && lines.h1Line > 0) ? h1Proj - lines.h1Line : NaN;
+  return {
+    h1Proj, h1Edge, projA1H, projB1H, h1SampleTier,
+    h1HasH2H, h1ProjectionOnly: !h1HasH2H && h1SampleTier === "thin",
+    h1FullModel: h1SampleTier === "full",
+    paceGapRisk: false, defensiveFloorFlag: false,
+    aVol1, bVol1, aS1: avgOrNaN(aS1), bS1: avgOrNaN(bS1)
+  };
+}
+
+  const sampleSize = Math.min(aS1.length, bS1.length);
+  const leagueBase1H = (eb / 2) * 0.5;
+  // Issue 3: safeAverage for 1H series prevents NaN from cascading into NO PLAY
+  let aS_pre = anchorProjection(safeAverage(aS1, leagueBase1H), sampleSize, leagueBase1H);
+  let bS_pre = anchorProjection(safeAverage(bS1, leagueBase1H), sampleSize, leagueBase1H);
+  aS_pre = applyVolatility(aS_pre, aS1, volLimit, league);
+  bS_pre = applyVolatility(bS_pre, bS1, volLimit, league);
+
+  let aAllowed = safeAverage(aA1, leagueBase1H);
+  let bAllowed = safeAverage(bA1, leagueBase1H);
+
+  // FIX #16: H1 now uses advanced stats (ORTG/DRTG/pace) when available,
+  // consistent with FT. Previously quarters/H1 never used ESPN-fetched rating data.
+  const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
+  const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
+  const leagueRatingBase = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
+
+  const ctxA = g_massacreFetchContext?.A || {};
+  const ctxB = g_massacreFetchContext?.B || {};
+  const avgPaceA = safeAverage(ctxA.pace10, leaguePaceBase);
+  const avgPaceB = safeAverage(ctxB.pace10, leaguePaceBase);
+  const clamp = getEffectivePaceClamp(league);
+
+  let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
+  let hasRealRatings = isFinite(safeAverage(ctxA.ortg10, leagueRatingBase)) && isFinite(safeAverage(ctxA.drtg10, leagueRatingBase)) && isFinite(safeAverage(ctxB.ortg10, leagueRatingBase)) && isFinite(safeAverage(ctxB.drtg10, leagueRatingBase));
+
+  let synPace = leaguePaceBase;
+  if (hasRealPace) {
+    const rawPace = (avgPaceA + avgPaceB) / 2;
+    synPace = clampNumber(rawPace, leaguePaceBase * clamp.min, leaguePaceBase * clamp.max);
+  }
+
+  let projA1H, projB1H;
+  if (isEspnLeague && hasRealRatings && hasRealPace) {
+    const _h1ortgA = safeAverage(ctxA.ortg10, leagueRatingBase);
+    const _h1drtgA = safeAverage(ctxA.drtg10, leagueRatingBase);
+    const _h1ortgB = safeAverage(ctxB.ortg10, leagueRatingBase);
+    const _h1drtgB = safeAverage(ctxB.drtg10, leagueRatingBase);
+    const projectedRatingA = _h1ortgA + _h1drtgB - leagueRatingBase;
+    const projectedRatingB = _h1ortgB + _h1drtgA - leagueRatingBase;
+    // Issue 5: Replace arbitrary 190 with calibrated divisor based on league pace
+    const halfDivisor = leaguePaceBase * 2;
+    projA1H = (synPace * projectedRatingA) / halfDivisor;
+    projB1H = (synPace * projectedRatingB) / halfDivisor;
+  } else {
+    projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre + bAllowed) / 2 : aS_pre;
+    projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre + aAllowed) / 2 : bS_pre;
+  }
+
+  projA1H *= injMultA;
+  projB1H *= injMultB;
+
+  // Issue 1: Defensive multiplier — losing a key defender allows opponent to score more in 1H too
+  if (injMultA < 1) projB1H *= (1 + (1 - injMultA) * BB_MAGIC_NUMBERS.INJURY_DEF_MULT);
+  if (injMultB < 1) projA1H *= (1 + (1 - injMultB) * BB_MAGIC_NUMBERS.INJURY_DEF_MULT);
+
+  const aVol1 = getVolatilityRatioForSeries(aS1, volLimit);
+  const bVol1 = getVolatilityRatioForSeries(bS1, volLimit);
+  const combinedVol = Math.max(aVol1, bVol1);
+
+  // FIX #5: Intel signal applied once here only (not again in applyIntelligenceLayerToPicks)
+  const intel = computeIntelligencePack(league);
+  const intelSignal = buildTotalMarketIntelSignal(intel);
+  if (isFinite(intelSignal.signal) && intelSignal.signal !== 0) {
+    projA1H = applyDampedIntelSignal(projA1H, intelSignal.signal / 4, bVol1);
+    projB1H = applyDampedIntelSignal(projB1H, intelSignal.signal / 4, aVol1);
+  }
+
+  const aH2H = getH2HSeries("A", "h1", parsed);
+  const bH2H = getH2HSeries("B", "h1", parsed);
+  const h1HasH2H = maybeReadH2HEnabled("h1") && aH2H.length >= 2 && bH2H.length >= 2;
+  if (h1HasH2H) {
+    // FIX #18: Use decay-weighted H2H series for consistency with FT
+    const massacreH2H = getMassacreH2HSeries("h1", getCurrentFixtureMeta(), parsed);
+    const decayH2HA = massacreH2H.A.length >= 2 ? massacreH2H.A : aH2H;
+    const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
+    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "h1", h1SampleTier, Math.abs(projA1H - projB1H), league, leagueBase1H, 1.0, {
+      enabled: h1HasH2H,
+      injMultA,
+      injMultB,
+      volRatio: combinedVol,
+      blowoutGap: Math.abs(projA1H - projB1H),
+      paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
+    });
+    projA1H = isFinite(projA1H) ? (projA1H * (1 - hw) + avgOrNaN(decayH2HA) * hw) : avgOrNaN(decayH2HA);
+    projB1H = isFinite(projB1H) ? (projB1H * (1 - hw) + avgOrNaN(decayH2HB) * hw) : avgOrNaN(decayH2HB);
+  }
+  let h1Proj = (isFinite(projA1H) ? projA1H : 0) + (isFinite(projB1H) ? projB1H : 0);
+
+  // FIX #4/#14: h1Proj is authoritative and must NOT be overwritten by the
+  // H1 Alignment block (_distFT.proj * 0.46) in runEngine. That block has been
+  // removed. h1Proj stays as computed here throughout the pick pipeline.
+  const h1Edge = (isFinite(h1Proj) && isFinite(lines.h1Line) && lines.h1Line > 0) ? h1Proj - lines.h1Line : NaN;
+  return {
+    h1Proj, h1Edge, projA1H, projB1H, h1SampleTier,
+    h1HasH2H, h1ProjectionOnly: !h1HasH2H && h1SampleTier === "thin",
+    h1FullModel: h1SampleTier === "full",
+    paceGapRisk: false, defensiveFloorFlag: false,
+    aVol1, bVol1, aS1: avgOrNaN(aS1), bS1: avgOrNaN(bS1)
+  };
+}
+
+
+
+
 
 function getMarketVolLimit(league, marketKey) {
   const cfg = LEAGUE_CONFIG_MAP[String(league || "").toUpperCase()];
@@ -13964,24 +14301,26 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
   const rawB = [];
   const decayWeights = [];
 
-            games.slice(0, weights.length).forEach((g) => {
-            const valueA =
-              marketKey === "ft" ? g.scoreA :
-              marketKey === "h1" ? g.h1A :
-              marketKey === "h2" ? g.h2A :
-              marketKey === "q1" ? g.q1A :
-              marketKey === "q2" ? g.q2A :
-              marketKey === "q3" ? g.q3A :
-              marketKey === "q4" ? g.q4A : 0;
+  games.slice(0, weights.length).forEach((g) => {
+    const teamAIsHome = fixtureHomeId && String(g.teamAId || "") === fixtureHomeId;
 
-            const valueB =
-              marketKey === "ft" ? g.scoreB :
-              marketKey === "h1" ? g.h1B :
-              marketKey === "h2" ? g.h2B :
-              marketKey === "q1" ? g.q1B :
-              marketKey === "q2" ? g.q2B :
-              marketKey === "q3" ? g.q3B :
-              marketKey === "q4" ? g.q4B : 0;
+    const valueA =
+      marketKey === "ft" ? (teamAIsHome ? g.scoreA : g.scoreB) :
+      marketKey === "h1" ? (teamAIsHome ? g.h1A : g.h1B) :
+      marketKey === "h2" ? (teamAIsHome ? g.h2A : g.h2B) :
+      marketKey === "q1" ? (teamAIsHome ? g.q1A : g.q1B) :
+      marketKey === "q2" ? (teamAIsHome ? g.q2A : g.q2B) :
+      marketKey === "q3" ? (teamAIsHome ? g.q3A : g.q3B) :
+      marketKey === "q4" ? (teamAIsHome ? g.q4A : g.q4B) : 0;
+
+    const valueB =
+      marketKey === "ft" ? (teamAIsHome ? g.scoreB : g.scoreA) :
+      marketKey === "h1" ? (teamAIsHome ? g.h1B : g.h1A) :
+      marketKey === "h2" ? (teamAIsHome ? g.h2B : g.h2A) :
+      marketKey === "q1" ? (teamAIsHome ? g.q1B : g.q1A) :
+      marketKey === "q2" ? (teamAIsHome ? g.q2B : g.q2A) :
+      marketKey === "q3" ? (teamAIsHome ? g.q3B : g.q3A) :
+      marketKey === "q4" ? (teamAIsHome ? g.q4B : g.q4A) : 0;
 
     // [FIX 6/15: SEASON DECAY] Collect both scores as a pair so the same decay weight
     // applies to both A and B for the same game. Only push when both are valid.
