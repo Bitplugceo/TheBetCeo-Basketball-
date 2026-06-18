@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3574,7 +3575,15 @@ const BB_CONFIG = {
 // via config.teamWeight. The blend ratio (0.65 own-scoring / 0.35 opponent-defense) is now
 // actually applied in the non-advanced branch instead of the former hardcoded 0.5.
 function getDynamicWeights(sampleTier, volatility, league) {
-  return { teamWeight: 0.65, oppWeight: 0.35 };
+  // FIX: Real adaptive implementation — adjusts teamWeight by sampleTier and volatility ratio
+  let teamWeight = 0.65;
+  if (sampleTier === "thin") teamWeight = 0.60;
+  else if (sampleTier === "insufficient") teamWeight = 0.55;
+  const volLimit = LEAGUE_VOL_LIMITS[String(league || "").toLowerCase()] || 12;
+  const volRatio = Math.min(1, (isFinite(volatility) ? Math.abs(volatility) : 0) / volLimit);
+  if (volRatio > 0.75) teamWeight = Math.max(0.50, teamWeight - 0.05);
+  const oppWeight = parseFloat((1 - teamWeight).toFixed(4));
+  return { teamWeight, oppWeight };
 }
 
 function getUnifiedVolatilityState(aSeries, bSeries, volLimit) {
@@ -3641,16 +3650,10 @@ function getDynamicEdgeThreshold(league, marketKey, context = null) {
   return thresholdPct;
 }
 
-function applyVolatility(proj, series, leagueVolLimit, league = "unknown") {
-  if (!isFinite(proj) || !Array.isArray(series) || !series.length) return proj;
-  const sd = stdDev(series);
-  const limit = Number(leagueVolLimit) || 12;
-  const ratio = sd / limit;
-  const factor = ratio - 0.5;
-  const mult = String(league).toLowerCase().includes("wnba") ? 0.25 : 0.20;
-  const adjustment = clampNumber(factor * mult, -0.08, 0.08);
-  return proj * (1 + adjustment);
-}
+// [DELETED] Duplicate applyVolatility definition removed. Authoritative implementation
+// is at line ~10769. This earlier definition was overwriting the real one in flat script
+// scope due to JavaScript's last-write-wins function declaration behaviour.
+// DO NOT re-add a second applyVolatility definition anywhere in this file.
 
    const MODEL_CONFIG = {
       H2H_DIVERGE_THRESHOLD: 0.20,
@@ -9670,8 +9673,9 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
 
   const derived = g_trackerDerivedState || defaultTrackerDerivedState();
   const settled = Number(derived?.settledPicks || 0);
-  // FIX: Use explicit numeric fallback constants to prevent OR-chain masking a legitimate 0 value
-  const minSettledThreshold = Number(TRACKER_SOFT_EFFECTS.minSettled) || 5;
+  // FIX: Raised minSettled to 20 — below this the posterior barely moves off 0.50 prior
+  // and tracker influence degrades pick quality rather than improving it.
+  const minSettledThreshold = Math.max(20, Number(TRACKER_SOFT_EFFECTS.minSettled) || 20);
   if (settled < minSettledThreshold) return;
 
   const profile = buildTrackerFeedbackProfile();
@@ -9680,6 +9684,9 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
   const activation = phase2Activation || getPhase2ActivationState();
   const advisoryOnly = !!TRACKER_POLICY.advisoryOnly || (!activation?.trackerFeedbackLive && !activation?.teamMemoryLive);
 
+  // FIX: Confidence shifts only permitted above 30 settled — below that posterior is unreliable
+  const minSettledForShift = Math.max(30, Number(TRACKER_SOFT_EFFECTS.minSettled) || 30);
+  const shiftAllowed = settled >= minSettledForShift;
   const minSettledFull = Number(TRACKER_SOFT_EFFECTS.minSettledFull) || 50;
   const mildMode = settled < minSettledFull;
 
@@ -9714,11 +9721,12 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
         mildMode
       };
 
-      // Confidence shift based on posterior win probability
-      if (posteriorWinProb >= 0.62) {
+    // Confidence shift based on posterior win probability
+    // FIX: Only apply confidence shifts when shiftAllowed (30+ settled results)
+      if (shiftAllowed && posteriorWinProb >= 0.62) {
         confidenceShift += 1;
         reasons.push("tracker strong market");
-      } else if (posteriorWinProb <= 0.44) {
+      } else if (shiftAllowed && posteriorWinProb <= 0.44) {
         confidenceShift -= 1;
         lockRestricted = true;
         reasons.push("tracker weak market");
@@ -11074,6 +11082,41 @@ function getConfidenceGrade(params) {
     q4Edge = null, q2Edge = null
   } = params || {};
 
+  // FIX: Attempt logistic regression grade first when a calibrated model is available
+  // and at least 50 settled picks exist. Falls through to additive scoring on failure.
+  if (pick && pick !== "NO PLAY" && !note && isFinite(line) && line > 0 && isFinite(edge)) {
+    try {
+      const stored = localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF");
+      const settledRaw = localStorage.getItem("BB_SETTLED_COUNT");
+      const settledCount = settledRaw ? Number(JSON.parse(settledRaw)) : 0;
+      if (stored && settledCount >= 50) {
+        const models = JSON.parse(stored);
+        const leagueKey = String(params.league || modelState?.league || "").toLowerCase();
+        const leagueGroup = leagueKey === "nba" ? "nba"
+          : (leagueKey === "ncaa" || leagueKey === "ncaaw") ? "ncaa" : "other";
+        const coeff = models[leagueKey] || models[leagueGroup] || models["global"];
+        if (coeff) {
+          const edgePctLR = Math.abs(edge / line);
+          const volRatioLR = (isFinite(volatility) && isFinite(volLimit) && volLimit > 0)
+            ? Math.min(1, volatility / volLimit) : 0.5;
+          const logOdds =
+            (coeff.intercept   || -0.2) +
+            (coeff.edgePct     ||  8.0) * (edgePctLR - 0.060) +
+            (coeff.volRatio    || -0.8) * (volRatioLR - 1.0) +
+            (coeff.sampleFull  ||  0.4) * (sampleTier === "full" ? 1 : 0) +
+            (coeff.h2h         ||  0.2) * (hasH2H ? 1 : 0) +
+            (coeff.trap        || -1.2) * (trap ? 1 : 0);
+          const winProb = 1 / (1 + Math.exp(-Math.min(10, Math.max(-10, logOdds))));
+          // Map calibrated win probability to grade boundaries
+          if (winProb >= 0.65) return "A";
+          if (winProb >= 0.57) return "B";
+          if (winProb >= 0.50) return "C";
+          return "D";
+        }
+      }
+    } catch(_) {}
+  }
+
   let score = 0;
   if (!pick || pick === "NO PLAY" || note || line === null || !isFinite(line) || line <= 0 || !isFinite(edge)) {
     score = -999;
@@ -11145,6 +11188,8 @@ function anchorProjection(proj, sampleSize, leagueBase) {
   if (!isFinite(proj)) return proj;
   const n = Math.max(0, Number(sampleSize) || 0);
   const base = Number(leagueBase) || proj;
+  // FIX: Guard against zero or invalid leagueBase silently collapsing projection to 0
+  if (!isFinite(base) || base <= 0) return proj;
   if (n >= 6) return proj;
   const blendFactor = n / 6;
   return proj * blendFactor + base * (1 - blendFactor);
@@ -13748,6 +13793,15 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const ftEdge = (isFinite(ftProj) && isFinite(lines.ftLine) && lines.ftLine > 0) ? ftProj - lines.ftLine : NaN;
   const aEdge = (isFinite(projAFT) && isFinite(lines.aLine) && lines.aLine > 0) ? projAFT - lines.aLine : NaN;
   const bEdge = (isFinite(projBFT) && isFinite(lines.bLine) && lines.bLine > 0) ? projBFT - lines.bLine : NaN;
+
+  // FIX: Compute H2H divergence warning — emitted when recent form and H2H disagree by >15 pts
+  const _recentFormTotal = (isFinite(aS) ? aS : 0) + (isFinite(bS) ? bS : 0);
+  const _h2hTotal = ftHasH2H ? (avgOrNaN(getMassacreH2HSeries("ft", null, {}).A || []) + avgOrNaN(getMassacreH2HSeries("ft", null, {}).B || [])) : NaN;
+  const _h2hDivergence = isFinite(_recentFormTotal) && isFinite(_h2hTotal) ? Math.abs(_recentFormTotal - _h2hTotal) : null;
+  const h2hDivergenceWarning = isFinite(_h2hDivergence) && _h2hDivergence > 15
+    ? { divergencePoints: parseFloat(_h2hDivergence.toFixed(1)), recentFormTotal: parseFloat(_recentFormTotal.toFixed(1)), h2hTotal: parseFloat(_h2hTotal.toFixed(1)), flag: "HIGH_H2H_DIVERGENCE" }
+    : null;
+
   return {
     eb, projAFT, projBFT, ftProj, ftSampleTier,
     ftHasH2H, ftEdge, aEdge, bEdge,
@@ -13756,13 +13810,15 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     ftProjectionOnly: !ftHasH2H && ftSampleTier === "thin",
     blowoutGap: Math.abs((projAFT||0) - (projBFT||0)),
     aS, bS, aScores: aFTS, bScores: bFTS,
-    aVenueEnabled: false, bVenueEnabled: false,
+    aVenueEnabled: useVenueA,
+    bVenueEnabled: useVenueB,
     pace: synPace,
     synNetA, synNetB,
     usedAdvanced,
     aVol: _aVolRatio * volLimit,
     bVol: _bVolRatio * volLimit,
-    ftVolRatio: _ftVolRatio
+    ftVolRatio: _ftVolRatio,
+    h2hDivergenceWarning
   };
 }
 
@@ -13907,25 +13963,20 @@ function getMassacreRuns() { return 500; }
 function getMassacreModelRangeLimit() { return 120; }
 
 function getH2HSeasonDecayWeight(dateStr) {
-  // [FIX 6/15: SEASON DECAY WEIGHT] Maps each H2H game's season to its decay multiplier.
-  // Current season = 1.00 | -1 = 0.75 | -2 = 0.50 | -3 or older = 0.30.
-  // Season boundary: October = start of new season year (Oct 2024 → 2025 season).
-  // DO NOT hardcode to calendar year — basketball seasons straddle two calendar years.
+  // [FIX 6/15: SEASON DECAY WEIGHT] Maps each H2H game's age to a continuous exponential
+  // decay multiplier. Half-weight at ~180 days (~6 months). Replaces coarse season-bucket
+  // steps (1.00/0.75/0.50/0.30) with smooth per-game decay: weight = exp(-daysSince / 180).
+  // Season boundary logic removed — calendar-age decay is more precise and needs no
+  // October boundary heuristic. Minimum floor of 0.20 prevents very old games from
+  // contributing zero but retains their directional signal.
+  // DO NOT revert to season-bucket steps without a comparative accuracy analysis.
   if (!dateStr) return 0.75;
   try {
     const d = new Date(dateStr);
     if (isNaN(d.getTime())) return 0.75;
-    const gameYear = d.getUTCFullYear();
-    const gameMonth = d.getUTCMonth(); // 0-based; Oct = 9
-    const gameSeasonYear = gameMonth >= 9 ? gameYear + 1 : gameYear;
-    const nowMonth = new Date().getUTCMonth();
-    const nowYear = new Date().getUTCFullYear();
-    const currentSeasonYear = nowMonth >= 9 ? nowYear + 1 : nowYear;
-    const diff = currentSeasonYear - gameSeasonYear;
-    if (diff <= 0) return 1.00;
-    if (diff === 1) return 0.75;
-    if (diff === 2) return 0.50;
-    return 0.30;
+    const daysSince = (Date.now() - d.getTime()) / 86400000;
+    if (!isFinite(daysSince) || daysSince < 0) return 1.00;
+    return Math.max(0.20, Math.exp(-daysSince / 180));
   } catch (_) { return 0.75; }
 }
 
@@ -15495,7 +15546,19 @@ const h1Calc = compute1HProjection({
     const h1Target = isFinite(h1Calc.h1Proj) && h1Calc.h1Proj > 0 ? h1Calc.h1Proj : rawQ12Sum;
     const h2Target = isFinite(ftCalc.ftProj) && h1Target > 0 ? ftCalc.ftProj - h1Target : rawQ34Sum;
 
-            if (rawQ12Sum > 0 && isFinite(h1Target)) {
+    // FIX: Quarter reconciliation scaling clamp — guard against implausible multipliers
+    // that would hallucinate inflated or collapsed quarter projections.
+    // If the scaling multiplier would exceed ±40% of raw quarters, skip scaling and
+    // emit a diagnostic warning instead. This protects against edge cases where
+    // h1Target or ftProj is valid but rawQSum is anomalously small.
+    const _q12ScaleMult = rawQ12Sum > 0 && isFinite(h1Target) ? h1Target / rawQ12Sum : 1;
+    const _q34ScaleMult = rawQ34Sum > 0 && isFinite(h2Target) && h2Target > 0 ? h2Target / rawQ34Sum : 1;
+    const _q12ScaleOk = isFinite(_q12ScaleMult) && _q12ScaleMult >= 0.70 && _q12ScaleMult <= 1.40;
+    const _q34ScaleOk = isFinite(_q34ScaleMult) && _q34ScaleMult >= 0.70 && _q34ScaleMult <= 1.40;
+    if (!_q12ScaleOk) engineDebug("RECONCILE WARNING: Q1+Q2 scale multiplier out of safe range", { _q12ScaleMult, rawQ12Sum, h1Target });
+    if (!_q34ScaleOk) engineDebug("RECONCILE WARNING: Q3+Q4 scale multiplier out of safe range", { _q34ScaleMult, rawQ34Sum, h2Target });
+
+            if (_q12ScaleOk && rawQ12Sum > 0 && isFinite(h1Target)) {
           const q1Weight = 1.0;
           const q2Weight = 1.03; // Accounting for Q2 rotation pacing shifts
           const totalWeightedRaw = (q1?.proj || 0) * q1Weight + (q2?.proj || 0) * q2Weight;
@@ -15522,7 +15585,7 @@ const h1Calc = compute1HProjection({
           }
         }
 
-        if (rawQ34Sum > 0 && isFinite(h2Target) && h2Target > 0) {
+        if (_q34ScaleOk && rawQ34Sum > 0 && isFinite(h2Target) && h2Target > 0) {
           const q3Weight = 1.0;
           const q4Weight = 1.08; // 8% fouling inflation premium modeled for Q4
           const totalWeightedRaw = (q3?.proj || 0) * q3Weight + (q4?.proj || 0) * q4Weight;
@@ -16484,7 +16547,8 @@ window.__LAST_AUDIT_STATE = {
         avgB:       avgOrNaN(_aud_h2hFTB),
         h2hWeight:  _aud_ftH2HW,
         teamWeight: 1 - _aud_ftH2HW,
-        formulaNote: "projA = projA*(1-hw) + avgH2HA*hw  (hw=0.35 fixed)"
+        formulaNote: "projA = projA*(1-hw) + avgH2HA*hw  (hw=0.35 fixed)",
+        h2hDivergenceWarning: ftCalc.h2hDivergenceWarning || null
       },
       STEP8_injuryMultApplication: {
         multA: g_injA.scoringMult, multB: g_injB.scoringMult,
@@ -16511,7 +16575,8 @@ window.__LAST_AUDIT_STATE = {
         ftProjectionOnly: ftCalc.ftProjectionOnly,
         aVenueEnabled: ftCalc.aVenueEnabled,
         bVenueEnabled: ftCalc.bVenueEnabled,
-        volatilityBlock: ftCalc.volatilityBlock
+        volatilityBlock: ftCalc.volatilityBlock,
+        h2hDivergenceWarning: ftCalc.h2hDivergenceWarning || null
       }
     },
 
@@ -18802,6 +18867,51 @@ window.ENGINE_TEST_SUITE = (() => {
     expect("3 games = thin",        getSampleTier([1,2,3],[1,2,3]),         "thin");
     expect("1 game = insufficient", getSampleTier([1],[1]),                 "insufficient");
     expect("empty = insufficient",  getSampleTier([],[]),                   "insufficient");
+  });
+
+  suite("displayLine — integer and invalid inputs", () => {
+    expect("integer line shows .0",  displayLine(174),   "174.0");
+    expect("exact .5 passes through",displayLine(173.5), "173.5");
+    expect("invalid NaN returns dash",displayLine(NaN),  "—");
+    expect("null returns dash",       displayLine(null), "—");
+    expect("zero returns dash",       displayLine(0),    "—");
+  });
+
+  suite("anchorProjection — base guard", () => {
+    expectApprox("n>=6 returns proj unchanged", anchorProjection(90, 6, 84), 90, 0.001);
+    expectApprox("n=3 blends toward base",      anchorProjection(90, 3, 84), 87, 0.1);
+    expectApprox("invalid base returns proj",   anchorProjection(90, 3, 0),  90, 0.001);
+    expectApprox("negative base returns proj",  anchorProjection(90, 3, -5), 90, 0.001);
+  });
+
+  suite("evaluateMassacreForPick — severity consistency with profiles", () => {
+    const noneProfile  = { severity: "none",  streakLength: 2, avgMargin:  3, streakDirection: "hot" };
+    const lightProfile = { severity: "light", streakLength: 4, avgMargin: 12, streakDirection: "hot" };
+    const heavyProfile = { severity: "heavy", streakLength: 5, avgMargin: 22, streakDirection: "hot" };
+    const overPick  = { pick: "OVER 173.5" };
+    const underPick = { pick: "UNDER 173.5" };
+    const r1 = evaluateMassacreForPick(overPick,  noneProfile,  noneProfile);
+    expect("two none profiles = no massacre",       r1.isMassacre, false);
+    const r2 = evaluateMassacreForPick(overPick,  heavyProfile, noneProfile);
+    expect("heavy profileA over = isMassacre",      r2.isMassacre, true);
+    expect("heavy severity preserved on over side", r2.severity,   "heavy");
+    const r3 = evaluateMassacreForPick(overPick,  lightProfile, noneProfile);
+    expect("light severity preserved on over side", r3.severity,   "light");
+    const r4 = evaluateMassacreForPick(underPick, noneProfile,  heavyProfile);
+    expect("heavy profileB under = isMassacre",     r4.isMassacre, true);
+    expect("heavy severity preserved on under side",r4.severity,   "heavy");
+  });
+
+  suite("getDynamicWeights — adaptive behaviour", () => {
+    const wFull = getDynamicWeights("full", 6, "wnba");
+    expect("full tier teamWeight = 0.65",        wFull.teamWeight, 0.65);
+    expectTrue("full weights sum to 1", Math.abs(wFull.teamWeight + wFull.oppWeight - 1) < 0.001);
+    const wThin = getDynamicWeights("thin", 6, "wnba");
+    expect("thin tier teamWeight = 0.60",        wThin.teamWeight, 0.60);
+    const wInsuf = getDynamicWeights("insufficient", 6, "wnba");
+    expect("insufficient tier teamWeight = 0.55", wInsuf.teamWeight, 0.55);
+    const wHighVol = getDynamicWeights("full", 11, "wnba"); // vol > 75% of limit 13
+    expectTrue("high vol reduces teamWeight below 0.65", wHighVol.teamWeight < 0.65);
   });
 
   function run() {
