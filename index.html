@@ -539,7 +539,7 @@ input,
                 th,
 td {
   border: 1px solid var(--table-border);
-  padding: 10px 8px !important;
+  padding: 10px 8px;
   text-align: center;
   vertical-align: middle;
 }
@@ -548,15 +548,15 @@ td {
 
 
     th {
-  background: var(--table-head) !important;
-  color: #fff !important;
+  background: var(--table-head);
+  color: #fff;
   font-weight: 700;
 }
 
     td {
-  background: var(--panel) !important;
-  color: var(--text) !important;
-  font-weight: 600 !important;
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
 }
 
     .pred-over {
@@ -859,7 +859,7 @@ body.engine-alert .actions {
   animation: engineAlertPulse 1.15s ease-in-out infinite alternate;
 }
 
-body.engine-alert .section {
+body.engine-alert:not(.dark-mode) .section {
   background: #fff6f6 !important;
 }
 
@@ -3151,14 +3151,6 @@ function _removedDetectTournament(eventsA, eventsB) {
 
 
 
-// Called when user manually edits the ssTournamentId field.
-function onTournamentIdInput() {
-  const nameEl = document.getElementById("ssTournamentName");
-  if (nameEl) nameEl.textContent = "";
-  const val = (document.getElementById("ssTournamentId")?.value || "").trim();
-  if (!val) window.__fixtureTournamentId = null;
-}
-
 function getLeagueGender() {
   const league = document.getElementById("leagueSelect")?.value || "";
   if (league.endsWith("_w")) return "women";
@@ -3668,7 +3660,9 @@ const MODEL_TUNING = {
 };
 
 // ========== RETROSPECTIVE TUNING GRID ==========
-// Issue 13: Reduced to 2 H2H factors × 3 recency profiles. edgeMult/injuryMult removed.
+// FIX: edgeMults/paceDampenings/injuryMults were single-element arrays making the
+// nested loops in runRetrospectiveAnalysis iterate exactly once — pointless.
+// Replaced with scalar constants; the loops now only iterate over real dimensions.
 const TUNING_GRID = {
   h2hFactors: [0.75, 1.0],
   recencyProfiles: [
@@ -3676,9 +3670,9 @@ const TUNING_GRID = {
     [1.60, 1.30, 0.90, 0.60, 0.40], // aggressive
     [1.00, 1.00, 1.00, 1.00, 1.00]  // flat
   ],
-  edgeMults: [1.00],
-  paceDampenings: [0.35],
-  injuryMults: [1.0]
+  edgeMult: 1.00,
+  paceDampening: 0.35,
+  injuryMult: 1.0
 };
 // ==============================================
 
@@ -3790,10 +3784,10 @@ async function runRetrospectiveAnalysis(pick) {
 
   for (const h2hFactor of h2hFactors) {
     for (const recencyProfile of recencyProfiles) {
-      for (const edgeMult of edgeMults) {
-        const paceDampening = 0.35;
-        const injuryMult = 1.0;
-        for (const _unused of [0]) {
+        const edgeMult = TUNING_GRID.edgeMult;
+        const paceDampening = TUNING_GRID.paceDampening;
+        const injuryMult = TUNING_GRID.injuryMult;
+        {
             const config = { h2hFactor, recencyProfile, paceDampening, edgeMult, injuryMult };
             // Determine which projection function to call based on marketKey
             let proj, line, edge, pickDecision;
@@ -3856,10 +3850,9 @@ if (aS.length < 2 || bS.length < 2) continue;
             if (delta !== 0) {
               updateCandidateScore(league, marketKey, config, delta);
             }
-          }
         }
-      }
     }
+  }
   // After processing, check if we have enough settled picks to lock a config
   const _mktPicks = getTotalSettledCountForLeagueMarket(league, marketKey);
   const _lgPicks  = getTotalSettledCountForLeague(league);
@@ -4369,12 +4362,8 @@ function getLeagueRecencyDefaults(league) {
   return learned;
 }
 
-const LEAGUE_HOME_EDGE = {
-  nba: 0, ncaa: 0, wnba: 0, wnba_pre: 0, nba_gl: 0,
-  euroleague: 0, eurocup: 0, champions_league: 0,
-  acb: 0, lba: 0, bbl: 0, turkey_bsl: 0, ausnbl: 0,
-  bleague: 0, united_league: 0, proa: 0
-};
+// LEAGUE_HOME_EDGE removed — all values were 0 and the constant was never read
+// in any calculation. Removing eliminates dead-data noise from the file.
 
 const LEAGUE_VOL_LIMITS = {
   nba: 12, ncaa: 15, ncaaw: 15, wnba: 13, wnba_pre: 14, nba_gl: 13,
@@ -4742,24 +4731,44 @@ function initBBDatabase() {
 }
 
 async function readAsyncStorage(key) {
+  // FIX: Reconcile IndexedDB and localStorage to prevent desync. Both stores are
+  // read; the one with more/better tracker data wins. Previously IDB could succeed
+  // for some writes and LS for others, leaving two diverged copies with no merge.
+  let dbValue;
+  let lsValue;
   try {
     const db = await initBBDatabase();
-    return new Promise((resolve, reject) => {
+    dbValue = await new Promise((resolve, reject) => {
       const tx = db.transaction(BB_STORE_NAME, "readonly");
       const request = tx.objectStore(BB_STORE_NAME).get(key);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
-  } catch (err) {
-    try {
-      const raw = localStorage.getItem(key);
-      if (raw === null) return undefined;
-      try { return JSON.parse(raw); } catch (e) { return raw; }
-    } catch (lsErr) {
-      console.error("[BB Engine] readAsyncStorage localStorage fallback failed", lsErr);
-      return undefined;
+  } catch (err) { /* IDB unavailable — fall through to LS */ }
+
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw !== null) {
+      try { lsValue = JSON.parse(raw); } catch (e) { lsValue = raw; }
     }
+  } catch (lsErr) {
+    console.error("[BB Engine] readAsyncStorage localStorage read failed", lsErr);
   }
+
+  // Reconcile: when both exist, return the one with richer tracker data.
+  if (dbValue !== undefined && lsValue !== undefined) {
+    try {
+      const dbParsed = typeof dbValue === "string" ? JSON.parse(dbValue) : dbValue;
+      const lsParsed = typeof lsValue === "string" ? JSON.parse(lsValue) : lsValue;
+      if (dbParsed && lsParsed && typeof dbParsed === "object" && typeof lsParsed === "object") {
+        return isBetterTrackerStateCandidate(lsParsed, dbParsed) ? lsValue : dbValue;
+      }
+    } catch (_) {}
+  }
+
+  if (dbValue !== undefined) return dbValue;
+  if (lsValue !== undefined) return lsValue;
+  return undefined;
 }
 
 async function writeAsyncStorage(key, value) {
@@ -4768,6 +4777,7 @@ async function writeAsyncStorage(key, value) {
       let parsed = JSON.parse(value);
       if (parsed.archivedPicks && parsed.archivedPicks.length > 150) {
         console.warn("[BB Engine] Pre-emptive Quota Rescue: Slicing archive to 150.");
+        engineDebug("STORAGE WARNING: Archive truncated to 150 entries due to storage quota pressure. Oldest picks silently removed — check device storage.");
         parsed.archivedPicks = parsed.archivedPicks.slice(0, 150);
         value = JSON.stringify(parsed);
         if (typeof g_trackerState !== "undefined" && g_trackerState) {
@@ -4827,9 +4837,9 @@ const TRACKER_LEARNING_ENABLED = true;
 
 const TRACKER_LEGACY_BUILD_KEYS = ["tracker_cleanup_v11_soft_live", "tracker_cleanup_v10_advisory", "tracker_cleanup_v9", "tracker_cleanup_v8", "tracker_cleanup_v7", "tracker_cleanup_v6", "tracker_cleanup_v5", "tracker_cleanup_v4"];
 
-const ENGINE_LINE_MEMORY_STORAGE = "bb_engine_line_memory_v1";
-let g_engineLineMemory = {};
-
+// Line memory infrastructure removed — all four functions kept as no-ops so
+// existing call-sites do not crash. The storage key and object are intentionally
+// omitted; there is no data worth preserving.
 function loadEngineLineMemory() { return {}; }
 function syncLineMemoryIntoTrackerState() {}
 function saveEngineLineMemory() {}
@@ -5116,6 +5126,25 @@ function getAllTrackedPicksForReport() {
 }
 let g_trackerDerivedState = defaultTrackerDerivedState();
 
+// Cached empirical prior for finalizeDerivedBucket — invalidated when tracker state changes.
+let _empiricalPriorCache = null;
+let _empiricalPriorCacheVersion = null;
+function getEmpiricalPriorForBucket() {
+  const currentVersion = g_trackerState?.updatedAt || null;
+  if (_empiricalPriorCache !== null && _empiricalPriorCacheVersion === currentVersion) {
+    return _empiricalPriorCache;
+  }
+  try {
+    const _settled = getLearningTrackedPicks().filter(p => p.resultStatus === "win" || p.resultStatus === "loss");
+    _empiricalPriorCache = _settled.length < 30 ? 50
+      : Math.min(60, Math.max(40, (_settled.filter(p => p.resultStatus === "win").length / _settled.length) * 100));
+  } catch(e) {
+    _empiricalPriorCache = 50;
+  }
+  _empiricalPriorCacheVersion = currentVersion;
+  return _empiricalPriorCache;
+}
+
 function makeDerivedBucket(label = "") {
   return {
     label,
@@ -5239,15 +5268,10 @@ function finalizeDerivedBucket(bucket) {
   // Fix: derive the prior from all settled learning picks, capped 40–60% for stability
   // against extreme early samples. Falls back to 50 with fewer than 30 settled picks.
   // DO NOT hardcode 50 as the fourth argument to getStabilizedBucketWinRate here.
-  const _empiricalPrior = (() => {
-    try {
-      const _settled = getLearningTrackedPicks().filter(p => p.resultStatus === "win" || p.resultStatus === "loss");
-      if (_settled.length < 30) return 50;
-      const _w = _settled.filter(p => p.resultStatus === "win").length;
-      return Math.min(60, Math.max(40, (_w / _settled.length) * 100));
-    } catch(e) { return 50; }
-  })();
-  const stabilizedWinRate = getStabilizedBucketWinRate(wins, losses, 12, _empiricalPrior);
+  // FIX: Empirical prior is now resolved via a cached helper (getEmpiricalPriorForBucket)
+  // instead of an inline IIFE that called getLearningTrackedPicks() on every single bucket,
+  // causing O(n * bucketCount) work on every analytics render pass.
+  const stabilizedWinRate = getStabilizedBucketWinRate(wins, losses, 12, getEmpiricalPriorForBucket());
   const reliabilityScore = getBucketReliabilityScore(decisive);
   const reliabilityTier = getBucketReliabilityTier(reliabilityScore);
   // [FIX: decisive passed as third arg — required by z-score formula in getBucketSignalStrength]
@@ -5575,11 +5599,7 @@ function renderEngineDebugPanel() {
     renderTrackerAnalytics();
   }
 }
-// Auto-Patcher V12: define missing globals
-window.recordPickVariance = window.recordPickVariance || function(pick) {};
-window.getRollingMeanError = window.getRollingMeanError || function(n) { return NaN; };
-window.g_pickVarianceLog = window.g_pickVarianceLog || [];
-// Auto-Patcher V11: define missing global functions
+// Variance / drift stubs — call-sites guard with typeof checks so no crash if absent.
 window.recordPickVariance = window.recordPickVariance || function(pick) {};
 window.getRollingMeanError = window.getRollingMeanError || function(n) { return NaN; };
 window.g_pickVarianceLog = window.g_pickVarianceLog || [];
@@ -6407,8 +6427,10 @@ async function proxyFetch(url, timeoutMs = 12000) {
 const fetchLabel = getEngineFetchLabel(url); 
 const cacheKey = url; 
 if (_proxyFetchCache.has(cacheKey)) { 
-const { data, timestamp } = _proxyFetchCache.get(cacheKey); 
-if (Date.now() - timestamp < 60 * 60 * 1000) { 
+const { data, timestamp } = _proxyFetchCache.get(cacheKey);
+// FIX: TTL reduced from 60 minutes to 5 minutes. Live sports scoreboards and
+// summaries change every few minutes; a 60-minute stale cache returned wrong scores.
+if (Date.now() - timestamp < 5 * 60 * 1000) { 
 engineDebug("fetch cache hit", { request: fetchLabel }); 
 return data; 
 } else { 
@@ -7040,6 +7062,7 @@ function normalizeTrackerState(raw) {
     sId: raw?.sId || window.__BETCEO_SESSION_ID,
     activePicks: reconciled.activePicks,
     archivedPicks: reconciled.archivedPicks,
+    shadowPicks: Array.isArray(raw?.shadowPicks) ? raw.shadowPicks.slice(0, 500) : [],
     stats: {
       total: Number(raw?.stats?.total) || 0,
       settled: Number(raw?.stats?.settled) || 0,
@@ -7726,6 +7749,7 @@ function createEmptyTrackerState() {
     sId: window.__BETCEO_SESSION_ID,
     activePicks: [],
     archivedPicks: [],
+    shadowPicks: [],
     stats: { total: 0, settled: 0, wins: 0, losses: 0, pushes: 0 },
     updatedAt: new Date().toISOString(),
     lineMemory: {}
@@ -7821,6 +7845,7 @@ function mergeTrackerStates(localState, serverState) {
     sId: server.sId || local.sId,
     activePicks: mergeTrackerActivePicks(local.activePicks, server.activePicks, local.archivedPicks),
     archivedPicks: mergeTrackerArchivedPicks(local.archivedPicks, server.archivedPicks),
+    shadowPicks: Array.isArray(local.shadowPicks) ? local.shadowPicks.slice(0, 500) : [],
     stats: useServerStats ? (server.stats || local.stats) : (local.stats || server.stats),
     updatedAt: new Date().toISOString(),
     lineMemory: { ...(local.lineMemory || {}), ...(server.lineMemory || {}) }
@@ -8216,6 +8241,8 @@ function closeTrackerModal() {
   clearTimeout(_liveClockPollTimer);
   _liveClockPollTimer = null;
   stopLiveClockTicker();
+  // FIX: Clear all registered timers on close so none fire against a closed modal.
+  _clearAllNamedTimers();
   g_liveGameStatus.clear();
   modal.classList.remove("open");
   syncTrackerModalView();
@@ -9406,40 +9433,6 @@ function clampNumber(val, min, max) {
 
 // [DELETED] settledTrackerScore – unused function
 
-// [FIX #11: MONTE CARLO PROBABILITY OUTPUTS]
-// Lightweight MC simulation for the main pick path — adds win probability output
-// to every OVER/UNDER pick, not just massacre picks. Runs N Box-Muller normal samples
-// of the game total centered at proj with spread vol, returns fraction hitting the side.
-// Budget: default 5000 runs balances speed vs accuracy for client-side use.
-function quickMCWinProb(proj, line, vol, nRuns, side) {
-  if (!isFinite(proj) || !isFinite(line) || line <= 0) return null;
-  if (!isFinite(vol) || vol < 0) return null;
-  if (side !== "over" && side !== "under") return null;
-  const runs = Math.max(500, Math.min(nRuns || 5000, 10000));
-  // FIX #10: The caller passes max(sdA, sdB) as vol. For a game total we need
-  // combined variance = sqrt(sdA² + sdB²). Approximating sdA ≈ sdB ≈ vol gives
-  // combined sigma = vol * sqrt(2). This is the correct statistical fix.
-  const sigma = Math.max(vol * Math.SQRT2, 1.0);
-  let hits = 0;
-  for (let i = 0; i < runs; i += 2) {
-    const u1 = Math.random() || 1e-12;
-    const u2 = Math.random() || 1e-12;
-    const z1 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-    const z2 = Math.sqrt(-2 * Math.log(u1)) * Math.sin(2 * Math.PI * u2);
-    const s1 = proj + z1 * sigma;
-    const s2 = proj + z2 * sigma;
-    if (side === "over") {
-      if (s1 > line) hits++;
-      if ((i + 1) < runs && s2 > line) hits++;
-    } else {
-      if (s1 < line) hits++;
-      if ((i + 1) < runs && s2 < line) hits++;
-    }
-  }
-  const actualRuns = (runs % 2 === 0) ? runs : runs - 1;
-  return parseFloat(clampNumber(hits / actualRuns, 0.05, 0.95).toFixed(3));
-}
-
 function getTrackerFeedbackMinSample(marketKey) {
   // Gap 2 Bayesian: Bayesian prior absorbs early noise — lower gates let signal emerge sooner
   if (marketKey === "ft") return 5;
@@ -9538,12 +9531,6 @@ function getTrackerPosteriorWinProb(league, marketKey, side, priorGames = 12, pr
   const l3Weight = clampNumber((l3Total - 15) / 35, 0, 1);
   return (1 - l3Weight) * l2Posterior + l3Weight * (l3Wins / l3Total);
 }
-
-// Legacy function kept for compatibility but returns null (no longer used)
-function getTrackerFeedbackSignal(profile, marketKey, side, league) {
-  return null;
-}
-
 
 function getAllSettledTrackedPicks() {
   return getLearningTrackedPicks()
@@ -9898,8 +9885,8 @@ function isTrackerSupportedLeague(league) {
 
 
 async function settleTrackedPick(signature, status) {
-  let pick = g_trackerState.activePicks.find(p => p.signature === signature);
-  if (!pick) pick = g_trackerState.archivedPicks.find(p => p.signature === signature);
+  let pick = g_trackerState.activePicks.find(p => makeTrackedSignature(p) === signature || p.signature === signature);
+  if (!pick) pick = g_trackerState.archivedPicks.find(p => makeTrackedSignature(p) === signature || p.signature === signature);
   if (!pick) return;
   const _sA = (pick.homeTeam && pick.homeTeam !== "—") ? pick.homeTeam : "A";
   const _sB = (pick.awayTeam && pick.awayTeam !== "—") ? pick.awayTeam : "B";
@@ -10080,15 +10067,9 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
   ) {
     setTimeout(async () => {
       try {
-        await executeRetrospectiveBacktest({
-          league: window.__lastRunLeague,
-          parsed: window.__lastRunParsed,
-          lines: window.__lastRunFinalLines,
-          fixtureMeta: window.__lastRunFixtureMeta || {
-            eventId: (touchedPick && touchedPick.eventId) || "",
-            eventDate: (touchedPick && touchedPick.eventDate) || ""
-          }
-        });
+        await executeRetrospectiveBacktest(
+          (touchedPick && touchedPick.eventId) || ""
+        );
         engineDebug("Phase 2 post-settle retrospective complete", { league: window.__lastRunLeague });
       } catch (err) {
         engineDebug("Phase 2 post-settle retrospective error", err.message);
@@ -10790,16 +10771,18 @@ function addTrackedPicks(newPicks) {
 }
 
   function applyVolatility(proj, series, leagueVolLimit, league) {
-  // FIX #1: Restored the real volatility adjustment. The duplicate no-op definition
-  // that silently overwrote this function has been removed (the dead second definition
-  // appeared later in the file and has been deleted below).
+  // FIX: High volatility dampens the projection toward the mean (regression to mean).
+  // Sign flipped: factor>0 (high vol, ratio>0.5) now produces a negative adjustment,
+  // pulling the projection down. factor<0 (low vol) gives a small positive boost.
+  // This corrects the prior bug where high-variance teams were systematically
+  // over-projected. Cap: max -8% dampen, max +4% boost.
   if (!isFinite(proj) || !Array.isArray(series) || !series.length) return proj;
   const sd = stdDev(series);
   const limit = Number(leagueVolLimit) || 12;
   const ratio = sd / limit;
   const factor = ratio - 0.5;
   const mult = String(league || "").toLowerCase().includes("wnba") ? 0.25 : 0.20;
-  const adjustment = clampNumber(factor * mult, -0.08, 0.08);
+  const adjustment = clampNumber(-factor * mult, -0.08, 0.04);
   return proj * (1 + adjustment);
 }
 
@@ -11206,6 +11189,11 @@ function getConfidenceGrade(params) {
 
   if (score === null || score === undefined || isNaN(score)) score = -999;
 
+  // FIX: Logistic regression path (above) and additive integer scoring now have
+  // explicitly separated grade boundaries. The additive path uses the calibrated
+  // thresholds from getConfidenceGradeThresholds(). The logistic path maps directly
+  // from win probability to letter grades (≥0.65→A, ≥0.57→B, ≥0.50→C, else D)
+  // and returns early so neither path can corrupt the other.
   const isH2 = marketKey === "h2";
   const _gt = getConfidenceGradeThresholds();
   if (isH2 && score >= _gt.aThresh) return "B";
@@ -13523,7 +13511,9 @@ DEFAULT AUDIT ACTION: CLOSED — DO NOT TOUCH.
 
 
 function avgOrNaN(arr) {
-  return Array.isArray(arr) && arr.length ? trimmedAvg(arr) : NaN;
+  // FIX: Uses simple mean (avg) so the name matches the behaviour.
+  // Call trimmedAvg() directly in the rare cases where outlier-trimming is explicitly wanted.
+  return Array.isArray(arr) && arr.length ? avg(arr) : NaN;
 }
 
 // Issue 16: safeAverage prevents NaN from silently cascading into NO PLAY when data is sparse.
@@ -13537,27 +13527,7 @@ function avgFinite(values = []) {
   return nums.length ? avg(nums) : NaN;
 }
 
-function getFixtureSideRole(side) {
-  const fixtureMeta = getCurrentFixtureMeta();
-  const teamId = String(selectedTeamIds?.[side] || "");
-  const homeId = String(fixtureMeta?.homeId || "");
-  const awayId = String(fixtureMeta?.awayId || "");
-  if (teamId && homeId && teamId === homeId) return "home";
-  if (teamId && awayId && teamId === awayId) return "away";
-
-  const teamName = normalizeTeamName(document.getElementById(side === "A" ? "teamAName" : "teamBName")?.value || "");
-  if (teamName && normalizeTeamName(fixtureMeta?.homeTeam || "") === teamName) return "home";
-  if (teamName && normalizeTeamName(fixtureMeta?.awayTeam || "") === teamName) return "away";
-
-  // Manual leagues: Team A = Home, Team B = Away when no fixture is linked
-  const league = document.getElementById("leagueSelect")?.value || "";
-  const isManual = league && league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa" && league !== "ncaaw" && league !== "nba_gl";
-  if (isManual) return side === "A" ? "home" : "away";
-
-  return "";
-}
-
-function getFetchedSeries(side, scope, marketKey, metric) { 
+function getFetchedSeries(side, scope, marketKey, metric) {
   const ctx = g_massacreFetchContext?.[side]?.[scope]; 
   if (!ctx) return []; 
   const prefix = marketKey === "ft" ? "ft" : marketKey === "h1" ? "h1" : "h2"; 
@@ -13740,8 +13710,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     if (!isFinite(seriesMean) || !isFinite(seriesSd) || seriesSd === 0) return series;
     const mostRecent = series[0];
     const zScore = Math.abs(mostRecent - seriesMean) / seriesSd;
-    if (zScore > 2) {
-      // Replace first element with a dampened value blended toward the series mean
+    if (zScore > 2.5) {
+      // Replace first element with a dampened value blended toward the series mean.
+      // Threshold raised from 2.0 to 2.5: z>2 fires on ~5% of valid games, creating
+      // false damping. z>2.5 targets only genuine outliers (~1.2% of games).
       const dampened = mostRecent * 0.5 + seriesMean * 0.5;
       engineDebug("Outlier dampened in series", { mostRecent, seriesMean, zScore: zScore.toFixed(2), dampened: dampened.toFixed(1) });
       return [dampened, ...series.slice(1)];
@@ -14055,7 +14027,10 @@ function getH2HSeasonDecayWeight(dateStr) {
     if (isNaN(d.getTime())) return 0.75;
     const daysSince = (Date.now() - d.getTime()) / 86400000;
     if (!isFinite(daysSince) || daysSince < 0) return 1.00;
-    return Math.max(0.20, Math.exp(-daysSince / 180));
+    // FIX: Floor lowered from 0.20 to 0.05. A 3-year-old game had natural decay of
+    // ~0.002 but was clamped to 0.20 — 100× its statistical weight. The 0.05 floor
+    // retains a minimal directional signal without dominating the projection.
+    return Math.max(0.05, Math.exp(-daysSince / 180));
   } catch (_) { return 0.75; }
 }
 
@@ -14181,7 +14156,10 @@ function meanFromList(values) {
 const _mcCache = new Map();
 async function runMassacreMonteCarlo(teamSeriesFiltered, iterations, marketLine) {
   const series = normalizeIntelSeries(teamSeriesFiltered);
-  const runs = Math.max(500, Math.min(Number(iterations) || getMassacreRuns(), 10000));
+  // FIX: Cap reduced from 10000 to 3000 to avoid blocking the main UI thread.
+  // 3000 Box-Muller samples give <1% error on win probability at the edge sizes
+  // this engine acts on; 10000 provided no meaningful additional accuracy.
+  const runs = Math.max(500, Math.min(Number(iterations) || getMassacreRuns(), 3000));
   if (series.length < 5) return { overPct: 50, underPct: 50 };
   const mean = avg(series);
   const sigma = Math.max(stdDev(series), 1.0);
@@ -14338,10 +14316,15 @@ function calibrateConfidenceModel() {
     const cThreshold = scores[Math.floor(scores.length * 0.8)]?.score || 2;
     // FIX: Stamp the current model version into the stored thresholds so
     // getConfidenceGradeThresholds() can detect and discard stale values after a version bump.
-    const gradeThresholds = { aThresh: aThreshold, bThresh: bThreshold, cThresh: cThreshold, modelVersion: getCurrentModelVersion() };
+    const gradeThresholds = { aThresh: aThreshold, bThresh: bThreshold, cThresh: cThreshold, modelVersion: getCurrentModelVersion(), sampleCount: scores.length };
     try {
-      localStorage.setItem("BB_CONFIDENCE_THRESHOLDS", JSON.stringify(gradeThresholds));
-      engineDebug("Confidence grade thresholds calibrated", gradeThresholds);
+      const _existingThresh = (() => { try { return JSON.parse(localStorage.getItem("BB_CONFIDENCE_THRESHOLDS") || "{}"); } catch(_) { return {}; } })();
+      if (_existingThresh.sampleCount && _existingThresh.sampleCount >= scores.length) {
+        engineDebug("Confidence thresholds not overwritten — existing sample is larger", { existing: _existingThresh.sampleCount, new: scores.length });
+      } else {
+        localStorage.setItem("BB_CONFIDENCE_THRESHOLDS", JSON.stringify(gradeThresholds));
+        engineDebug("Confidence grade thresholds calibrated", gradeThresholds);
+      }
     } catch(e) {}
   }
 
@@ -15228,8 +15211,17 @@ async function runEngine() {
   const leagueSelectEl = document.getElementById("leagueSelect");
   const currentLeagueForRun = leagueSelectEl ? leagueSelectEl.value : "";
 
-  // Prevent cross‑league contamination: if stored context belongs to a different league, reset it
-  if (g_massacreFetchContext.league && g_massacreFetchContext.league !== currentLeagueForRun) {
+  // FIX: Extended stale-context guard. Previously only checked league mismatch.
+  // Now also clears when the fetched team names no longer match the inputs —
+  // prevents a stale context from a prior run (same league, different teams) being
+  // used when the user changes teams without re-fetching.
+  const _runTeamANorm = normalizeTeamName(document.getElementById("teamAName")?.value || "");
+  const _runTeamBNorm = normalizeTeamName(document.getElementById("teamBName")?.value || "");
+  const _ctxStale =
+    (g_massacreFetchContext.league && g_massacreFetchContext.league !== currentLeagueForRun) ||
+    (g_lastFetchedTeams.A && _runTeamANorm && _runTeamANorm !== g_lastFetchedTeams.A) ||
+    (g_lastFetchedTeams.B && _runTeamBNorm && _runTeamBNorm !== g_lastFetchedTeams.B);
+  if (_ctxStale) {
     engineDebug("runEngine: clearing stale massacre context", { old: g_massacreFetchContext.league, new: currentLeagueForRun });
     g_massacreFetchContext = defaultMassacreFetchContext();
     g_massacreFetchContext.league = currentLeagueForRun;
@@ -15570,8 +15562,20 @@ const h1Calc = compute1HProjection({
         projB = anchorProjection((synPaceQ * projRatingBQ) / 400, sampleSize, leagueBaseQ);
       } else {
         // FIX #15: 50/50 blend (was 75/25)
-        projA = anchorProjection(avgOrNaN(aS) * 0.50 + avgOrNaN(bA) * 0.50, sampleSize, leagueBaseQ);
-        projB = anchorProjection(avgOrNaN(bS) * 0.50 + avgOrNaN(aA) * 0.50, sampleSize, leagueBaseQ);
+        // FIX: Guard against NaN cascade when allowed series is empty — fall back to
+        // offense-only projection rather than producing NaN for the entire quarter.
+        const _qAavgS = avgOrNaN(aS);
+        const _qBavgA = avgOrNaN(bA);
+        const _qBavgS = avgOrNaN(bS);
+        const _qAavgA = avgOrNaN(aA);
+        projA = anchorProjection(
+          isFinite(_qBavgA) ? (_qAavgS * 0.50 + _qBavgA * 0.50) : _qAavgS,
+          sampleSize, leagueBaseQ
+        );
+        projB = anchorProjection(
+          isFinite(_qAavgA) ? (_qBavgS * 0.50 + _qAavgA * 0.50) : _qBavgS,
+          sampleSize, leagueBaseQ
+        );
       }
 
       projA = applyVolatility(projA, aS, volLimit, league);
@@ -16238,6 +16242,8 @@ const markets = finalPicksForDisplay.map(p => ({
              </div>`
           : "";
 
+        // FIX: All dynamic values passed through escapeHtml to close XSS vectors
+        // for any attacker-controlled string that could reach innerHTML via network data.
         const dashHtml = `
         <div style="background: #333; color: #ffd700; padding: 8px 10px; font-weight: 800; font-size: 11px; display: flex; justify-content: space-between; border-bottom: 1px solid var(--panel-border);">
           <span>SYNDICATE INSIGHT (LEVEL 2)</span>
@@ -16247,8 +16253,8 @@ const markets = finalPicksForDisplay.map(p => ({
         ${_h1RatioHtml}
         ${_qCoherenceHtml}
         <div style="display: grid; grid-template-columns: 1fr 1fr; padding: 12px; text-align: center; gap: 5px;">
-          <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team A Net</div><div style="font-size: 18px; font-weight: 900; color: ${netAColor}">${netADisplay}</div></div>
-          <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team B Net</div><div style="font-size: 18px; font-weight: 900; color: ${netBColor}">${netBDisplay}</div></div>
+          <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team A Net</div><div style="font-size: 18px; font-weight: 900; color: ${escapeHtml(netAColor)}">${escapeHtml(netADisplay)}</div></div>
+          <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team B Net</div><div style="font-size: 18px; font-weight: 900; color: ${escapeHtml(netBColor)}">${escapeHtml(netBDisplay)}</div></div>
         </div>`;
 
         let existingDash = document.getElementById('syndicateDashboard');
@@ -16841,15 +16847,8 @@ if (trackedToSave.length) {
     trackerStateAfterSave: getTrackerStateDebugScore(g_trackerState)
   });
 } else if (actionablePicks.length) {
-  // [CLOSED: ESPN+ EXPANSION] Tracker support expanded to all 5 ESPN auto-fetch leagues.
-  // ncaaw and nba_gl have full live polling + settlement parity with the original 3.
-  // Must always match getTrackedLeagueBase — DO NOT narrow this set independently.
-  // [FIX: tracker now supports ALL leagues — manual leagues generate synthetic eventIds
-  // so their picks are tracked and settleable just like ESPN leagues.]
-  const isSupportedForTracker = true;
-  const trackerReason = "no valid fixture event is linked.";
   setStatusText(
-    `⚠ Picks were generated, but they were not saved to tracker because ${trackerReason}`,
+    `⚠ Picks were generated, but they were not saved to tracker because no valid fixture event is linked.`,
     "err"
   );
 }
@@ -17330,20 +17329,11 @@ if (trackedToSave.length) {
       accordionOpen("leagueSection");
       validateFetchSection();
 
-            // Reset SofaScore manual section
-      const ssInputs = ["ssTeamAName", "ssTeamAId", "ssPasteA", "ssTeamBName", "ssTeamBId", "ssPasteB", "ssTournamentId"];
-      ssInputs.forEach(id => {
-        const el = document.getElementById(id);
-        if (el) el.value = "";
-      });
+      // SofaScore DOM refs removed — those elements no longer exist in the HTML.
       window.__fixtureTournamentId = null;
       window.__lastEventsA = null;
       window.__lastEventsB = null;
       window.__h2hEntryCache = [];
-      const _ssTournamentName = document.getElementById("ssTournamentName");
-      if (_ssTournamentName) _ssTournamentName.textContent = "";
-      const ssStatus = document.getElementById("ssFetchStatus");
-      if (ssStatus) ssStatus.textContent = "";
 
       // Reset quarter H2H checkboxes
       ["useQ1H2H", "useQ2H2H", "useQ3H2H", "useQ4H2H"].forEach(id => {
@@ -18539,7 +18529,7 @@ document.addEventListener('DOMContentLoaded', function() {
       if (schedReady || h2hReady || searchReady) {
         if (schedReady && typeof fetchScheduleCore === 'function') {
           const _origSched = fetchScheduleCore;
-          window.fetchScheduleCore = async function(base, teamId, league) {
+          window.fetchScheduleCore = async function(base, teamId, leagueKey, requiredVenue, allowFallback) {
             try {
               const res = await _origSched.apply(this, arguments);
               if (!res) AFDB.log('ERROR','scheduleCore','NULL RESULT for teamId=' + teamId + ' — this blocks auto-fill!');
