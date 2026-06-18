@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10773,7 +10774,15 @@ function addTrackedPicks(newPicks) {
     const paceGapRisk = context.paceGapRisk ?? false;
     if (paceGapRisk) weight *= 0.85;
   }
-  return Math.min(0.35, weight * factor);
+  // FIX: Dynamic H2H cap based on divergence between recent form total and H2H total.
+  // A large gap means H2H history is stale relative to current form — cap it accordingly.
+  // Gap < 15 → 35% max | 15–30 → 25% | 30–50 → 15% | > 50 → 8%
+  const h2hDivergence = isFinite(context?.h2hDivergence) ? Math.abs(context.h2hDivergence) : 0;
+  let divergenceCap = 0.35;
+  if (h2hDivergence > 50) divergenceCap = 0.08;
+  else if (h2hDivergence > 30) divergenceCap = 0.15;
+  else if (h2hDivergence > 15) divergenceCap = 0.25;
+  return Math.min(divergenceCap, weight * factor);
 }
 
   function applyVolatility(proj, series, leagueVolLimit, league) {
@@ -11093,7 +11102,8 @@ function getConfidenceGrade(params) {
   const {
     pick, note, line, edge, sampleTier, projectionOnly, fullModel, trap,
     hasH2H, volatility, volLimit, marketKey = "", modelState = null,
-    q4Edge = null, q2Edge = null
+    q4Edge = null, q2Edge = null,
+    h1RatioFlag = false, quarterSampleCap = false
   } = params || {};
 
   // FIX: Attempt logistic regression grade first when a calibrated model is available
@@ -11182,6 +11192,12 @@ function getConfidenceGrade(params) {
     // back-to-back adjustments (handled elsewhere). Kept: sampleTier, fullModel, projectionOnly,
     // hasH2H, edgePct, H2 uncertainty, and cross-market (q4Edge/q2Edge).
     if (isH2) score -= 1.0;
+
+    // FIX: H1/FT ratio anomaly penalty — unusual split reduces confidence
+    if (h1RatioFlag) score -= 1.0;
+
+    // FIX: Quarter confidence cap — thin-sample quarters cannot grade above C
+    if (quarterSampleCap) score = Math.min(score, 0.4);
   }
 
   if (score === null || score === undefined || isNaN(score)) score = -999;
@@ -13686,11 +13702,20 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const leagueBase = eb / 2;
   const volLimit = getMarketVolLimit(league, "ft");
 
-  const useVenueA = document.getElementById("aVenueSplitEnabled")?.checked;
-  const useVenueB = document.getElementById("bVenueSplitEnabled")?.checked;
+  const _manualVenueA = document.getElementById("aVenueSplitEnabled")?.checked;
+  const _manualVenueB = document.getElementById("bVenueSplitEnabled")?.checked;
+  // FIX: Auto-activate venue splits when fetched venue data has >= 5 games and
+  // manual toggle is off. Home/Away splits are more predictive than overall averages
+  // in venue-consistent leagues (WNBA, NBA). Manual toggle always takes precedence.
+  const _venueSeriesA = getFetchedSeries("A", "venue", "ft", "scored");
+  const _venueSeriesB = getFetchedSeries("B", "venue", "ft", "scored");
+  const _autoVenueA = !_manualVenueA && _venueSeriesA.length >= 5;
+  const _autoVenueB = !_manualVenueB && _venueSeriesB.length >= 5;
+  const useVenueA = _manualVenueA || _autoVenueA;
+  const useVenueB = _manualVenueB || _autoVenueB;
 
-  const aFTS = useVenueA ? getFetchedSeries("A", "venue", "ft", "scored") : getOverallSeries("A", 10);
-  const bFTS = useVenueB ? getFetchedSeries("B", "venue", "ft", "scored") : getOverallSeries("B", 10);
+  const aFTS = useVenueA ? _venueSeriesA : getOverallSeries("A", 10);
+  const bFTS = useVenueB ? _venueSeriesB : getOverallSeries("B", 10);
   const aFTA = useVenueA ? getFetchedSeries("A", "venue", "ft", "allowed") : getManualAllowedSeries("A", "ft", parsed);
   const bFTA = useVenueB ? getFetchedSeries("B", "venue", "ft", "allowed") : getManualAllowedSeries("B", "ft", parsed);
 
@@ -13700,8 +13725,30 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
   const sampleSize = Math.min(aFTS.length, bFTS.length);
-  let aS_pre = anchorProjection(avgOrNaN(aFTS), sampleSize, leagueBase);
-  let bS_pre = anchorProjection(avgOrNaN(bFTS), sampleSize, leagueBase);
+
+  // FIX: Recency outlier detection — if the most recent game deviates > 2 SD from
+  // the series mean, reduce its recency weight to prevent a single outlier game
+  // from dominating the projection via the 1.35x recency multiplier.
+  function applyOutlierDampen(series) {
+    if (!Array.isArray(series) || series.length < 3) return series;
+    const seriesMean = avg(series);
+    const seriesSd = stdDev(series);
+    if (!isFinite(seriesMean) || !isFinite(seriesSd) || seriesSd === 0) return series;
+    const mostRecent = series[0];
+    const zScore = Math.abs(mostRecent - seriesMean) / seriesSd;
+    if (zScore > 2) {
+      // Replace first element with a dampened value blended toward the series mean
+      const dampened = mostRecent * 0.5 + seriesMean * 0.5;
+      engineDebug("Outlier dampened in series", { mostRecent, seriesMean, zScore: zScore.toFixed(2), dampened: dampened.toFixed(1) });
+      return [dampened, ...series.slice(1)];
+    }
+    return series;
+  }
+  const aFTSDampened = applyOutlierDampen(aFTS);
+  const bFTSDampened = applyOutlierDampen(bFTS);
+
+  let aS_pre = anchorProjection(avgOrNaN(aFTSDampened), sampleSize, leagueBase);
+  let bS_pre = anchorProjection(avgOrNaN(bFTSDampened), sampleSize, leagueBase);
   let aAllowed = avgOrNaN(aFTA);
   let bAllowed = avgOrNaN(bFTA);
 
@@ -13792,13 +13839,19 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const massacreH2H = getMassacreH2HSeries("ft", getCurrentFixtureMeta(), parsed);
     const decayH2HA = massacreH2H.A.length >= 2 ? massacreH2H.A : aH2H;
     const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
+    // FIX: Pass h2hDivergence into getH2HWeight so the dynamic cap is applied.
+    // Divergence = difference between combined recent-form total and combined H2H total.
+    const _ftRecentTotal = (isFinite(aS) ? aS : 0) + (isFinite(bS) ? bS : 0);
+    const _ftH2HTotal = avgOrNaN(decayH2HA) + avgOrNaN(decayH2HB);
+    const _ftH2HDivergence = isFinite(_ftRecentTotal) && isFinite(_ftH2HTotal) ? Math.abs(_ftRecentTotal - _ftH2HTotal) : 0;
     const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "ft", ftSampleTier, Math.abs(aS - bS), league, leagueBase, 1.0, {
       enabled: ftHasH2H,
       injMultA,
       injMultB,
       volRatio: _ftVolRatio,
       blowoutGap: Math.abs(aS - bS),
-      paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
+      paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6,
+      h2hDivergence: _ftH2HDivergence
     });
     projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgOrNaN(decayH2HA) * hw) : avgOrNaN(decayH2HA);
     projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(decayH2HB) * hw) : avgOrNaN(decayH2HB);
@@ -13928,23 +13981,31 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const massacreH2H = getMassacreH2HSeries("h1", getCurrentFixtureMeta(), parsed);
     const decayH2HA = massacreH2H.A.length >= 2 ? massacreH2H.A : aH2H;
     const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
+    // FIX: Pass h2hDivergence for H1 market — same dynamic cap logic as FT
+    const _h1RecentTotal = (isFinite(projA1H) ? projA1H : 0) + (isFinite(projB1H) ? projB1H : 0);
+    const _h1H2HTotal = avgOrNaN(decayH2HA) + avgOrNaN(decayH2HB);
+    const _h1H2HDivergence = isFinite(_h1RecentTotal) && isFinite(_h1H2HTotal) ? Math.abs(_h1RecentTotal - _h1H2HTotal) : 0;
     const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "h1", h1SampleTier, Math.abs(projA1H - projB1H), league, leagueBase1H, 1.0, {
       enabled: h1HasH2H,
       injMultA,
       injMultB,
       volRatio: combinedVol,
       blowoutGap: Math.abs(projA1H - projB1H),
-      paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
+      paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6,
+      h2hDivergence: _h1H2HDivergence
     });
     projA1H = isFinite(projA1H) ? (projA1H * (1 - hw) + avgOrNaN(decayH2HA) * hw) : avgOrNaN(decayH2HA);
     projB1H = isFinite(projB1H) ? (projB1H * (1 - hw) + avgOrNaN(decayH2HB) * hw) : avgOrNaN(decayH2HB);
   }
   let h1Proj = (isFinite(projA1H) ? projA1H : 0) + (isFinite(projB1H) ? projB1H : 0);
 
-  // FIX #4/#14: h1Proj is authoritative and must NOT be overwritten by the
+    // FIX #4/#14: h1Proj is authoritative and must NOT be overwritten by the
   // H1 Alignment block (_distFT.proj * 0.46) in runEngine. That block has been
   // removed. h1Proj stays as computed here throughout the pick pipeline.
   const h1Edge = (isFinite(h1Proj) && isFinite(lines.h1Line) && lines.h1Line > 0) ? h1Proj - lines.h1Line : NaN;
+  // FIX: Compute h1RatioFlag for downstream confidence grading — anomalous H1/FT ratio
+  // reduces confidence. Cannot compute FT here so ratio is deferred to runEngine,
+  // but we expose h1Proj so the caller can compute and pass h1RatioFlag into getConfidenceGrade.
   return {
     h1Proj, h1Edge, projA1H, projB1H, h1SampleTier,
     h1HasH2H, h1ProjectionOnly: !h1HasH2H && h1SampleTier === "thin",
@@ -15528,10 +15589,13 @@ const h1Calc = compute1HProjection({
       const qProj = projA + projB;
       const qEdge = lineVal ? qProj - lineVal : NaN;
       const qPick = getPick(qEdge, lineVal, league, qKey, { aSc: avgOrNaN(aS), bSc: avgOrNaN(bS) });
+      // FIX: Quarter confidence cap — if combined sample < 8 games cap grade at C
+      const _qSampleCap = (aS.length + bS.length) < 16;
       const qConf = getConfidenceGrade({
         pick: qPick, line: lineVal, edge: qEdge, sampleTier: tier,
         volatility: stdDev(aS.concat(bS)), volLimit,
-        marketKey: "h1", hasH2H: hasH2H
+        marketKey: "h1", hasH2H: hasH2H,
+        quarterSampleCap: _qSampleCap
       });
 
       return { proj: qProj, edge: qEdge, line: lineVal, pick: qPick, confidence: qConf, tier, projA, projB, hasH2H };
@@ -15695,12 +15759,17 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       modelState: globalModelState
     });
 
+        // FIX: Compute H1/FT ratio flag here where both h1Proj and ftProj are available
+    const _h1FTRatioForGrade = isFinite(h1Calc.h1Proj) && isFinite(ftCalc.ftProj) && ftCalc.ftProj > 0
+      ? h1Calc.h1Proj / ftCalc.ftProj : null;
+    const _h1RatioFlagForGrade = isFinite(_h1FTRatioForGrade) && (_h1FTRatioForGrade < 0.46 || _h1FTRatioForGrade > 0.54);
         const h1Confidence = getConfidenceGrade({
       pick: h1Pick, note: h1Note, line: h1Line, edge: h1Calc.h1Edge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: false, hasH2H: h1Calc.h1HasH2H,
       marketKey: "h1",
-      modelState: globalModelState
+      modelState: globalModelState,
+      h1RatioFlag: _h1RatioFlagForGrade
     });
 
     const h1ConfidenceFinal = h1Confidence;
@@ -16134,9 +16203,7 @@ const markets = finalPicksForDisplay.map(p => ({
         const netBDisplay = isFinite(netB) ? (netB >= 0 ? "+" : "") + netB.toFixed(1) : "—";
         const netAColor = !isFinite(netA) ? 'var(--muted)' : (netA >= 0 ? '#3a9c35' : '#c91920');
         const netBColor = !isFinite(netB) ? 'var(--muted)' : (netB >= 0 ? '#3a9c35' : '#c91920');
-        // FIX: Build H2H divergence warning banner — renders only when recent form and H2H
-        // disagree by more than 15 points. Surfaces the warning that previously existed only
-        // in the raw diagnostics JSON output, making it visible to the user during operation.
+        // FIX: Build H2H divergence warning banner
         const _divWarn = ftCalc.h2hDivergenceWarning;
         const _divWarnHtml = _divWarn
           ? `<div style="background: #7a3f00; color: #ffcf73; padding: 7px 10px; font-size: 10px; font-weight: 800; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #a05a00;">
@@ -16144,12 +16211,37 @@ const markets = finalPicksForDisplay.map(p => ({
               <span>Recent Form: ${_divWarn.recentFormTotal} &nbsp;|&nbsp; H2H Avg: ${_divWarn.h2hTotal} &nbsp;|&nbsp; Gap: ${_divWarn.divergencePoints} pts</span>
              </div>`
           : "";
+
+        // FIX: H1/FT ratio sanity banner — flag anomalous first-half splits
+        const _h1FTRatio = isFinite(h1Calc.h1Proj) && isFinite(ftCalc.ftProj) && ftCalc.ftProj > 0
+          ? h1Calc.h1Proj / ftCalc.ftProj : null;
+        const _h1RatioAnomaly = isFinite(_h1FTRatio) && (_h1FTRatio < 0.46 || _h1FTRatio > 0.54);
+        const _h1RatioHtml = _h1RatioAnomaly
+          ? `<div style="background: #4a2500; color: #ffa559; padding: 7px 10px; font-size: 10px; font-weight: 800; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #7a4000;">
+              <span>⚠️ H1/FT RATIO ANOMALY</span>
+              <span>H1: ${h1Calc.h1Proj?.toFixed(1)} &nbsp;|&nbsp; FT: ${ftCalc.ftProj?.toFixed(1)} &nbsp;|&nbsp; Ratio: ${(_h1FTRatio * 100).toFixed(1)}% (normal 46–54%)</span>
+             </div>`
+          : "";
+
+        // FIX: Quarter distribution coherence banner — flag large Q1-to-Q4 spread on thin samples
+        const _qProjs = [q1?.proj, q2?.proj, q3?.proj, q4?.proj].filter(v => isFinite(v));
+        const _qSpread = _qProjs.length === 4 ? Math.max(..._qProjs) - Math.min(..._qProjs) : 0;
+        const _qSampleThin = (q1?.tier === "thin" || q1?.tier === "insufficient");
+        const _qCoherenceHtml = (_qSpread > 8 && _qSampleThin)
+          ? `<div style="background: #1a1a4a; color: #9fb4ff; padding: 7px 10px; font-size: 10px; font-weight: 800; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2a2a6a;">
+              <span>⚠️ QUARTER DISTRIBUTION ALERT</span>
+              <span>Q spread: ${_qSpread.toFixed(1)} pts on thin sample — quarter models unstable</span>
+             </div>`
+          : "";
+
         const dashHtml = `
         <div style="background: #333; color: #ffd700; padding: 8px 10px; font-weight: 800; font-size: 11px; display: flex; justify-content: space-between; border-bottom: 1px solid var(--panel-border);">
           <span>SYNDICATE INSIGHT (LEVEL 2)</span>
           <span style="color: ${ftCalc.ftFullModel ? '#4CAF50' : '#ffa500'}">${ftCalc.ftFullModel ? '🟢 FULL MODEL' : '🟡 LIMITED DATA'}</span>
         </div>
         ${_divWarnHtml}
+        ${_h1RatioHtml}
+        ${_qCoherenceHtml}
         <div style="display: grid; grid-template-columns: 1fr 1fr; padding: 12px; text-align: center; gap: 5px;">
           <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team A Net</div><div style="font-size: 18px; font-weight: 900; color: ${netAColor}">${netADisplay}</div></div>
           <div><div style="font-size: 9px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase;">Team B Net</div><div style="font-size: 18px; font-weight: 900; color: ${netBColor}">${netBDisplay}</div></div>
