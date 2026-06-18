@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6744,11 +6743,11 @@ function trimmedAvg(arr) {
     }
 
     function displayLine(val) {
-  if (val === null || val === undefined || isNaN(val) || !isFinite(val)) return "NaN";
+  if (val === null || val === undefined || isNaN(val) || !isFinite(val)) return "—";
   const rounded = Math.round(val * 2) / 2;
-  // Always output .5 – if the rounded value is an integer, add .5
+  // Output the rounded value as-is: integers get ".0", half-values get ".5"
   if (Math.abs(rounded - Math.round(rounded)) < 0.01) {
-    return (Math.round(rounded)).toFixed(0) + ".5";
+    return (Math.round(rounded)).toFixed(1);
   }
   return rounded.toFixed(1);
 }
@@ -9671,7 +9670,9 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
 
   const derived = g_trackerDerivedState || defaultTrackerDerivedState();
   const settled = Number(derived?.settledPicks || 0);
-  if (settled < Number(TRACKER_SOFT_EFFECTS.minSettled || 20)) return;
+  // FIX: Use explicit numeric fallback constants to prevent OR-chain masking a legitimate 0 value
+  const minSettledThreshold = Number(TRACKER_SOFT_EFFECTS.minSettled) || 5;
+  if (settled < minSettledThreshold) return;
 
   const profile = buildTrackerFeedbackProfile();
   if (!profile || !profile.totalSettled) return;
@@ -9679,7 +9680,8 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
   const activation = phase2Activation || getPhase2ActivationState();
   const advisoryOnly = !!TRACKER_POLICY.advisoryOnly || (!activation?.trackerFeedbackLive && !activation?.teamMemoryLive);
 
-  const mildMode = settled < Number(TRACKER_SOFT_EFFECTS.minSettledFull || 100);
+  const minSettledFull = Number(TRACKER_SOFT_EFFECTS.minSettledFull) || 50;
+  const mildMode = settled < minSettledFull;
 
   picks.forEach(p => {
     if (!p || p.pick === "NO PLAY" || p.note) return;
@@ -13826,8 +13828,11 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projA1H = (synPace * projectedRatingA) / halfDivisor;
     projB1H = (synPace * projectedRatingB) / halfDivisor;
   } else {
-    projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre + bAllowed) / 2 : aS_pre;
-    projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre + aAllowed) / 2 : bS_pre;
+    // FIX: Use dynamic teamWeight from config (matching computeFTProjection) instead of hardcoded 0.5/0.5
+    const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+    const _ow1 = 1 - _tw1;
+    projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw1 + bAllowed * _ow1) : aS_pre;
+    projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw1 + aAllowed * _ow1) : bS_pre;
   }
 
   projA1H *= injMultA;
@@ -14080,18 +14085,24 @@ function evaluateMassacreForPick(pickRow, profileA, profileB) {
   let direction = "";
   
   // Streak activation logic (Issue 7 Massacre Activation)
-  if (profileA && (Math.abs(profileA.avgMargin) > 10 || profileA.streakLength >= 4)) {
+  // FIX: Use profile.severity directly to stay consistent with getMassacreProfile thresholds
+  // (nuclear>=30, heavy>=20, light>=10, none<10). Activation requires profile severity not "none"
+  // OR streakLength>=4 with absMargin>10 — same guard as before but severity derived from profile.
+  if (profileA && (profileA.severity !== "none" || profileA.streakLength >= 4)) {
     if (side === "over") {
       isMassacre = true;
-      severity = Math.abs(profileA.avgMargin) >= 20 ? "nuclear" : "heavy";
+      severity = profileA.severity !== "none" ? profileA.severity : "light";
       direction = "hot";
     }
   }
-  if (profileB && (Math.abs(profileB.avgMargin) > 10 || profileB.streakLength >= 4)) {
+  if (profileB && (profileB.severity !== "none" || profileB.streakLength >= 4)) {
     if (side === "under") {
+      const bSev = profileB.severity !== "none" ? profileB.severity : "light";
+      if (!isMassacre || ["nuclear","heavy","light"].indexOf(bSev) < ["nuclear","heavy","light"].indexOf(severity)) {
+        severity = bSev;
+      }
       isMassacre = true;
-      severity = Math.abs(profileB.avgMargin) >= 20 ? "nuclear" : "heavy";
-      direction = "cold";
+      direction = direction || "cold";
     }
   }
   
