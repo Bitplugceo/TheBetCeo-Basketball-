@@ -1,4 +1,3 @@
-K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3902,8 +3901,10 @@ const TRACKER_POLICY = {
 
 const TRACKER_SOFT_EFFECTS = {
   enabled: true,
-  minSettled: 5,
-  minSettledFull: 50,
+  // Issue 4 fix: raised from 5/50 to 30/75 so the tracker doesn't apply downgrades
+  // off statistically meaningless small-sample noise (8 settled bets is not signal).
+  minSettled: 30,
+  minSettledFull: 75,
   strongFactorBoost: 1.05,
   weakFactorCut: 0.94,
   hardBlockFactor: 0.88,
@@ -11017,10 +11018,13 @@ function getConfidenceGrade(params) {
     // FIX #2: "medium" tier removed — getSampleTier now maps 8-14 games to "thin",
     // so there is no longer a case that falls through to the -4.0 branch incorrectly.
     // FIX #3: fullModel is now reachable because getSampleTier threshold lowered to 10.
+    // Issue 1 fix: "thin" (5-9 games) no longer carries a penalty — it's the expected
+    // baseline sample, not a deficiency. "full" (10+ games) bonus raised to +1.5 to
+    // reward the larger sample instead of merely not punishing the smaller one.
     if (fullModel && !projectionOnly && sampleTier === "full") score += 2.0;
     else if (fullModel && !projectionOnly) score += 1.0;
-    else if (sampleTier === "full") score += 1.0;
-    else if (sampleTier === "thin") score -= 2.0;
+    else if (sampleTier === "full") score += 1.5;
+    else if (sampleTier === "thin") score += 0;
     else score -= 4.0; // only "insufficient" reaches here now
 
     if (projectionOnly) score -= 1.0;
@@ -13533,13 +13537,17 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const leagueBase = eb / 2;
   const volLimit = getMarketVolLimit(league, "ft");
 
-  const useVenueA = document.getElementById("aVenueSplitEnabled")?.checked;
-  const useVenueB = document.getElementById("bVenueSplitEnabled")?.checked;
+  // Issue 6 fix: venue data is now auto-blended (60% overall / 40% venue) whenever
+  // at least 5 venue games exist, instead of requiring the manual checkbox toggle.
+  const aFTS = getOverallSeries("A", 10);
+  const bFTS = getOverallSeries("B", 10);
+  const aFTA = getManualAllowedSeries("A", "ft", parsed);
+  const bFTA = getManualAllowedSeries("B", "ft", parsed);
 
-  const aFTS = useVenueA ? getFetchedSeries("A", "venue", "ft", "scored") : getOverallSeries("A", 10);
-  const bFTS = useVenueB ? getFetchedSeries("B", "venue", "ft", "scored") : getOverallSeries("B", 10);
-  const aFTA = useVenueA ? getFetchedSeries("A", "venue", "ft", "allowed") : getManualAllowedSeries("A", "ft", parsed);
-  const bFTA = useVenueB ? getFetchedSeries("B", "venue", "ft", "allowed") : getManualAllowedSeries("B", "ft", parsed);
+  const aVenueFTS = getFetchedSeries("A", "venue", "ft", "scored");
+  const bVenueFTS = getFetchedSeries("B", "venue", "ft", "scored");
+  const aVenueFTA = getFetchedSeries("A", "venue", "ft", "allowed");
+  const bVenueFTA = getFetchedSeries("B", "venue", "ft", "allowed");
 
   const ftSampleTier = getSampleTier(aFTS, bFTS);
   if (ftSampleTier === "insufficient") {
@@ -13547,10 +13555,20 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
   const sampleSize = Math.min(aFTS.length, bFTS.length);
-  let aS_pre = anchorProjection(avgOrNaN(aFTS), sampleSize, leagueBase);
-  let bS_pre = anchorProjection(avgOrNaN(bFTS), sampleSize, leagueBase);
-  let aAllowed = avgOrNaN(aFTA);
-  let bAllowed = avgOrNaN(bFTA);
+  const aOverallAvg = avgOrNaN(aFTS);
+  const bOverallAvg = avgOrNaN(bFTS);
+  const aVenueAvg = avgOrNaN(aVenueFTS);
+  const bVenueAvg = avgOrNaN(bVenueFTS);
+  const aBlendedScored = (aVenueFTS.length >= 5 && isFinite(aVenueAvg)) ? (aOverallAvg * 0.6) + (aVenueAvg * 0.4) : aOverallAvg;
+  const bBlendedScored = (bVenueFTS.length >= 5 && isFinite(bVenueAvg)) ? (bOverallAvg * 0.6) + (bVenueAvg * 0.4) : bOverallAvg;
+  let aS_pre = anchorProjection(aBlendedScored, sampleSize, leagueBase);
+  let bS_pre = anchorProjection(bBlendedScored, sampleSize, leagueBase);
+  const aAllowedOverall = avgOrNaN(aFTA);
+  const bAllowedOverall = avgOrNaN(bFTA);
+  const aAllowedVenue = avgOrNaN(aVenueFTA);
+  const bAllowedVenue = avgOrNaN(bVenueFTA);
+  let aAllowed = (aVenueFTA.length >= 5 && isFinite(aAllowedVenue)) ? (aAllowedOverall * 0.6) + (aAllowedVenue * 0.4) : aAllowedOverall;
+  let bAllowed = (bVenueFTA.length >= 5 && isFinite(bAllowedVenue)) ? (bAllowedOverall * 0.6) + (bAllowedVenue * 0.4) : bAllowedOverall;
 
   // Issue 2: Volatility applied AFTER both branches set aS/bS — early pre-value calls removed
   // to prevent double-application when advanced stats are used.
