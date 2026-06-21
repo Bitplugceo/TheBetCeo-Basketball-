@@ -1,4 +1,3 @@
-Q
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13690,8 +13689,12 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const leagueBase1H = (eb / 2) * 0.5;
   let aS_pre = anchorProjection(avgOrNaN(aS1), sampleSize, leagueBase1H);
   let bS_pre = anchorProjection(avgOrNaN(bS1), sampleSize, leagueBase1H);
-  aS_pre = applyVolatility(aS_pre, aS1, volLimit, league);
-  bS_pre = applyVolatility(bS_pre, bS1, volLimit, league);
+  // FIX #36: Volatility removed from this early point. Applying it here meant it only
+  // ever affected the non-advanced blend branch below (diluted further by the 50/50
+  // average with bAllowed/aAllowed), and was skipped ENTIRELY when the isEspnLeague
+  // advanced-ratings branch ran below. computeFTProjection applies volatility once,
+  // AFTER both branches, so it always reaches the final projection — volatility is
+  // now applied the same way below, once projA1H/projB1H are set by either branch.
 
   let aAllowed = avgOrNaN(aA1);
   let bAllowed = avgOrNaN(bA1);
@@ -13731,9 +13734,21 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projA1H = (synPace * projectedRatingA) / halfDivisor;
     projB1H = (synPace * projectedRatingB) / halfDivisor;
   } else {
-    projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre + bAllowed) / 2 : aS_pre;
-    projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre + aAllowed) / 2 : bS_pre;
+    // FIX #37: Use the same dynamic teamWeight/oppWeight as computeFTProjection
+    // (Issue 3 / FIX #8) instead of a fixed 50/50 average. A hardcoded /2 split here
+    // made H1's offense/opponent-defense blend inconsistent with FT's calibrated
+    // ratio for the exact same two teams.
+    const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+    const _ow1 = 1 - _tw1;
+    projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw1 + bAllowed * _ow1) : aS_pre;
+    projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw1 + aAllowed * _ow1) : bS_pre;
   }
+
+  // FIX #36: Apply volatility AFTER both branches (mirrors computeFTProjection's
+  // Issue #2 fix) so it always impacts the final projection, regardless of which
+  // branch produced it.
+  projA1H = applyVolatility(projA1H, aS1, volLimit, league);
+  projB1H = applyVolatility(projB1H, bS1, volLimit, league);
 
   projA1H *= injMultA;
   projB1H *= injMultB;
@@ -15242,7 +15257,7 @@ const h1Calc = compute1HProjection({
   lines: finalLines,
   injMultA: g_injA.scoringMult,
   injMultB: g_injB.scoringMult,
-  config: h1ConfigOverride
+  config: { ...h1ConfigOverride, teamWeight: _dynWeights.teamWeight, oppWeight: _dynWeights.oppWeight }
 });
 
 
@@ -15313,9 +15328,15 @@ const h1Calc = compute1HProjection({
         projA = anchorProjection((synPaceQ * projRatingAQ) / 400, sampleSize, leagueBaseQ);
         projB = anchorProjection((synPaceQ * projRatingBQ) / 400, sampleSize, leagueBaseQ);
       } else {
-        // FIX #15: 50/50 blend (was 75/25)
-        projA = anchorProjection(avgOrNaN(aS) * 0.50 + avgOrNaN(bA) * 0.50, sampleSize, leagueBaseQ);
-        projB = anchorProjection(avgOrNaN(bS) * 0.50 + avgOrNaN(aA) * 0.50, sampleSize, leagueBaseQ);
+        // FIX #15→#38: 50/50 blend replaced with the same dynamic teamWeight/oppWeight
+        // used by computeFTProjection (Issue 3 / FIX #8). The 50/50 split was correct
+        // relative to the OLD 75/25 FT blend, but FT was later upgraded to a dynamic
+        // weight (default 0.65/0.35) and this branch was never updated to match,
+        // leaving quarters silently inconsistent with FT's current blend ratio.
+        const _twQ = isFinite(_dynWeights?.teamWeight) ? Number(_dynWeights.teamWeight) : 0.65;
+        const _owQ = 1 - _twQ;
+        projA = anchorProjection(avgOrNaN(aS) * _twQ + avgOrNaN(bA) * _owQ, sampleSize, leagueBaseQ);
+        projB = anchorProjection(avgOrNaN(bS) * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
       }
 
       projA = applyVolatility(projA, aS, volLimit, league);
@@ -15841,12 +15862,17 @@ await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtur
 // had no statistical basis and made H1 a fixed fraction of FT with no independent signal.
 // h1Proj is now authoritative as computed in compute1HProjection.
 
+// FIX #39: A second block below independently overwrote h1P.proj with
+// q1P.proj + q2P.proj (post Q-scaling), directly contradicting the "h1Proj is
+// authoritative" guarantee stated above. That overwrite has been removed; the
+// Q1-Q4 scaling against the FT anchor is preserved, but H1 itself is no longer
+// touched here.
+
 // FINAL RECONCILIATION (Last Step: Robust Alignment) 
 const fP = finalPicksForDisplay.find(x => x.marketKey === 'ft'); 
 if (fP && isFinite(fP.proj)) { 
 // Shield Fix: Only scale row where the line is significantly smaller than the FT total
 const qPicks = finalPicksForDisplay.filter(x => ['q1','q2','q3','q4'].includes(x.marketKey) && isFinite(x.proj) && x.line < (fP.line * 0.45)); 
-const h1P = finalPicksForDisplay.find(x => x.marketKey === 'h1'); 
 const rawQSum = qPicks.reduce((s, x) => s + x.proj, 0);
 
 if (rawQSum > 50 && qPicks.length > 0) { 
@@ -15860,16 +15886,6 @@ qPicks.forEach(q => {
 });
 
 }
-
-if (h1P) { 
-const q1P = qPicks.find(x => x.marketKey === 'q1'); 
-const q2P = qPicks.find(x => x.marketKey === 'q2'); 
-if (q1P && q2P) { 
-h1P.proj = q1P.proj + q2P.proj; 
-h1P.edge = h1P.proj - h1P.line; 
-h1P.pick = getPick(h1P.edge, h1P.line, league, "h1", {}); 
-} 
-} 
 } 
 
 
@@ -16472,8 +16488,8 @@ window.__LAST_AUDIT_STATE = {
 
     reconciliation: {
       ftProjAnchor:            ftCalc.ftProj,
-      quarterScalingFormula:   "qProj *= (ftProj / rawQSum) when rawQSum > 100",
-      h1TetheredToQSumFormula: "h1Proj = q1.proj + q2.proj after scaling",
+      quarterScalingFormula:   "qProj *= (ftProj * (qPicks.length/4) / rawQSum) when rawQSum > 50",
+      h1TetheredToQSumFormula: "REMOVED (FIX #39): h1Proj is authoritative from compute1HProjection and is no longer overwritten by q1.proj + q2.proj",
       finalH1Proj:             h1Calc.h1Proj,
       finalFTProj:             ftCalc.ftProj,
       h1FTRatio:               isFinite(h1Calc.h1Proj) && isFinite(ftCalc.ftProj) ? (h1Calc.h1Proj / ftCalc.ftProj).toFixed(4) : null,
