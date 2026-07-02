@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3087,6 +3088,21 @@ function ssIsBasketballEvent(ev) {
   return true;
 }
 
+// [LOCK: KNOWN LIMITATION, OPEN — QUARTER/H1 RECENCY-POSITION DRIFT. q1-q4/h1 series below
+// only push an entry when that game's box score includes period-by-period scoring, while
+// scoredList/allowedList (FT) push unconditionally — so a quarter series can skip-compact
+// past games missing period data, and array position no longer reliably equals "games ago"
+// for that series. This DOES reach live math: avgOrNaN() -> trimmedAvg() -> weightedRecentAverage()
+// applies MODEL_TUNING.recencyWeights by array position to every series the engine averages,
+// quarters/H1 included. VERIFIED NOT a quick fix: trimmedAvg already does
+// arr.map(Number).filter(isFinite) and drops the min/max outlier BEFORE positional weighting
+// (see FIX #17 above trimmedAvg) — so inserting NaN placeholders here to preserve gap
+// positions would be silently erased by that same filter step and fix nothing. A real fix
+// requires making weightedRecentAverage/trimmedAvg recency-index-aware instead of
+// array-position-aware, which changes the aggregation math for every market in this engine
+// (FT, H1, Team, Quarters — anything calling avgOrNaN), not just this one gap case. DO NOT
+// attempt a local patch here without redesigning that shared pipeline and a full regression
+// pass across all markets.
 function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
   const scoredList = [], allowedList = [];
   const homeScoredList = [], homeAllowedList = [];
@@ -12523,6 +12539,10 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
         const lm = mine?.linescores || [];
         const lo = opp?.linescores || [];
 
+        // [LOCK: OT DETECTION FOR ADVANCED METRICS — VERIFIED FIX, see guard below. Mirrors
+        // the exact condition stripOTFromScores uses internally to decide a game went to OT.]
+        const _wentToOT = lm.length > rules.regulationPeriods && lo.length > rules.regulationPeriods;
+
         if (lm.length >= 1 && lo.length >= 1) {
           if (rules.regulationPeriods >= 4) {
             h1m = (readVal(lm[0]) || 0) + (readVal(lm[1]) || 0);
@@ -12569,7 +12589,19 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
             }
           }
           
-          if (Object.keys(sMap).length > 0) {
+          // [LOCK: OT/POSSESSIONS MISMATCH FIX — VERIFIED. stripOTFromScores above strips
+          // overtime points from ms/os (regulation-only), but sMap's FGA/FTA/OREB/TOV come
+          // from aggregate boxscore team/player totals with NO per-period breakdown available
+          // to strip OT from. Feeding regulation-only points with full-game-incl-OT
+          // possessions into calculateAdvancedMetrics inflates the possessions denominator,
+          // understating ORTG/DRTG/pace for any team with a recent OT game. Since there is no
+          // reliable way to isolate OT-only box stats from this data source, skip Level 2
+          // extraction entirely for OT games rather than compute from mismatched inputs —
+          // consistent with this function's existing "return null over fabricated data"
+          // policy (see the NULL RETURN FOR INVALID POSSESSIONS lock in calculateAdvancedMetrics
+          // itself). DO NOT attempt to approximate OT-stripped box stats by scaling FGA/FTA/
+          // OREB/TOV by a minutes ratio — that fabricates data this source cannot support.
+          if (Object.keys(sMap).length > 0 && !_wentToOT) {
             const gameMinutes = leagueKey === "nba" ? 48 : 40;
             const advResult = calculateAdvancedMetrics(sMap, ms, os, gameMinutes);
             if (advResult) {
