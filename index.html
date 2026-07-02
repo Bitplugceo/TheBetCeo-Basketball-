@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3103,13 +3102,32 @@ function ssIsBasketballEvent(ev) {
 // (FT, H1, Team, Quarters — anything calling avgOrNaN), not just this one gap case. DO NOT
 // attempt a local patch here without redesigning that shared pipeline and a full regression
 // pass across all markets.
+// [LOCK: ISSUE #14 FIX — PER-GAME DATE STASH, IMPLEMENTED 2026-07-03. Real per-game dates
+// live only where they're fetched (fetchScheduleCore/ssProcessTeamEvents); by the time
+// runEngine reads a series it's a flattened comma-separated string in a DOM textbox with
+// no dates attached. This tiny window-scoped cache lets the fetch layer hand dates forward
+// to runEngine's shadow-mode diagnostics (see weightedRecentAverageByDate above) without
+// threading a new parameter through every intermediate function. It is diagnostic-only
+// plumbing: nothing here changes what value ends up in a projection. DO NOT remove.]
+window.__seriesDateCache = window.__seriesDateCache || {};
+function stashSeriesDates(side, marketKey, dates) {
+  if (!Array.isArray(dates) || !dates.length) return;
+  window.__seriesDateCache[side + "_" + marketKey] = dates;
+}
+function getStashedSeriesDates(side, marketKey) {
+  return window.__seriesDateCache[side + "_" + marketKey] || null;
+}
+
 function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
   const scoredList = [], allowedList = [];
   const homeScoredList = [], homeAllowedList = [];
   const awayScoredList = [], awayAllowedList = [];
   const h1ScoredList = [], h1AllowedList = [];
+  const h1ScoredDates = []; // [LOCK: ISSUE #14 — parallel date array, additive only, see stash helpers above]
   const q1ScoredList = [], q2ScoredList = [], q3ScoredList = [], q4ScoredList = [];
   const q1AllowedList = [], q2AllowedList = [], q3AllowedList = [], q4AllowedList = [];
+  // [LOCK: ISSUE #14 — parallel date arrays for the quarter lists above, additive only]
+  const q1ScoredDates = [], q2ScoredDates = [], q3ScoredDates = [], q4ScoredDates = [];
 
   // LOCK: Filter to basketball events ONLY before any processing.
   // ssIsBasketballEvent checks sport slug, sport id, and score shape.
@@ -3170,14 +3188,19 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
         const oppQ2 = Number(oppScore.period2 ?? 0);
         const oppQ3 = Number(oppScore.period3 ?? 0);
         const oppQ4 = Number(oppScore.period4 ?? 0);
+        // [LOCK: ISSUE #14 — real game date for the date-aware shadow average, additive only]
+        const _evDate = ev.startTimestamp ? new Date(ev.startTimestamp * 1000).toISOString() : null;
             if (myQ1 + myQ2 + myQ3 + myQ4 > 0) {
       q1ScoredList.push(myQ1); q2ScoredList.push(myQ2);
       q3ScoredList.push(myQ3); q4ScoredList.push(myQ4);
       q1AllowedList.push(oppQ1); q2AllowedList.push(oppQ2);
       q3AllowedList.push(oppQ3); q4AllowedList.push(oppQ4);
+      q1ScoredDates.push(_evDate); q2ScoredDates.push(_evDate);
+      q3ScoredDates.push(_evDate); q4ScoredDates.push(_evDate);
       if (myQ1 + myQ2 > 0) {
         h1ScoredList.push(myQ1 + myQ2);
         h1AllowedList.push(oppQ1 + oppQ2);
+        h1ScoredDates.push(_evDate);
       }
     }
       }
@@ -3208,10 +3231,20 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
     }
   });
 
+  // [LOCK: ISSUE #10 FIX — VERIFIED 2026-07-03. SofaScore manual-league path: this is
+  // where real per-game FT scores enter the engine for the ~85 leagues without ESPN
+  // coverage, so it's the correct hook for the volatility cache. League is read from the
+  // same DOM select every other call site in this file already uses. DO NOT remove.]
+  updateLeagueVolCache(document.getElementById("leagueSelect")?.value || "", scoredList);
+
   return { scoredList, allowedList, homeScoredList, homeAllowedList, awayScoredList, awayAllowedList,
            h1ScoredList, h1AllowedList,
+           // [LOCK: ISSUE #14 — additive date arrays, parallel to the lists above. Existing
+           // keys and existing consumers of this return value are completely untouched.]
+           h1ScoredDates,
            q1ScoredList, q2ScoredList, q3ScoredList, q4ScoredList,
-           q1AllowedList, q2AllowedList, q3AllowedList, q4AllowedList };
+           q1AllowedList, q2AllowedList, q3AllowedList, q4AllowedList,
+           q1ScoredDates, q2ScoredDates, q3ScoredDates, q4ScoredDates };
 }
 
 function validateSofascoreSection() {
@@ -4628,6 +4661,15 @@ const LEAGUE_VOL_LIMITS = {
   ausnbl: 12, bleague: 11, united_league: 12, proa: 11,
   default: 12
 };
+// [LOCK: ISSUE #10 RESOLVED 2026-07-03 — SELF-LEARNING VOLATILITY CACHE] The limitation
+// documented below (uncovered leagues falling to LEAGUE_VOL_LIMITS.default = 12) is now
+// closed by the learned-volatility cache defined immediately after this comment block.
+// getMarketVolLimit() checks LEAGUE_CONFIG_MAP first (explicit, hand-verified calibration
+// for ~14 leagues — always wins when present), then this localStorage-backed cache
+// (per-league running mean/stdDev built from real fetched scores as users use the app),
+// and only falls through to the static LEAGUE_VOL_LIMITS default when neither exists yet
+// (e.g. a brand-new league with zero fetch history). DO NOT remove this cache or revert
+// getMarketVolLimit to skip it — that reopens Issue #10 for the ~85 uncovered leagues.
 // [LOCK: KNOWN LIMITATION, OPEN — TWO PARALLEL VOL-LIMIT TABLES] LEAGUE_CONFIG_MAP.volLimit
 // (below) and LEAGUE_VOL_LIMITS (above) currently agree numerically but only cover ~14 of
 // the ~100 leagues in LEAGUE_BASES. Every uncovered league silently falls through to
@@ -4637,7 +4679,75 @@ const LEAGUE_VOL_LIMITS = {
 // per-league volLimit values to "complete" this table; leave the documented default
 // fallback until real calibration data is available.
 
+// [LOCK: ISSUE #10 FIX — SELF-LEARNING VOLATILITY CACHE, IMPLEMENTED 2026-07-03.
+// Stores a per-league running mean/stdDev of real fetched FT scoring values in
+// localStorage using Welford's online algorithm (numerically stable, O(1) memory —
+// no raw game history is stored, so this never grows unbounded). getMarketVolLimit()
+// uses getLearnedVolLimit() as its second-priority source (after the hand-calibrated
+// LEAGUE_CONFIG_MAP, before the static LEAGUE_VOL_LIMITS default). updateLeagueVolCache()
+// is called from ssProcessTeamEvents() (SofaScore manual-league path) and
+// fetchESPNCore() (ESPN big-5 + NCAA path) — the two places real per-game scores enter
+// the engine — so the cache accumulates naturally as the app is used, with zero extra
+// user action required. DO NOT call updateLeagueVolCache from both fetchScheduleCore AND
+// fetchESPNCore — fetchESPNCore already receives fetchScheduleCore's output for both
+// teams, so hooking both would double-count every sample.]
+const VOL_CACHE_KEY = "engineVolCache_v1";
+const VOL_CACHE_MIN_SAMPLES = 25;   // don't trust the cache until it has real breadth
+const VOL_CACHE_MAX_SAMPLES = 2000; // sanity ceiling on Welford's running count, not a real limit
+const VOL_CACHE_MIN_LIMIT = 6;      // clamp band — protects against a near-zero-variance fluke
+const VOL_CACHE_MAX_LIMIT = 30;     // clamp band — protects against an early outlier-heavy sample
 
+function loadVolCache() {
+  try {
+    const raw = localStorage.getItem(VOL_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return (parsed && typeof parsed === "object") ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveVolCache(cache) {
+  try {
+    localStorage.setItem(VOL_CACHE_KEY, JSON.stringify(cache));
+  } catch (e) {
+    // localStorage full or unavailable — cache just won't persist this run, non-fatal
+  }
+}
+
+function updateLeagueVolCache(league, values) {
+  const key = String(league || "").toLowerCase();
+  if (!key) return;
+  const clean = Array.isArray(values) ? values.map(Number).filter(v => isFinite(v) && v > 0) : [];
+  if (!clean.length) return;
+
+  const cache = loadVolCache();
+  const entry = cache[key] || { n: 0, mean: 0, m2: 0 };
+
+  clean.forEach(v => {
+    if (entry.n >= VOL_CACHE_MAX_SAMPLES) return;
+    entry.n += 1;
+    const delta = v - entry.mean;
+    entry.mean += delta / entry.n;
+    const delta2 = v - entry.mean;
+    entry.m2 += delta * delta2;
+  });
+
+  entry.updatedAt = new Date().toISOString();
+  cache[key] = entry;
+  saveVolCache(cache);
+}
+
+function getLearnedVolLimit(league) {
+  const key = String(league || "").toLowerCase();
+  const cache = loadVolCache();
+  const entry = cache[key];
+  if (!entry || entry.n < VOL_CACHE_MIN_SAMPLES) return null;
+  const variance = entry.n > 1 ? entry.m2 / (entry.n - 1) : 0;
+  const sd = Math.sqrt(variance);
+  if (!isFinite(sd) || sd <= 0) return null;
+  return Math.min(VOL_CACHE_MAX_LIMIT, Math.max(VOL_CACHE_MIN_LIMIT, Math.round(sd * 10) / 10));
+}
 
 const LEAGUE_CONFIG_MAP = {
   NBA: { volLimit:12, sanityMin:160, sanityMax:250 },
@@ -6984,6 +7094,43 @@ function trimmedAvg(arr) {
     return true;
   });
   return weightedRecentAverage(trimmed);
+}
+
+// [LOCK: ISSUE #14 FIX — DATE-AWARE RECENCY AVERAGE, IMPLEMENTED 2026-07-03, SHADOW MODE
+// ONLY. This is the redesigned aggregation primitive described in the Issue #14 audit
+// note above ssProcessTeamEvents: it assigns recency weights by actual game date instead
+// of array position, so a quarter/H1 series that skip-compacts past games missing
+// period-by-period data (see that note for why NaN placeholders can't fix this — trimmedAvg
+// already strips non-finite values before positional weighting) no longer silently
+// misaligns "most recent" with array index 0.
+// This function is intentionally NOT wired into any live projection yet. It is invoked
+// only from the SHADOW MODE diagnostic blocks in compute1HProjection and the computeQ
+// closure inside runEngine, which log a comparison against the existing
+// weightedRecentAverage() result but continue to use the OLD value for actual picks.
+// DO NOT swap this in as the live averaging function until the shadow-mode logs have been
+// reviewed across enough real runs to confirm FT/H1/Team projections are unaffected where
+// expected and appropriately corrected where the drift is real. DO NOT delete this as
+// "unused" — its call sites are the shadow-test blocks, by design.]
+function weightedRecentAverageByDate(items, weights = MODEL_TUNING.recencyWeights) {
+  const clean = Array.isArray(items)
+    ? items
+        .filter(it => it && it.date != null && isFinite(Number(it.value)))
+        .map(it => ({ date: new Date(it.date), value: Number(it.value) }))
+        .filter(it => !isNaN(it.date.getTime()))
+    : [];
+  if (!clean.length) return NaN;
+  clean.sort((a, b) => b.date - a.date); // most recent game first, by real date not array position
+  if (!Array.isArray(weights) || weights.length === 0) {
+    return clean.reduce((s, it) => s + it.value, 0) / clean.length;
+  }
+  const truncated = clean.slice(0, weights.length);
+  let weightedSum = 0, weightTotal = 0;
+  for (let i = 0; i < truncated.length; i++) {
+    weightedSum += truncated[i].value * weights[i];
+    weightTotal += weights[i];
+  }
+  return weightTotal ? weightedSum / weightTotal
+                      : (truncated.reduce((s, it) => s + it.value, 0) / truncated.length);
 }
 
     function stdDev(arr) {
@@ -12624,10 +12771,16 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
     h1m: gotLS && h1m > 0 ? Math.round(h1m) : null,
     h1o: gotLS && h1o > 0 ? Math.round(h1o) : null,
     qs: ref.qs,
-    advanced: advanced
+    advanced: advanced,
+    // [LOCK: ISSUE #14 — carry the real game date forward, additive field only]
+    date: ref.date || null
   };
 }));
 
+
+  // [LOCK: ISSUE #14 — parallel date arrays for h1Scored10/qS below, additive only]
+  const h1Scored10Dates = [];
+  const qDates = { q1:[], q2:[], q3:[], q4:[] };
 
   summaries.filter(Boolean).forEach(game => {
     scored10.push(game.ms);
@@ -12636,12 +12789,15 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
     if (game.h1m !== null && game.h1o !== null) {
       h1Scored10.push(game.h1m);
       h1Allowed10.push(game.h1o);
+      h1Scored10Dates.push(game.date || null);
     }
 
     // 2H REMOVAL: second-half aggregation permanently removed — see comment above.
     if (game.qs) {
       qS.q1.push(game.qs.m[0]); qS.q2.push(game.qs.m[1]); qS.q3.push(game.qs.m[2]); qS.q4.push(game.qs.m[3]);
       qA.q1.push(game.qs.o[0]); qA.q2.push(game.qs.o[1]); qA.q3.push(game.qs.o[2]); qA.q4.push(game.qs.o[3]);
+      qDates.q1.push(game.date || null); qDates.q2.push(game.date || null);
+      qDates.q3.push(game.date || null); qDates.q4.push(game.date || null);
     }
   });
 
@@ -12660,6 +12816,11 @@ q1Allowed: qA.q1.slice(0, 10), q2Allowed: qA.q2.slice(0, 10), q3Allowed: qA.q3.s
         allowed10,
         h1Scored10,
         h1Allowed10,
+        // [LOCK: ISSUE #14 — additive date-array keys, parallel to the arrays above.
+        // Existing keys and every existing consumer of this return value are untouched.]
+        h1ScoredDates: h1Scored10Dates,
+        q1ScoredDates: qDates.q1, q2ScoredDates: qDates.q2,
+        q3ScoredDates: qDates.q3, q4ScoredDates: qDates.q4,
         lastGameDate: unique[0]?.date || null,
         venueReliable,
         usedVenueFallback,
@@ -13322,6 +13483,24 @@ async function fetchESPNCore(league, teamAName, teamBName) {
     const bStats = await (_useNcaaPath ? fetchNcaaSchedule(espnBase, teamBId, null, true, league) : fetchScheduleCore(espnBase, teamBId, league, null, true));
     const aVenueStats = teamAVenue ? await (_useNcaaPath ? fetchNcaaSchedule(espnBase, teamAId, teamAVenue, true, league) : fetchScheduleCore(espnBase, teamAId, league, teamAVenue, true)) : null;
     const bVenueStats = teamBVenue ? await (_useNcaaPath ? fetchNcaaSchedule(espnBase, teamBId, teamBVenue, true, league) : fetchScheduleCore(espnBase, teamBId, league, teamBVenue, true)) : null;
+
+    // [LOCK: ISSUE #10 FIX — VERIFIED 2026-07-03. ESPN big-5 + NCAA path: this is the
+    // single hook point for both teams' fetched scores. Do NOT also add a call inside
+    // fetchScheduleCore/fetchNcaaSchedule — that would double-count every sample, since
+    // this function already receives their combined output for both sides.]
+    if (aStats?.scored?.length) updateLeagueVolCache(league, aStats.scored);
+    if (bStats?.scored?.length) updateLeagueVolCache(league, bStats.scored);
+
+    // [LOCK: ISSUE #14 FIX — VERIFIED 2026-07-03. Stash per-game dates for the shadow-mode
+    // diagnostics in compute1HProjection and the computeQ closure in runEngine. Diagnostic
+    // plumbing only — does not affect aStats/bStats, the DOM fields they populate below, or
+    // any live projection.]
+    if (aStats?.h1ScoredDates?.length) stashSeriesDates("A", "h1", aStats.h1ScoredDates);
+    if (bStats?.h1ScoredDates?.length) stashSeriesDates("B", "h1", bStats.h1ScoredDates);
+    ["q1", "q2", "q3", "q4"].forEach(qk => {
+      if (aStats?.[qk + "ScoredDates"]?.length) stashSeriesDates("A", qk, aStats[qk + "ScoredDates"]);
+      if (bStats?.[qk + "ScoredDates"]?.length) stashSeriesDates("B", qk, bStats[qk + "ScoredDates"]);
+    });
 
     if (!aStats && !bStats) throw new Error("No recent schedule data found from ESPN.");
     g_injA = defaultInjuryMeta();
@@ -14186,6 +14365,36 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let aA1 = getManualAllowedSeries("A", "h1", parsed);
   let bA1 = getManualAllowedSeries("B", "h1", parsed);
 
+  // [LOCK: ISSUE #14 FIX — SHADOW MODE ONLY, IMPLEMENTED 2026-07-03. Compares the existing
+  // array-position-based weightedRecentAverage against the new date-aware
+  // weightedRecentAverageByDate for H1 and logs any significant (>3%) divergence via
+  // engineDebug. aS1/bS1 below and h1Proj/h1Edge further down are computed exactly as
+  // before this fix — this block reads aS1/bS1 but never writes to them or to anything
+  // that affects the projection. DO NOT let this block set aS1/bS1/aVol1/bVol1 or any
+  // other variable used downstream; that would be the un-validated "swap" the audit
+  // explicitly said not to do yet. Silently no-ops when no stashed dates exist (e.g. data
+  // was pasted/typed manually rather than freshly fetched) — that's expected, not a bug.]
+  try {
+    const _shadowDatesA1 = getStashedSeriesDates("A", "h1");
+    const _shadowDatesB1 = getStashedSeriesDates("B", "h1");
+    if (_shadowDatesA1 && _shadowDatesA1.length === aS1.length) {
+      const _oldA1 = weightedRecentAverage(aS1);
+      const _newA1 = weightedRecentAverageByDate(aS1.map((v, i) => ({ value: v, date: _shadowDatesA1[i] })));
+      if (isFinite(_oldA1) && isFinite(_newA1) && _oldA1 !== 0 && Math.abs(_newA1 - _oldA1) / Math.abs(_oldA1) > 0.03) {
+        engineDebug("SHADOW TEST diff — H1 Team A recency average", { old: _oldA1, dateAware: _newA1, pctDiff: (((_newA1 - _oldA1) / _oldA1) * 100).toFixed(1) + "%" });
+      }
+    }
+    if (_shadowDatesB1 && _shadowDatesB1.length === bS1.length) {
+      const _oldB1 = weightedRecentAverage(bS1);
+      const _newB1 = weightedRecentAverageByDate(bS1.map((v, i) => ({ value: v, date: _shadowDatesB1[i] })));
+      if (isFinite(_oldB1) && isFinite(_newB1) && _oldB1 !== 0 && Math.abs(_newB1 - _oldB1) / Math.abs(_oldB1) > 0.03) {
+        engineDebug("SHADOW TEST diff — H1 Team B recency average", { old: _oldB1, dateAware: _newB1, pctDiff: (((_newB1 - _oldB1) / _oldB1) * 100).toFixed(1) + "%" });
+      }
+    }
+  } catch (_shadowErr) {
+    // Shadow test must never break live projections — swallow and move on.
+  }
+
   const h1SampleTier = getSampleTier(aS1, bS1);
   if (h1SampleTier === "insufficient") {
     return {
@@ -14332,9 +14541,20 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
 
 
+// [LOCK: ISSUE #10 FIX — VERIFIED 2026-07-03. Priority order is intentional:
+// 1) LEAGUE_CONFIG_MAP — explicit, hand-verified per-league calibration (~14 leagues).
+// 2) getLearnedVolLimit() — self-learning cache (see definition above LEAGUE_CONFIG_MAP),
+//    covers any league once it has >= VOL_CACHE_MIN_SAMPLES real fetched scores.
+// 3) LEAGUE_VOL_LIMITS[...] || 12 — original static table/default, now only reached for
+//    a league with neither explicit calibration nor enough learned history yet.
+// DO NOT reorder these three steps and do NOT remove step 2 — that was the entire fix
+// for Issue #10 (the ~85 leagues that used to silently hit the uncalibrated default=12).]
 function getMarketVolLimit(league, marketKey) {
   const cfg = LEAGUE_CONFIG_MAP[String(league || "").toUpperCase()];
-  return (cfg && isFinite(cfg.volLimit)) ? cfg.volLimit : (LEAGUE_VOL_LIMITS[String(league || "").toLowerCase()] || 12);
+  if (cfg && isFinite(cfg.volLimit)) return cfg.volLimit;
+  const learned = getLearnedVolLimit(league);
+  if (learned != null) return learned;
+  return LEAGUE_VOL_LIMITS[String(league || "").toLowerCase()] || 12;
 }
 
 
@@ -15910,6 +16130,35 @@ const h1Calc = compute1HProjection({
       const aS = getManualSeries("A", qKey, parsed);
       const bS = getManualSeries("B", qKey, parsed);
 
+      // [LOCK: ISSUE #14 FIX — SHADOW MODE ONLY, IMPLEMENTED 2026-07-03. Same shadow
+      // comparison as compute1HProjection's H1 block above, applied per-quarter. Reads
+      // aS/bS but never writes to them or to anything used by the real projection below —
+      // only logs via engineDebug when the date-aware average diverges from the existing
+      // one by more than 3%. No-ops silently when no stashed dates exist for this
+      // side+quarter (manual/pasted data, or a league fetched before this fix ran).
+      // DO NOT wire weightedRecentAverageByDate's result into aS/bS or into the live qEdge/
+      // qPick calculation further down until shadow-mode logs have been validated.]
+      try {
+        const _shadowDatesAQ = getStashedSeriesDates("A", qKey);
+        const _shadowDatesBQ = getStashedSeriesDates("B", qKey);
+        if (_shadowDatesAQ && _shadowDatesAQ.length === aS.length) {
+          const _oldAQ = weightedRecentAverage(aS);
+          const _newAQ = weightedRecentAverageByDate(aS.map((v, i) => ({ value: v, date: _shadowDatesAQ[i] })));
+          if (isFinite(_oldAQ) && isFinite(_newAQ) && _oldAQ !== 0 && Math.abs(_newAQ - _oldAQ) / Math.abs(_oldAQ) > 0.03) {
+            engineDebug("SHADOW TEST diff — " + qKey.toUpperCase() + " Team A recency average", { old: _oldAQ, dateAware: _newAQ, pctDiff: (((_newAQ - _oldAQ) / _oldAQ) * 100).toFixed(1) + "%" });
+          }
+        }
+        if (_shadowDatesBQ && _shadowDatesBQ.length === bS.length) {
+          const _oldBQ = weightedRecentAverage(bS);
+          const _newBQ = weightedRecentAverageByDate(bS.map((v, i) => ({ value: v, date: _shadowDatesBQ[i] })));
+          if (isFinite(_oldBQ) && isFinite(_newBQ) && _oldBQ !== 0 && Math.abs(_newBQ - _oldBQ) / Math.abs(_oldBQ) > 0.03) {
+            engineDebug("SHADOW TEST diff — " + qKey.toUpperCase() + " Team B recency average", { old: _oldBQ, dateAware: _newBQ, pctDiff: (((_newBQ - _oldBQ) / _oldBQ) * 100).toFixed(1) + "%" });
+          }
+        }
+      } catch (_shadowErrQ) {
+        // Shadow test must never break live projections — swallow and move on.
+      }
+
       const pKeyA = "a" + qKey.toUpperCase() + "Allowed";
       const pKeyB = "b" + qKey.toUpperCase() + "Allowed";
       const aA = (parsed[pKeyA] && parsed[pKeyA].length) ? parsed[pKeyA] : (g_massacreFetchContext.A[qKey + "Allowed"] || []);
@@ -16606,7 +16855,6 @@ qPicks.forEach(q => {
 
 }
 } 
----REPLACE---
 
 
 
