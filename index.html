@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3069,9 +3068,13 @@ function ssIsBasketballEvent(ev) {
   // Tertiary check: score shape — basketball scores are integers typically 1–200.
   // Football scores are 0–20 range. If both scores are ≤ 5 and sport is ambiguous,
   // treat as non-basketball to avoid football contamination.
+  // FIX: this checked current ?? normaltime while ssProcessTeamEvents (the actual
+  // score-extraction path, used 3 places) checks normaltime ?? current — same two
+  // fields, opposite precedence, in the same file. Aligned to normaltime-first to
+  // match the extraction path, since that's the higher-stakes usage.
   if (sportSlug === "" && sportId === -1) {
-    const hScore = Number(ev?.homeScore?.current ?? ev?.homeScore?.normaltime ?? -1);
-    const aScore = Number(ev?.awayScore?.current ?? ev?.awayScore?.normaltime ?? -1);
+    const hScore = Number(ev?.homeScore?.normaltime ?? ev?.homeScore?.current ?? -1);
+    const aScore = Number(ev?.awayScore?.normaltime ?? ev?.awayScore?.current ?? -1);
     if (isFinite(hScore) && isFinite(aScore) && hScore >= 0 && aScore >= 0) {
       if (hScore <= 9 && aScore <= 9) return false; // Almost certainly football
     }
@@ -3764,8 +3767,21 @@ const BB_CONFIG = {
     // Issue 3/14: getDynamicWeights returns calibrated fixed weights used by computeFTProjection
 // via config.teamWeight. The blend ratio (0.65 own-scoring / 0.35 opponent-defense) is now
 // actually applied in the non-advanced branch instead of the former hardcoded 0.5.
+// UNVERIFIED CALIBRATION: the function previously ignored sampleTier/volatility/league
+// entirely despite accepting them. This version makes it genuinely responsive to sample
+// size (thin samples regress harder toward a neutral 50/50, since we trust the team's
+// own scoring less when we have fewer games) as a defensible, low-risk default. The
+// 0.65/0.35 base ratio and the specific regression curve are NOT independently
+// re-derived from your historical data — treat as a starting point, not a verified
+// optimum, until backtested.
 function getDynamicWeights(sampleTier, volatility, league) {
-  return { teamWeight: 0.65, oppWeight: 0.35 };
+  const base = { teamWeight: 0.65, oppWeight: 0.35 };
+  if (sampleTier === "full") return base;
+  const shrink = sampleTier === "thin" ? 0.5 : 0.85;
+  return {
+    teamWeight: base.teamWeight - (base.teamWeight - 0.5) * shrink,
+    oppWeight: base.oppWeight - (base.oppWeight - 0.5) * shrink
+  };
 }
 
 function getUnifiedVolatilityState(aSeries, bSeries, volLimit) {
@@ -3791,46 +3807,37 @@ function applyDampedIntelSignal(baseProj, rawSignal, opponentVolRatio) {
 function buildGlobalModelState({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const volLimit = getMarketVolLimit(league, "ft");
-  const useVenueA = document.getElementById("aVenueSplitEnabled")?.checked;
-  const useVenueB = document.getElementById("bVenueSplitEnabled")?.checked;
-  const aFTS = useVenueA ? getFetchedSeries("A", "venue", "ft", "scored") : getOverallSeries("A", 25);
-  const bFTS = useVenueB ? getFetchedSeries("B", "venue", "ft", "scored") : getOverallSeries("B", 25);
+  // FIX: aVenueSplitEnabled/bVenueSplitEnabled previously drove a full switch to
+  // venue-only data here, while computeFTProjection — the function that actually
+  // produces the point projection — ignores these checkboxes completely and always
+  // auto-blends venue data by sample size instead (per its own "Issue 6 fix"
+  // comment: 60% overall / 40% venue whenever >=5 venue games exist). That meant
+  // volatility and the real projection could be built from two different
+  // definitions of "this team's recent scoring" for the same game, and checking
+  // the box didn't actually do what a user would reasonably expect for either one.
+  // Replaced the checkbox-gated switch with the same >=5-game automatic trigger
+  // computeFTProjection uses, so volatility responds to the same condition the
+  // projection does. NOTE: this makes aVenueSplitEnabled/bVenueSplitEnabled fully
+  // unread by any JS in this file — the checkboxes themselves are now dead UI and
+  // should be removed or repurposed in the HTML; that's outside what a JS-only
+  // patch can safely touch.
+  const aVenue = getFetchedSeries("A", "venue", "ft", "scored");
+  const bVenue = getFetchedSeries("B", "venue", "ft", "scored");
+  const aFTS = aVenue.length >= 5 ? aVenue : getOverallSeries("A", 25);
+  const bFTS = bVenue.length >= 5 ? bVenue : getOverallSeries("B", 25);
   const volState = getUnifiedVolatilityState(aFTS, bFTS, volLimit);
   const intel = computeIntelligencePack(league);
   const ftCalc = computeFTProjection({ league, parsed, lines, injMultA, injMultB });
   return { league, eb, volLimit, volState, intel, injMultA, injMultB, aFTS, bFTS, lines, usedAdvanced: ftCalc.usedAdvanced };
 }
 
-function getDynamicEdgeThreshold(league, marketKey, context = null) {
-  const lKey = String(league || "").toLowerCase();
-  let rules = EDGE_RULES_V1;
-  if (EDGE_RULES_V1[lKey] !== undefined) {
-    rules = EDGE_RULES_V1[lKey];
-  }
-
-  let key = String(marketKey || "default").toLowerCase();
-  if (key === "team_a" || key === "team_b") key = "team";
-  else if (key && key.startsWith("q") && key.length === 2) key = "q";
-  
-  let basePct = rules[key] !== undefined ? rules[key] : (rules.default || EDGE_RULES_V1.default);
-  let thresholdPct = basePct;
-
-  if (context) {
-    const volRatio = context.volRatio ?? 1.0;
-    if (volRatio > 0.85) {
-      thresholdPct *= 1.20;
-    } else if (volRatio < 0.40) {
-      thresholdPct *= 0.85;
-    }
-    const sampleTier = context.sampleTier || "thin";
-    if (sampleTier === "thin") {
-      thresholdPct *= 1.15;
-    } else if (sampleTier === "insufficient") {
-      thresholdPct *= 1.5;
-    }
-  }
-  return thresholdPct;
-}
+// [DELETED] getDynamicEdgeThreshold – zero call sites anywhere in the file.
+// This was a parallel, percentage-based edge-threshold system (fed by
+// EDGE_RULES_V1, deleted alongside this) that never actually ran; every real
+// pick decision goes through getLeagueEdgePointThreshold / LEAGUE_EDGE_POINT_THRESHOLDS
+// instead. Keeping dead code with plausible-looking calibration comments next
+// to the live system it was never wired into was a real risk for a future
+// accidental edit to the wrong table.
 
 // [DELETED] FIX #24: applyVolatility (dead duplicate) – unused function.
 // This earlier definition was always shadowed by the second applyVolatility
@@ -4242,17 +4249,11 @@ function getLeagueUnderBlockRatio(league) {
 }
 
 
-
-
-    const LEAGUE_EDGE_THRESHOLDS = {
-  nba:      { ft: 0.055, h1: 0.050 },
-      ncaa:     { ft: 0.060, h1: 0.058 },
-      wnba:     { ft: 0.062, h1: 0.058 },
-      wnba_pre: { ft: 0.062, h1: 0.058 },
-      europe:   { ft: 0.062, h1: 0.059 },
-      asia:     { ft: 0.068, h1: 0.063 },
-      default:  { ft: 0.065, h1: 0.067 }
-    };
+// [DELETED] LEAGUE_EDGE_THRESHOLDS – the percentage-based table read only by
+// the now-deleted getDynamicEdgeThreshold and by a debug-export line (updated
+// separately). Never used in any live pick decision. LEAGUE_EDGE_POINT_THRESHOLDS
+// below is the table that actually gates picks — this removes the parallel,
+// misleading duplicate.
 
 // Raw point thresholds (edge = projection - line)
 const LEAGUE_EDGE_POINT_THRESHOLDS = {
@@ -6465,9 +6466,9 @@ function safeText(str) {
     function normalizeTeamName(name) {
       return String(name || "")
         .toLowerCase()
+        .replace(/\ba&m\b/g, "a and m")
         .replace(/[.''()<>&"]/g, "")
         .replace(/\bsaint\b/g, "st")
-        .replace(/\ba&m\b/g, "a and m")
         .replace(/&/g, " and ")
         .replace(/\s+/g, " ")
         .trim();
@@ -7654,7 +7655,7 @@ async function pollLiveGameClocks() {
   if (!byLeague.size) { g_liveGameStatus.clear(); renderTrackedPicks(); return; }
   let didChange = false;
   for (const [league, eventIds] of byLeague) {
-    const base = getTrackedLeagueBase(league);
+    const base = getTrackedLeagueApiBase(league);
     if (!base) continue;
     try {
       let data = null;
@@ -9568,13 +9569,16 @@ function clampNumber(val, min, max) {
 }
 
     function bumpConfidenceGrade(grade, shift = 0) {
-  // bumpConfidenceGrade — intelligence signals no longer adjust grades.
-  // Only confidence grading logic in getConfidenceGrade drives letter grades.
+  // bumpConfidenceGrade — intelligence signals DO still adjust grades via
+  // applyIntelligenceLayerToPicks (confAdj -> bumpConfidenceGrade). The comment
+  // above previously claimed otherwise; corrected to avoid misleading future edits.
+  // Lower bound is now clamped to "D" instead of returning the undefined "F" —
+  // "F" was never a recognized grade in getConfidenceClass/getConfidenceRank and
+  // contradicted this function's own test suite ("D-1 stays D").
   const ladder = ["D", "C", "B", "A"];
   const idx = ladder.indexOf(String(grade || "").toUpperCase());
   if (idx === -1) return grade || "—";
   const newIdx = idx + shift;
-  if (newIdx < 0) return "F";
   return ladder[clampNumber(newIdx, 0, ladder.length - 1)];
 }
 
@@ -9585,6 +9589,11 @@ function clampNumber(val, min, max) {
 // to every OVER/UNDER pick, not just massacre picks. Runs N Box-Muller normal samples
 // of the game total centered at proj with spread vol, returns fraction hitting the side.
 // Budget: default 5000 runs balances speed vs accuracy for client-side use.
+// NOTE: combined sigma = vol * sqrt(2) is a conservative approximation, exact only
+// when both teams' volatilities are equal (vol is passed in as max(sdA, sdB), not
+// a true combination of both). It's an upper bound on true combined variance, not
+// the precise value — fine as a deliberately conservative estimate, just documenting
+// the assumption instead of calling it exact.
 function quickMCWinProb(proj, line, vol, nRuns, side) {
   if (!isFinite(proj) || !isFinite(line) || line <= 0) return null;
   if (!isFinite(vol) || vol < 0) return null;
@@ -10001,7 +10010,10 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
 // ncaaw → womens-college-basketball. nba_gl → nba-g-league.
 // Powers live polling, settlement, and tracker for the two new leagues.
 // DO NOT add leagues whose ESPN endpoints are unreliable or inconsistently structured.
-function getTrackedLeagueBase(league) {
+// Renamed from getTrackedLeagueBase: this returns an ESPN API URL string, not a
+// numeric scoring baseline like LEAGUE_BASES/LEAGUE_PACE_BASES — old name was
+// actively misleading next to those.
+function getTrackedLeagueApiBase(league) {
   const l = String(league || "").toLowerCase();
   const ESPN_INTL_SLUGS = {
     euroleague: "euroleague", eurocup: "eurocup",
@@ -10033,7 +10045,7 @@ function getTrackedLeagueBase(league) {
 // DO NOT re-add a second selectLock definition.
 
 function isTrackerSupportedLeague(league) {
-  return !!getTrackedLeagueBase(String(league || "").toLowerCase());
+  return !!getTrackedLeagueApiBase(String(league || "").toLowerCase());
 }
 
 // [DELETED] isManualSettlementLeague – unused function
@@ -10118,6 +10130,16 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
   });
 
   if (!touchedPick) return false;
+
+  // FIX: win/loss/push here is entirely human-typed with zero cross-check against
+  // the score, then stored as engineResultStatus — a name implying the engine
+  // determined it, when it never verifies anything. This can't safely auto-parse
+  // arbitrary free-text actualScore formats, but it can require that SOME score
+  // was actually recorded before a win/loss can be saved, so a settled result is
+  // never persisted with zero evidence attached.
+  if ((normalizedStatus === "win" || normalizedStatus === "loss") && !String(touchedPick.actualScore || "").trim()) {
+    return false;
+  }
 
   // 2. Apply status updates
   const updatedPick = ensureTrackedPickKeys({
@@ -10567,7 +10589,7 @@ function handleTrackedPicksActionClick(event) {
 
     if (pendingPicks.length) {
       const eventEntries = [...new Map(pendingPicks.map(p => {
-        const base = getTrackedLeagueBase(p.league);
+        const base = getTrackedLeagueApiBase(p.league);
         if (!base) return null;
         return [`${p.league}:${p.eventId}`, { base, eventId: p.eventId }];
       }).filter(Boolean)).values()];
@@ -10972,8 +10994,17 @@ function getVolatilityRatioForSeries(series, leagueVolLimit) {
     // over‑anchoring to league average pace. Do not narrow without historical
     // pace distribution analysis.
     // Issue 18: Widened to ±35% to capture extreme games and reduce over-anchoring to league average.
+    // UNVERIFIED CALIBRATION: this previously returned the same ±35% for every
+    // league despite the comment above explicitly describing ±35% for NBA/NCAA
+    // and ±30% for "other leagues" — the split never existed in code. This
+    // restores that split using the isEspnLeague-style NBA/NCAA grouping already
+    // used elsewhere in the file. The ±30/±35 split itself is NOT independently
+    // re-derived from real pace-distribution data — it's implementing what the
+    // comment already claimed, not a new verified number.
 function getEffectivePaceClamp(league) {
-  return { min: 0.65, max: 1.35 };
+  const lk = String(league || "").toLowerCase();
+  const wide = lk === "nba" || lk === "ncaa" || lk === "ncaaw" || lk === "nba_gl";
+  return wide ? { min: 0.65, max: 1.35 } : { min: 0.70, max: 1.30 };
 }
 
 
@@ -11031,11 +11062,19 @@ function getEffectivePaceClamp(league) {
 // Helper: get overall 10-game scored series for a team side
 function getOverallSeries(side, limit) {
   const n = Math.max(2, Math.min(Number(limit) || 25, 25));
+  // FIX: this previously checked the fetch cache FIRST and only fell back to the
+  // live input field if the cache was thin — meaning a manual edit to the "Scored"
+  // field after a successful fetch was silently ignored on every recalculation,
+  // even though the field visibly showed the edited number. getManualSeries and
+  // getManualAllowedSeries (used elsewhere for H1/quarters/allowed data) always
+  // read the live field first; this aligns getOverallSeries to the same, more
+  // predictable precedence — a user's explicit edit always wins.
+  const fieldId = side === "A" ? "aFTScored" : "bFTScored";
+  const manual = readLooseSeries(fieldId);
+  if (manual.length >= 2) return manual.slice(0, n);
   const ctx = g_massacreFetchContext?.[side]?.overall;
   const fetched = Array.isArray(ctx?.ftScored10) ? ctx.ftScored10.map(Number).filter(v => isFinite(v) && v > 0) : [];
-  if (fetched.length >= 2) return fetched.slice(0, n);
-  const fieldId = side === "A" ? "aFTScored" : "bFTScored";
-  return readLooseSeries(fieldId).slice(0, n);
+  return fetched.slice(0, n);
 }
 
 // Helper: probability that a team's recent scores exceed a threshold
@@ -11080,10 +11119,8 @@ function getPick(edge, line, league, marketKey, context = {}) {
 }
 
 
-    function getTrapVolThreshold(marketType, league) {
-      const bucket = TRAP_RULES.volThresholds[marketType] || TRAP_RULES.volThresholds.ft;
-      return league === "nba" ? bucket.nba : bucket.other;
-    }
+    // [DELETED] getTrapVolThreshold – orphaned since detectTrap (below) was
+    // simplified to always return false per FIX #9. Zero call sites remained.
 
     function detectTrap(edge, line, pick, league, marketType, vol) {
   // FIX #9: detectTrap always returns false per spec — traps never block picks.
@@ -11212,21 +11249,8 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
     // simulation has not run at this point in the execution order.
     // DO NOT add more uncalibrated integer increments to this function.
     // DO NOT lower the trap penalty (-3) without a win-rate analysis of trap-flagged picks.
-    const EDGE_RULES_V1 = {
-  ft: 0.040,      // 4.0%
-  h1: 0.035,      // 3.5%
-  h2: 0.035,      // 3.5%
-  team: 0.035,    // 3.5%
-  q: 0.030,       // 3.0%
-  default: 0.035, // 3.5%
-  // WNBA Edge Threshold Relaxation (Issue 3)
-  wnba: {
-    ft: 0.035,    // relaxed FT threshold (Issue 3)
-    h1: 0.030,    // relaxed H1 threshold (Issue 3)
-    team: 0.032,  // relaxed Team threshold (Issue 3)
-    q: 0.030      // relaxed Q threshold (Issue 3)
-  }
-};
+    // [DELETED] EDGE_RULES_V1 – only ever read by the now-deleted getDynamicEdgeThreshold.
+    // Zero remaining references.
 
 function getConfidenceGrade(params) {
   const {
@@ -11452,8 +11476,11 @@ function buildTeamMarketIntelSignal(pack, teamSide) {
   // teams' projections whenever fatigue existed anywhere in the matchup. Both checks are
   // now keyed to THIS team's own rest status; the combined -2.5 magnitude for a genuinely
   // fatigued team is unchanged, but it no longer leaks onto its well-rested opponent.
-  if (restDays < 1) signal -= 1.5;
-  if (restDays < 1) signal -= 1;
+  // CORRECTION: the two checks below were both testing restDays < 1 — the same
+  // condition twice, not two independent signals (there is no separate per-team
+  // back-to-back flag in this codebase, only restDays). Consolidated to one
+  // check that applies the full stated -2.5 magnitude directly.
+  if (restDays < 1) signal -= 2.5;
   return { signal: clampNumber(signal, -3, 3) };
 }
 
@@ -11481,15 +11508,19 @@ function applyIntelligenceLayerToPicks(picks, intelligencePack, league) {
   // via applyDampedIntelSignal. Applying edgeMult here again compounds the same signal twice.
   // This function now only adjusts confidence grade (which is not affected by the earlier
   // per-projection signal application), preserving the behavioral intent without duplication.
-  if (!Array.isArray(picks) || !picks.length || !intelligencePack) return;
+    if (!Array.isArray(picks) || !picks.length || !intelligencePack) return;
   picks.forEach(p => {
     if (!p || p.pick === "NO PLAY") return;
     let confAdj = 0;
     const restA = Number(intelligencePack.restDaysA ?? 99);
     const restB = Number(intelligencePack.restDaysB ?? 99);
-    if (restA < 1 || restB < 1) { confAdj -= 1; }
+    // CORRECTION: this previously checked (restA<1||restB<1) for -1 AND
+    // intelligencePack.backToBack for -2 as if they were separate signals —
+    // backToBack is defined in computeIntelligencePack as exactly this same
+    // (restA<1||restB<1) condition, so both branches fired together every time,
+    // stacking to -3 off a single underlying fact. Consolidated to one check.
+    if (restA < 1 || restB < 1) { confAdj -= 2; }
     if (Number(intelligencePack.travelMiles || 0) > 1000) { confAdj -= 1; }
-    if (intelligencePack.backToBack) { confAdj -= 2; }
     if (p.confidence && confAdj !== 0) p.confidence = bumpConfidenceGrade(p.confidence, confAdj);
     if (confAdj !== 0) p.intelligenceAdjusted = true;
   });
@@ -12269,8 +12300,15 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
       if (!done || (comp?.competitors || []).length < 2) continue;
 
       const competitors = comp.competitors;
-      const mine = competitors.find(x => matchesTeam(x, tId)) || competitors[0];
-      const opp = competitors.find(x => !matchesTeam(x, tId)) || competitors[1];
+      // FIX: mine/opp previously fell back to competitors[0]/competitors[1] when
+      // matchesTeam found no match for either side. Since opp's fallback condition
+      // (!matchesTeam(x, tId)) is true for competitors[0] itself the moment matching
+      // fails, mine and opp could both resolve to the SAME competitor — reading one
+      // team's score as both sides of the game. Now: no match on either side means
+      // skip this game entirely rather than silently pair a team against itself.
+      const mine = competitors.find(x => matchesTeam(x, tId));
+      const opp = mine ? competitors.find(x => x !== mine) : null;
+      if (!mine || !opp) continue;
       const ps = s => typeof s === "object" ? parseFloat(s.value ?? s.displayValue ?? 0) : parseFloat(s);
 
       // [CLOSED: FIX 23 — SOS] oppId captured for opponent win% cross-reference at return time.
@@ -13513,10 +13551,10 @@ function safeAverage(arr, defaultVal) {
   return isFinite(v) ? v : (isFinite(defaultVal) ? defaultVal : 0);
 }
 
-function avgFinite(values = []) {
-  const nums = values.map(Number).filter(v => isFinite(v));
-  return nums.length ? avg(nums) : NaN;
-}
+// [DELETED] avgFinite – unused plain-mean helper, zero call sites. avgOrNaN
+// (trimmed + recency-weighted, via trimmedAvg) is the one actually used
+// everywhere; keeping a second, differently-behaved "avg" function with a
+// near-identical name was a real risk for an accidental future mix-up.
 
 function getFixtureSideRole(side) {
   const fixtureMeta = getCurrentFixtureMeta();
@@ -13828,7 +13866,6 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const decayH2HA = massacreH2H.A.length >= 2 ? massacreH2H.A : aH2H;
     const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
     const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "ft", ftSampleTier, Math.abs(aS - bS), league, leagueBase, 1.0, {
-      enabled: ftHasH2H,
       injMultA,
       injMultB,
       volRatio: _ftVolRatio,
@@ -13842,6 +13879,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const ftEdge = (isFinite(ftProj) && isFinite(lines.ftLine) && lines.ftLine > 0) ? ftProj - lines.ftLine : NaN;
   const aEdge = (isFinite(projAFT) && isFinite(lines.aLine) && lines.aLine > 0) ? projAFT - lines.aLine : NaN;
   const bEdge = (isFinite(projBFT) && isFinite(lines.bLine) && lines.bLine > 0) ? projBFT - lines.bLine : NaN;
+  // FIX: this object built an "enabled: ftHasH2H" context key that getH2HWeight
+  // never reads internally (checked the full function body — it uses
+  // context.injMultA/volRatio/blowoutGap/paceGapRisk, never context.enabled).
+  // Harmless as found (the caller already gates the whole getH2HWeight call
+  // behind `if (ftHasH2H)`, so the property did nothing either way) — removed
+  // to stop it looking like a real parameter.
   return {
     eb, projAFT, projBFT, ftProj, ftSampleTier,
     ftHasH2H, ftEdge, aEdge, bEdge,
@@ -14202,14 +14245,14 @@ function evaluateMassacreForPick(pickRow, profileA, profileB) {
     if (side === "over") {
       isMassacre = true;
       severity = Math.abs(profileA.avgMargin) >= 20 ? "nuclear" : "heavy";
-      direction = "hot";
+      direction = profileA.streakDirection || "hot";
     }
   }
   if (profileB && (Math.abs(profileB.avgMargin) > 10 || profileB.streakLength >= 4)) {
     if (side === "under") {
       isMassacre = true;
       severity = Math.abs(profileB.avgMargin) >= 20 ? "nuclear" : "heavy";
-      direction = "cold";
+      direction = profileB.streakDirection || "cold";
     }
   }
   
@@ -14218,7 +14261,7 @@ function evaluateMassacreForPick(pickRow, profileA, profileB) {
 
 function getMassacreProfile(series, teamName) {
   const games = normalizeIntelSeries(series);
-  if (!games.length) return { streakLength: 0, avgMargin: 0, severity: "none", rescueEligible: false };
+  if (!games.length) return { streakLength: 0, avgMargin: 0, severity: "none", rescueEligible: false, streakDirection: "none" };
   const margins = games.slice(0, 10);
   let streak = 1;
   const dir = margins[0] >= 0 ? 1 : -1;
@@ -14248,21 +14291,29 @@ function rescueBestMassacreLean(picks) {
   const scoredA = getOverallSeries("A", 10);
   const scoredB = getOverallSeries("B", 10);
   const allowedA = (() => {
+    const manual = readLooseSeries("aFTAllowed");
+    if (manual.length >= 2) return manual.slice(0, 10);
     const ctx = g_massacreFetchContext?.A?.overall;
-    if (Array.isArray(ctx?.ftAllowed10) && ctx.ftAllowed10.length >= 2) return ctx.ftAllowed10.slice(0, 10);
-    return readLooseSeries("aFTAllowed");
+    return Array.isArray(ctx?.ftAllowed10) ? ctx.ftAllowed10.slice(0, 10) : [];
   })();
   const allowedB = (() => {
+    const manual = readLooseSeries("bFTAllowed");
+    if (manual.length >= 2) return manual.slice(0, 10);
     const ctx = g_massacreFetchContext?.B?.overall;
-    if (Array.isArray(ctx?.ftAllowed10) && ctx.ftAllowed10.length >= 2) return ctx.ftAllowed10.slice(0, 10);
-    return readLooseSeries("bFTAllowed");
+    return Array.isArray(ctx?.ftAllowed10) ? ctx.ftAllowed10.slice(0, 10) : [];
   })();
   const marginA = marginSeries(scoredA, allowedA);
   const marginB = marginSeries(scoredB, allowedB);
   const profileA = getMassacreProfile(marginA.length >= 2 ? marginA : [], "Team A");
   const profileB = getMassacreProfile(marginB.length >= 2 ? marginB : [], "Team B");
+  // UNVERIFIED CALIBRATION: MIN_RESCUE_EDGE is a reasoned default (roughly double
+  // the hard NO-PLAY noise floor of 0.5 used in getPick), not independently
+  // derived from your historical rescue-pick performance. Previously there was
+  // no edge-magnitude floor at all — any NO PLAY candidate could get rescued
+  // regardless of how weak its edge was, as long as team profile eligibility passed.
+  const MIN_RESCUE_EDGE = 1.0;
   const candidate = [...picks]
-    .filter(p => p && p.pick === "NO PLAY" && !(p.leagueTrust?.mode === "block"))
+    .filter(p => p && p.pick === "NO PLAY" && !(p.leagueTrust?.mode === "block") && Math.abs(Number(p.edge || 0)) >= MIN_RESCUE_EDGE)
     .sort((a, b) => Math.abs(Number(b.edge || 0)) - Math.abs(Number(a.edge || 0)))[0];
   if (!candidate) return;
   const side = candidate.edge > 0 ? "over" : "under";
@@ -14274,7 +14325,7 @@ function rescueBestMassacreLean(picks) {
     ? "OVER " + displayLine(candidate.line)
     : "UNDER " + displayLine(candidate.line);
   candidate.recommendationTier = "lean";
-  candidate.confidence = "—";
+  candidate.confidence = "D";
   candidate.note = "Massacre lean rescue";
   candidate.massacreDecision = "lean_rescue";
 }
@@ -14310,13 +14361,35 @@ function calibrateConfidenceModel() {
   }).filter(s => s.score > 0);
   if (scores.length >= 30) {
     scores.sort((a,b) => a.score - b.score);
-    const aThreshold = scores[Math.floor(scores.length * 0.2)]?.score || 4;
-    const bThreshold = scores[Math.floor(scores.length * 0.5)]?.score || 3;
-    const cThreshold = scores[Math.floor(scores.length * 0.8)]?.score || 2;
+    let aThreshold = scores[Math.floor(scores.length * 0.2)]?.score || 4;
+    let bThreshold = scores[Math.floor(scores.length * 0.5)]?.score || 3;
+    let cThreshold = scores[Math.floor(scores.length * 0.8)]?.score || 2;
+    // FIX: thresholds above are percentiles of this run's own letter-grade
+    // output, remapped to 1-4 — they never referenced gradeWinRates (computed
+    // above, previously dead) at all, so recalibrating just entrenched whatever
+    // bias the model already had rather than correcting it against outcomes.
+    // UNVERIFIED CALIBRATION: TARGET_WR_GAP (each grade should out-win the one
+    // below it by at least 4 points) is a reasoned starting assumption, not
+    // derived from your historical data. This nudges a grade's cutoff up by one
+    // step when its empirical win rate doesn't clear the grade below it by that
+    // margin — a bounded, incremental correction rather than a full re-derivation,
+    // since re-deriving cutoffs from raw score percentiles would need the
+    // underlying numeric score exposed from getConfidenceGrade, a larger change.
+    const TARGET_WR_GAP = 0.04;
+    if (isFinite(thresholds.AWinRate) && isFinite(thresholds.BWinRate) && thresholds.AWinRate < thresholds.BWinRate + TARGET_WR_GAP) {
+      aThreshold += 1;
+    }
+    if (isFinite(thresholds.BWinRate) && isFinite(thresholds.CWinRate) && thresholds.BWinRate < thresholds.CWinRate + TARGET_WR_GAP) {
+      bThreshold += 1;
+    }
+    if (isFinite(thresholds.CWinRate) && isFinite(thresholds.DWinRate) && thresholds.CWinRate < thresholds.DWinRate + TARGET_WR_GAP) {
+      cThreshold += 1;
+    }
     const gradeThresholds = { aThresh: aThreshold, bThresh: bThreshold, cThresh: cThreshold };
     try {
       localStorage.setItem("BB_CONFIDENCE_THRESHOLDS", JSON.stringify(gradeThresholds));
-      engineDebug("Confidence grade thresholds calibrated", gradeThresholds);
+      localStorage.setItem("BB_CONFIDENCE_GRADE_WIN_RATES", JSON.stringify(thresholds));
+      engineDebug("Confidence grade thresholds calibrated", { gradeThresholds, winRates: thresholds });
     } catch(e) {}
   }
 
@@ -15583,8 +15656,16 @@ const h1Calc = compute1HProjection({
         // unlike FT and H1 which use the dynamic, context-aware getH2HWeight() (sample-size
         // log-scaling, injury gap, volatility ratio, blowout gap, pace-gap risk). Quarters
         // now use the same dynamic weighting for consistency across all markets.
+        // FIX: quarters were still using plain getH2HSeries (no season-decay weighting)
+        // while FT and H1 both prefer getMassacreH2HSeries (decay-weighted, more weight
+        // to recent seasons) and only fall back to the plain series when the decay-weighted
+        // one has fewer than 2 games. getMassacreH2HSeries already supports q1-q4 market
+        // keys (see its own marketKey.startsWith("q") branch) — it just wasn't called here.
+        const massacreH2HQ = getMassacreH2HSeries(qKey, getCurrentFixtureMeta(), parsed);
+        const decayH2HA = massacreH2HQ.A.length >= 2 ? massacreH2HQ.A : aH2H;
+        const decayH2HB = massacreH2HQ.B.length >= 2 ? massacreH2HQ.B : bH2H;
         const qVolRatio = getVolatilityRatioForSeries(aS.concat(bS), volLimit);
-        const hw = getH2HWeight(aH2H.length, bH2H.length, qKey, tier, Math.abs(projA - projB), league, leagueBaseQ, 1.0, {
+        const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, qKey, tier, Math.abs(projA - projB), league, leagueBaseQ, 1.0, {
           enabled: hasH2H,
           injMultA: injA,
           injMultB: injB,
@@ -15592,8 +15673,8 @@ const h1Calc = compute1HProjection({
           blowoutGap: Math.abs(projA - projB),
           paceGapRisk: Math.abs((avgOrNaN(ctxAQ.pace10) || 74) - (avgOrNaN(ctxBQ.pace10) || 74)) > 6
         });
-        projA = (projA * (1 - hw)) + (avgOrNaN(aH2H) * hw);
-        projB = (projB * (1 - hw)) + (avgOrNaN(bH2H) * hw);
+        projA = (projA * (1 - hw)) + (avgOrNaN(decayH2HA) * hw);
+        projB = (projB * (1 - hw)) + (avgOrNaN(decayH2HB) * hw);
       }
 
       const qProj = projA + projB;
@@ -15754,7 +15835,17 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     // Uses the higher-quality (stronger) team's roster as primary signal for totals markets,
     // since a dominant offense drives game totals more than a weak one suppresses them.
     // Falls back to 0.5 (neutral) when fetchRoster() returned an empty array.
-    const _lqiShared = 0.5;
+    // FIX: this comment described the intended computation but the code below it was
+    // just a hardcoded 0.5 — computeLineupQuality(roster, injuryMeta) already existed
+    // and was fully implemented, it just had zero call sites. Wiring it in here using
+    // each side's actual fetched roster (g_massacreFetchContext.X.roster) and injury
+    // multiplier (g_injA/g_injB) instead of inventing a new "which team is stronger"
+    // selection heuristic per the comment's specific phrasing — averaging both teams'
+    // scores for the shared/total-market signal is simpler and doesn't require an
+    // extra quality judgment before quality has been computed.
+    const lqA = computeLineupQuality(g_massacreFetchContext?.A?.roster, g_injA);
+    const lqB = computeLineupQuality(g_massacreFetchContext?.B?.roster, g_injB);
+    const _lqiShared = (lqA + lqB) / 2;
 
     const ftConfidence = getConfidenceGrade({
       pick: ftPick,
@@ -15773,7 +15864,14 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       defensiveFloorFlag: false,
       blowoutGap: 0,
       marketKey: "ft",
-      lineupQuality: 0.5,
+      // FIX: q4Edge/q2Edge below were never passed at any real call site despite
+      // getConfidenceGrade having live logic for both (normalizes by /55, adds a
+      // score bonus when the quarter edge agrees with the FT/H1 side) — the engine's
+      // own debug scoringFormula string even documents this bonus as active. q4 is
+      // computed earlier in this same function scope (see computeQ("q4", ...) above),
+      // so .edge is already available here.
+      q4Edge: q4?.edge,
+      lineupQuality: _lqiShared,
       modelState: globalModelState
     });
 
@@ -15782,6 +15880,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: false, hasH2H: h1Calc.h1HasH2H,
       marketKey: "h1",
+      q2Edge: q2?.edge,
+      lineupQuality: _lqiShared,
       modelState: globalModelState
     });
 
@@ -15801,7 +15901,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       volLimit: 12,
       injuryNotes: [],
       marketKey: "team_a",
-      lineupQuality: 0.5,
+      lineupQuality: lqA,
       modelState: globalModelState
     });
 
@@ -15819,7 +15919,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       volLimit: 12,
       injuryNotes: [],
       marketKey: "team_b",
-      lineupQuality: 0.5,
+      lineupQuality: lqB,
       modelState: globalModelState
     });
     const h1aConfidence = getConfidenceGrade({
@@ -16538,7 +16638,6 @@ window.__LAST_AUDIT_STATE = {
     phase2Control: PHASE2_CONTROL,
     trackerPolicy: TRACKER_POLICY,
     trackerLearningEnabled: TRACKER_LEARNING_ENABLED,
-    leagueEdgeThresholds: LEAGUE_EDGE_THRESHOLDS,
     leagueVolLimits:      LEAGUE_VOL_LIMITS,
     leaguePaceBases:      LEAGUE_PACE_BASES,
     leagueRatingBases:    LEAGUE_RATING_BASES,
