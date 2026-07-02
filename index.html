@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3838,8 +3839,8 @@ function buildGlobalModelState({ league, parsed, lines, injMultA = 1, injMultB =
   // without also fixing computeFTProjection to match.]
   const aVenue = getFetchedSeries("A", "venue", "ft", "scored");
   const bVenue = getFetchedSeries("B", "venue", "ft", "scored");
-  const aFTS = aVenue.length >= 5 ? aVenue : getOverallSeries("A", 25);
-  const bFTS = bVenue.length >= 5 ? bVenue : getOverallSeries("B", 25);
+  const aFTS = aVenue.length >= 6 ? aVenue : getOverallSeries("A", 25);
+  const bFTS = bVenue.length >= 6 ? bVenue : getOverallSeries("B", 25);
   const volState = getUnifiedVolatilityState(aFTS, bFTS, volLimit);
   const intel = computeIntelligencePack(league);
   const ftCalc = computeFTProjection({ league, parsed, lines, injMultA, injMultB });
@@ -13658,10 +13659,60 @@ function getFixtureSideRole(side) {
 function getFetchedSeries(side, scope, marketKey, metric) { 
   const ctx = g_massacreFetchContext?.[side]?.[scope]; 
   if (!ctx) return []; 
-  const prefix = marketKey === "ft" ? "ft" : marketKey === "h1" ? "h1" : "h2"; 
+  const prefix = marketKey; 
   const suffix = metric === "allowed" ? "Allowed10" : "Scored10"; 
   const arr = ctx?.[prefix + suffix]; 
   return Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v) && v > 0).slice(0, 10) : []; 
+}
+
+// [OVERRIDE OF PRIOR LOCK — user-directed architecture change]
+// Adaptive sample-tier venue blending. Thresholds/weights centralized in
+// VENUE_BLEND_CONFIG so they're tunable in one place without touching logic.
+// No significance filter: sample size alone governs confidence — a qualifying
+// venue sample (>=6 games) is always blended in at its tier weight, regardless
+// of how close the venue average is to the overall average.
+const VENUE_BLEND_CONFIG = {
+  minGames: 6,
+  strongGames: 10,
+  moderateVenueWeight: 0.50,
+  strongVenueWeight: 0.70
+};
+
+function getVenueBlendWeights(sampleSize) {
+  if (sampleSize >= VENUE_BLEND_CONFIG.strongGames) {
+    return { wVenue: VENUE_BLEND_CONFIG.strongVenueWeight, wOverall: 1 - VENUE_BLEND_CONFIG.strongVenueWeight, tier: "strong" };
+  }
+  if (sampleSize >= VENUE_BLEND_CONFIG.minGames) {
+    return { wVenue: VENUE_BLEND_CONFIG.moderateVenueWeight, wOverall: 1 - VENUE_BLEND_CONFIG.moderateVenueWeight, tier: "moderate" };
+  }
+  return { wVenue: 0, wOverall: 1.00, tier: "none" };
+}
+
+function computeVenueBlend(overallAvg, venueAvg, venueSampleSize) {
+  if (!isFinite(overallAvg)) {
+    return { value: venueAvg, diag: { enabled: false, reason: "No overall data", blendWeightVenue: 0, blendWeightOverall: 0, sampleSize: venueSampleSize, adjustment: 0, ignoredBecauseDifferenceTooSmall: false } };
+  }
+  if (!isFinite(venueAvg) || venueSampleSize < VENUE_BLEND_CONFIG.minGames) {
+    return { value: overallAvg, diag: { enabled: false, reason: venueSampleSize > 0 ? "Insufficient sample" : "No venue data", blendWeightVenue: 0, blendWeightOverall: 1, sampleSize: venueSampleSize, adjustment: 0, ignoredBecauseDifferenceTooSmall: false } };
+  }
+  const w = getVenueBlendWeights(venueSampleSize);
+  const blended = (overallAvg * w.wOverall) + (venueAvg * w.wVenue);
+  return { value: blended, diag: { enabled: true, reason: "Qualified", blendWeightVenue: w.wVenue, blendWeightOverall: w.wOverall, sampleSize: venueSampleSize, adjustment: blended - overallAvg, ignoredBecauseDifferenceTooSmall: false } };
+}
+
+function combineVenueDiag(scoredDiag, allowedDiag) {
+  const primary = scoredDiag.enabled ? scoredDiag : (allowedDiag.enabled ? allowedDiag : scoredDiag);
+  return {
+    enabled: scoredDiag.enabled || allowedDiag.enabled,
+    reason: primary.reason,
+    blendWeightVenue: primary.blendWeightVenue,
+    blendWeightOverall: primary.blendWeightOverall,
+    sampleSizeScored: scoredDiag.sampleSize,
+    sampleSizeAllowed: allowedDiag.sampleSize,
+    offensiveAdjustment: scoredDiag.adjustment,
+    defensiveAdjustment: allowedDiag.adjustment,
+    ignoredBecauseDifferenceTooSmall: false
+  };
 }
 
 function getManualSeries(side, marketKey, parsed) {
@@ -13803,8 +13854,9 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const leagueBase = eb / 2;
   const volLimit = getMarketVolLimit(league, "ft");
 
-  // Issue 6 fix: venue data is now auto-blended (60% overall / 40% venue) whenever
-  // at least 5 venue games exist, instead of requiring the manual checkbox toggle.
+  // Adaptive venue blending (overrides prior fixed-60/40 LOCK, user-directed):
+  // >=10 venue games = 70/30, 6-9 = 50/50, <6 = ignore venue. Also skips the blend
+  // if venue avg is within ~2.5 pts of overall (insignificant difference = noise).
   const aFTS = getOverallSeries("A", 10);
   const bFTS = getOverallSeries("B", 10);
   const aFTA = getManualAllowedSeries("A", "ft", parsed);
@@ -13825,16 +13877,22 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const bOverallAvg = avgOrNaN(bFTS);
   const aVenueAvg = avgOrNaN(aVenueFTS);
   const bVenueAvg = avgOrNaN(bVenueFTS);
-  const aBlendedScored = (aVenueFTS.length >= 5 && isFinite(aVenueAvg)) ? (aOverallAvg * 0.6) + (aVenueAvg * 0.4) : aOverallAvg;
-  const bBlendedScored = (bVenueFTS.length >= 5 && isFinite(bVenueAvg)) ? (bOverallAvg * 0.6) + (bVenueAvg * 0.4) : bOverallAvg;
+  const aScoredBlendFT = computeVenueBlend(aOverallAvg, aVenueAvg, aVenueFTS.length);
+  const bScoredBlendFT = computeVenueBlend(bOverallAvg, bVenueAvg, bVenueFTS.length);
+  const aBlendedScored = aScoredBlendFT.value;
+  const bBlendedScored = bScoredBlendFT.value;
   let aS_pre = anchorProjection(aBlendedScored, sampleSize, leagueBase);
   let bS_pre = anchorProjection(bBlendedScored, sampleSize, leagueBase);
   const aAllowedOverall = avgOrNaN(aFTA);
   const bAllowedOverall = avgOrNaN(bFTA);
   const aAllowedVenue = avgOrNaN(aVenueFTA);
   const bAllowedVenue = avgOrNaN(bVenueFTA);
-  let aAllowed = (aVenueFTA.length >= 5 && isFinite(aAllowedVenue)) ? (aAllowedOverall * 0.6) + (aAllowedVenue * 0.4) : aAllowedOverall;
-  let bAllowed = (bVenueFTA.length >= 5 && isFinite(bAllowedVenue)) ? (bAllowedOverall * 0.6) + (bAllowedVenue * 0.4) : bAllowedOverall;
+  const aAllowedBlendFT = computeVenueBlend(aAllowedOverall, aAllowedVenue, aVenueFTA.length);
+  const bAllowedBlendFT = computeVenueBlend(bAllowedOverall, bAllowedVenue, bVenueFTA.length);
+  let aAllowed = aAllowedBlendFT.value;
+  let bAllowed = bAllowedBlendFT.value;
+  const aVenueDiag = combineVenueDiag(aScoredBlendFT.diag, aAllowedBlendFT.diag);
+  const bVenueDiag = combineVenueDiag(bScoredBlendFT.diag, bAllowedBlendFT.diag);
 
   // Issue 2: Volatility applied AFTER both branches set aS/bS — early pre-value calls removed
   // to prevent double-application when advanced stats are used.
@@ -13978,7 +14036,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     // Bugfix: useVenueA/useVenueB no longer exist (removed by the Issue 6 auto-blend
     // patch). This now reports whether the venue blend actually applied this run,
     // which is more accurate than the old manual-checkbox flag it replaces.
-    aVenueEnabled: aVenueFTS.length >= 5, bVenueEnabled: bVenueFTS.length >= 5,
+    aVenueEnabled: aVenueDiag.enabled, bVenueEnabled: bVenueDiag.enabled,
+    aVenueAdjustment: aVenueDiag, bVenueAdjustment: bVenueDiag,
     paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6,
     pace: synPace,
     synNetA, synNetB,
@@ -14008,10 +14067,23 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     };
   }
 
+  // Venue blending extended to H1 (was fetched into venue.h1Scored10/h1Allowed10 but
+  // never consumed anywhere before this patch). Same adaptive tiers as FT.
+  const aVenueH1S = getFetchedSeries("A", "venue", "h1", "scored");
+  const bVenueH1S = getFetchedSeries("B", "venue", "h1", "scored");
+  const aVenueH1A = getFetchedSeries("A", "venue", "h1", "allowed");
+  const bVenueH1A = getFetchedSeries("B", "venue", "h1", "allowed");
+  const aScoredBlend1 = computeVenueBlend(avgOrNaN(aS1), avgOrNaN(aVenueH1S), aVenueH1S.length);
+  const bScoredBlend1 = computeVenueBlend(avgOrNaN(bS1), avgOrNaN(bVenueH1S), bVenueH1S.length);
+  const aAllowedBlend1 = computeVenueBlend(avgOrNaN(aA1), avgOrNaN(aVenueH1A), aVenueH1A.length);
+  const bAllowedBlend1 = computeVenueBlend(avgOrNaN(bA1), avgOrNaN(bVenueH1A), bVenueH1A.length);
+  const aVenueDiag1 = combineVenueDiag(aScoredBlend1.diag, aAllowedBlend1.diag);
+  const bVenueDiag1 = combineVenueDiag(bScoredBlend1.diag, bAllowedBlend1.diag);
+
   const sampleSize = Math.min(aS1.length, bS1.length);
   const leagueBase1H = (eb / 2) * 0.5;
-  let aS_pre = anchorProjection(avgOrNaN(aS1), sampleSize, leagueBase1H);
-  let bS_pre = anchorProjection(avgOrNaN(bS1), sampleSize, leagueBase1H);
+  let aS_pre = anchorProjection(aScoredBlend1.value, sampleSize, leagueBase1H);
+  let bS_pre = anchorProjection(bScoredBlend1.value, sampleSize, leagueBase1H);
   // FIX #36: Volatility removed from this early point. Applying it here meant it only
   // ever affected the non-advanced blend branch below (diluted further by the 50/50
   // average with bAllowed/aAllowed), and was skipped ENTIRELY when the isEspnLeague
@@ -14019,8 +14091,8 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   // AFTER both branches, so it always reaches the final projection — volatility is
   // now applied the same way below, once projA1H/projB1H are set by either branch.
 
-  let aAllowed = avgOrNaN(aA1);
-  let bAllowed = avgOrNaN(bA1);
+  let aAllowed = aAllowedBlend1.value;
+  let bAllowed = bAllowedBlend1.value;
 
   // FIX #16: H1 now uses advanced stats (ORTG/DRTG/pace) when available,
   // consistent with FT. Previously quarters/H1 never used ESPN-fetched rating data.
@@ -14118,7 +14190,9 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     h1HasH2H, h1ProjectionOnly: !h1HasH2H && h1SampleTier === "thin",
     h1FullModel: h1SampleTier === "full",
     paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6, defensiveFloorFlag: false,
-    aVol1, bVol1, aS1: avgOrNaN(aS1), bS1: avgOrNaN(bS1)
+    aVol1, bVol1, aS1: avgOrNaN(aS1), bS1: avgOrNaN(bS1),
+    aVenueEnabled: aVenueDiag1.enabled, bVenueEnabled: bVenueDiag1.enabled,
+    aVenueAdjustment: aVenueDiag1, bVenueAdjustment: bVenueDiag1
   };
 }
 
@@ -15703,6 +15777,10 @@ const h1Calc = compute1HProjection({
       const aA = (parsed[pKeyA] && parsed[pKeyA].length) ? parsed[pKeyA] : (g_massacreFetchContext.A[qKey + "Allowed"] || []);
       const bA = (parsed[pKeyB] && parsed[pKeyB].length) ? parsed[pKeyB] : (g_massacreFetchContext.B[qKey + "Allowed"] || []);
 
+      // Quarter venue blending intentionally NOT wired here — no venue-split quarter
+      // fetch pipeline exists (verified: no venue.q1Scored10/etc is ever populated
+      // anywhere in the file). Adding blend calls that always no-op is dead plumbing;
+      // this gets wired for real once a venue-aware quarter fetch exists.
       const volLimit = getMarketVolLimit(league, qKey);
       const sampleSize = Math.min(aS.length, bS.length);
       const leagueBaseQ = (LEAGUE_BASES[league] || 160) / 8;
@@ -16149,7 +16227,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     sampleTier: ftCalc.ftSampleTier,
     hasH2H: ftCalc.ftHasH2H,
     aVenueEnabled: ftCalc.aVenueEnabled,
-    bVenueEnabled: ftCalc.bVenueEnabled
+    bVenueEnabled: ftCalc.bVenueEnabled,
+    aVenueAdjustment: ftCalc.aVenueAdjustment,
+    bVenueAdjustment: ftCalc.bVenueAdjustment
   },
   {
     _idx: 1,
@@ -16166,7 +16246,11 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     note: h1Note,
     fullModel: h1Calc.h1FullModel,
     sampleTier: h1Calc.h1SampleTier,
-    hasH2H: h1Calc.h1HasH2H
+    hasH2H: h1Calc.h1HasH2H,
+    aVenueEnabled: h1Calc.aVenueEnabled,
+    bVenueEnabled: h1Calc.bVenueEnabled,
+    aVenueAdjustment: h1Calc.aVenueAdjustment,
+    bVenueAdjustment: h1Calc.bVenueAdjustment
   },
       // FIX #15/#16: Quarters now use consistent 50/50 blend (matching FT, not 75/25).
       // fullModel flag is passed through from ftCalc.ftFullModel so quarters can access
@@ -16191,7 +16275,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     fullModel: ftCalc.teamFullModel,
     sampleTier: ftCalc.ftSampleTier,
     hasH2H: ftCalc.ftHasH2H,
-    aVenueEnabled: ftCalc.aVenueEnabled
+    aVenueEnabled: ftCalc.aVenueEnabled,
+    aVenueAdjustment: ftCalc.aVenueAdjustment
   },
   {
     _idx: 4,
@@ -16209,7 +16294,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     fullModel: ftCalc.teamFullModel,
     sampleTier: ftCalc.ftSampleTier,
     hasH2H: ftCalc.ftHasH2H,
-    bVenueEnabled: ftCalc.bVenueEnabled
+    bVenueEnabled: ftCalc.bVenueEnabled,
+    bVenueAdjustment: ftCalc.bVenueAdjustment
   },
   {
     _idx: 14,
@@ -16672,7 +16758,8 @@ window.__LAST_AUDIT_STATE = {
       ftAllowedActuallyUsed: _aud_aFTAll,
       ftSeries_stdDev: stdDev(_aud_aFTRaw),
       ftSeries_avg: avgOrNaN(_aud_aFTRaw),
-      venueEnabled: document.getElementById("aVenueSplitEnabled")?.checked || false,
+      venueEnabled: ftCalc.aVenueEnabled,
+      venueAdjustment: ftCalc.aVenueAdjustment,
       missingFTScored: !safeArr(parsed.aFTScored)?.length,
       missingFTAllowed: !safeArr(parsed.aFTAllowed)?.length
     },
@@ -16690,7 +16777,8 @@ window.__LAST_AUDIT_STATE = {
       ftAllowedActuallyUsed: _aud_bFTAll,
       ftSeries_stdDev: stdDev(_aud_bFTRaw),
       ftSeries_avg: avgOrNaN(_aud_bFTRaw),
-      venueEnabled: document.getElementById("bVenueSplitEnabled")?.checked || false,
+      venueEnabled: ftCalc.bVenueEnabled,
+      venueAdjustment: ftCalc.bVenueAdjustment,
       missingFTScored: !safeArr(parsed.bFTScored)?.length,
       missingFTAllowed: !safeArr(parsed.bFTAllowed)?.length
     },
