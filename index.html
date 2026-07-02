@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3837,6 +3836,10 @@ function buildGlobalModelState({ league, parsed, lines, injMultA = 1, injMultB =
   // The checkboxes themselves are now dead UI — a separate HTML-level cleanup, not
   // something this JS fix touches. Do not reintroduce checkbox-gated switching here
   // without also fixing computeFTProjection to match.]
+  // [LOCK: volatility trigger threshold aligned to VENUE_BLEND_CONFIG.minGames (6) —
+  // VERIFIED. Must always match the qualifying floor used by computeVenueBlend, or
+  // volatility and the real projection will silently disagree about whether venue
+  // data applies for this game, which is exactly the bug this was fixed to prevent.]
   const aVenue = getFetchedSeries("A", "venue", "ft", "scored");
   const bVenue = getFetchedSeries("B", "venue", "ft", "scored");
   const aFTS = aVenue.length >= 6 ? aVenue : getOverallSeries("A", 25);
@@ -13656,6 +13659,12 @@ function getFixtureSideRole(side) {
   return "";
 }
 
+// [LOCK: getFetchedSeries prefix fix — VERIFIED. Previously collapsed every
+// marketKey that wasn't "ft"/"h1" onto a dead "h2" key left over from the 2H
+// removal, meaning quarter venue lookups could never work even in principle.
+// Now passes the real marketKey through as the prefix. Harmless no-op for
+// ft/h1 (identity), and correctly prepares q1-q4 for when a venue-split quarter
+// fetch pipeline eventually exists. Do not reintroduce the ft/h1/else-"h2" branch.]
 function getFetchedSeries(side, scope, marketKey, metric) { 
   const ctx = g_massacreFetchContext?.[side]?.[scope]; 
   if (!ctx) return []; 
@@ -13665,12 +13674,20 @@ function getFetchedSeries(side, scope, marketKey, metric) {
   return Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v) && v > 0).slice(0, 10) : []; 
 }
 
-// [OVERRIDE OF PRIOR LOCK — user-directed architecture change]
-// Adaptive sample-tier venue blending. Thresholds/weights centralized in
-// VENUE_BLEND_CONFIG so they're tunable in one place without touching logic.
-// No significance filter: sample size alone governs confidence — a qualifying
-// venue sample (>=6 games) is always blended in at its tier weight, regardless
-// of how close the venue average is to the overall average.
+// [LOCK: ADAPTIVE VENUE BLEND SYSTEM — VERIFIED, user-directed design, do not alter]
+// Overrides an earlier LOCKed fixed-60/40-at->=5-games blend. Adaptive sample-tier
+// venue blending. Thresholds/weights centralized in VENUE_BLEND_CONFIG so they're
+// tunable in one place without touching logic. No significance filter: sample size
+// alone governs confidence — a qualifying venue sample (>=6 games) is always blended
+// in at its tier weight, regardless of how close the venue average is to the overall
+// average. This was an explicit, deliberate rejection of a difference-threshold gate
+// (tested and rejected: it could hide meaningful edges, especially in H1/quarter
+// markets). Weights (70/30 at >=10 games, 50/50 at 6-9) were explicitly confirmed at
+// these exact values — do not "improve" toward stronger venue weighting (e.g. 65/35,
+// 60/40) without a new explicit decision; this was already considered and rejected in
+// favor of these values. DO NOT reintroduce a significance/difference threshold. DO
+// NOT change the weight values. DO NOT decentralize the thresholds back into inline
+// magic numbers.
 const VENUE_BLEND_CONFIG = {
   minGames: 6,
   strongGames: 10,
@@ -13714,6 +13731,9 @@ function combineVenueDiag(scoredDiag, allowedDiag) {
     ignoredBecauseDifferenceTooSmall: false
   };
 }
+// [LOCK: END ADAPTIVE VENUE BLEND SYSTEM — VERIFIED. sampleSizeScored/sampleSizeAllowed
+// are reported separately by design (scored and allowed venue samples can qualify at
+// different sizes) — do not collapse back into a single sampleSize field.]
 
 function getManualSeries(side, marketKey, parsed) {
   if (!parsed) return [];
@@ -13854,9 +13874,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const leagueBase = eb / 2;
   const volLimit = getMarketVolLimit(league, "ft");
 
-  // Adaptive venue blending (overrides prior fixed-60/40 LOCK, user-directed):
-  // >=10 venue games = 70/30, 6-9 = 50/50, <6 = ignore venue. Also skips the blend
-  // if venue avg is within ~2.5 pts of overall (insignificant difference = noise).
+  // [LOCK: FT VENUE BLEND WIRING — VERIFIED, see VENUE_BLEND_CONFIG for the
+  // canonical tier rules. No significance filter — sample size alone governs
+  // confidence. Do not alter without also updating buildGlobalModelState's
+  // matching threshold above.]
   const aFTS = getOverallSeries("A", 10);
   const bFTS = getOverallSeries("B", 10);
   const aFTA = getManualAllowedSeries("A", "ft", parsed);
@@ -14033,9 +14054,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     ftProjectionOnly: !ftHasH2H && ftSampleTier === "thin",
     blowoutGap: Math.abs((projAFT||0) - (projBFT||0)),
     aS, bS, aScores: aFTS, bScores: bFTS,
-    // Bugfix: useVenueA/useVenueB no longer exist (removed by the Issue 6 auto-blend
-    // patch). This now reports whether the venue blend actually applied this run,
-    // which is more accurate than the old manual-checkbox flag it replaces.
+    // [LOCK: FT venue diagnostics — VERIFIED. aVenueEnabled/bVenueEnabled and
+    // aVenueAdjustment/bVenueAdjustment are the real, data-driven venue status —
+    // do not replace with a checkbox read (document.getElementById(...).checked);
+    // that was the exact bug this fixed.]
     aVenueEnabled: aVenueDiag.enabled, bVenueEnabled: bVenueDiag.enabled,
     aVenueAdjustment: aVenueDiag, bVenueAdjustment: bVenueDiag,
     paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6,
@@ -14067,8 +14089,10 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     };
   }
 
-  // Venue blending extended to H1 (was fetched into venue.h1Scored10/h1Allowed10 but
-  // never consumed anywhere before this patch). Same adaptive tiers as FT.
+  // [LOCK: H1 VENUE BLEND WIRING — VERIFIED. Venue data was already being fetched
+  // into venue.h1Scored10/h1Allowed10 but was never consumed anywhere before this
+  // fix. Uses the same VENUE_BLEND_CONFIG tiers as FT — do not diverge the weights
+  // or thresholds between FT and H1.]
   const aVenueH1S = getFetchedSeries("A", "venue", "h1", "scored");
   const bVenueH1S = getFetchedSeries("B", "venue", "h1", "scored");
   const aVenueH1A = getFetchedSeries("A", "venue", "h1", "allowed");
@@ -14191,6 +14215,7 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     h1FullModel: h1SampleTier === "full",
     paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6, defensiveFloorFlag: false,
     aVol1, bVol1, aS1: avgOrNaN(aS1), bS1: avgOrNaN(bS1),
+    // [LOCK: H1 venue diagnostics — VERIFIED, mirrors the FT diagnostics fix.]
     aVenueEnabled: aVenueDiag1.enabled, bVenueEnabled: bVenueDiag1.enabled,
     aVenueAdjustment: aVenueDiag1, bVenueAdjustment: bVenueDiag1
   };
@@ -15777,10 +15802,17 @@ const h1Calc = compute1HProjection({
       const aA = (parsed[pKeyA] && parsed[pKeyA].length) ? parsed[pKeyA] : (g_massacreFetchContext.A[qKey + "Allowed"] || []);
       const bA = (parsed[pKeyB] && parsed[pKeyB].length) ? parsed[pKeyB] : (g_massacreFetchContext.B[qKey + "Allowed"] || []);
 
-      // Quarter venue blending intentionally NOT wired here — no venue-split quarter
-      // fetch pipeline exists (verified: no venue.q1Scored10/etc is ever populated
-      // anywhere in the file). Adding blend calls that always no-op is dead plumbing;
-      // this gets wired for real once a venue-aware quarter fetch exists.
+      // [LOCK: QUARTER VENUE BLENDING INTENTIONALLY NOT WIRED — VERIFIED, do not add.
+      // No venue-split quarter fetch pipeline exists (checked: no venue.q1Scored10/
+      // q1Allowed10/etc. is ever populated anywhere in the file — venue data is only
+      // fetched for FT and H1). Wiring computeVenueBlend() into quarters today would
+      // always no-op (empty arrays -> enabled:false every time) — dead plumbing with
+      // no behavioral effect. Do not add venue blend calls here until a real
+      // venue-aware quarter fetch (home/away split by quarter) is built and populates
+      // g_massacreFetchContext[side].venue.q1Scored10 etc. When that fetch exists,
+      // wire it through computeVenueBlend()/combineVenueDiag() exactly as FT and H1
+      // are wired, using the same VENUE_BLEND_CONFIG tiers — do not invent different
+      // thresholds for quarters.]
       const volLimit = getMarketVolLimit(league, qKey);
       const sampleSize = Math.min(aS.length, bS.length);
       const leagueBaseQ = (LEAGUE_BASES[league] || 160) / 8;
@@ -16226,6 +16258,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     fullModel: ftCalc.ftFullModel,
     sampleTier: ftCalc.ftSampleTier,
     hasH2H: ftCalc.ftHasH2H,
+    // [LOCK: pick-level venue diagnostics — VERIFIED. Sourced from ftCalc/h1Calc's
+    // real venue status, not from checkbox state. See dataQuality block below for
+    // the matching fix — both must stay on the same data-driven source.]
     aVenueEnabled: ftCalc.aVenueEnabled,
     bVenueEnabled: ftCalc.bVenueEnabled,
     aVenueAdjustment: ftCalc.aVenueAdjustment,
@@ -16758,6 +16793,11 @@ window.__LAST_AUDIT_STATE = {
       ftAllowedActuallyUsed: _aud_aFTAll,
       ftSeries_stdDev: stdDev(_aud_aFTRaw),
       ftSeries_avg: avgOrNaN(_aud_aFTRaw),
+      // [LOCK: dataQuality.teamA.venueEnabled — VERIFIED. Previously read the dead
+      // aVenueSplitEnabled checkbox directly, which meant this field and
+      // picks[].aVenueEnabled disagreed (checkbox always false vs. real data-driven
+      // flag true) — that exact inconsistency was the reported bug. Do not revert to
+      // a document.getElementById(...).checked read.]
       venueEnabled: ftCalc.aVenueEnabled,
       venueAdjustment: ftCalc.aVenueAdjustment,
       missingFTScored: !safeArr(parsed.aFTScored)?.length,
@@ -16777,6 +16817,8 @@ window.__LAST_AUDIT_STATE = {
       ftAllowedActuallyUsed: _aud_bFTAll,
       ftSeries_stdDev: stdDev(_aud_bFTRaw),
       ftSeries_avg: avgOrNaN(_aud_bFTRaw),
+      // [LOCK: dataQuality.teamB.venueEnabled — VERIFIED, mirrors the teamA fix.
+      // Do not revert to a document.getElementById(...).checked read.]
       venueEnabled: ftCalc.bVenueEnabled,
       venueAdjustment: ftCalc.bVenueAdjustment,
       missingFTScored: !safeArr(parsed.bFTScored)?.length,
