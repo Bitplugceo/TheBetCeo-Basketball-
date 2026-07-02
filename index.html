@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -14034,6 +14035,61 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(decayH2HB) * hw) : avgOrNaN(decayH2HB);
   }
   let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
+
+  // [LOCK: netVenueEffect SHADOW RECOMPUTATION — VERIFIED, diagnostic-only, do not
+  // remove or "simplify" by reusing offensiveAdjustment/defensiveAdjustment instead.
+  // Those raw input-stage deltas do NOT equal the actual final-total impact, because:
+  // (1) the ESPN advanced ORTG/DRTG branch never reads the venue-blended inputs at
+  // all, so venue's true effect is correctly 0 on those games even when
+  // offensiveAdjustment is nonzero; (2) volatility/injury/intel/H2H all apply
+  // nonlinear transforms downstream of the raw scored/allowed averages. This block
+  // re-runs those exact same steps a second time with pure overall (pre-venue)
+  // inputs, using variables already in scope (aOverallAvg, bOverallAvg,
+  // aAllowedOverall, bAllowedOverall, aFTS, bFTS, config, isEspnLeague,
+  // hasRealRatings, hasRealPace, aS_pre, bS_pre, _bVolRatio, _aVolRatio,
+  // intelSignalA/B, _ftVolRatio, ftHasH2H, aH2H, bH2H) so it can never drift out of
+  // sync with the real branch-selection logic above. It writes ONLY to _nv-suffixed
+  // local variables and never mutates aS, bS, projAFT, projBFT, or ftProj — the real
+  // pick pipeline is completely unaffected by this block's presence or absence.]
+  let aS_pre_nv = anchorProjection(aOverallAvg, sampleSize, leagueBase);
+  let bS_pre_nv = anchorProjection(bOverallAvg, sampleSize, leagueBase);
+  let aS_nv, bS_nv;
+  if (isEspnLeague && hasRealRatings && hasRealPace) {
+    aS_nv = aS_pre;
+    bS_nv = bS_pre;
+  } else {
+    const _twNv = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+    const _owNv = 1 - _twNv;
+    aS_nv = isFinite(aS_pre_nv) && isFinite(bAllowedOverall) ? (aS_pre_nv * _twNv + bAllowedOverall * _owNv) : aS_pre_nv;
+    bS_nv = isFinite(bS_pre_nv) && isFinite(aAllowedOverall) ? (bS_pre_nv * _twNv + aAllowedOverall * _owNv) : bS_pre_nv;
+  }
+  aS_nv = applyVolatility(aS_nv, aFTS, volLimit, league);
+  bS_nv = applyVolatility(bS_nv, bFTS, volLimit, league);
+  aS_nv *= injMultA;
+  bS_nv *= injMultB;
+  if (injMultA < 1) bS_nv *= (1 + (1 - injMultA) * 0.2);
+  if (injMultB < 1) aS_nv *= (1 + (1 - injMultB) * 0.2);
+  aS_nv = applyDampedIntelSignal(aS_nv, intelSignalA.signal, _bVolRatio);
+  bS_nv = applyDampedIntelSignal(bS_nv, intelSignalB.signal, _aVolRatio);
+  let projAFT_nv = aS_nv;
+  let projBFT_nv = bS_nv;
+  if (ftHasH2H) {
+    const massacreH2H_nv = getMassacreH2HSeries("ft", getCurrentFixtureMeta(), parsed);
+    const decayH2HA_nv = massacreH2H_nv.A.length >= 2 ? massacreH2H_nv.A : aH2H;
+    const decayH2HB_nv = massacreH2H_nv.B.length >= 2 ? massacreH2H_nv.B : bH2H;
+    const hw_nv = getH2HWeight(decayH2HA_nv.length, decayH2HB_nv.length, "ft", ftSampleTier, Math.abs(aS_nv - bS_nv), league, leagueBase, 1.0, {
+      injMultA,
+      injMultB,
+      volRatio: _ftVolRatio,
+      blowoutGap: Math.abs(aS_nv - bS_nv),
+      paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
+    });
+    projAFT_nv = isFinite(projAFT_nv) ? (projAFT_nv * (1 - hw_nv) + avgOrNaN(decayH2HA_nv) * hw_nv) : avgOrNaN(decayH2HA_nv);
+    projBFT_nv = isFinite(projBFT_nv) ? (projBFT_nv * (1 - hw_nv) + avgOrNaN(decayH2HB_nv) * hw_nv) : avgOrNaN(decayH2HB_nv);
+  }
+  const ftProj_nv = (isFinite(projAFT_nv) ? projAFT_nv : 0) + (isFinite(projBFT_nv) ? projBFT_nv : 0);
+  const netVenueEffect = (isFinite(ftProj) && isFinite(ftProj_nv)) ? (ftProj - ftProj_nv) : 0;
+
   const ftEdge = (isFinite(ftProj) && isFinite(lines.ftLine) && lines.ftLine > 0) ? ftProj - lines.ftLine : NaN;
   const aEdge = (isFinite(projAFT) && isFinite(lines.aLine) && lines.aLine > 0) ? projAFT - lines.aLine : NaN;
   const bEdge = (isFinite(projBFT) && isFinite(lines.bLine) && lines.bLine > 0) ? projBFT - lines.bLine : NaN;
@@ -14060,6 +14116,11 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     // that was the exact bug this fixed.]
     aVenueEnabled: aVenueDiag.enabled, bVenueEnabled: bVenueDiag.enabled,
     aVenueAdjustment: aVenueDiag, bVenueAdjustment: bVenueDiag,
+    // [LOCK: netVenueEffect — VERIFIED. The true final-total FT delta from venue
+    // blending, via the shadow recomputation above. Reads 0 for games that used the
+    // ESPN advanced ORTG/DRTG branch — that is correct, not a bug, since that branch
+    // never consumes venue-blended inputs.]
+    netVenueEffect,
     paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6,
     pace: synPace,
     synNetA, synNetB,
@@ -16264,7 +16325,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     aVenueEnabled: ftCalc.aVenueEnabled,
     bVenueEnabled: ftCalc.bVenueEnabled,
     aVenueAdjustment: ftCalc.aVenueAdjustment,
-    bVenueAdjustment: ftCalc.bVenueAdjustment
+    bVenueAdjustment: ftCalc.bVenueAdjustment,
+    netVenueEffect: ftCalc.netVenueEffect
   },
   {
     _idx: 1,
