@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7077,27 +7076,15 @@ function weightedRecentAverage(arr, weights = MODEL_TUNING.recencyWeights) {
 function trimmedAvg(arr) {
   const work = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
   if (!work.length) return NaN;
-  if (work.length <= 2) return weightedRecentAverage(work);
-  // FIX #17: Guard against trimming leaving fewer than 3 values.
-  // With 3 games, dropping min+max leaves 1 game — a single outlier determines
-  // the entire "average". Require at least 4 games before trimming.
-  if (work.length <= 3) return weightedRecentAverage(work);
-  const minVal = Math.min(...work);
-  const maxVal = Math.max(...work);
-  let minRemoved = false;
-  let maxRemoved = false;
-  const trimmed = work.filter(v => {
-    if (v === minVal && !minRemoved) {
-      minRemoved = true;
-      return false;
-    }
-    if (v === maxVal && !maxRemoved) {
-      maxRemoved = true;
-      return false;
-    }
-    return true;
-  });
-  return weightedRecentAverage(trimmed);
+  // ISSUE #6 FIX: previously trimmed the min/max BEFORE calling weightedRecentAverage,
+  // which weights by array index (0 = most recent). Removing a value from the middle of
+  // the chronological order shifts every later index down by one, so a game's recency
+  // weight no longer corresponds to how many games ago it actually was — e.g. if the
+  // 2nd most recent game is trimmed, the 3rd most recent silently inherits the weight
+  // meant for the 2nd. With sample sizes this small (<=10 games), trimming outliers adds
+  // more distortion than it removes, so it has been dropped entirely in favor of plain
+  // recency weighting, which already down-weights old/anomalous games naturally.
+  return weightedRecentAverage(work);
 }
 
 // [LOCK: ISSUE #14 FIX — DATE-AWARE RECENCY AVERAGE, IMPLEMENTED 2026-07-03, SHADOW MODE
@@ -10137,6 +10124,18 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
         mildMode
       };
 
+      // ISSUE #11 FIX: adjustedEdge was computed and stored in trackerFeedback metadata
+      // but never actually applied to p.edge, so the Bayesian tracker feedback loop could
+      // only nudge the confidence grade and never correct the edge magnitude itself — the
+      // number used for display, lock selection, and tracker saving stayed the raw model
+      // edge. Applied here (skipped in advisory-only mode, matching how confidence/lock
+      // effects below are also gated), and displayEdge is kept in sync since it was
+      // already copied from p.edge earlier in the pipeline before this function ran.
+      if (!advisoryOnly) {
+        p.edge = adjustedEdge;
+        if (isFinite(p.displayEdge)) p.displayEdge = adjustedEdge;
+      }
+
       // Confidence shift based on posterior win probability
       if (posteriorWinProb >= 0.62) {
         confidenceShift += 1;
@@ -11203,14 +11202,14 @@ function addTrackedPicks(newPicks) {
   // FIX #1/#24: This is now the only applyVolatility definition in the file.
   // The dead earlier duplicate (which appeared before this one in source order,
   // and was therefore always shadowed/never executed) has been deleted by FIX #24.
-  if (!isFinite(proj) || !Array.isArray(series) || !series.length) return proj;
-  const sd = stdDev(series);
-  const limit = Number(leagueVolLimit) || 12;
-  const ratio = sd / limit;
-  const factor = ratio - 0.5;
-  const mult = String(league || "").toLowerCase().includes("wnba") ? 0.25 : 0.20;
-  const adjustment = clampNumber(factor * mult, -0.08, 0.08);
-  return proj * (1 + adjustment);
+  // ISSUE #7 FIX: this previously shifted the point projection itself based on
+  // volatility (higher variance -> higher projection, lower variance -> lower
+  // projection), with no statistical basis for a more erratic team scoring more on
+  // average. Volatility is a confidence/uncertainty signal, not a mean-shift signal,
+  // so the projection is now returned unchanged. Volatility still affects grading via
+  // getConfidenceGrade's volRatio-based logistic reconciliation step.
+  if (!isFinite(proj)) return proj;
+  return proj;
 }
 
 function getVolatilityRatioForSeries(series, leagueVolLimit) {
@@ -14622,10 +14621,16 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 // for Issue #10 (the ~85 leagues that used to silently hit the uncalibrated default=12).]
 function getMarketVolLimit(league, marketKey) {
   const cfg = LEAGUE_CONFIG_MAP[String(league || "").toUpperCase()];
-  if (cfg && isFinite(cfg.volLimit)) return cfg.volLimit;
-  const learned = getLearnedVolLimit(league);
-  if (learned != null) return learned;
-  return LEAGUE_VOL_LIMITS[String(league || "").toLowerCase()] || 12;
+  const base = (cfg && isFinite(cfg.volLimit)) ? cfg.volLimit :
+    (getLearnedVolLimit(league) != null ? getLearnedVolLimit(league) : (LEAGUE_VOL_LIMITS[String(league || "").toLowerCase()] || 12));
+  // ISSUE #2 FIX: marketKey was accepted but never used, so H1/quarter volatility
+  // adjustments were computed against the FT-scale limit (e.g. 12 for NBA), which is
+  // roughly double/quadruple the real half/quarter scoring range, artificially
+  // suppressing the volatility adjustment and H2H dampening for those markets.
+  const key = String(marketKey || "").toLowerCase();
+  if (key === "h1" || key === "h1_team_a" || key === "h1_team_b") return base * 0.5;
+  if (key.startsWith("q")) return base * 0.25;
+  return base;
 }
 
 
@@ -16139,8 +16144,12 @@ if (verifiedTeamBConfig && verifiedTeamBConfig.configKey) {
 // projection blend ratio instead of using hardcoded inline 50/50 split.
 // The blend is applied via the config object passed to computeFTProjection.
 MODEL_TUNING.recencyWeights = ftConfigOverride.recencyProfile || _runFTWeights;
+// ISSUE #3 FIX: getDynamicWeights expects a sample-tier string ("full"/"thin") in its
+// first parameter, but a volatility-regime flag (stable/volatile) was being passed
+// instead — the function's own sampleTier argument (from baseFtCalc, already computed
+// above) was never used. Volatility now only informs the second parameter, as intended.
 const _dynWeights = getDynamicWeights(
-  globalModelState?.volState?.regime === "stable" ? "full" : "thin",
+  baseFtCalc.ftSampleTier,
   globalModelState?.volState?.combinedVolRatio ?? 0.5,
   league
 );
@@ -16321,6 +16330,10 @@ const h1Calc = compute1HProjection({
       const bH2H = getH2HSeries("B", qKey, parsed);
       const hasH2H = maybeReadH2HEnabled(qKey) && aH2H.length >= 2 && bH2H.length >= 2;
       const tier = getSampleTier(aS, bS);
+      // PATCHED ISSUE #1: quarter-specific fullModel/projectionOnly flags, computed from
+      // this quarter's own sample tier instead of borrowing ftCalc.ftFullModel (FT's flag).
+      const qFullModel = tier === "full";
+      const qProjectionOnly = !hasH2H && tier === "thin";
       if (hasH2H) {
         // FIX #26: Quarters previously used a flat hardcoded hw=0.15 for H2H blending,
         // unlike FT and H1 which use the dynamic, context-aware getH2HWeight() (sample-size
@@ -16438,9 +16451,13 @@ const h1Calc = compute1HProjection({
             // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: siblingEdge (h1Calc.h1Edge, for the
             // symmetric cross-market bonus) and league (for the logistic reconciliation)
             // added — this is the block that determines the final displayed Q1 confidence.
+            // ISSUE #1 FIX: fullModel/projectionOnly re-added here (previously omitted,
+            // silently defaulting to falsy on every rescale, so a rescaled Q1 could never
+            // earn the fullModel score bonus even with a strong sample).
             q1.confidence = getConfidenceGrade({
               pick: q1.pick, line: q1.line, edge: q1.edge, sampleTier: q1.tier,
               volLimit: getMarketVolLimit(league, "q1"), marketKey: "q1", hasH2H: q1.hasH2H,
+              fullModel: q1.fullModel, projectionOnly: q1.projectionOnly,
               siblingEdge: h1Calc.h1Edge, league
             });
           }
@@ -16454,9 +16471,11 @@ const h1Calc = compute1HProjection({
             q2.pick = getPick(q2.edge, q2.line, league, "q2", {});
             // PATCHABLE ISSUE #3/#7 FIX: same volLimit/modelState fix as Q1 above.
             // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: same siblingEdge/league fix as Q1 above.
+            // ISSUE #1 FIX: fullModel/projectionOnly re-added, matching Q1's fix above.
             q2.confidence = getConfidenceGrade({
               pick: q2.pick, line: q2.line, edge: q2.edge, sampleTier: q2.tier,
               volLimit: getMarketVolLimit(league, "q2"), marketKey: "q2", hasH2H: q2.hasH2H,
+              fullModel: q2.fullModel, projectionOnly: q2.projectionOnly,
               siblingEdge: h1Calc.h1Edge, league
             });
           }
@@ -16481,9 +16500,11 @@ const h1Calc = compute1HProjection({
             q3.pick = getPick(q3.edge, q3.line, league, "q3", {});
             // PATCHABLE ISSUE #3/#7 FIX: volLimit/modelState fix, matching Q1/Q2 above.
             // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: siblingEdge (ftCalc.ftEdge) and league added.
+            // ISSUE #1 FIX: fullModel/projectionOnly re-added, matching Q1/Q2's fix above.
             q3.confidence = getConfidenceGrade({
               pick: q3.pick, line: q3.line, edge: q3.edge, sampleTier: q3.tier,
               volLimit: getMarketVolLimit(league, "q3"), marketKey: "q3", hasH2H: q3.hasH2H,
+              fullModel: q3.fullModel, projectionOnly: q3.projectionOnly,
               siblingEdge: ftCalc.ftEdge, league
             });
           }
@@ -16497,9 +16518,11 @@ const h1Calc = compute1HProjection({
             q4.pick = getPick(q4.edge, q4.line, league, "q4", {});
             // PATCHABLE ISSUE #3/#7 FIX: volLimit/modelState fix, matching Q1/Q2 above.
             // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: siblingEdge (ftCalc.ftEdge) and league added.
+            // ISSUE #1 FIX: fullModel/projectionOnly re-added, matching Q1/Q2/Q3's fix above.
             q4.confidence = getConfidenceGrade({
               pick: q4.pick, line: q4.line, edge: q4.edge, sampleTier: q4.tier,
               volLimit: getMarketVolLimit(league, "q4"), marketKey: "q4", hasH2H: q4.hasH2H,
+              fullModel: q4.fullModel, projectionOnly: q4.projectionOnly,
               siblingEdge: ftCalc.ftEdge, league
             });
           }
@@ -16603,6 +16626,12 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       pick: h1Pick, note: h1Note, line: h1Line, edge: h1Calc.h1Edge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: false, hasH2H: h1Calc.h1HasH2H,
+      // ISSUE #9 FIX: no volatility/volLimit were passed here at all, so the logistic
+      // reconciliation step inside getConfidenceGrade silently defaulted volRatio to a
+      // neutral 1.0 for every H1 pick, instead of using H1's own measured volatility
+      // (already computed in h1Calc as aVol1/bVol1) like FT and the other markets do.
+      volatility: Math.max(h1Calc.aVol1, h1Calc.bVol1),
+      volLimit: getMarketVolLimit(league, "h1"),
       marketKey: "h1",
       // [LOCK: q2Edge now passed — see matching lock at the FT q4Edge call above.
       // VERIFIED fix, do not remove.]
@@ -16626,8 +16655,14 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       fullModel: ftCalc.teamFullModel,
       trap: false,
       hasH2H: ftCalc.ftHasH2H,
-      volatility: 0,
-      volLimit: 12,
+      // ISSUE #9 FIX: previously hardcoded volatility:0, volLimit:12, which asserts zero
+      // variance (0/12=0) for every team-total pick regardless of the team's actual
+      // scoring volatility, giving team markets an artificial confidence boost relative
+      // to FT/H1 (which pass their real, measured volatility). Now uses Team A's own
+      // measured volatility (ftCalc.aVol, already computed as stdDev-based ratio*volLimit)
+      // and the market-specific limit, consistent with how FT computes its volatility input.
+      volatility: ftCalc.aVol,
+      volLimit: getMarketVolLimit(league, "team_a"),
       injuryNotes: [],
       marketKey: "team_a",
       // PATCHABLE ISSUE #7 FIX: modelState removed — getConfidenceGrade never read it.
@@ -16644,8 +16679,10 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       fullModel: ftCalc.teamFullModel,
       trap: false,
       hasH2H: ftCalc.ftHasH2H,
-      volatility: 0,
-      volLimit: 12,
+      // ISSUE #9 FIX: same hardcoded volatility:0/volLimit:12 problem as Team A above,
+      // fixed the same way using Team B's own measured volatility (ftCalc.bVol).
+      volatility: ftCalc.bVol,
+      volLimit: getMarketVolLimit(league, "team_b"),
       injuryNotes: [],
       marketKey: "team_b",
       // PATCHABLE ISSUE #7 FIX: modelState removed — getConfidenceGrade never read it.
@@ -16989,6 +17026,11 @@ if (rawQSum > 50 && qPicks.length > 0) {
 const gameCoverageShare = qPicks.length / 4; 
 const scale = (fP.proj * gameCoverageShare) / rawQSum;
 
+// ISSUE #8 FIX: only run this rescale pass when it actually changes anything meaningful.
+// Previously ran unconditionally every time rawQSum>50, even when Q1+Q2/Q3+Q4 already
+// summed correctly from the earlier reconciliation passes, silently reintroducing scaling
+// noise and (see ISSUE #1 fix below) leaving q.confidence stale relative to q.edge.
+if (Math.abs(scale - 1) > 0.01) {
 qPicks.forEach(q => {
   q.proj *= scale;
   q.edge = q.proj - q.line;
@@ -17001,7 +17043,15 @@ qPicks.forEach(q => {
   // correct scale, consistent with FIX #27's identical fix in getConfidenceGrade. Do NOT
   // hardcode this back to "h1" or any other single market key.]
   q.pick = getPick(q.edge, q.line, league, q.marketKey, {});
+  // ISSUE #1 FIX: recompute confidence after this rescale so the displayed grade reflects
+  // the post-rescale edge instead of staying stale from the earlier Q1+Q2/Q3+Q4 pass.
+  q.confidence = getConfidenceGrade({
+    pick: q.pick, line: q.line, edge: q.edge, sampleTier: q.sampleTier,
+    volLimit: getMarketVolLimit(league, q.marketKey), marketKey: q.marketKey,
+    hasH2H: q.hasH2H, fullModel: q.fullModel, projectionOnly: false, league
+  });
 });
+}
 
 }
 } 
@@ -17200,15 +17250,21 @@ window.__lastRunFixtureMeta = fixtureMeta;
   // Retrospective backtest removed per spec
 
 // ── AUDIT PRE-COMPUTE HELPERS ─────────────────────────────────────────────
+// ISSUE #10 FIX: getPick() (the live pick decision logic) only ever multiplies by
+// UNDER_EDGE_FACTOR for the under-side threshold — it never reads
+// getLeagueUnderBlockRatio() or PICK_RULES. This audit block previously multiplied by
+// an extra _aud_underRatio factor on top, so the audit dump displayed a different
+// (larger) under-side threshold than the engine actually uses to decide picks. The
+// extra factor has been removed so the displayed threshold matches getPick() exactly.
 const _aud_underRatio  = getLeagueUnderBlockRatio(league);
 const _aud_ftThO  = getLeagueEdgePointThreshold(league, "ft");
-const _aud_ftThU  = _aud_ftThO  * UNDER_EDGE_FACTOR * _aud_underRatio;
+const _aud_ftThU  = _aud_ftThO  * UNDER_EDGE_FACTOR;
 const _aud_h1ThO  = getLeagueEdgePointThreshold(league, "h1");
-const _aud_h1ThU  = _aud_h1ThO  * UNDER_EDGE_FACTOR * _aud_underRatio;
+const _aud_h1ThU  = _aud_h1ThO  * UNDER_EDGE_FACTOR;
 const _aud_tmThO  = getLeagueEdgePointThreshold(league, "team_a");
-const _aud_tmThU  = _aud_tmThO  * UNDER_EDGE_FACTOR * _aud_underRatio;
+const _aud_tmThU  = _aud_tmThO  * UNDER_EDGE_FACTOR;
 const _aud_qThO   = getLeagueEdgePointThreshold(league, "q1");
-const _aud_qThU   = _aud_qThO   * UNDER_EDGE_FACTOR * _aud_underRatio;
+const _aud_qThU   = _aud_qThO   * UNDER_EDGE_FACTOR;
 const _aud_aFTRaw = getOverallSeries("A", 10);
 const _aud_bFTRaw = getOverallSeries("B", 10);
 const _aud_aFTAll = getManualAllowedSeries("A", "ft", parsed);
@@ -17241,7 +17297,13 @@ const _aud_profA       = getMassacreProfile(_aud_marginA.length >= 2 ? _aud_marg
 const _aud_profB       = getMassacreProfile(_aud_marginB.length >= 2 ? _aud_marginB : [], "Team B");
 const _aud_trust       = getLeagueTrustMeta(league);
 const _aud_settledPicks = (typeof g_trackerDerivedState !== "undefined") ? (g_trackerDerivedState?.settledPicks || 0) : 0;
-const _aud_gradeThresholds = (function() { try { const _s = localStorage.getItem("BB_CONFIDENCE_THRESHOLDS"); return _s ? JSON.parse(_s) : { aThresh: 5, bThresh: 1.4, cThresh: 1 }; } catch(e) { return { aThresh: 5, bThresh: 1.4, cThresh: 1 }; } })();
+// ISSUE #13 FIX: this previously hardcoded its own fallback ({aThresh:5, bThresh:1.4,
+// cThresh:1}), different from getConfidenceGradeThresholds()'s fallback ({aThresh:4,
+// bThresh:1.0, cThresh:0.5}) used by the live engine. On a fresh install before any
+// calibration has run, the audit dump would show different thresholds than the engine
+// actually graded with. Now calls the same helper the engine uses, so they can never
+// drift apart again.
+const _aud_gradeThresholds = getConfidenceGradeThresholds();
 // ─────────────────────────────────────────────────────────────────────────
 
 window.__LAST_AUDIT_STATE = {
@@ -19492,9 +19554,15 @@ window.ENGINE_TEST_SUITE = (() => {
   });
 
   suite("anchorProjection", () => {
-    const a = anchorProjection(250, 220, "nba", "ft");
-    expectApprox("returns proj unchanged (removed per spec)", a, 250, 0.001);
-    expectApprox("within gate no change", anchorProjection(232, 220, "nba", "ft"), 232, 0.5);
+    // ISSUE #12 FIX: anchorProjection(proj, sampleSize, leagueBase) takes 3 args, not 4.
+    // The old calls passed a 4th "ft" argument that was silently ignored, and used
+    // sampleSize=220 (>=6), which always skips the blending branch entirely — so the
+    // blending logic (n<6) was never exercised by this suite despite the function still
+    // implementing it. sampleSize=3 now actually exercises the blend-toward-base branch.
+    const a = anchorProjection(250, 220, "nba");
+    expectApprox("n>=6 returns proj unchanged", a, 250, 0.001);
+    const blended = anchorProjection(300, 3, 220);
+    expectTrue("n<6 blends toward leagueBase (between base and proj)", blended > 220 && blended < 300);
   });
 
   suite("parseMarketRangeMeta", () => {
