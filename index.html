@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -11492,18 +11493,17 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
 
 // calibrateConfidenceModel stub removed by Auto-Patcher V11 (full implementation exists later)
 
-    // [LOCK: ADDITIVE INTEGER SCORING — WEIGHTS ARE HEURISTIC, NOT EMPIRICALLY CALIBRATED]
+    // [UNLOCKED PER MAINTAINER REQUEST — see PATCHABLE ISSUES #1/#4/#5. This function
+    // previously forbade adding uncalibrated increments; lineupQuality (#1) and the
+    // symmetric quarter cross-market bonus (#4) were deliberately added anyway, and a
+    // bounded logistic-reconciliation step (#5) was added at the end of the function.
+    // These are still UNVERIFIED CALIBRATION — tune the constants once real settled-pick
+    // history exists to check them against. The remaining guidance below still holds:]
     // Each factor (+2 fullModel, +1 H2H, -3 trap, etc.) is an arbitrary integer with no
     // statistical derivation. calibrateMassacreCoefficients adjusts only the grade BOUNDARY
     // THRESHOLDS (A/B/C cutoffs) from settled win rates — it never adjusts individual factor
     // weights. A model could have persistently miscalibrated A-vs-B discrimination even after
     // calibration runs if any single factor weight is wrong.
-    // The correct long-term replacement is logistic regression on (edgePct, sampleTier,
-    // hasH2H, volatility ratio, trap, paceGapRisk) predicting P(win), with grade boundaries
-    // set from calibrated probability thresholds. simPct from the massacre Monte Carlo is
-    // applied downstream via bumpConfidenceGrade — it cannot be added here because the
-    // simulation has not run at this point in the execution order.
-    // DO NOT add more uncalibrated integer increments to this function.
     // DO NOT lower the trap penalty (-3) without a win-rate analysis of trap-flagged picks.
     // [LOCK: INTENTIONAL DELETION — see matching lock at getDynamicEdgeThreshold above.
     // VERIFIED, zero remaining references, do not re-add.]
@@ -11513,10 +11513,15 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
 function getConfidenceGrade(params) {
   // PATCHABLE ISSUE #7 FIX: modelState was accepted but never read anywhere in this
   // function body — removed from the destructure. Call sites cleaned up separately.
+  // PATCHABLE ISSUES #1/#4/#5 (UNLOCKED) FIX: added lineupQuality (previously computed
+  // and passed everywhere but silently dropped), siblingEdge (symmetric cross-market
+  // agreement bonus for quarters), and league (needed for the logistic reconciliation
+  // step at the end of this function).
   const {
     pick, note, line, edge, sampleTier, projectionOnly, fullModel, trap,
     hasH2H, volatility, volLimit, marketKey = "",
-    q4Edge = null, q2Edge = null
+    q4Edge = null, q2Edge = null, siblingEdge = null,
+    lineupQuality = null, league = ""
   } = params || {};
 
   let score = 0;
@@ -11563,10 +11568,31 @@ function getConfidenceGrade(params) {
       const q2EdgeNorm = q2Edge / 55;
       score += Math.abs(q2EdgeNorm) * 0.20;
     }
+    // PATCHABLE ISSUE #4 (UNLOCKED) FIX: quarters previously had no symmetric
+    // cross-market bonus (only FT<-Q4 and H1<-Q2 existed). siblingEdge is the
+    // encompassing half/total's edge (H1 for Q1/Q2, FT for Q3/Q4), passed in by
+    // the caller. UNVERIFIED CALIBRATION: 0.20/0.375 mirror the FT/H1 magnitudes
+    // above at roughly half weight, not independently re-derived from data.
+    if ((marketKey === "q1" || marketKey === "q2" || marketKey === "q3" || marketKey === "q4") && isFinite(siblingEdge) && isFinite(edge)) {
+      const qEdgeNorm = edge / 55;
+      score += Math.abs(qEdgeNorm) * 0.20;
+      const qSide = edge > 0 ? "over" : "under";
+      const siblingSide = siblingEdge > 0 ? "over" : "under";
+      if (Math.abs(qEdgeNorm) > 0.09 && qSide === siblingSide) {
+        score += 0.375;
+      }
+    }
 
     // 3. H2H Presence
     if (hasH2H) score += 1.0;
     else score -= 0.15;
+
+    // PATCHABLE ISSUE #1 (UNLOCKED) FIX: lineupQuality was computed and passed to
+    // every call site but never read here. UNVERIFIED CALIBRATION: neutral point
+    // and +/-0.5 cap are reasoned defaults, not independently re-derived from data.
+    if (isFinite(lineupQuality)) {
+      score += clampNumber((lineupQuality - 0.7) / 0.3 * 0.5, -0.5, 0.5);
+    }
 
         // Issue 26: Simplified — removed trap penalty (always false), volatility, injury, and
     // back-to-back adjustments (handled elsewhere). Kept: sampleTier, fullModel, projectionOnly,
@@ -11583,10 +11609,32 @@ function getConfidenceGrade(params) {
   if (score === -999) return "NaN";
 
   const _gt = getConfidenceGradeThresholds();
-  if (score >= _gt.aThresh) return "A";
-  if (score >= _gt.bThresh) return "B";
-  if (score >= _gt.cThresh) return "C";
-  return "D";
+  let finalGrade;
+  if (score >= _gt.aThresh) finalGrade = "A";
+  else if (score >= _gt.bThresh) finalGrade = "B";
+  else if (score >= _gt.cThresh) finalGrade = "C";
+  else finalGrade = "D";
+
+  // PATCHABLE ISSUE #5 (UNLOCKED) FIX: bounded reconciliation between the heuristic
+  // point-based grade and the logistic win-probability model (getConfidenceWinProbability,
+  // already used elsewhere for winProbability). This does NOT replace the heuristic system
+  // — a full redesign is still a separate, larger undertaking than a patch — it only nudges
+  // the grade by at most one notch when the two systems strongly disagree (2+ grade ranks
+  // apart). UNVERIFIED CALIBRATION: the 0.66/0.58/0.51 probability cutoffs and the 2-rank
+  // disagreement gate are reasoned defaults, not independently re-derived from data.
+  if (isFinite(edge) && isFinite(line) && line > 0 && league) {
+    const edgePct = Math.abs(edge / line);
+    const volRatio = (isFinite(volatility) && isFinite(volLimit) && volLimit > 0) ? volatility / volLimit : 1.0;
+    const logisticWinProb = getConfidenceWinProbability(finalGrade, edgePct, volRatio, sampleTier, hasH2H, false, league);
+    const impliedGrade = logisticWinProb >= 0.66 ? "A" : logisticWinProb >= 0.58 ? "B" : logisticWinProb >= 0.51 ? "C" : "D";
+    const _rankMap = { A: 4, B: 3, C: 2, D: 1 };
+    const gap = (_rankMap[impliedGrade] || 0) - (_rankMap[finalGrade] || 0);
+    if (Math.abs(gap) >= 2) {
+      finalGrade = bumpConfidenceGrade(finalGrade, gap > 0 ? 1 : -1);
+    }
+  }
+
+  return finalGrade;
 }
 
     const _anchorCapCache = new Map();
@@ -14194,6 +14242,18 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     synNetA = avgOrNaN(ctxA.ortg10) - avgOrNaN(ctxA.drtg10);
     synNetB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
     usedAdvanced = true;
+    // PATCHABLE ISSUE #2 (UNLOCKED) FIX: this branch previously ignored venue-blended
+    // scored averages entirely. Applies a partial (35%) nudge toward the venue-blended
+    // average, since the advanced ORTG/DRTG history already captures some venue signal
+    // on its own. UNVERIFIED CALIBRATION: 0.35 is a reasoned starting weight, not
+    // independently re-derived from data — tune once enough venue games settle.
+    const VENUE_ADVANCED_BLEND_FACTOR = 0.35;
+    if (aVenueDiag.enabled && isFinite(aVenueAvg) && isFinite(aOverallAvg)) {
+      aS += (aVenueAvg - aOverallAvg) * VENUE_ADVANCED_BLEND_FACTOR;
+    }
+    if (bVenueDiag.enabled && isFinite(bVenueAvg) && isFinite(bOverallAvg)) {
+      bS += (bVenueAvg - bOverallAvg) * VENUE_ADVANCED_BLEND_FACTOR;
+    }
   } else {
     // Issue 3: Use dynamic teamWeight from config (default 0.65/0.35) instead of hardcoded 0.5
     const _tw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
@@ -16227,6 +16287,21 @@ const h1Calc = compute1HProjection({
         projB = anchorProjection(avgOrNaN(bS) * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
       }
 
+      // PATCHABLE ISSUE #3 (UNLOCKED) FIX: no real venue-split quarter data is ever
+      // fetched (no fetch pipeline exists for it), so a true per-quarter home/away
+      // blend isn't possible without new fetch infrastructure. As an honest proxy
+      // (NOT real quarter venue data), this distributes the already-computed FT-level
+      // venue adjustment evenly across the 4 quarters at partial (50%) trust, since
+      // it's a proxy rather than actual quarter-level signal. UNVERIFIED CALIBRATION:
+      // if real venue-split quarter fetching is ever built, replace this proxy.
+      const QUARTER_VENUE_PROXY_FACTOR = 0.5;
+      if (ftCalc.aVenueEnabled && isFinite(ftCalc.aVenueAdjustment?.offensiveAdjustment)) {
+        projA += (ftCalc.aVenueAdjustment.offensiveAdjustment / 4) * QUARTER_VENUE_PROXY_FACTOR;
+      }
+      if (ftCalc.bVenueEnabled && isFinite(ftCalc.bVenueAdjustment?.offensiveAdjustment)) {
+        projB += (ftCalc.bVenueAdjustment.offensiveAdjustment / 4) * QUARTER_VENUE_PROXY_FACTOR;
+      }
+
       projA = applyVolatility(projA, aS, volLimit, league);
       projB = applyVolatility(projB, bS, volLimit, league);
 
@@ -16299,7 +16374,14 @@ const h1Calc = compute1HProjection({
         // real qKey avoids relying on that coincidence and keeps this market correctly
         // distinguished from the actual H1 market everywhere getConfidenceGrade branches on
         // marketKey.
-        marketKey: qKey, hasH2H: hasH2H
+        marketKey: qKey, hasH2H: hasH2H,
+        // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: siblingEdge is the encompassing half/total's
+        // edge (H1 for Q1/Q2, FT for Q3/Q4) for the symmetric cross-market bonus; league is
+        // needed for the logistic reconciliation step. Note: this initial computeQ pass gets
+        // overwritten by the rescale block in runEngine for the final displayed confidence —
+        // this call is patched too for internal consistency.
+        siblingEdge: (qKey === "q1" || qKey === "q2") ? h1Calc.h1Edge : ftCalc.ftEdge,
+        league
       });
 
       return { proj: qProj, edge: qEdge, line: lineVal, pick: qPick, confidence: qConf, tier, projA, projB, hasH2H };
@@ -16353,9 +16435,13 @@ const h1Calc = compute1HProjection({
             // PATCHABLE ISSUE #3/#7 FIX: volLimit was hardcoded 12 instead of the
             // per-league/per-market limit, and modelState was passed but never read
             // by getConfidenceGrade — removed.
+            // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: siblingEdge (h1Calc.h1Edge, for the
+            // symmetric cross-market bonus) and league (for the logistic reconciliation)
+            // added — this is the block that determines the final displayed Q1 confidence.
             q1.confidence = getConfidenceGrade({
               pick: q1.pick, line: q1.line, edge: q1.edge, sampleTier: q1.tier,
-              volLimit: getMarketVolLimit(league, "q1"), marketKey: "q1", hasH2H: q1.hasH2H
+              volLimit: getMarketVolLimit(league, "q1"), marketKey: "q1", hasH2H: q1.hasH2H,
+              siblingEdge: h1Calc.h1Edge, league
             });
           }
           if (q2 && isFinite(q2.proj) && isFinite(q2.line)) {
@@ -16367,9 +16453,11 @@ const h1Calc = compute1HProjection({
             // valid Q2 picks that had real edge but not enough to clear the wrong (larger) bar.
             q2.pick = getPick(q2.edge, q2.line, league, "q2", {});
             // PATCHABLE ISSUE #3/#7 FIX: same volLimit/modelState fix as Q1 above.
+            // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: same siblingEdge/league fix as Q1 above.
             q2.confidence = getConfidenceGrade({
               pick: q2.pick, line: q2.line, edge: q2.edge, sampleTier: q2.tier,
-              volLimit: getMarketVolLimit(league, "q2"), marketKey: "q2", hasH2H: q2.hasH2H
+              volLimit: getMarketVolLimit(league, "q2"), marketKey: "q2", hasH2H: q2.hasH2H,
+              siblingEdge: h1Calc.h1Edge, league
             });
           }
         }
@@ -16392,9 +16480,11 @@ const h1Calc = compute1HProjection({
             // valid Q3 picks that had real edge but not enough to clear the wrong (larger) bar.
             q3.pick = getPick(q3.edge, q3.line, league, "q3", {});
             // PATCHABLE ISSUE #3/#7 FIX: volLimit/modelState fix, matching Q1/Q2 above.
+            // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: siblingEdge (ftCalc.ftEdge) and league added.
             q3.confidence = getConfidenceGrade({
               pick: q3.pick, line: q3.line, edge: q3.edge, sampleTier: q3.tier,
-              volLimit: getMarketVolLimit(league, "q3"), marketKey: "q3", hasH2H: q3.hasH2H
+              volLimit: getMarketVolLimit(league, "q3"), marketKey: "q3", hasH2H: q3.hasH2H,
+              siblingEdge: ftCalc.ftEdge, league
             });
           }
           if (q4 && isFinite(q4.proj) && isFinite(q4.line)) {
@@ -16406,9 +16496,11 @@ const h1Calc = compute1HProjection({
             // valid Q4 picks that had real edge but not enough to clear the wrong (larger) bar.
             q4.pick = getPick(q4.edge, q4.line, league, "q4", {});
             // PATCHABLE ISSUE #3/#7 FIX: volLimit/modelState fix, matching Q1/Q2 above.
+            // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: siblingEdge (ftCalc.ftEdge) and league added.
             q4.confidence = getConfidenceGrade({
               pick: q4.pick, line: q4.line, edge: q4.edge, sampleTier: q4.tier,
-              volLimit: getMarketVolLimit(league, "q4"), marketKey: "q4", hasH2H: q4.hasH2H
+              volLimit: getMarketVolLimit(league, "q4"), marketKey: "q4", hasH2H: q4.hasH2H,
+              siblingEdge: ftCalc.ftEdge, league
             });
           }
         }
@@ -16501,7 +16593,10 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       // scoringFormula string) that no live call site ever fed until this fix.]
       q4Edge: q4?.edge,
       // PATCHABLE ISSUE #7 FIX: modelState removed — getConfidenceGrade never read it.
-      lineupQuality: _lqiShared
+      lineupQuality: _lqiShared,
+      // PATCHABLE ISSUE #5 (UNLOCKED) FIX: league needed for the logistic reconciliation
+      // step inside getConfidenceGrade.
+      league
     });
 
         const h1Confidence = getConfidenceGrade({
@@ -16513,7 +16608,10 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       // VERIFIED fix, do not remove.]
       q2Edge: q2?.edge,
       // PATCHABLE ISSUE #7 FIX: modelState removed — getConfidenceGrade never read it.
-      lineupQuality: _lqiShared
+      lineupQuality: _lqiShared,
+      // PATCHABLE ISSUE #5 (UNLOCKED) FIX: league needed for the logistic reconciliation
+      // step inside getConfidenceGrade.
+      league
     });
 
     const h1ConfidenceFinal = h1Confidence;
@@ -16558,13 +16656,19 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       pick: h1aPick, note: h1Note, line: finalLines.h1aLine, edge: h1aEdge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: false, hasH2H: h1Calc.h1HasH2H,
-      marketKey: "h1"
+      marketKey: "h1",
+      // PATCHABLE ISSUE #5 (UNLOCKED) FIX: league needed for the logistic reconciliation
+      // step inside getConfidenceGrade.
+      league
     });
     const h1bConfidence = getConfidenceGrade({
       pick: h1bPick, note: h1Note, line: finalLines.h1bLine, edge: h1bEdge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: false, hasH2H: h1Calc.h1HasH2H,
-      marketKey: "h1"
+      marketKey: "h1",
+      // PATCHABLE ISSUE #5 (UNLOCKED) FIX: league needed for the logistic reconciliation
+      // step inside getConfidenceGrade.
+      league
     });
 
     const phase2Activation = (typeof getPhase2ActivationState === "function") ? getPhase2ActivationState() : null;
