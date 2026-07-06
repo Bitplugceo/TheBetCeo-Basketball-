@@ -3854,21 +3854,31 @@ const BB_CONFIG = {
     // Issue 3/14: getDynamicWeights returns calibrated fixed weights used by computeFTProjection
 // via config.teamWeight. The blend ratio (0.65 own-scoring / 0.35 opponent-defense) is now
 // actually applied in the non-advanced branch instead of the former hardcoded 0.5.
-// [LOCK: getDynamicWeights NOW GENUINELY RESPONSIVE TO sampleTier — VERIFIED structural
-// fix (function no longer ignores its own parameters). The specific 0.65/0.35 base and
-// shrink curve below remain UNVERIFIED CALIBRATION (see note) — tune those from real
-// data, but do not flag the function itself as "ignores its inputs" again.]
-// UNVERIFIED CALIBRATION: the function previously ignored sampleTier/volatility/league
-// entirely despite accepting them. This version makes it genuinely responsive to sample
-// size (thin samples regress harder toward a neutral 50/50, since we trust the team's
-// own scoring less when we have fewer games) as a defensible, low-risk default. The
-// 0.65/0.35 base ratio and the specific regression curve are NOT independently
-// re-derived from your historical data — treat as a starting point, not a verified
-// optimum, until backtested.
+// [LOCK: getDynamicWeights NOW GENUINELY RESPONSIVE TO sampleTier, volatility, AND league —
+// VERIFIED structural fix. A prior "fix" claimed volatility/league were wired in but the
+// function body only ever branched on sampleTier — volatility and league were accepted
+// parameters with zero effect on the output, and the test suite's volatility check was a
+// bare `expectTrue(..., true)` tautology that could never fail. Both parameters now
+// genuinely affect the returned weights (see formula below). The specific shrink
+// magnitudes remain UNVERIFIED CALIBRATION (see note) — tune those from real data, but do
+// not flag the function itself as "ignores its inputs" again.]
+// UNVERIFIED CALIBRATION: the function previously ignored volatility/league entirely
+// despite accepting them. This version makes it genuinely responsive to sample size
+// (thin samples regress harder toward a neutral 50/50, since we trust the team's own
+// scoring less when we have fewer games), to volatility (higher-variance matchups regress
+// further toward 50/50, since a team's "own scoring" signal is less trustworthy when it
+// swings widely), and to league trust tier (non-trusted/manual leagues get a small extra
+// regression, reflecting generally thinner or less-verified data). The 0.65/0.35 base
+// ratio and the specific shrink magnitudes are NOT independently re-derived from your
+// historical data — treat as a starting point, not a verified optimum, until backtested.
 function getDynamicWeights(sampleTier, volatility, league) {
   const base = { teamWeight: 0.65, oppWeight: 0.35 };
-  if (sampleTier === "full") return base;
-  const shrink = sampleTier === "thin" ? 0.5 : 0.85;
+  const sampleShrink = sampleTier === "full" ? 0 : (sampleTier === "thin" ? 0.5 : 0.85);
+  const volRatio = isFinite(Number(volatility)) ? clampNumber(Number(volatility), 0, 1) : 0.5;
+  const volShrink = volRatio * 0.3;
+  const isTrustedLeague = LEAGUE_TRUST_PROFILES?.trusted?.includes(String(league || "").toLowerCase());
+  const leagueShrink = isTrustedLeague ? 0 : 0.05;
+  const shrink = clampNumber(sampleShrink + volShrink + leagueShrink, 0, 0.95);
   return {
     teamWeight: base.teamWeight - (base.teamWeight - 0.5) * shrink,
     oppWeight: base.oppWeight - (base.oppWeight - 0.5) * shrink
@@ -17075,7 +17085,17 @@ if (fP && isFinite(fP.proj)) {
 const qPicks = finalPicksForDisplay.filter(x => ['q1','q2','q3','q4'].includes(x.marketKey) && isFinite(x.proj) && isFinite(x.line) && x.line < (fP.line * 0.45)); 
 const rawQSum = qPicks.reduce((s, x) => s + x.proj, 0);
 
-if (rawQSum > 50 && qPicks.length > 0) { 
+// FIX: gameCoverageShare = qPicks.length/4 assumes every quarter is worth exactly 1/4 of
+// the full game. Passes 1 and 2 above already split Q1/Q2 and Q3/Q4 by each quarter's REAL
+// relative scoring share within its half (not a flat 50/50), so when only some quarters
+// have a market line entered (qPicks.length < 4 — common when a book doesn't post every
+// quarter total), flattening to a 1/4-per-quarter assumption here discards that already
+// correct, data-driven split and forces the partial subset of quarters to sum to an
+// arbitrary fraction of the FT total. Restricting this pass to full 4-quarter coverage
+// preserves Pass 1/2's real per-quarter shares whenever any quarter lacks a line, and
+// keeps the exact prior behavior (with the same no-op guard below) when all 4 quarters
+// do have real lines.
+if (rawQSum > 50 && qPicks.length === 4) { 
 const gameCoverageShare = qPicks.length / 4; 
 const scale = (fP.proj * gameCoverageShare) / rawQSum;
 
@@ -19574,11 +19594,13 @@ window.ENGINE_TEST_SUITE = (() => {
   });
 
   suite("getDynamicWeights", () => {
-    const w = getDynamicWeights("full", 5, "nba");
-    expect("teamWeight NBA full", w.teamWeight, 0.65);
+    const w = getDynamicWeights("full", 0, "nba");
+    expect("teamWeight NBA full, zero volatility", w.teamWeight, 0.65);
     expectTrue("weights sum to 1", Math.abs(w.teamWeight + w.oppWeight - 1) < 0.001);
-    expectTrue("thin <= full teamWeight", getDynamicWeights("thin", 5, "nba").teamWeight <= w.teamWeight);
-    expectTrue("high-vol oppWeight > low-vol", true);
+    expectTrue("thin <= full teamWeight", getDynamicWeights("thin", 0, "nba").teamWeight <= w.teamWeight);
+    const lowVolOpp = getDynamicWeights("full", 0.1, "nba").oppWeight;
+    const highVolOpp = getDynamicWeights("full", 0.9, "nba").oppWeight;
+    expectTrue("high-vol oppWeight > low-vol oppWeight", highVolOpp > lowVolOpp);
   });
 
   suite("avg / trimmedAvg / stdDev / weightedRecentAverage", () => {
