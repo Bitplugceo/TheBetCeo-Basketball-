@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10707,6 +10708,8 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
         setTimeout(async () => {
           try {
             await runRetrospectiveAnalysis(updatedPick);
+            const _oosResult2 = runOutOfSampleValidation(updatedPick.league);
+            if (_oosResult2) engineDebug("Out-of-sample validation result", _oosResult2);
             if (typeof renderConfigsPanel === "function") renderConfigsPanel();
           } catch (err) {
             engineDebug("Retrospective analysis error", err.message);
@@ -11320,7 +11323,11 @@ function handleTrackedPicksActionClick(event) {
               try { if (typeof window.calibrateMassacreCoefficients === 'function') window.calibrateMassacreCoefficients(); } catch(e) {}
               try { calibrateConfidenceModel(); } catch(e) {}
               try { optimizePickThresholds(); } catch(e) {}
-              try { runOutOfSampleValidation(); } catch(e) {}
+              try {
+                const _oosLeague = document.getElementById("leagueSelect")?.value || "";
+                const _oosResult = runOutOfSampleValidation(_oosLeague);
+                if (_oosResult) engineDebug("Out-of-sample validation result", _oosResult);
+              } catch(e) {}
               try { checkModelHealth(); } catch(e) {}
               localStorage.setItem("BB_RETRAIN_CHECKPOINT", JSON.stringify({
                 settledCount: _nowSettled, ts: new Date().toISOString()
@@ -11796,130 +11803,40 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
     // Zero remaining references.
 
 function getConfidenceGrade(params) {
-  // PATCHABLE ISSUE #7 FIX: modelState was accepted but never read anywhere in this
-  // function body — removed from the destructure. Call sites cleaned up separately.
-  // PATCHABLE ISSUES #1/#4/#5 (UNLOCKED) FIX: added lineupQuality (previously computed
-  // and passed everywhere but silently dropped), siblingEdge (symmetric cross-market
-  // agreement bonus for quarters), and league (needed for the logistic reconciliation
-  // step at the end of this function).
+  // ITEM #1 FIX — LOGISTIC REGRESSION FULL REPLACEMENT (2026-07-08): grading is now
+  // purely data-driven via getConfidenceWinProbability() (the existing logistic model
+  // that was previously only used for a bounded ±1-notch reconciliation nudge at the
+  // end of this function). All heuristic point-based scoring (+2 fullModel, +1 H2H,
+  // cross-market agreement bonuses, lineupQuality nudge, edge-floor scaling, etc.) has
+  // been removed — win probability now maps directly to a letter grade. The probability
+  // cutoffs below (0.66/0.58/0.51) are carried over unchanged from the former
+  // reconciliation step, which already mapped this same model's output to A/B/C/D.
+  // Call sites still pass q4Edge/q2Edge/siblingEdge/lineupQuality/trap/fullModel/
+  // projectionOnly/marketKey for backward compatibility; they are accepted here but no
+  // longer read, since the logistic model does not consume them directly. DO NOT
+  // reintroduce the old point-scoring branches — getConfidenceWinProbability is now the
+  // single source of truth for the grade.
   const {
-    pick, note, line, edge, sampleTier, projectionOnly, fullModel, trap,
-    hasH2H, volatility, volLimit, marketKey = "",
-    q4Edge = null, q2Edge = null, siblingEdge = null,
-    lineupQuality = null, league = ""
+    pick, note, line, edge, sampleTier, hasH2H, volatility, volLimit,
+    league = ""
   } = params || {};
 
-  let score = 0;
+  // [LOCK: NaN SENTINEL — VERIFIED, UNCHANGED FROM PRIOR IMPLEMENTATION] "no valid
+  // pick" (no pick, NO PLAY, missing/invalid line, or non-finite edge) must return the
+  // string "NaN", NOT "D" — buildTrackedPickPayload and the Q1-Q4 payload builders treat
+  // "NaN" as the official no-pick sentinel for tracker filtering. DO NOT remove this.
   if (!pick || pick === "NO PLAY" || note || line === null || !isFinite(line) || line <= 0 || !isFinite(edge)) {
-    score = -999;
-  } else {
-    const edgePct = Math.abs(edge / line);
-    // FIX #33: isH2 removed — the h2 (second half) market never had a projection or
-    // pick generated for it, so marketKey === "h2" was unreachable here. All isH2
-    // branches below collapsed to their non-h2 behavior; removed accordingly.
-
-    // 1. Model quality & sample size
-    // FIX #2: "medium" tier removed — getSampleTier now maps 8-14 games to "thin",
-    // so there is no longer a case that falls through to the -4.0 branch incorrectly.
-    // FIX #3: fullModel is now reachable because getSampleTier threshold lowered to 10.
-    // Issue 1 fix: "thin" (5-9 games) no longer carries a penalty — it's the expected
-    // baseline sample, not a deficiency. "full" (10+ games) bonus raised to +1.5 to
-    // reward the larger sample instead of merely not punishing the smaller one.
-    if (fullModel && !projectionOnly && sampleTier === "full") score += 2.0;
-    else if (fullModel && !projectionOnly) score += 1.0;
-    else if (sampleTier === "full") score += 1.5;
-    else if (sampleTier === "thin") score += 0;
-    else score -= 4.0; // only "insufficient" reaches here now
-
-    if (projectionOnly) score -= 1.0;
-
-    // 2. Edge signal
-    const edgeFloor = 0.050;
-    score += clampNumber((edgePct - edgeFloor) / 0.03, -1.0, 2.0);
-
-    // Cross-market edge weight contributions
-    // FIX #19: q4Edge/q2Edge are raw points — normalize by dividing by a typical
-    // quarter line (~55) to convert to a dimensionless ratio before adding to score.
-    if (marketKey === "ft" && isFinite(q4Edge)) {
-      const q4EdgeNorm = q4Edge / 55;
-      score += Math.abs(q4EdgeNorm) * 0.40;
-      const q4Side = q4Edge > 0 ? "over" : "under";
-      const ftSide = edge > 0 ? "over" : "under";
-      if (Math.abs(q4EdgeNorm) > 0.09 && q4Side === ftSide) {
-        score += 0.75;
-      }
-    }
-    if (marketKey === "h1" && isFinite(q2Edge)) {
-      const q2EdgeNorm = q2Edge / 55;
-      score += Math.abs(q2EdgeNorm) * 0.20;
-    }
-    // PATCHABLE ISSUE #4 (UNLOCKED) FIX: quarters previously had no symmetric
-    // cross-market bonus (only FT<-Q4 and H1<-Q2 existed). siblingEdge is the
-    // encompassing half/total's edge (H1 for Q1/Q2, FT for Q3/Q4), passed in by
-    // the caller. UNVERIFIED CALIBRATION: 0.20/0.375 mirror the FT/H1 magnitudes
-    // above at roughly half weight, not independently re-derived from data.
-    if ((marketKey === "q1" || marketKey === "q2" || marketKey === "q3" || marketKey === "q4") && isFinite(siblingEdge) && isFinite(edge)) {
-      const qEdgeNorm = edge / 55;
-      score += Math.abs(qEdgeNorm) * 0.20;
-      const qSide = edge > 0 ? "over" : "under";
-      const siblingSide = siblingEdge > 0 ? "over" : "under";
-      if (Math.abs(qEdgeNorm) > 0.09 && qSide === siblingSide) {
-        score += 0.375;
-      }
-    }
-
-    // 3. H2H Presence
-    if (hasH2H) score += 1.0;
-    else score -= 0.15;
-
-    // PATCHABLE ISSUE #1 (UNLOCKED) FIX: lineupQuality was computed and passed to
-    // every call site but never read here. UNVERIFIED CALIBRATION: neutral point
-    // and +/-0.5 cap are reasoned defaults, not independently re-derived from data.
-    if (isFinite(lineupQuality)) {
-      score += clampNumber((lineupQuality - 0.7) / 0.3 * 0.5, -0.5, 0.5);
-    }
-
-        // Issue 26: Simplified — removed trap penalty (always false), volatility, injury, and
-    // back-to-back adjustments (handled elsewhere). Kept: sampleTier, fullModel, projectionOnly,
-    // hasH2H, edgePct, and cross-market (q4Edge/q2Edge).
+    return "NaN";
   }
 
-  if (score === null || score === undefined || isNaN(score)) score = -999;
+  const edgePct = Math.abs(edge / line);
+  const volRatio = (isFinite(volatility) && isFinite(volLimit) && volLimit > 0) ? volatility / volLimit : 0.5;
+  const winProb = getConfidenceWinProbability(null, edgePct, volRatio, sampleTier, hasH2H, false, league);
 
-  // [LOCK: NaN SENTINEL — VERIFIED FIX] score === -999 marks "no valid pick" (no pick,
-  // NO PLAY, missing/invalid line, or non-finite edge). This must return the string "NaN",
-  // NOT "D" — buildTrackedPickPayload and the Q1-Q4 payload builders treat "NaN" as the
-  // official no-pick sentinel for tracker filtering. Returning "D" here silently mislabels
-  // every NO PLAY market with a real-looking confidence badge. DO NOT remove this branch.
-  if (score === -999) return "NaN";
-
-  const _gt = getConfidenceGradeThresholds();
-  let finalGrade;
-  if (score >= _gt.aThresh) finalGrade = "A";
-  else if (score >= _gt.bThresh) finalGrade = "B";
-  else if (score >= _gt.cThresh) finalGrade = "C";
-  else finalGrade = "D";
-
-  // PATCHABLE ISSUE #5 (UNLOCKED) FIX: bounded reconciliation between the heuristic
-  // point-based grade and the logistic win-probability model (getConfidenceWinProbability,
-  // already used elsewhere for winProbability). This does NOT replace the heuristic system
-  // — a full redesign is still a separate, larger undertaking than a patch — it only nudges
-  // the grade by at most one notch when the two systems strongly disagree (2+ grade ranks
-  // apart). UNVERIFIED CALIBRATION: the 0.66/0.58/0.51 probability cutoffs and the 2-rank
-  // disagreement gate are reasoned defaults, not independently re-derived from data.
-  if (isFinite(edge) && isFinite(line) && line > 0 && league) {
-    const edgePct = Math.abs(edge / line);
-    const volRatio = (isFinite(volatility) && isFinite(volLimit) && volLimit > 0) ? volatility / volLimit : 1.0;
-    const logisticWinProb = getConfidenceWinProbability(finalGrade, edgePct, volRatio, sampleTier, hasH2H, false, league);
-    const impliedGrade = logisticWinProb >= 0.66 ? "A" : logisticWinProb >= 0.58 ? "B" : logisticWinProb >= 0.51 ? "C" : "D";
-    const _rankMap = { A: 4, B: 3, C: 2, D: 1 };
-    const gap = (_rankMap[impliedGrade] || 0) - (_rankMap[finalGrade] || 0);
-    if (Math.abs(gap) >= 2) {
-      finalGrade = bumpConfidenceGrade(finalGrade, gap > 0 ? 1 : -1);
-    }
-  }
-
-  return finalGrade;
+  if (winProb >= 0.66) return "A";
+  if (winProb >= 0.58) return "B";
+  if (winProb >= 0.51) return "C";
+  return "D";
 }
 
     const _anchorCapCache = new Map();
@@ -18377,7 +18294,7 @@ if (headerErrorBtn) {
 }
 
       const trackerToggleBtn = document.getElementById("trackerToggleBtn");
-      if (trackerToggleBtn) trackerToggleBtn.addEventListener("click", openTrackerModal);
+      if (trackerToggleBtn) trackerToggleBtn.addEventListener("click", withErrorBoundary(openTrackerModal, "openTrackerModal"));
 
 
 
@@ -18440,16 +18357,16 @@ if (headerErrorBtn) {
       }
 
       const trackedPicksBody = document.getElementById("trackedPicksBody");
-      if (trackedPicksBody) trackedPicksBody.addEventListener("click", handleTrackedPicksActionClick);
+      if (trackedPicksBody) trackedPicksBody.addEventListener("click", withErrorBoundary(handleTrackedPicksActionClick, "handleTrackedPicksActionClick"));
 
       const leagueSelect = document.getElementById("leagueSelect");
       if (leagueSelect) leagueSelect.addEventListener("change", onLeagueChange);
 
       const fixturesTodayBtn = document.getElementById("fixturesTodayBtn");
-      if (fixturesTodayBtn) fixturesTodayBtn.addEventListener("click", () => loadFixtures(0));
+      if (fixturesTodayBtn) fixturesTodayBtn.addEventListener("click", withErrorBoundary(() => loadFixtures(0), "loadFixtures_today"));
 
       const fixturesTomorrowBtn = document.getElementById("fixturesTomorrowBtn");
-      if (fixturesTomorrowBtn) fixturesTomorrowBtn.addEventListener("click", () => loadFixtures(1));
+      if (fixturesTomorrowBtn) fixturesTomorrowBtn.addEventListener("click", withErrorBoundary(() => loadFixtures(1), "loadFixtures_tomorrow"));
 
       const fixtureSelect = document.getElementById("fixtureSelect");
       if (fixtureSelect) fixtureSelect.addEventListener("change", onFixtureSelect);
