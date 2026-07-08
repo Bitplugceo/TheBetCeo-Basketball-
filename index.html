@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -20393,6 +20392,330 @@ window.ENGINE_TEST_SUITE = (() => {
   }
 
   return { run };
+})();
+
+// ITEM #3 FIX — INTEGRATION TEST SUITE (2026-07-08): exercises the real
+// Fetch -> Run -> Track -> Settle pipeline end to end using the app's own live
+// functions (runEngine, addTrackedPicks — called internally by runEngine,
+// applyManualSettlementToTrackedPick), not mocks of them. "Fetch" is simulated by
+// seeding the same manual-entry DOM fields the engine already treats identically to
+// an ESPN auto-fetch result (this codebase's manual-league path and ESPN path
+// converge on the same input fields before runEngine ever runs, so this is a
+// faithful stand-in for a real fetch without needing to mock ESPN's network
+// responses — see fetchESPNCore, which populates the exact same field IDs this test
+// seeds directly). Uses a unique team-name marker so every artifact this test
+// creates can be found and purged afterward, and never touches real tracked picks.
+// This suite is NOT auto-run on page load (matching ENGINE_TEST_SUITE's own pattern
+// above) — it is intended to be run manually from the console:
+// INTEGRATION_TEST_SUITE.run()
+// DO NOT wire this to run automatically on every page load; it mutates live form
+// fields and tracker state mid-run (restored via clearAll()/purgeTestPicks() in its
+// finally block), which would be disruptive if triggered without the user asking
+// for it.
+window.INTEGRATION_TEST_SUITE = (() => {
+  const TEST_MARKER = "ZZINTEGRATIONTEST";
+  const TEAM_A = TEST_MARKER + "_TeamA";
+  const TEAM_B = TEST_MARKER + "_TeamB";
+
+  function setVal(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.value = val;
+  }
+
+  function isTestPick(p) {
+    return String(p?.homeTeam || "").includes(TEST_MARKER) || String(p?.awayTeam || "").includes(TEST_MARKER);
+  }
+
+  // Removes every pick this test created from active/archived/shadow buckets and
+  // rebuilds tracker stats, so a test run never leaves fake data behind in the
+  // user's real tracker. Returns counts removed, purely for the console summary.
+  function purgeTestPicks() {
+    if (typeof g_trackerState === "undefined" || !g_trackerState) return { removedActive: 0, removedArchived: 0 };
+    const beforeActive = g_trackerState.activePicks?.length || 0;
+    const beforeArchived = g_trackerState.archivedPicks?.length || 0;
+    g_trackerState.activePicks = (g_trackerState.activePicks || []).filter(p => !isTestPick(p));
+    g_trackerState.archivedPicks = (g_trackerState.archivedPicks || []).filter(p => !isTestPick(p));
+    if (g_trackerState.shadowPicks) {
+      g_trackerState.shadowPicks = g_trackerState.shadowPicks.filter(p => !isTestPick(p));
+    }
+    rebuildTrackerStats();
+    return {
+      removedActive: beforeActive - g_trackerState.activePicks.length,
+      removedArchived: beforeArchived - g_trackerState.archivedPicks.length
+    };
+  }
+
+  async function run() {
+    const results = [];
+    function check(label, cond) { results.push({ label, pass: !!cond }); }
+
+    if (window.__engineRunInProgress) {
+      console.error("%cINTEGRATION TEST ABORTED: an engine run is already in progress.", "color:#ff5c61;font-weight:900;");
+      return { passed: 0, failed: 1, total: 1, aborted: true };
+    }
+
+    const statsBefore = { ...(g_trackerState?.stats || {}) };
+
+    try {
+      // ---- STEP 1: "FETCH" (seed manual-entry inputs the same way a real
+      // fetch or manual paste would populate them, per the comment above) ----
+      const ls = document.getElementById("leagueSelect");
+      if (ls) ls.value = "nba";
+      selectedTeamIds = { A: null, B: null };
+      setVal("teamAName", TEAM_A);
+      setVal("teamBName", TEAM_B);
+      setVal("aFTScored", "115,118,120,117,119");
+      setVal("aFTAllowed", "100,98,102,101,99");
+      setVal("bFTScored", "112,110,115,111,113");
+      setVal("bFTAllowed", "105,103,107,104,106");
+      // Line deliberately set far below the expected ~230 combined total so the
+      // engine's edge threshold is cleared unambiguously (avoids a flaky NO PLAY
+      // depending on minor projection variance).
+      setVal("ftMarket", "150.5-152.5");
+      setVal("h1Market", "");
+      setVal("teamAMarket", "");
+      setVal("teamBMarket", "");
+      setVal("q1Market", ""); setVal("q2Market", "");
+      setVal("q3Market", ""); setVal("q4Market", "");
+      g_injA = defaultInjuryMeta();
+      g_injB = defaultInjuryMeta();
+
+      // ---- STEP 2: "RUN" (the real engine, unmocked) ----
+      await runEngine();
+
+      // ---- STEP 3: "TRACK" (verify runEngine's own addTrackedPicks call saved it) ----
+      const savedPick = (g_trackerState.activePicks || []).find(p => isTestPick(p) && p.marketKey === "ft");
+      check("FT pick was saved to tracker after runEngine", !!savedPick);
+      check("Saved pick side is OVER (large positive edge expected)", getPickSideFromText(savedPick?.predictionText || "") === "over");
+      check("Saved pick starts pending", savedPick?.resultStatus === "pending");
+
+      if (!savedPick) {
+        throw new Error("No tracked pick was produced — cannot continue to settle step.");
+      }
+
+      // ---- STEP 4: "SETTLE" (manual settlement, same path a real user click uses) ----
+      savedPick.actualScore = "235-210"; // comfortably above our 151.5 OVER line
+      const settleOk = await applyManualSettlementToTrackedPick(savedPick.signature, "win");
+      check("applyManualSettlementToTrackedPick returned true", settleOk === true);
+
+      const settledPick = (g_trackerState.archivedPicks || []).find(p => isTestPick(p) && p.marketKey === "ft");
+      check("Settled pick moved to archivedPicks", !!settledPick);
+      check("Settled pick resultStatus is win", settledPick?.resultStatus === "win");
+
+      const winsDelta = Number(g_trackerState?.stats?.wins || 0) - Number(statsBefore.wins || 0);
+      check("Tracker stats.wins incremented by exactly 1", winsDelta === 1);
+
+    } catch (err) {
+      results.push({ label: "Integration pipeline threw: " + (err?.message || String(err)), pass: false });
+    } finally {
+      // ---- CLEANUP: remove every artifact this test created, restore idle UI state.
+      // clearAll() is the app's own existing reset routine (DOM fields, fetch
+      // context, section locks) — reused here rather than hand-restoring each field,
+      // since it does not touch g_trackerState and is already exercised by real usage. ----
+      purgeTestPicks();
+      try { await saveTrackerStateToLocal(); } catch(e) {}
+      try { clearAll(); } catch(e) {}
+    }
+
+    const passed = results.filter(r => r.pass).length;
+    const failed = results.length - passed;
+    const summary = (failed === 0 ? "✅ ALL PASSED" : "❌ " + failed + " FAILED") + " | " + passed + "/" + results.length + " passed";
+    console[failed ? "error" : "log"]("%c" + summary, "color:" + (failed ? "#ff5c61" : "#3a9c35") + ";font-weight:900;font-size:14px;");
+    results.filter(r => !r.pass).forEach(r => console.error("FAIL: " + r.label));
+    if (typeof engineDebug === "function") {
+      engineDebug("INTEGRATION_TEST_SUITE: " + summary, { failures: results.filter(r => !r.pass).map(r => r.label) });
+    }
+    return { passed, failed, total: results.length, results };
+  }
+
+  return { run };
+})();
+
+// ITEM #4 FIX — REGRESSION GOLDEN-OUTPUT TESTS (2026-07-08): runs a fixed set of
+// scenarios (fixed league + fixed scored/allowed/H2H series + fixed market lines)
+// through the real, unmocked runEngine, then extracts a stable subset of numeric
+// outputs (FT/H1/Team projections, edges, confidence grades) from
+// window.__LAST_AUDIT_STATE — the same audit object the "Copy Audit" button
+// exports, already assembled by runEngine on every run. This suite is intentionally
+// NOT initialized with hand-picked hardcoded expected numbers: this file's
+// projection math (venue blending, H2H decay weighting, dynamic sample-tier
+// weights, advanced-stat branches, etc.) is too deep to hand-compute a trustworthy
+// golden value externally without actually executing the code. Instead this uses
+// the standard "record once, compare forever after" golden-test pattern:
+//   - First call to REGRESSION_TEST_SUITE.run() with no stored baseline for a given
+//     scenario RECORDS the current output as the golden baseline (localStorage key
+//     BB_REGRESSION_GOLDEN) and reports it as "recorded", not pass/fail.
+//   - Every subsequent run compares fresh output against that stored baseline
+//     within a small numeric tolerance, and FAILS loudly on any drift — which is
+//     exactly the regression signal this test type exists to catch.
+// Call REGRESSION_TEST_SUITE.resetGolden() to intentionally re-baseline after a
+// deliberate, reviewed model change. Like INTEGRATION_TEST_SUITE above, this is
+// NOT auto-run on page load — run manually: REGRESSION_TEST_SUITE.run()
+// DO NOT hand-edit BB_REGRESSION_GOLDEN values directly; always regenerate via
+// resetGolden() + run() so the baseline reflects a real, reproducible engine output.
+window.REGRESSION_TEST_SUITE = (() => {
+  const GOLDEN_KEY = "BB_REGRESSION_GOLDEN";
+  const TOLERANCE = 0.15; // absolute point tolerance for projection/edge drift
+
+  const SCENARIOS = [
+    {
+      name: "nba_standard_over",
+      league: "nba",
+      fields: {
+        teamAName: "ZZGOLDEN_TeamA", teamBName: "ZZGOLDEN_TeamB",
+        aFTScored: "115,118,120,117,119,116,121,114,118,120",
+        aFTAllowed: "100,98,102,101,99,103,97,100,102,101",
+        bFTScored: "112,110,115,111,113,109,114,112,110,113",
+        bFTAllowed: "105,103,107,104,106,108,102,105,107,104",
+        a1HScored: "", a1HAllowed: "", b1HScored: "", b1HAllowed: "",
+        aFTH2H: "", bFTH2H: "",
+        ftMarket: "220.5-222.5", h1Market: "", teamAMarket: "", teamBMarket: "",
+        q1Market: "", q2Market: "", q3Market: "", q4Market: ""
+      }
+    },
+    {
+      name: "nba_h2h_blend",
+      league: "nba",
+      fields: {
+        teamAName: "ZZGOLDEN_TeamC", teamBName: "ZZGOLDEN_TeamD",
+        aFTScored: "108,105,110,107,109,106,111,104,108,110",
+        aFTAllowed: "112,110,115,111,113,109,114,112,110,113",
+        bFTScored: "118,120,116,119,117,121,115,118,120,116",
+        bFTAllowed: "108,106,110,107,109,105,111,108,106,109",
+        a1HScored: "", a1HAllowed: "", b1HScored: "", b1HAllowed: "",
+        aFTH2H: "215,220,218,222,216", bFTH2H: "210,208,212,209,211",
+        ftMarket: "225.5-227.5", h1Market: "", teamAMarket: "", teamBMarket: "",
+        q1Market: "", q2Market: "", q3Market: "", q4Market: ""
+      }
+    }
+  ];
+
+  function loadGolden() {
+    try { return JSON.parse(localStorage.getItem(GOLDEN_KEY) || "{}"); }
+    catch(e) { return {}; }
+  }
+  function saveGolden(store) {
+    try { localStorage.setItem(GOLDEN_KEY, JSON.stringify(store)); }
+    catch(e) { engineDebug("REGRESSION_TEST_SUITE failed to save golden store: " + (e?.message || String(e)), { error: e }); }
+  }
+
+  function resetGolden(scenarioName) {
+    if (!scenarioName) {
+      localStorage.removeItem(GOLDEN_KEY);
+      console.log("%cREGRESSION_TEST_SUITE: all golden baselines cleared.", "color:#ffcf73;font-weight:900;");
+      return;
+    }
+    const store = loadGolden();
+    delete store[scenarioName];
+    saveGolden(store);
+    console.log("%cREGRESSION_TEST_SUITE: golden baseline cleared for '" + scenarioName + "'.", "color:#ffcf73;font-weight:900;");
+  }
+
+  function setVal(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.value = val;
+  }
+
+  // Pulls a small, stable set of numeric outputs from window.__LAST_AUDIT_STATE
+  // (populated by runEngine on every run) — the fields most sensitive to an
+  // unintended change in the projection/edge/grade pipeline.
+  function extractSnapshot() {
+    const a = window.__LAST_AUDIT_STATE;
+    if (!a) return null;
+    const ft = a.projectionBuild?.FT_TOTAL;
+    const h1 = a.projectionBuild?.H1_TOTAL;
+    const conf = a.confidenceBuild?.markets;
+    return {
+      ftProjA: ft?.STEP9_finalProjections?.teamA ?? null,
+      ftProjB: ft?.STEP9_finalProjections?.teamB ?? null,
+      ftTotal: ft?.STEP9_finalProjections?.total ?? null,
+      ftEdge:  ft?.STEP10_edgeCalc?.edge ?? null,
+      h1Total: h1?.STEP7_finalProjections?.total ?? null,
+      h1Edge:  h1?.STEP8_edgeCalc?.edge ?? null,
+      ftGrade: conf?.FT?.finalGrade ?? null,
+      h1Grade: conf?.H1?.finalGrade ?? null
+    };
+  }
+
+  function diffWithinTolerance(goldenVal, freshVal) {
+    if (goldenVal === null || freshVal === null) return goldenVal === freshVal;
+    if (typeof goldenVal === "string" || typeof freshVal === "string") return goldenVal === freshVal;
+    if (!isFinite(goldenVal) || !isFinite(freshVal)) return goldenVal === freshVal;
+    return Math.abs(goldenVal - freshVal) <= TOLERANCE;
+  }
+
+  async function runScenario(scenario, goldenStore, results) {
+    const ls = document.getElementById("leagueSelect");
+    if (ls) ls.value = scenario.league;
+    selectedTeamIds = { A: null, B: null };
+    Object.entries(scenario.fields).forEach(([id, val]) => setVal(id, val));
+    g_injA = defaultInjuryMeta();
+    g_injB = defaultInjuryMeta();
+
+    await runEngine();
+    const snapshot = extractSnapshot();
+
+    if (!snapshot) {
+      results.push({ label: scenario.name + ": no audit snapshot produced", pass: false });
+      return;
+    }
+
+    const golden = goldenStore[scenario.name];
+    if (!golden) {
+      goldenStore[scenario.name] = snapshot;
+      results.push({ label: scenario.name + ": recorded new golden baseline", pass: true, recorded: true });
+      return;
+    }
+
+    let scenarioOk = true;
+    Object.keys(snapshot).forEach(key => {
+      const ok = diffWithinTolerance(golden[key], snapshot[key]);
+      if (!ok) scenarioOk = false;
+      results.push({
+        label: scenario.name + "." + key + " (golden=" + golden[key] + ", fresh=" + snapshot[key] + ")",
+        pass: ok
+      });
+    });
+    if (!scenarioOk) {
+      results.push({ label: scenario.name + ": DRIFTED from golden baseline — review before accepting", pass: false });
+    }
+  }
+
+  async function run() {
+    if (window.__engineRunInProgress) {
+      console.error("%cREGRESSION TEST ABORTED: an engine run is already in progress.", "color:#ff5c61;font-weight:900;");
+      return { passed: 0, failed: 1, total: 1, aborted: true };
+    }
+
+    const results = [];
+    const goldenStore = loadGolden();
+
+    try {
+      for (const scenario of SCENARIOS) {
+        await runScenario(scenario, goldenStore, results);
+      }
+      saveGolden(goldenStore);
+    } catch (err) {
+      results.push({ label: "Regression suite threw: " + (err?.message || String(err)), pass: false });
+    } finally {
+      try { clearAll(); } catch(e) {}
+    }
+
+    const passed = results.filter(r => r.pass).length;
+    const failed = results.length - passed;
+    const recordedCount = results.filter(r => r.recorded).length;
+    const summary = (failed === 0 ? "✅ ALL PASSED" : "❌ " + failed + " FAILED")
+      + " | " + passed + "/" + results.length + " passed"
+      + (recordedCount ? " | " + recordedCount + " new baseline(s) recorded" : "");
+    console[failed ? "error" : "log"]("%c" + summary, "color:" + (failed ? "#ff5c61" : "#3a9c35") + ";font-weight:900;font-size:14px;");
+    results.filter(r => !r.pass).forEach(r => console.error("FAIL: " + r.label));
+    if (typeof engineDebug === "function") {
+      engineDebug("REGRESSION_TEST_SUITE: " + summary, { failures: results.filter(r => !r.pass).map(r => r.label) });
+    }
+    return { passed, failed, total: results.length, results };
+  }
+
+  return { run, resetGolden };
 })();
 
 
