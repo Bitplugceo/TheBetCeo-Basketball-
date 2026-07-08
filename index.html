@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3132,6 +3133,15 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
   const scoredList = [], allowedList = [];
   const homeScoredList = [], homeAllowedList = [];
   const awayScoredList = [], awayAllowedList = [];
+  // [FEATURE ADD — VERIFIED audit finding, 2026-07-08: H1 home/away split was never
+  // collected here, unlike FT (homeScoredList/awayScoredList above). This silently
+  // disabled H1 venue blending for every non-ESPN league that uses this SofaScore
+  // manual-paste path (the ESPN auto-fetch path already collects this correctly via
+  // fetchScheduleCore's h1Scored10/h1Allowed10 + requiredVenue). Added at user request
+  // to bring this path to parity. Populated in the completedAll.forEach loop below,
+  // parallel to the existing FT home/away collection.]
+  const h1HomeScoredList = [], h1HomeAllowedList = [];
+  const h1AwayScoredList = [], h1AwayAllowedList = [];
   const h1ScoredList = [], h1AllowedList = [];
   const h1ScoredDates = []; // [LOCK: ISSUE #14 — parallel date array, additive only, see stash helpers above]
   const q1ScoredList = [], q2ScoredList = [], q3ScoredList = [], q4ScoredList = [];
@@ -3237,6 +3247,30 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
             awayAllowedList.push(oppFT);
           }
         }
+        // [FEATURE ADD — VERIFIED audit finding, 2026-07-08: H1 home/away collection,
+        // parallel to the FT home/away block directly above. Uses the same period1+period2
+        // sum as the existing overall h1ScoredList collection earlier in this function.
+        // Only pushes when at least one quarter score is present, matching that same
+        // existing sanity gate, and caps each list at 10 independently (a game with a real
+        // FT score but no period breakdown contributes to home/awayScoredList but not
+        // here — same documented "KNOWN LIMITATION, OPEN" recency-position tradeoff that
+        // already applies to the existing overall h1ScoredList/q1-q4 lists in this file,
+        // not a new one introduced by this addition).]
+        const myQ1h = Number(myScore.period1 ?? 0), myQ2h = Number(myScore.period2 ?? 0);
+        const oppQ1h = Number(oppScore.period1 ?? 0), oppQ2h = Number(oppScore.period2 ?? 0);
+        if (myQ1h + myQ2h > 0) {
+          if (isHome) {
+            if (h1HomeScoredList.length < 10) {
+              h1HomeScoredList.push(myQ1h + myQ2h);
+              h1HomeAllowedList.push(oppQ1h + oppQ2h);
+            }
+          } else {
+            if (h1AwayScoredList.length < 10) {
+              h1AwayScoredList.push(myQ1h + myQ2h);
+              h1AwayAllowedList.push(oppQ1h + oppQ2h);
+            }
+          }
+        }
       }
     }
   });
@@ -3248,6 +3282,10 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
   updateLeagueVolCache(document.getElementById("leagueSelect")?.value || "", scoredList);
 
   return { scoredList, allowedList, homeScoredList, homeAllowedList, awayScoredList, awayAllowedList,
+           // [FEATURE ADD — VERIFIED audit finding, 2026-07-08: additive return keys,
+           // parallel to homeScoredList/awayScoredList above. Existing keys and existing
+           // consumers of this return value are completely untouched.]
+           h1HomeScoredList, h1HomeAllowedList, h1AwayScoredList, h1AwayAllowedList,
            h1ScoredList, h1AllowedList,
            // [LOCK: ISSUE #14 — additive date arrays, parallel to the lists above. Existing
            // keys and existing consumers of this return value are completely untouched.]
@@ -3489,16 +3527,44 @@ function parseSofascoreIndividual(side) {
         g_massacreFetchContext.A.overall.allowed10 = stats.allowedList;
         g_massacreFetchContext.A.overall.scored = display5S;
         g_massacreFetchContext.A.overall.allowed = display5A;
-        if (stats.homeScoredList.length >= 2) {
+        // [FIX — VERIFIED audit finding, 2026-07-08: venue was unconditionally set from
+        // stats.homeScoredList/homeAllowedList, i.e. Team A's OWN historical home split,
+        // regardless of whether Team A is actually home or away in THIS fixture.
+        // getFixtureSideRole() already exists to answer that exact question from
+        // fixtureMeta but had zero call sites anywhere in the file. Now wired in: use
+        // Team A's away split when Team A is actually the away team this game; fall back
+        // to the home split (prior behavior) when role is "home" or unresolved (e.g.
+        // manual leagues with no linked fixture, where Team A = Home is the documented
+        // default in getFixtureSideRole itself).]
+        const _roleA = getFixtureSideRole("A");
+        const _venueScoredA  = _roleA === "away" ? stats.awayScoredList  : stats.homeScoredList;
+        const _venueAllowedA = _roleA === "away" ? stats.awayAllowedList : stats.homeAllowedList;
+        if (_venueScoredA.length >= 2) {
           if (!g_massacreFetchContext.A.venue) g_massacreFetchContext.A.venue = {};
-          g_massacreFetchContext.A.venue.ftScored10 = stats.homeScoredList;
-          g_massacreFetchContext.A.venue.ftAllowed10 = stats.homeAllowedList;
+          g_massacreFetchContext.A.venue.ftScored10 = _venueScoredA;
+          g_massacreFetchContext.A.venue.ftAllowed10 = _venueAllowedA;
         }
         if (stats.h1ScoredList?.length >= 2) {
           document.getElementById("a1HScored").value = stats.h1ScoredList.slice(0, 10).join(",");
           document.getElementById("a1HAllowed").value = stats.h1AllowedList.slice(0, 10).join(",");
           g_massacreFetchContext.A.overall.h1Scored10 = stats.h1ScoredList;
           g_massacreFetchContext.A.overall.h1Allowed10 = stats.h1AllowedList;
+        }
+        // [FEATURE ADD — VERIFIED audit finding, 2026-07-08: wires the new H1 home/away
+        // collection into venue blending, mirroring the FT venue fix above. Uses
+        // getFixtureSideRole("A") so this respects the ACTUAL fixture role rather than
+        // assuming Team A = home, exactly like the FT venue fix. Falls back to the home
+        // split (prior no-op state, i.e. still disabled) only when role is unresolved AND
+        // no home data exists — but since getFixtureSideRole defaults unresolved manual
+        // leagues to "home" already (see its own fallback logic), this correctly activates
+        // for manual leagues too.]
+        const _roleA_h1 = getFixtureSideRole("A");
+        const _venueH1ScoredA  = _roleA_h1 === "away" ? stats.h1AwayScoredList  : stats.h1HomeScoredList;
+        const _venueH1AllowedA = _roleA_h1 === "away" ? stats.h1AwayAllowedList : stats.h1HomeAllowedList;
+        if (_venueH1ScoredA && _venueH1ScoredA.length >= 2) {
+          if (!g_massacreFetchContext.A.venue) g_massacreFetchContext.A.venue = {};
+          g_massacreFetchContext.A.venue.h1Scored10 = _venueH1ScoredA;
+          g_massacreFetchContext.A.venue.h1Allowed10 = _venueH1AllowedA;
         }
         if (stats.q1ScoredList?.length >= 2) {
           document.getElementById("aQ1Scored").value = stats.q1ScoredList.slice(0, 10).join(",");
@@ -3542,16 +3608,36 @@ function parseSofascoreIndividual(side) {
         g_massacreFetchContext.B.overall.allowed10 = stats.allowedList;
         g_massacreFetchContext.B.overall.scored = display5S;
         g_massacreFetchContext.B.overall.allowed = display5A;
-        if (stats.awayScoredList.length >= 2) {
+        // [FIX — VERIFIED audit finding, 2026-07-08: mirrors the identical Team A fix
+        // above. venue was unconditionally set from stats.awayScoredList/awayAllowedList,
+        // i.e. Team B's OWN historical away split, regardless of whether Team B is
+        // actually away in THIS fixture. Now uses getFixtureSideRole() to pick Team B's
+        // home split when Team B is actually the home team; falls back to the away split
+        // (prior behavior) when role is "away" or unresolved.]
+        const _roleB = getFixtureSideRole("B");
+        const _venueScoredB  = _roleB === "home" ? stats.homeScoredList  : stats.awayScoredList;
+        const _venueAllowedB = _roleB === "home" ? stats.homeAllowedList : stats.awayAllowedList;
+        if (_venueScoredB.length >= 2) {
           if (!g_massacreFetchContext.B.venue) g_massacreFetchContext.B.venue = {};
-          g_massacreFetchContext.B.venue.ftScored10 = stats.awayScoredList;
-          g_massacreFetchContext.B.venue.ftAllowed10 = stats.awayAllowedList;
+          g_massacreFetchContext.B.venue.ftScored10 = _venueScoredB;
+          g_massacreFetchContext.B.venue.ftAllowed10 = _venueAllowedB;
         }
         if (stats.h1ScoredList?.length >= 2) {
           document.getElementById("b1HScored").value = stats.h1ScoredList.slice(0, 10).join(",");
           document.getElementById("b1HAllowed").value = stats.h1AllowedList.slice(0, 10).join(",");
           g_massacreFetchContext.B.overall.h1Scored10 = stats.h1ScoredList;
           g_massacreFetchContext.B.overall.h1Allowed10 = stats.h1AllowedList;
+        }
+        // [FEATURE ADD — VERIFIED audit finding, 2026-07-08: mirrors the identical Team A
+        // H1 venue wiring above. Uses getFixtureSideRole("B") so this respects the ACTUAL
+        // fixture role rather than assuming Team B = away.]
+        const _roleB_h1 = getFixtureSideRole("B");
+        const _venueH1ScoredB  = _roleB_h1 === "home" ? stats.h1HomeScoredList  : stats.h1AwayScoredList;
+        const _venueH1AllowedB = _roleB_h1 === "home" ? stats.h1HomeAllowedList : stats.h1AwayAllowedList;
+        if (_venueH1ScoredB && _venueH1ScoredB.length >= 2) {
+          if (!g_massacreFetchContext.B.venue) g_massacreFetchContext.B.venue = {};
+          g_massacreFetchContext.B.venue.h1Scored10 = _venueH1ScoredB;
+          g_massacreFetchContext.B.venue.h1Allowed10 = _venueH1AllowedB;
         }
         if (stats.q1ScoredList?.length >= 2) {
           document.getElementById("bQ1Scored").value = stats.q1ScoredList.slice(0, 10).join(",");
@@ -3716,8 +3802,19 @@ function extractH2HFromPastedEvents() {
     }
   });
 
-  // Strict H2H filter: only games where the two exact team IDs match
-  // Exclude Rapid League (low quality) and games where any team scored below 40 points
+  // Strict H2H filter: only games where the two exact team IDs match.
+  // [ORPHANED COMMENT REMOVED — VERIFIED audit finding, 2026-07-08: this block previously
+  // said "Exclude Rapid League (low quality) and games where any team scored below 40
+  // points," but no such name-string or score-threshold check exists below. The LOCK
+  // comment on the next block confirms why: that filtering was deliberately replaced by
+  // the uniqueTournament.id competition filter, which is strictly more reliable (Rapid
+  // League games simply carry a different tournament id and are excluded automatically,
+  // for every competition globally, with no name-guessing). Removed the stale comment so
+  // it stops implying missing functionality. NOTE: a residual gap remains — an anomalously
+  // low-scoring game (e.g. a truncated/forfeited game) WITHIN the correct competition and
+  // tournament id would still pass this filter, since there is no score-sanity floor
+  // anywhere in this function. That is a real open question, not silently resolved here —
+  // see below.]
     let h2hMatches = uniqueEvents.filter(ev => {
     const sType = ev.status?.type ?? "";
     const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
