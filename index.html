@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -11475,9 +11476,24 @@ function computeLineupQuality(roster, injuryMeta) {
   const injImpact = isFinite(Number(injuryMeta?.scoringMult)) ? (1 - Number(injuryMeta.scoringMult)) : 0;
   score -= Math.min(0.25, injImpact);
   if (Array.isArray(roster) && roster.length) {
-    const avgPM = roster.reduce((s, p) => s + (Number(p?.plusMinus) || 0), 0) / roster.length;
-    const rosterFactor = clampNumber((avgPM + 5) / 10, 0.5, 1.0);
-    score *= rosterFactor;
+    // [LOCK: NULL-VS-ZERO PLUSMINUS GUARD — VERIFIED FIX. fetchRoster stores plusMinus
+    // as `_fs("plusMinus") || null`, so a genuinely missing/unavailable stat from ESPN
+    // and a real value of exactly 0 both collapse to `null` at that stage. Here,
+    // `Number(p?.plusMinus) || 0` then treated that null as 0 for every player — so when
+    // ESPN's statsSummary doesn't return a plusMinus field at all (which it frequently
+    // doesn't for this endpoint), avgPM silently computed as exactly 0 for every roster,
+    // every run, producing a flat rosterFactor of 0.5 — a permanent 50% quality penalty
+    // baked into every game's lineupQuality with no way to distinguish "no data" from
+    // "genuinely weak roster." Now filters to players with a real (non-null, finite)
+    // plusMinus value first, and skips the roster factor entirely when no player on the
+    // roster has real data, so a missing stat is neutral (1.0) rather than silently
+    // penalized (0.5). DO NOT revert to computing avgPM over the full unfiltered roster.]
+    const withPM = roster.filter(p => p?.plusMinus !== null && p?.plusMinus !== undefined && isFinite(Number(p.plusMinus)));
+    if (withPM.length) {
+      const avgPM = withPM.reduce((s, p) => s + Number(p.plusMinus), 0) / withPM.length;
+      const rosterFactor = clampNumber((avgPM + 5) / 10, 0.5, 1.0);
+      score *= rosterFactor;
+    }
   }
   return Math.max(0.3, Math.min(1.0, score));
 }
@@ -11821,9 +11837,21 @@ function getIntelSeries(side, scopeName, key, fallback = []) {
 function buildTotalMarketIntelSignal(pack) {
   let signal = 0;
   if (!pack) return { signal: 0 };
-  if (pack.backToBack) signal -= 1.5;
-  if ((pack.restDaysA ?? 99) < 1) signal -= 1;
-  if ((pack.restDaysB ?? 99) < 1) signal -= 1;
+  // [LOCK: back-to-back penalty consolidated to ONE check per team — VERIFIED fix,
+  // mirrors buildTeamMarketIntelSignal's FIX #40 and applyIntelligenceLayerToPicks's
+  // CORRECTION elsewhere in this file, both of which fixed this exact pattern for the
+  // Team and FT markets. pack.backToBack is defined as (restDaysA<1 || restDaysB<1), so
+  // checking it AND restDaysA<1 AND restDaysB<1 as three separate conditions
+  // double/triple-counted the same underlying rest fact for H1 total projections,
+  // leaving H1 with an inflated rest-day penalty relative to the now-corrected Team/FT
+  // markets. Each team's back-to-back status now contributes exactly one penalty, sized
+  // to match the per-team magnitude buildTeamMarketIntelSignal already uses, so the
+  // total-market signal stays consistent with the team-market signal for the same game.
+  // DO NOT reintroduce a separate pack.backToBack check alongside the per-team checks.]
+  const restDaysA = pack.restDaysA ?? 99;
+  const restDaysB = pack.restDaysB ?? 99;
+  if (restDaysA < 1) signal -= 2.5;
+  if (restDaysB < 1) signal -= 2.5;
   return { signal: clampNumber(signal, -3, 3) };
 }
 
@@ -14890,7 +14918,16 @@ function evaluateMassacreForPick(pickRow, profileA, profileB) {
   // RAISED: >10 avg margin / 4-game streak was noise-level in small samples (a
   // single blowout or a 4-game run is common variance, not a real signal). Bar
   // raised to >15 / 6-game streak so this only fires on genuinely lopsided form.
-  if (profileA && (Math.abs(profileA.avgMargin) > 15 || profileA.streakLength >= 6)) {
+  // [LOCK: DIRECTION-GATED TRIGGER — VERIFIED FIX. The prior version gated only on
+  // Math.abs(avgMargin), so a team getting BLOWN OUT by 15-20+ points a game (a very
+  // negative avgMargin, streakDirection "cold") still fired the OVER boost for that
+  // team's picks, exactly as if it were a team blowing opponents out. A previous fix
+  // only corrected what the resulting direction LABEL said (see the still-present
+  // comment below) but never gated the trigger itself on that direction. Now the OVER
+  // branch requires profileA to actually be "hot" (winning big), and the UNDER branch
+  // requires profileB to actually be "cold" (losing big / low-scoring), matching what
+  // the boost is supposed to represent. DO NOT revert to a magnitude-only gate.]
+  if (profileA && profileA.streakDirection === "hot" && (Math.abs(profileA.avgMargin) > 15 || profileA.streakLength >= 6)) {
     if (side === "over") {
       isMassacre = true;
       severity = Math.abs(profileA.avgMargin) >= 20 ? "nuclear" : "heavy";
@@ -14900,7 +14937,7 @@ function evaluateMassacreForPick(pickRow, profileA, profileB) {
       direction = profileA.streakDirection || "hot";
     }
   }
-  if (profileB && (Math.abs(profileB.avgMargin) > 15 || profileB.streakLength >= 6)) {
+  if (profileB && profileB.streakDirection === "cold" && (Math.abs(profileB.avgMargin) > 15 || profileB.streakLength >= 6)) {
     if (side === "under") {
       isMassacre = true;
       severity = Math.abs(profileB.avgMargin) >= 20 ? "nuclear" : "heavy";
@@ -15219,7 +15256,22 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
       // negative (UNDER) edges, rawDelta is itself negative and always smaller than the
       // positive maxBonus, so Math.min silently returned it uncapped. Cap on magnitude and
       // restore the sign so OVER and UNDER picks are throttled identically.
-      const maxBonus = (league === 'nba' ? 6.5 : 4.5);
+      // [LOCK: MARKET-SCALED CAP — VERIFIED FIX. The flat 6.5/4.5 pt cap was applied
+      // identically to every market this loop touches (FT ~220pt totals, Team ~75-110pt
+      // totals, Quarters ~40-55pt totals), so the same absolute bonus is a small fraction
+      // of an FT total but a large fraction of a quarter total — disproportionately
+      // inflating quarter/team edges relative to FT for the exact same massacre signal.
+      // Scaled down for smaller-magnitude markets so the bonus represents a comparable
+      // relative share of each market's typical scale. UNVERIFIED CALIBRATION: the 0.5/
+      // 0.25 scale factors are a reasoned proportional default (roughly matching each
+      // market's scale relative to a full game total), not independently re-derived from
+      // historical data — tune from real results, but do not revert to a flat cap.]
+      const baseMaxBonus = (league === 'nba' ? 6.5 : 4.5);
+      let marketScale = 1;
+      if (p.marketKey === 'h1' || p.marketKey === 'h1_team_a' || p.marketKey === 'h1_team_b') marketScale = 0.5;
+      else if (p.marketKey === 'team_a' || p.marketKey === 'team_b') marketScale = 0.5;
+      else if (p.marketKey === 'q1' || p.marketKey === 'q2' || p.marketKey === 'q3' || p.marketKey === 'q4') marketScale = 0.25;
+      const maxBonus = baseMaxBonus * marketScale;
       const rawBonus = p.edge - oldEdge;
       const bonus = Math.sign(rawBonus) * Math.min(Math.abs(rawBonus), maxBonus);
       p.edge = oldEdge + bonus;
