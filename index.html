@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3399,7 +3400,48 @@ function onTournamentIdInput() {
   const nameEl = document.getElementById("ssTournamentName");
   if (nameEl) nameEl.textContent = "";
   const val = (document.getElementById("ssTournamentId")?.value || "").trim();
-  if (!val) window.__fixtureTournamentId = null;
+  if (!val) { window.__fixtureTournamentId = null; return; }
+  if (!/^\d+$/.test(val)) return;
+  window.__fixtureTournamentId = val;
+  validateTournamentSample(val);
+}
+
+// FIX #3: Extends the existing thin-tournament warning (previously only shown after
+// auto-detection via intersection) to manual Tournament ID entry. Reuses the same
+// <3-combined-games threshold and warning copy as the auto-detect path in
+// parseSofascoreIndividual, so the two code paths stay visually consistent.
+function validateTournamentSample(manualId) {
+  const evA = window.__lastEventsA || [];
+  const evB = window.__lastEventsB || [];
+  if (!evA.length && !evB.length) return;
+
+  function countCompletedForTournament(events, tid) {
+    let count = 0;
+    events.forEach(ev => {
+      if (!ssIsBasketballEvent(ev)) return;
+      const sType = ev.status?.type ?? "";
+      const done = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
+      if (!done) return;
+      const evTid = ev?.tournament?.uniqueTournament?.id;
+      if (evTid != null && String(evTid) === String(tid)) count++;
+    });
+    return count;
+  }
+
+  const countA = countCompletedForTournament(evA, manualId);
+  const countB = countCompletedForTournament(evB, manualId);
+  const combined = countA + countB;
+  if (combined <= 0) return;
+
+  const nameEl = document.getElementById("ssTournamentName");
+  const statusEl = document.getElementById("ssFetchStatus");
+  if (combined < 3) {
+    if (nameEl) nameEl.textContent = "⚠ thin match (" + combined + " games) — verify manually";
+    if (statusEl) {
+      statusEl.style.color = "#d98a00";
+      statusEl.textContent = "⚠ Manual Tournament ID is thin (" + combined + " games combined). Verify this is the correct competition.";
+    }
+  }
 }
 
 function getLeagueGender() {
@@ -3970,6 +4012,11 @@ const BB_CONFIG = {
 // genuinely affect the returned weights (see formula below). The specific shrink
 // magnitudes remain UNVERIFIED CALIBRATION (see note) — tune those from real data, but do
 // not flag the function itself as "ignores its inputs" again.]
+// FIX #6: netVenueEffect shadow recomputation block removed below. It duplicated
+// ~40 lines of computeFTProjection's live projection logic (anchor, volatility,
+// injury, intel, H2H) solely to produce a diagnostic-only field, meaning any future
+// change to the real projection logic had to be manually mirrored here or the
+// diagnostic silently went stale. netVenueEffect is now always 0.
 // UNVERIFIED CALIBRATION: the function previously ignored volatility/league entirely
 // despite accepting them. This version makes it genuinely responsive to sample size
 // (thin samples regress harder toward a neutral 50/50, since we trust the team's own
@@ -4642,16 +4689,8 @@ function getLeagueEdgePointThreshold(league, marketKey) {
     // PATCHABLE ISSUE #8 FIX: [DELETED] EUROPE_EDGE_LEAGUES and ASIA_EDGE_LEAGUES –
     // both were empty arrays with zero references anywhere in the file.
 
-    const TRAP_RULES = {
-      minEdgePct: 0.015,
-      extremeEdgePct: 0.12,
-      lowLineUnder: { nba: 205, ncaa: 125 },
-      volThresholds: {
-        ft:   { nba: 18, other: 15 },
-        h1:   { nba: 10.5, other: 9.0 },
-        team: { nba: 11.5, other: 10.0 }
-      }
-    };
+    // [DELETED] FIX: TRAP_RULES – dead object, never imported, used, or referenced
+    // anywhere in the file (detectTrap always returns false by design). Zero call sites.
 
             const ANCHOR_RULES = {
       ft:   { nbaDiff: 18, otherDiff: 25, nbaWeight: MODEL_CONFIG.LINE_ANCHOR_NBA, otherWeight: MODEL_CONFIG.LINE_ANCHOR_OTHER },
@@ -14377,7 +14416,7 @@ function getConfidenceClass(conf) {
 
 function getMarketKeyFromName(name, marketKeyOverride) {
   // Fix: Priority Override. If the engine already assigned a key, keep it.
-  const validKeys = ["ft", "h1", "h2", "team_a", "team_b", "q1", "q2", "q3", "q4", "h1_team_a", "h1_team_b", "player"];
+  const validKeys = ["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "h1_team_a", "h1_team_b", "player"];
   if (validKeys.includes(marketKeyOverride)) return marketKeyOverride;
   if (marketKeyOverride === "player") return "player";
   const n = String(name || "");
@@ -14589,65 +14628,15 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
   let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
 
-  // [LOCK: netVenueEffect SHADOW RECOMPUTATION — VERIFIED, diagnostic-only, do not
-  // remove or "simplify" by reusing offensiveAdjustment/defensiveAdjustment instead.
-  // Those raw input-stage deltas do NOT equal the actual final-total impact, because:
-  // (1) the ESPN advanced ORTG/DRTG branch never reads the venue-blended inputs at
-  // all, so venue's true effect is correctly 0 on those games even when
-  // offensiveAdjustment is nonzero; (2) volatility/injury/intel/H2H all apply
-  // nonlinear transforms downstream of the raw scored/allowed averages. This block
-  // re-runs those exact same steps a second time with pure overall (pre-venue)
-  // inputs, using variables already in scope (aOverallAvg, bOverallAvg,
-  // aAllowedOverall, bAllowedOverall, aFTS, bFTS, config, isEspnLeague,
-  // hasRealRatings, hasRealPace, aS_pre, bS_pre, _bVolRatio, _aVolRatio,
-  // intelSignalA/B, _ftVolRatio, ftHasH2H, aH2H, bH2H) so it can never drift out of
-  // sync with the real branch-selection logic above. It writes ONLY to _nv-suffixed
-  // local variables and never mutates aS, bS, projAFT, projBFT, or ftProj — the real
-  // pick pipeline is completely unaffected by this block's presence or absence.]
-  let aS_pre_nv = anchorProjection(aOverallAvg, sampleSize, leagueBase);
-  let bS_pre_nv = anchorProjection(bOverallAvg, sampleSize, leagueBase);
-  let aS_nv, bS_nv;
-  if (isEspnLeague && hasRealRatings && hasRealPace) {
-    aS_nv = aS_pre;
-    bS_nv = bS_pre;
-  } else {
-    const _twNv = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
-    const _owNv = 1 - _twNv;
-    aS_nv = isFinite(aS_pre_nv) && isFinite(bAllowedOverall) ? (aS_pre_nv * _twNv + bAllowedOverall * _owNv) : aS_pre_nv;
-    bS_nv = isFinite(bS_pre_nv) && isFinite(aAllowedOverall) ? (bS_pre_nv * _twNv + aAllowedOverall * _owNv) : bS_pre_nv;
-  }
-  aS_nv = applyVolatility(aS_nv, aFTS, volLimit, league);
-  bS_nv = applyVolatility(bS_nv, bFTS, volLimit, league);
-  aS_nv *= injMultA;
-  bS_nv *= injMultB;
-  // PATCHABLE ISSUE #5 FIX: use the centralized INJURY_OPPONENT_BOOST_FACTOR constant.
-  if (injMultA < 1) bS_nv *= (1 + (1 - injMultA) * INJURY_OPPONENT_BOOST_FACTOR);
-  if (injMultB < 1) aS_nv *= (1 + (1 - injMultB) * INJURY_OPPONENT_BOOST_FACTOR);
-  aS_nv = applyDampedIntelSignal(aS_nv, intelSignalA.signal, _bVolRatio);
-  bS_nv = applyDampedIntelSignal(bS_nv, intelSignalB.signal, _aVolRatio);
-  let projAFT_nv = aS_nv;
-  let projBFT_nv = bS_nv;
-  if (ftHasH2H) {
-    const massacreH2H_nv = getMassacreH2HSeries("ft", getCurrentFixtureMeta(), parsed);
-    const decayH2HA_nv = massacreH2H_nv.A.length >= 2 ? massacreH2H_nv.A : aH2H;
-    const decayH2HB_nv = massacreH2H_nv.B.length >= 2 ? massacreH2H_nv.B : bH2H;
-    // PATCHABLE ISSUE #1 FIX: same h2hFactor fix applied to the shadow (netVenueEffect)
-    // recompute so it stays consistent with the live projection above.
-    // BUGFIX: _ftH2hFactor from the live block above is block-scoped to that if-block
-    // and is NOT visible here — redeclare it locally so this shadow block doesn't throw.
-    const _ftH2hFactor = isFinite(config?.h2hFactor) ? Number(config.h2hFactor) : 1.0;
-    const hw_nv = getH2HWeight(decayH2HA_nv.length, decayH2HB_nv.length, "ft", ftSampleTier, Math.abs(aS_nv - bS_nv), league, leagueBase, _ftH2hFactor, {
-      injMultA,
-      injMultB,
-      volRatio: _ftVolRatio,
-      blowoutGap: Math.abs(aS_nv - bS_nv),
-      paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
-    });
-    projAFT_nv = isFinite(projAFT_nv) ? (projAFT_nv * (1 - hw_nv) + avgOrNaN(decayH2HA_nv) * hw_nv) : avgOrNaN(decayH2HA_nv);
-    projBFT_nv = isFinite(projBFT_nv) ? (projBFT_nv * (1 - hw_nv) + avgOrNaN(decayH2HB_nv) * hw_nv) : avgOrNaN(decayH2HB_nv);
-  }
-  const ftProj_nv = (isFinite(projAFT_nv) ? projAFT_nv : 0) + (isFinite(projBFT_nv) ? projBFT_nv : 0);
-  const netVenueEffect = (isFinite(ftProj) && isFinite(ftProj_nv)) ? (ftProj - ftProj_nv) : 0;
+  // FIX #6: netVenueEffect shadow recomputation block deleted (see LOCK comment
+  // above computeFTProjection). It duplicated the entire projection pipeline a
+  // second time purely to populate a diagnostic-only audit field, creating a
+  // maintenance trap where any future change to the real projection logic had to
+  // be manually mirrored here or the diagnostic would silently drift out of sync.
+  // netVenueEffect is now a fixed 0 — the field is kept in the return object below
+  // for backward compatibility with the audit dump, but no longer carries a
+  // computed value.
+  const netVenueEffect = 0;
 
   const ftEdge = (isFinite(ftProj) && isFinite(lines.ftLine) && lines.ftLine > 0) ? ftProj - lines.ftLine : NaN;
   const aEdge = (isFinite(projAFT) && isFinite(lines.aLine) && lines.aLine > 0) ? projAFT - lines.aLine : NaN;
@@ -14896,6 +14885,11 @@ function getMarketVolLimit(league, marketKey) {
   // suppressing the volatility adjustment and H2H dampening for those markets.
   const key = String(marketKey || "").toLowerCase();
   if (key === "h1" || key === "h1_team_a" || key === "h1_team_b") return base * 0.5;
+  // FIX #5: team_a/team_b previously fell through to the full FT-scale limit
+  // unscaled, even though team totals are roughly half of FT totals (e.g. ~110 vs
+  // ~220), which artificially halved the volatility ratio (stdDev/limit) for team
+  // markets and produced overconfident confidence grades on Team Total picks.
+  if (key === "team_a" || key === "team_b") return base * 0.5;
   if (key.startsWith("q")) return base * 0.25;
   return base;
 }
@@ -17299,72 +17293,14 @@ await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtur
 // Q1-Q4 scaling against the FT anchor is preserved, but H1 itself is no longer
 // touched here.
 
-// FINAL RECONCILIATION (Last Step: Robust Alignment) 
-const fP = finalPicksForDisplay.find(x => x.marketKey === 'ft'); 
-if (fP && isFinite(fP.proj)) { 
-// Shield Fix: Only scale row where the line is significantly smaller than the FT total
-// [LOCK: NULL-LINE COERCION BUG FIX — VERIFIED 2026-07-03. x.line < (fP.line * 0.45)
-// previously had no isFinite(x.line) guard. When a quarter has no market line entered,
-// x.line is null, and JS comparison operators coerce null to 0 for `<` — so
-// `null < (fP.line * 0.45)` evaluates true for EVERY lineless quarter, wrongly pulling
-// it into this rescale group meant only for quarters whose real line is much smaller
-// than the FT total. Two knock-on effects: (1) q.proj got needlessly rescaled by
-// `scale` even with no line to compare against, corrupting the stored projection for
-// that quarter; (2) `q.edge = q.proj - q.line` below then computed `q.proj - null`,
-// which JS coerces to `q.proj - 0`, so q.edge became a copy of q.proj — a nonsensical
-// "edge" equal to the full projected total (this is what shows up as e.g. Q1 edge =
-// 42.47, matching Q1's own projection exactly, in any audit/debug dump of q1.edge).
-// getPick() still safely returns NO PLAY for a null line downstream, so this never
-// changed a live betting recommendation — but it did pollute q.proj/q.edge for any
-// caller that reads those fields directly (debug panels, audit exports, future tracker
-// features). Adding isFinite(x.line) here restores the comment's actual intent: only
-// scale quarters that HAVE a real, smaller-than-FT line. DO NOT remove this guard.]
-const qPicks = finalPicksForDisplay.filter(x => ['q1','q2','q3','q4'].includes(x.marketKey) && isFinite(x.proj) && isFinite(x.line) && x.line < (fP.line * 0.45)); 
-const rawQSum = qPicks.reduce((s, x) => s + x.proj, 0);
-
-// FIX: gameCoverageShare = qPicks.length/4 assumes every quarter is worth exactly 1/4 of
-// the full game. Passes 1 and 2 above already split Q1/Q2 and Q3/Q4 by each quarter's REAL
-// relative scoring share within its half (not a flat 50/50), so when only some quarters
-// have a market line entered (qPicks.length < 4 — common when a book doesn't post every
-// quarter total), flattening to a 1/4-per-quarter assumption here discards that already
-// correct, data-driven split and forces the partial subset of quarters to sum to an
-// arbitrary fraction of the FT total. Restricting this pass to full 4-quarter coverage
-// preserves Pass 1/2's real per-quarter shares whenever any quarter lacks a line, and
-// keeps the exact prior behavior (with the same no-op guard below) when all 4 quarters
-// do have real lines.
-if (rawQSum > 50 && qPicks.length === 4) { 
-const gameCoverageShare = qPicks.length / 4; 
-const scale = (fP.proj * gameCoverageShare) / rawQSum;
-
-// ISSUE #8 FIX: only run this rescale pass when it actually changes anything meaningful.
-// Previously ran unconditionally every time rawQSum>50, even when Q1+Q2/Q3+Q4 already
-// summed correctly from the earlier reconciliation passes, silently reintroducing scaling
-// noise and (see ISSUE #1 fix below) leaving q.confidence stale relative to q.edge.
-if (Math.abs(scale - 1) > 0.01) {
-qPicks.forEach(q => {
-  q.proj *= scale;
-  q.edge = q.proj - q.line;
-  // [LOCKED: marketKey fix — VERIFIED 2026-07-02. This getPick call was hardcoded to
-  // "h1", so every rescaled quarter pick (q1-q4) was graded against H1's edge-point
-  // threshold instead of the quarter's own (getLeagueEdgePointThreshold branches on
-  // marketKey: "q" vs "h1" are different, smaller-scale numbers). That mismatch could
-  // flip a genuine quarter OVER/UNDER to NO PLAY or vice versa after rescaling. Use the
-  // pick's own marketKey (q.marketKey, e.g. "q1"/"q2"/"q3"/"q4") so it's graded on the
-  // correct scale, consistent with FIX #27's identical fix in getConfidenceGrade. Do NOT
-  // hardcode this back to "h1" or any other single market key.]
-  q.pick = getPick(q.edge, q.line, league, q.marketKey, {});
-  // ISSUE #1 FIX: recompute confidence after this rescale so the displayed grade reflects
-  // the post-rescale edge instead of staying stale from the earlier Q1+Q2/Q3+Q4 pass.
-  q.confidence = getConfidenceGrade({
-    pick: q.pick, line: q.line, edge: q.edge, sampleTier: q.sampleTier,
-    volLimit: getMarketVolLimit(league, q.marketKey), marketKey: q.marketKey,
-    hasH2H: q.hasH2H, fullModel: q.fullModel, projectionOnly: false, league
-  });
-});
-}
-
-}
-} 
+// FIX #6: FINAL RECONCILIATION block permanently removed. Passes 1 and 2 above
+// (Q1+Q2 scaled to match h1Proj, Q3+Q4 scaled to match ftProj-h1Proj) already
+// guarantee all four quarters sum correctly while preserving each pass's real,
+// data-driven internal split. This third pass re-flattened that to a naive 1/4-
+// per-quarter assumption and could override the more principled H1-anchored split,
+// and its own null-line coercion bug (see prior LOCK comment, now removed) made
+// q.edge for lineless quarters equal to q.proj — a nonsensical value. No further
+// scaling is needed after passes 1 and 2.
 
 
 
