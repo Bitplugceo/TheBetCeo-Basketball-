@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -688,6 +689,51 @@ td {
   margin-left: 4px;
   margin-right: 0;
 }
+
+    /* ITEM #19 FIX — "WHY THIS PICK" FACTOR BREAKDOWN (2026-07-08): plain,
+       rules-based explanation UI, NOT a SHAP/LIME integration. See the
+       getPickExplanationFactors/buildPickExplanationDetails JS functions for the
+       full rationale comment. Styling only — no new state, no new dependencies. */
+    .why-pick-details {
+      display: block;
+      margin-top: 6px;
+      font-size: 10px;
+      font-weight: 600;
+      white-space: normal;
+    }
+    .why-pick-details summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 700;
+      list-style: none;
+      outline: none;
+    }
+    .why-pick-details summary::-webkit-details-marker { display: none; }
+    .why-pick-details[open] summary { color: var(--text); }
+    .why-pick-body {
+      margin-top: 4px;
+      padding: 6px 8px;
+      background: var(--panel-soft);
+      border: 1px solid var(--table-border);
+    }
+    .why-pick-list {
+      margin: 0;
+      padding-left: 14px;
+      display: grid;
+      gap: 4px;
+    }
+    .why-pick-list li {
+      color: var(--text);
+      font-size: 10px;
+      line-height: 1.35;
+      font-weight: 600;
+    }
+    .why-pick-note {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 600;
+    }
 
     .track-pending {
       background: #eceff3 !important;
@@ -6331,6 +6377,53 @@ function renderTrackerDebugPanel() {
 const ENGINE_DEBUG_LIMIT = 180;
 let g_engineDebugLog = [];
 
+// ITEM #7 FIX — CENTRAL STATE STORE, BATCH 1 OF 6 (2026-07-08): AppState is the
+// start of a phased migration consolidating this file's scattered globals
+// (g_trackerState, g_massacreFetchContext, g_fetchMeta, g_engineDebugLog, etc.)
+// into one place. Batch 1 covers ONLY the debug log arrays — the lowest-risk
+// slice, since they're read/written for display purposes and never feed
+// pick/edge/grade decisions. AppState.debug.engineLog/trackerLog are defined as
+// getter/setter PROXIES onto the existing g_engineDebugLog/g_trackerDebugLog
+// variables (this one, and the g_trackerDebugLog declared earlier near
+// TRACKER_DEBUG_LIMIT) rather than replacements for them — every existing
+// read/write site for those two arrays keeps working completely unchanged.
+// Later batches will migrate variable ownership itself into AppState and update
+// the remaining call sites (engineDebug/trackerDebug's own unshift/slice logic,
+// clearAll(), runEngine()'s log-reset line). DO NOT remove g_engineDebugLog or
+// g_trackerDebugLog until that happens — AppState.debug depends on them existing.
+// ITEM #7 FIX — CENTRAL STATE STORE, BATCH 2 OF 6 (2026-07-08): adds AppState.selection
+// as a second proxy slice, covering selectedTeamIds/g_lastFetchedTeams/activeDropTeam.
+// Same pattern as Batch 1 (debug logs) — getter/setter pass-through onto the existing
+// variables, no ownership change yet. selectedTeamIds is declared earlier in the file
+// (near _schedCache/_fixtureCache) but that's fine: these are getters, so the closure
+// only reads selectedTeamIds/g_lastFetchedTeams/activeDropTeam when actually invoked,
+// long after all top-level declarations have run. Batch 2 migrates two read-only call
+// sites (getFixtureSideRole, validateFetchSection's duplicate-team check) as proof —
+// every write site (selectTeam(), clearAll(), onLeagueChange(), fetchESPNCore(), etc.)
+// is deliberately left untouched in this batch. DO NOT remove selectedTeamIds,
+// g_lastFetchedTeams, or activeDropTeam until a later batch migrates those write sites
+// too — AppState.selection depends on them existing.
+const AppState = {
+  debug: {
+    get engineLog() { return g_engineDebugLog; },
+    set engineLog(v) { g_engineDebugLog = v; },
+    get trackerLog() { return g_trackerDebugLog; },
+    set trackerLog(v) { g_trackerDebugLog = v; }
+  },
+  selection: {
+    get teamAId() { return selectedTeamIds.A; },
+    set teamAId(v) { selectedTeamIds.A = v; },
+    get teamBId() { return selectedTeamIds.B; },
+    set teamBId(v) { selectedTeamIds.B = v; },
+    get lastFetchedA() { return g_lastFetchedTeams.A; },
+    set lastFetchedA(v) { g_lastFetchedTeams.A = v; },
+    get lastFetchedB() { return g_lastFetchedTeams.B; },
+    set lastFetchedB(v) { g_lastFetchedTeams.B = v; },
+    get activeDrop() { return activeDropTeam; },
+    set activeDrop(v) { activeDropTeam = v; }
+  }
+};
+
 function engineDebug(message, extra = null) {
   try {
     const stamp = new Date().toLocaleTimeString([], { hour12: false });
@@ -6941,10 +7034,11 @@ function buildFetchAuditIssues({
     if (!teamAName) errors.push("Team A is empty.");
     if (!teamBName) errors.push("Team B is empty.");
 
+    // ITEM #7 FIX — BATCH 2: same proxy-read migration as getFixtureSideRole above.
     const sameById =
-      selectedTeamIds.A &&
-      selectedTeamIds.B &&
-      String(selectedTeamIds.A) === String(selectedTeamIds.B);
+      AppState.selection.teamAId &&
+      AppState.selection.teamBId &&
+      String(AppState.selection.teamAId) === String(AppState.selection.teamBId);
 
     const sameByName =
       teamAName &&
@@ -9949,11 +10043,12 @@ function renderTrackerAnalytics() {
   const pendingActiveCount = Array.isArray(g_trackerState?.activePicks) ? g_trackerState.activePicks.filter(p => !["win", "loss", "push"].includes(String(p?.resultStatus || "").toLowerCase())).length : 0;
 
   const importantEngineLines = [];
-  const rawImportantEngineLines = getVisibleDebugLines(g_engineDebugLog, "engine", 6);
+  // ITEM #7 FIX — BATCH 1: same proxy-read migration as the debug view above.
+  const rawImportantEngineLines = getVisibleDebugLines(AppState.debug.engineLog, "engine", 6);
   if (rawImportantEngineLines.length) importantEngineLines.push(...rawImportantEngineLines);
 
   const importantTrackerLines = [];
-  const rawImportantTrackerLines = getVisibleDebugLines(g_trackerDebugLog, "tracker", 6);
+  const rawImportantTrackerLines = getVisibleDebugLines(AppState.debug.trackerLog, "tracker", 6);
   rawImportantTrackerLines.forEach(line => { if (!importantTrackerLines.includes(line)) importantTrackerLines.push(line); });
 
   syncTrackerModalView();
@@ -10461,8 +10556,13 @@ function renderTrackerAnalytics() {
       </div>
     `;
   } else if (currentView === "debug") {
-    const engineLines = g_engineDebugLog.map(line => `<li class="${getDebugSeverityClass(line)}">${safeText(line)}</li>`).join('');
-    const trackerLines = g_trackerDebugLog.map(line => `<li class="${getDebugSeverityClass(line)}">${safeText(line)}</li>`).join('');
+    // ITEM #7 FIX — BATCH 1: reads via AppState.debug instead of the raw
+    // globals directly. AppState.debug.engineLog/trackerLog are getters that
+    // return the exact same array references as g_engineDebugLog/
+    // g_trackerDebugLog, so this is behaviorally identical to the prior direct
+    // reads — no output change, just routed through the central store.
+    const engineLines = AppState.debug.engineLog.map(line => `<li class="${getDebugSeverityClass(line)}">${safeText(line)}</li>`).join('');
+    const trackerLines = AppState.debug.trackerLog.map(line => `<li class="${getDebugSeverityClass(line)}">${safeText(line)}</li>`).join('');
     panel.innerHTML = `
       <div class="tracker-analytics-shell">
         <div class="tracker-analytics-topbar">
@@ -14610,7 +14710,11 @@ function safeAverage(arr, defaultVal) {
 
 function getFixtureSideRole(side) {
   const fixtureMeta = getCurrentFixtureMeta();
-  const teamId = String(selectedTeamIds?.[side] || "");
+  // ITEM #7 FIX — BATCH 2: reads via AppState.selection instead of the raw
+  // selectedTeamIds global directly. AppState.selection.teamAId/teamBId are
+  // getters onto the exact same object property, so this is behaviorally
+  // identical to the prior direct read.
+  const teamId = String((side === "A" ? AppState.selection.teamAId : AppState.selection.teamBId) || "");
   const homeId = String(fixtureMeta?.homeId || "");
   const awayId = String(fixtureMeta?.awayId || "");
   if (teamId && homeId && teamId === homeId) return "home";
@@ -14794,6 +14898,102 @@ function getDiagnosticsHasH2HForMarket(market) {
 function getPredictionClass(pick, recommendationTier = "") {
   if (!pick || pick === "NO PLAY") return "pred-noplay";
   return getPickSideFromText(pick) === "under" ? "pred-under" : "pred-over";
+}
+
+// ITEM #19 FIX — "WHY THIS PICK" FACTOR BREAKDOWN (2026-07-08): a plain,
+// rules-based explanation of what already-computed values drove this pick's edge
+// and grade — NOT a SHAP/LIME integration. This engine's grades come from
+// heuristic scoring (edge %, sample tier, H2H presence, volatility, venue blend,
+// tracker feedback, massacre framework, league trust), not a trained model with
+// learned feature weights, so there is nothing here for a real feature-attribution
+// library like SHAP/LIME to decompose — labeling this as SHAP/LIME would be
+// misleading. This surfaces the same intermediate values the engine already
+// computed for this pick during runEngine (edge, line, sampleTier, hasH2H,
+// trackerSoftInfluence, massacre, leagueTrust, highEdgeFlag — all already present
+// on the pick object passed into buildResultRows) as a readable list. DO NOT
+// rename this to claim SHAP/LIME or any real feature-attribution method — it is a
+// factor summary of existing rule-based signals, nothing more.
+function getPickExplanationFactors(p, isLock) {
+  const factors = [];
+  if (!p) return factors;
+
+  const side = getPickSideFromText(p.pick);
+  const edgeVal = isFinite(p.displayEdge) ? p.displayEdge : p.edge;
+  const lineVal = isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line;
+  if (isFinite(edgeVal) && isFinite(lineVal) && lineVal > 0) {
+    const edgePct = Math.abs(edgeVal / lineVal) * 100;
+    factors.push(`Edge: ${formatEdge(edgeVal, lineVal)} pts (${edgePct.toFixed(1)}%) vs the ${displayLine(lineVal)} line — this is what makes it ${side ? side.toUpperCase() : "a pick"}.`);
+  }
+
+  const tierLabel = { full: "Full sample (10 games)", thin: "Thin sample (5–9 games)", insufficient: "Insufficient sample" }[p.sampleTier] || null;
+  if (tierLabel) factors.push(`Sample size: ${tierLabel}.`);
+
+  factors.push(p.hasH2H ? "Head-to-head history: included in the blend." : "Head-to-head history: not used (too few qualifying H2H games).");
+
+  if (p.marketKey === "ft" || p.marketKey === "h1" || p.marketKey === "team_a") {
+    if (p.aVenueEnabled) factors.push("Team A venue split: blended in (home/away sample qualified).");
+  }
+  if (p.marketKey === "ft" || p.marketKey === "h1" || p.marketKey === "team_b") {
+    if (p.bVenueEnabled) factors.push("Team B venue split: blended in (home/away sample qualified).");
+  }
+
+  if (isLock) factors.push("🔒 Selected as the Lock pick (highest confidence + edge among this game's actionable markets).");
+
+  if (p.highEdgeFlag) {
+    factors.push(`⚠ Edge is ${p.highEdgeMultiple}x the normal threshold for this market — worth double-checking the line before staking.`);
+  }
+
+  const tsi = p.trackerSoftInfluence;
+  if (tsi && tsi.applied && tsi.action && tsi.action !== "keep" && tsi.action !== "shadow_keep") {
+    const actionLabel = {
+      boost: "Tracker history boosted this grade",
+      downgrade: "Tracker history downgraded this grade",
+      no_play: "Tracker history blocked this pick",
+      lock_restrict: "Tracker history restricted this pick from being the Lock",
+      shadow_boost: "Tracker history would boost this grade (shadow mode)",
+      shadow_downgrade: "Tracker history would downgrade this grade (shadow mode)",
+      shadow_no_play: "Tracker history would block this pick (shadow mode)"
+    }[tsi.action] || ("Tracker influence: " + tsi.action);
+    factors.push(`📊 ${actionLabel}${tsi.reasons?.length ? " — " + tsi.reasons.join(", ") : ""}.`);
+  }
+
+  if (p.teamMemory?.flaggedTeams?.length) {
+    const names = p.teamMemory.flaggedTeams.map(t => t.teamKey).join(", ");
+    factors.push(`📊 Team memory flagged: ${names} has a weak recent record on this side/market.`);
+  }
+
+  if (p.massacre?.severity && p.massacre.severity !== "none") {
+    factors.push(`🔥 Massacre framework: ${p.massacre.severity} ${p.massacre.direction || ""} streak detected, nudged the edge and grade.`);
+  }
+
+  if (p.leagueTrust && p.leagueTrust.mode !== "full") {
+    factors.push(`ℹ League trust: "${p.leagueTrust.label}" — ${p.leagueTrust.guidance}`);
+  }
+
+  return factors;
+}
+
+// ITEM #19 FIX — companion to getPickExplanationFactors above. Builds the actual
+// <details> DOM node inserted into the Prediction cell. Uses safeText() on every
+// factor string at render time (same escaping helper already used elsewhere in
+// this file, e.g. renderInjuryBox) so nothing here introduces a new XSS surface.
+function buildPickExplanationDetails(p, isLock) {
+  const wrap = document.createElement("details");
+  wrap.className = "why-pick-details";
+  const summary = document.createElement("summary");
+  summary.textContent = "ℹ️ Why this pick";
+  wrap.appendChild(summary);
+
+  const body = document.createElement("div");
+  body.className = "why-pick-body";
+  const factors = getPickExplanationFactors(p, isLock);
+  if (!factors.length) {
+    body.innerHTML = `<div class="why-pick-note">No additional factor detail available for this pick.</div>`;
+  } else {
+    body.innerHTML = `<ul class="why-pick-list">${factors.map(f => `<li>${safeText(f)}</li>`).join("")}</ul>`;
+  }
+  wrap.appendChild(body);
+  return wrap;
 }
 
 function getConfidenceClass(conf) {
@@ -16395,6 +16595,10 @@ async function executeRetrospectiveBacktest(gameId) {
         tdPred.appendChild(document.createTextNode(" "));
         tdPred.appendChild(lockSpan);
       }
+      // ITEM #19 FIX — "WHY THIS PICK" FACTOR BREAKDOWN (2026-07-08): appends a
+      // native <details> disclosure built from this pick's own already-computed
+      // fields. See getPickExplanationFactors/buildPickExplanationDetails above.
+      tdPred.appendChild(buildPickExplanationDetails(p, isLock));
     }
     row.appendChild(tdPred);
   });
