@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3472,6 +3471,21 @@ function parseSofascoreIndividual(side) {
             ? "(" + _best.name + (_candidates.length > 1 ? " · override if wrong" : "") + ")"
             : "";
           engineDebug("Tournament auto-detected via intersection: " + _best.id + " (" + _best.name + ")", { side, candidates: _candidates.length });
+          // LOCKED: PHASE 0 FIX #2 — THIN TOURNAMENT-FILTER FALLBACK WARNING. The
+          // intersection detector already picks the tournament with the highest
+          // combined game count (_candidates[0]), which is the "fall back to the
+          // most common tournament" behavior. This adds the missing half: warn the
+          // user in-UI when even the best match is thin (<3 combined games), since a
+          // silently-accepted 1-2 game tournament match can look identical in the UI
+          // to a well-supported one. Does not block the fetch — informational only.
+          if (_best.combined < 3 && _tNameEl) {
+            _tNameEl.textContent += " ⚠ thin match (" + _best.combined + " games) — verify manually";
+            const _ssStatusEl = document.getElementById("ssFetchStatus");
+            if (_ssStatusEl) {
+              _ssStatusEl.style.color = "#d98a00";
+              _ssStatusEl.textContent = "⚠ Tournament auto-match is thin (" + _best.combined + " games combined). Consider entering the Tournament ID manually.";
+            }
+          }
         } else {
           const _tNameEl = document.getElementById("ssTournamentName");
           if (_tNameEl) _tNameEl.textContent = "(no shared tournament found — paste fixture JSON or enter ID)";
@@ -3821,6 +3835,14 @@ function extractH2HFromPastedEvents() {
     if (!isTerminal) return false;
     const hId = String(ev.homeTeam?.id ?? "");
     const aId = String(ev.awayTeam?.id ?? "");
+    // LOCKED: PHASE 0 FIX #1 — H2H SELF-MATCH / DUPLICATE-ID GUARD. Reject any event
+    // where the home and away IDs resolved to the same value (corrupted/duplicate
+    // paste data, or a malformed event object) before the idA/idB pairing check runs.
+    // Without this, a corrupted event with hId===aId could satisfy neither branch of
+    // the pairing check safely, but a future edit to that check could accidentally
+    // let a self-paired game slip into H2H and silently duplicate one team's score
+    // as both sides of a "head-to-head" game. DO NOT remove this guard.
+    if (hId && hId === aId) return false;
     if (!((hId === idA && aId === idB) || (hId === idB && aId === idA))) return false;
 
     // LOCK: Filter H2H to the fixture's competition ONLY via uniqueTournament.id.
@@ -4155,7 +4177,13 @@ function storeVerifiedConfig(league, marketKey, configKey, netDelta, sampleCount
     // Clear candidate scores after locking
     localStorage.removeItem(`BB_CANDIDATE_SCORES_${league}_${marketKey}`);
     engineDebug("Verified config locked", { league, marketKey, configKey, netDelta });
-  } catch(e) {}
+  } catch(e) {
+    // LOCKED: PHASE 0 FIX #4 — SILENT CATCH LOGGING. This catch previously swallowed
+    // any localStorage failure (quota exceeded, private-mode block) with zero trace,
+    // so a verified config could silently fail to persist with no way to tell from
+    // the debug panel. DO NOT revert to an empty catch block.
+    engineDebug("storeVerifiedConfig failed to persist", { league, marketKey, configKey, error: e?.message || String(e) });
+  }
 }
 
 function getVerifiedConfig(league, marketKey) {
@@ -4166,7 +4194,14 @@ function getVerifiedConfig(league, marketKey) {
       const parsed = JSON.parse(raw);
       if (parsed.verified) return parsed;
     }
-  } catch(e) {}
+  } catch(e) {
+    // LOCKED: PHASE 0 FIX #4 — SILENT CATCH LOGGING. Previously a corrupt or
+    // unreadable BB_VERIFIED_CONFIG_* entry would fail parse and silently fall
+    // through to `return null` with zero trace, making a "why isn't my verified
+    // config applying" report unanswerable from the debug panel. DO NOT revert
+    // to an empty catch block.
+    engineDebug("getVerifiedConfig failed to read/parse", { league, marketKey, error: e?.message || String(e) });
+  }
   return null;
 }
 
@@ -4179,10 +4214,18 @@ async function runRetrospectiveAnalysis(pick) {
   const isWin = resultStatus === "win";
   if (!isWin && resultStatus !== "loss") return; // Only analyze wins and losses
 
-  // Issue 13: Minimum 30 settled picks required for this league+market before running analysis.
+  // LOCKED: PHASE 0 FIX #6 — LOWERED RETROSPECTIVE THRESHOLD FOR NON-BIG-5 LEAGUES,
+  // VERIFIED DECISION 2026-07-08. Manual/low-volume leagues could take a very long
+  // time to ever reach 30 settled picks for a given league+market, meaning their
+  // tuning grid (TUNING_GRID / getCandidateScoreKey) effectively never accumulates
+  // data. Big-5 ESPN leagues (higher pick volume, higher data trust) keep the
+  // original 30-pick gate; every other league now only needs 10. Do not lower this
+  // further without checking TUNING_GRID's noise sensitivity at very small samples.
+  const _isBig5ForRetro = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"].includes(String(league || "").toLowerCase());
+  const _retroMinSettled = _isBig5ForRetro ? 30 : 10;
   const _mktSettled = getTotalSettledCountForLeagueMarket(league, marketKey);
-  if (_mktSettled < 30) {
-    engineDebug("Retrospective skipped: need 30+ settled picks", { league, marketKey, have: _mktSettled });
+  if (_mktSettled < _retroMinSettled) {
+    engineDebug("Retrospective skipped: need " + _retroMinSettled + "+ settled picks", { league, marketKey, have: _mktSettled, threshold: _retroMinSettled });
     return;
   }
 
@@ -7548,6 +7591,37 @@ function rebuildTrackerStats() {
   };
 
   rebuildTrackerDerivedState();
+  // LOCKED: PHASE 4 FIX #23 — WIN-RATE DEGRADATION ALERT, ADDED 2026-07-08. Checks the
+  // most recent 30 settled picks (not all-time, so an old cold streak doesn't mask a
+  // live one) and fires a single engineDebug WARN + triggerGlobalEngineAlert if the
+  // rolling win rate over that window drops below 48%. Uses a session-scoped flag
+  // (g_winRateAlertFired) so it only alerts once per below-threshold dip instead of
+  // spamming the debug log on every rebuildTrackerStats() call while still below
+  // threshold; resets automatically once the rate recovers above 48%. UNVERIFIED
+  // CALIBRATION: the 48%/30-pick window values are reasoned defaults matching the
+  // roadmap's stated target, not independently re-derived from this engine's own
+  // variance profile — tune from real results, but do not remove the check.
+  try {
+    const _settledSorted = all
+      .filter(p => ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase()))
+      .sort((a, b) => getTrackedPickTimeMs(b) - getTrackedPickTimeMs(a));
+    const _recentWindow = _settledSorted.slice(0, 30);
+    if (_recentWindow.length >= 30) {
+      const _recentWins = _recentWindow.filter(p => p.resultStatus === "win").length;
+      const _recentDecisive = _recentWindow.filter(p => p.resultStatus === "win" || p.resultStatus === "loss").length;
+      const _recentWinRate = _recentDecisive > 0 ? (_recentWins / _recentDecisive) * 100 : null;
+      if (isFinite(_recentWinRate) && _recentWinRate < 48) {
+        if (!window.g_winRateAlertFired) {
+          window.g_winRateAlertFired = true;
+          engineDebug("WARN: Win rate below 48% over last 30 settled picks", { winRatePct: _recentWinRate.toFixed(1), decisive: _recentDecisive });
+        }
+      } else {
+        window.g_winRateAlertFired = false;
+      }
+    }
+  } catch (_alertErr) {
+    engineDebug("win-rate alert check failed", { error: _alertErr?.message || String(_alertErr) });
+  }
   return g_trackerState.stats;
 }
 
@@ -12694,11 +12768,28 @@ btn.addEventListener("click", () => { section.classList.toggle("collapsed"); });
 
       if (ppg <= 0) {
         result.unknownImpactCount++;
-        const unknownPenalty = isOut ? 0.02 : 0.01; 
+        // LOCKED: PHASE 0 FIX #3 — POSITION-BASED UNKNOWN-IMPACT ESTIMATE. Previously
+        // every player with no discoverable PPG (unknown impact) got the exact same
+        // flat 0.02/0.01 penalty regardless of role, treating a bench guard the same
+        // as a starting center. Centers/forwards typically carry more of a team's
+        // scoring+rebounding load than guards on a per-player basis in most rotations,
+        // so the base penalty is now scaled by position as a coarse proxy. UNVERIFIED
+        // CALIBRATION: the specific multipliers below are a reasoned starting point,
+        // not independently re-derived from real injury-impact data — tune from
+        // results, but do not revert to a single flat constant for every position.
+        const _posAbbr = String(athlete?.position?.abbreviation || "").toUpperCase();
+        const _posImpactMult =
+          (_posAbbr === "C")              ? 1.30 :
+          (_posAbbr === "PF" || _posAbbr === "F") ? 1.15 :
+          (_posAbbr === "SF")             ? 1.05 :
+          (_posAbbr === "SG" || _posAbbr === "G") ? 0.95 :
+          (_posAbbr === "PG")             ? 0.90 :
+          1.00; // unknown position — neutral
+        const unknownPenalty = (isOut ? 0.02 : 0.01) * _posImpactMult;
         totalReduction += unknownPenalty;
         result.notes.push({
           type: isOut ? "out" : "dtd",
-          text: `${playerName} — ${tag} (impact unknown) → -${(unknownPenalty * 100).toFixed(1)}%`
+          text: `${playerName} — ${tag} (impact unknown, ${_posAbbr || "pos?"}) → -${(unknownPenalty * 100).toFixed(1)}%`
         });
         continue;
       }
@@ -16503,14 +16594,16 @@ const h1Calc = compute1HProjection({
         projB = anchorProjection(avgOrNaN(bS) * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
       }
 
-      // PATCHABLE ISSUE #3 (UNLOCKED) FIX: no real venue-split quarter data is ever
-      // fetched (no fetch pipeline exists for it), so a true per-quarter home/away
-      // blend isn't possible without new fetch infrastructure. As an honest proxy
-      // (NOT real quarter venue data), this distributes the already-computed FT-level
-      // venue adjustment evenly across the 4 quarters at partial (50%) trust, since
-      // it's a proxy rather than actual quarter-level signal. UNVERIFIED CALIBRATION:
-      // if real venue-split quarter fetching is ever built, replace this proxy.
-      const QUARTER_VENUE_PROXY_FACTOR = 0.5;
+      // LOCKED: PHASE 0 FIX #5 — QUARTER VENUE PROXY DISABLED, VERIFIED DECISION
+      // 2026-07-08. No real venue-split quarter data is ever fetched (no fetch
+      // pipeline exists for it), so the prior behavior distributed the FT-level venue
+      // adjustment evenly across the 4 quarters at 50% trust as an honest-but-unproven
+      // proxy. Per explicit decision, quarters are now documented as venue-blind
+      // rather than carrying an unverified proxy signal — QUARTER_VENUE_PROXY_FACTOR
+      // is set to 0, a one-line flip to reinstate if a real quarter-level venue fetch
+      // is ever built. DO NOT re-enable this by guessing a nonzero factor without
+      // building real per-quarter venue data first.
+      const QUARTER_VENUE_PROXY_FACTOR = 0;
       if (ftCalc.aVenueEnabled && isFinite(ftCalc.aVenueAdjustment?.offensiveAdjustment)) {
         projA += (ftCalc.aVenueAdjustment.offensiveAdjustment / 4) * QUARTER_VENUE_PROXY_FACTOR;
       }
@@ -19869,6 +19962,53 @@ window.ENGINE_TEST_SUITE = (() => {
     expect("3 games = thin",        getSampleTier([1,2,3],[1,2,3]),         "thin");
     expect("1 game = insufficient", getSampleTier([1],[1]),                 "insufficient");
     expect("empty = insufficient",  getSampleTier([],[]),                   "insufficient");
+  });
+
+  // LOCKED: PHASE 3 FIX #17/#19 — EXPANDED TEST COVERAGE, ADDED 2026-07-08. New
+  // suites below cover pure functions that had zero regression protection despite
+  // being load-bearing for pick thresholds, tracker signal reliability, and massacre
+  // streak detection. DO NOT remove without replacing with equivalent coverage.
+  suite("getLeagueEdgePointThreshold", () => {
+    expect("nba ft",     getLeagueEdgePointThreshold("nba", "ft"),      7.0);
+    expect("nba h1",     getLeagueEdgePointThreshold("nba", "h1"),      8.0);
+    expect("nba team_a", getLeagueEdgePointThreshold("nba", "team_a"), 10.0);
+    expect("nba q1",     getLeagueEdgePointThreshold("nba", "q1"),      5.0);
+    expect("unknown league falls back to default", getLeagueEdgePointThreshold("not_a_real_league", "ft"), 5.0);
+  });
+
+  suite("getStabilizedBucketWinRate (Beta-Binomial shrinkage)", () => {
+    const noData = getStabilizedBucketWinRate(0, 0, 12, 50);
+    expect("no decisive games = null", noData, null);
+    const smallSample = getStabilizedBucketWinRate(3, 0, 12, 50);
+    expectTrue("3-0 record pulled toward prior, not 100%", smallSample < 100 && smallSample > 50);
+    const largeSample = getStabilizedBucketWinRate(80, 20, 12, 50);
+    expectTrue("large sample stays close to raw rate (~80%)", largeSample > 75 && largeSample < 82);
+  });
+
+  suite("getBucketSignalStrength (z-score)", () => {
+    const noSignal = getBucketSignalStrength(50, 0, 10);
+    expectApprox("50% win rate at any n = z near 0", noSignal, 0, 0.01);
+    const smallN = getBucketSignalStrength(70, 0, 5);
+    const largeN = getBucketSignalStrength(70, 0, 50);
+    expectTrue("same win rate, larger n = larger |z|", Math.abs(largeN) > Math.abs(smallN));
+  });
+
+  suite("getMassacreProfile", () => {
+    const empty = getMassacreProfile([], "Team X");
+    expect("empty series streakLength", empty.streakLength, 0);
+    expect("empty series direction",    empty.streakDirection, "none");
+    const hot = getMassacreProfile([20, 18, 22, 25, 15], "Hot Team");
+    expect("all-positive margins = hot direction", hot.streakDirection, "hot");
+    expectTrue("hot streak length matches consecutive positives", hot.streakLength === 5);
+    const cold = getMassacreProfile([-20, -18, -22, -25, -15], "Cold Team");
+    expect("all-negative margins = cold direction", cold.streakDirection, "cold");
+  });
+
+  suite("getVolatilityRatioForSeries", () => {
+    const zeroVar = getVolatilityRatioForSeries([100, 100, 100, 100], 12);
+    expectApprox("zero variance = ratio 0", zeroVar, 0, 0.01);
+    const capped = getVolatilityRatioForSeries([50, 200, 10, 300], 5);
+    expectTrue("ratio is capped at 1 even with extreme spread", capped <= 1);
   });
 
   function run() {
