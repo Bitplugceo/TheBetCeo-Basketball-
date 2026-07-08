@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2897,6 +2898,7 @@ body.dark-mode .tracker-analytics-section-head {
         <span id="trackerStatusLabel" style="position:absolute;left:50%;transform:translateX(-50%);font-size:12px;font-weight:900;pointer-events:none;white-space:nowrap;"></span>
                        <div class="tracker-head-actions">
 <button type="button" id="trackerMilitaryRaidBtn" class="tracker-insights-btn" title="Single-click: Military Raid · Double-click: Toggle debug view" onclick="triggerTrackerMilitaryRaid()">🚨</button>
+<button type="button" id="trackerHealthBtn" class="tracker-insights-btn" title="Engine health dashboard">❤️</button>
 <button type="button" id="trackerConfigBtn" class="tracker-insights-btn" title="View/Edit verified configs">⚙️</button>
 <button type="button" id="trackerCopyDataBtn" class="tracker-insights-btn" title="Copy tracker data to clipboard">📑</button>
 <button type="button" id="trackerCopyDataJsonBtn" class="tracker-insights-btn" title="Copy tracker data as JSON">🧾</button>
@@ -6288,6 +6290,12 @@ function isTrackerConfigsView() {
   return g_trackerModalView === "configs";
 }
 
+// ITEM #2 FIX — HEALTH DASHBOARD (2026-07-08): new view mode alongside
+// picks/report/debug/configs. Mirrors the existing isTrackerConfigsView pattern.
+function isTrackerHealthView() {
+  return g_trackerModalView === "health";
+}
+
 function trackerDebug(message, extra = null) {
   try {
     const stamp = new Date().toLocaleTimeString([], { hour12: false });
@@ -6689,11 +6697,14 @@ function updateTrackerInsightsButton() {
     if (isTrackerPicksView()) titleEl.textContent = "Tracked Picks";
     else if (isTrackerReportView()) titleEl.textContent = "Engine Report";
     else if (isTrackerConfigsView()) titleEl.textContent = "Verified Configs";
+    // ITEM #2 FIX — HEALTH DASHBOARD (2026-07-08): title for the new health view.
+    else if (isTrackerHealthView()) titleEl.textContent = "Engine Health";
   }
 
-  // Hide military raid button ONLY on the Configs page
+  // Hide military raid button on the Configs page AND the new Health page —
+  // neither benefits from a live fetch test the way the Picks/Report views do.
   if (militaryBtn) {
-    militaryBtn.style.display = isTrackerConfigsView() ? "none" : "";
+    militaryBtn.style.display = (isTrackerConfigsView() || isTrackerHealthView()) ? "none" : "";
   }
 
   // Unified copy button – visible in Report and Configs views
@@ -6724,7 +6735,8 @@ function syncTrackerModalView() {
 
 function setTrackerModalView(view) {
 
-  const next = ["picks", "report", "debug", "configs"].includes(String(view || "")) ? String(view) : "picks";
+  // ITEM #2 FIX — HEALTH DASHBOARD (2026-07-08): "health" added to the valid view list.
+  const next = ["picks", "report", "debug", "configs", "health"].includes(String(view || "")) ? String(view) : "picks";
   g_trackerModalView = next;
   if (isTrackerDebugView()) acknowledgeGlobalEngineAlert();
   updateTrackerInsightsButton();
@@ -6746,6 +6758,13 @@ function toggleTrackerDebugView() {
 function toggleTrackerConfigsView() {
   if (isTrackerConfigsView()) setTrackerModalView("picks");
   else setTrackerModalView("configs");
+}
+
+// ITEM #2 FIX — HEALTH DASHBOARD (2026-07-08): toggle handler for the new health
+// view, mirroring toggleTrackerConfigsView above.
+function toggleTrackerHealthView() {
+  if (isTrackerHealthView()) setTrackerModalView("picks");
+  else setTrackerModalView("health");
 }
 
 let g_trackerSaveFailureCount = 0;
@@ -9246,6 +9265,205 @@ function renderTrackedPicks() {
 let g_lastRenderedTrackerVersion = null;
 let g_lastRenderedTrackerView = null;
 
+// ITEM #2 FIX — HEALTH DASHBOARD (2026-07-08): gathers a snapshot of engine health
+// signals that already exist elsewhere in the file but had no UI surface — recent
+// win-rate drift (checkModelHealth), calibration metrics (BB_CALIBRATION_METRICS,
+// written by refreshTrackedPickResults), recent error/warn counts from the engine
+// debug log, tracker save failure count, approximate localStorage footprint, and
+// the last retraining pipeline checkpoint. Read-only — does not compute anything
+// new, just surfaces existing state.
+function getEngineHealthSnapshot() {
+  const league = document.getElementById("leagueSelect")?.value || "";
+  const modelHealth = league ? checkModelHealth(league) : null;
+
+  let calibration = null;
+  try {
+    calibration = JSON.parse(localStorage.getItem("BB_CALIBRATION_METRICS") || "null");
+  } catch(e) {
+    engineDebug("getEngineHealthSnapshot failed to read calibration metrics: " + (e?.message || String(e)), { error: e });
+  }
+
+  const recentDebugLines = (g_engineDebugLog || []).slice(0, 100);
+  const errorCount = recentDebugLines.filter(line => getDebugSeverity(line) === "error").length;
+  const warnCount = recentDebugLines.filter(line => getDebugSeverity(line) === "warn").length;
+
+  let storageBytes = 0;
+  try {
+    Object.keys(localStorage).forEach(k => {
+      storageBytes += (k.length + (localStorage.getItem(k) || "").length);
+    });
+  } catch(e) {
+    engineDebug("getEngineHealthSnapshot failed to measure storage: " + (e?.message || String(e)), { error: e });
+  }
+
+  const active = Array.isArray(g_trackerState?.activePicks) ? g_trackerState.activePicks.length : 0;
+  const archived = Array.isArray(g_trackerState?.archivedPicks) ? g_trackerState.archivedPicks.length : 0;
+  const settled = Number(g_trackerState?.stats?.settled || 0);
+  const wins = Number(g_trackerState?.stats?.wins || 0);
+  const losses = Number(g_trackerState?.stats?.losses || 0);
+
+  let lastRetrain = null;
+  try {
+    lastRetrain = JSON.parse(localStorage.getItem("BB_RETRAIN_CHECKPOINT") || "null");
+  } catch(e) {
+    engineDebug("getEngineHealthSnapshot failed to read retrain checkpoint: " + (e?.message || String(e)), { error: e });
+  }
+
+  return {
+    league, modelHealth, calibration,
+    errorCount, warnCount,
+    saveFailureCount: g_trackerSaveFailureCount || 0,
+    storageBytes, activeCount: active, archivedCount: archived,
+    settled, wins, losses,
+    lastRetrain
+  };
+}
+
+// ITEM #2 FIX — HEALTH DASHBOARD (2026-07-08): renders the health snapshot above
+// into the tracker's shared analytics panel, following the same card/section markup
+// pattern as renderConfigsPanel below. Purely informational — takes no actions and
+// changes no engine state.
+function renderHealthDashboardPanel() {
+  const panel = document.getElementById("trackerAnalyticsPanel");
+  if (!panel) return;
+
+  syncTrackerModalView();
+  panel.classList.remove("tracker-hidden");
+  panel.style.display = "block";
+
+  const snap = getEngineHealthSnapshot();
+  const formatPctLocal = (v) => isFinite(v) ? `${(v * 100).toFixed(1)}%` : "—";
+  const kb = (snap.storageBytes / 1024).toFixed(1);
+
+  let overallStatus = "unknown";
+  let overallGood = false;
+  if (snap.modelHealth) {
+    overallStatus = snap.modelHealth.status;
+    overallGood = overallStatus !== "degrading";
+  } else if (snap.errorCount > 0) {
+    overallStatus = "errors detected";
+    overallGood = false;
+  } else {
+    overallStatus = "nominal";
+    overallGood = true;
+  }
+
+  const html = `
+    <div class="tracker-analytics-shell">
+      <div class="tracker-analytics-topbar">
+        <div class="tracker-analytics-heading">
+          <div class="tracker-analytics-kicker">Engine Health</div>
+          <div class="tracker-analytics-title">Check Engine Light</div>
+          <div class="tracker-analytics-subtitle">Live diagnostics for the current league and overall tracker state. This is a system-status view, not a prediction-quality guarantee — pair it with the Engine Report.</div>
+        </div>
+      </div>
+
+      <div class="tracker-summary-strip">
+        <div class="tracker-summary-cell ${overallGood ? "primary" : ""}">
+          <div class="tracker-summary-label">Overall Status</div>
+          <div class="tracker-summary-value">${safeText(String(overallStatus).toUpperCase())}</div>
+          <div class="tracker-summary-sub">${snap.league ? safeText(snap.league.toUpperCase()) : "No league selected"}</div>
+        </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">Recent Errors</div>
+          <div class="tracker-summary-value">${snap.errorCount}</div>
+          <div class="tracker-summary-sub">${snap.warnCount} warnings (last 100 log lines)</div>
+        </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">Storage Used</div>
+          <div class="tracker-summary-value">${kb} KB</div>
+          <div class="tracker-summary-sub">localStorage footprint</div>
+        </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">Save Failures</div>
+          <div class="tracker-summary-value">${snap.saveFailureCount}</div>
+          <div class="tracker-summary-sub">Consecutive tracker save errors</div>
+        </div>
+      </div>
+
+      <div class="tracker-analytics-section">
+        <div class="tracker-analytics-section-head">
+          <div class="tracker-analytics-section-title">Recent Win Rate Drift</div>
+          <div class="tracker-analytics-section-meta">${snap.league ? safeText(snap.league.toUpperCase()) : "—"}</div>
+        </div>
+        <div class="tracker-analytics-section-body">
+          ${snap.modelHealth ? `
+            <div class="tracker-mini-stat-grid">
+              <div class="tracker-mini-stat">
+                <div class="name">All-Time Win Rate</div>
+                <div class="value">${formatPctLocal(snap.modelHealth.allWinRate)}</div>
+                <div class="sub">${snap.modelHealth.n} settled picks</div>
+              </div>
+              <div class="tracker-mini-stat">
+                <div class="name">Last 10 Win Rate</div>
+                <div class="value">${formatPctLocal(snap.modelHealth.recentWinRate)}</div>
+                <div class="sub">Drift: ${snap.modelHealth.drift >= 0 ? "+" : ""}${(snap.modelHealth.drift * 100).toFixed(1)} pts</div>
+              </div>
+            </div>
+          ` : `<div class="tracker-empty-note">Select a league with 10+ settled picks to see drift status.</div>`}
+        </div>
+      </div>
+
+      <div class="tracker-analytics-section">
+        <div class="tracker-analytics-section-head">
+          <div class="tracker-analytics-section-title">Calibration Status</div>
+          <div class="tracker-analytics-section-meta">${snap.calibration ? safeText(new Date(snap.calibration.ts).toLocaleDateString()) : "Not yet available"}</div>
+        </div>
+        <div class="tracker-analytics-section-body">
+          ${snap.calibration ? `
+            <div class="tracker-mini-stat-grid">
+              <div class="tracker-mini-stat">
+                <div class="name">Brier Score</div>
+                <div class="value">${Number(snap.calibration.brierScore).toFixed(4)}</div>
+                <div class="sub">Lower is better (0 = perfect)</div>
+              </div>
+              <div class="tracker-mini-stat">
+                <div class="name">Calibration Error (ECE)</div>
+                <div class="value">${Number(snap.calibration.ece).toFixed(4)}</div>
+                <div class="sub">Based on ${snap.calibration.n} recent picks</div>
+              </div>
+            </div>
+          ` : `<div class="tracker-empty-note">Needs 20+ settled picks with recorded win probabilities before calibration metrics appear.</div>`}
+        </div>
+      </div>
+
+      <div class="tracker-analytics-section">
+        <div class="tracker-analytics-section-head">
+          <div class="tracker-analytics-section-title">Tracker Volume</div>
+          <div class="tracker-analytics-section-meta">All leagues combined</div>
+        </div>
+        <div class="tracker-analytics-section-body">
+          <div class="tracker-mini-stat-grid">
+            <div class="tracker-mini-stat">
+              <div class="name">Active Picks</div>
+              <div class="value">${snap.activeCount}</div>
+              <div class="sub">${snap.archivedCount} archived</div>
+            </div>
+            <div class="tracker-mini-stat">
+              <div class="name">Settled</div>
+              <div class="value">${snap.settled}</div>
+              <div class="sub">${snap.wins}W / ${snap.losses}L</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tracker-analytics-section">
+        <div class="tracker-analytics-section-head">
+          <div class="tracker-analytics-section-title">Last Retraining Pass</div>
+          <div class="tracker-analytics-section-meta">${snap.lastRetrain ? safeText(new Date(snap.lastRetrain.ts).toLocaleString()) : "Never run"}</div>
+        </div>
+        <div class="tracker-analytics-section-body">
+          ${snap.lastRetrain ? `<div class="tracker-empty-note">Ran after ${snap.lastRetrain.settledCount} total settled picks. Fires automatically every 25 new settled picks.</div>` : `<div class="tracker-empty-note">Retraining pipeline has not run yet — needs 25+ settled picks.</div>`}
+        </div>
+      </div>
+    </div>
+  `;
+
+  panel.innerHTML = html;
+  updateTrackerInsightsButton();
+}
+
 function renderConfigsPanel() {
   const panel = document.getElementById("trackerAnalyticsPanel");
   if (!panel) return;
@@ -9487,6 +9705,19 @@ function renderTrackerAnalytics() {
     return;
   }
 
+  // ITEM #2 FIX — HEALTH DASHBOARD (2026-07-08): dispatches to the new health
+  // renderer, mirroring the configs branch above. Always re-renders (no version
+  // cache short-circuit) since health data (error logs, storage size) can change
+  // between tracker state saves.
+  if (currentView === "health") {
+    renderHealthDashboardPanel();
+    syncTrackerModalView();
+    panel.classList.remove("tracker-hidden");
+    panel.style.display = "block";
+    g_lastRenderedTrackerView = currentView;
+    return;
+  }
+
   if (g_lastRenderedTrackerVersion === g_trackerState.updatedAt && g_lastRenderedTrackerView === currentView) {
      syncTrackerModalView();
      panel.classList.remove("tracker-hidden");
@@ -9658,6 +9889,19 @@ function renderTrackerAnalytics() {
   const checkpointLeft = Math.max(0, trackerMin - settled);
   const reviewVersionSub = useFallbackReport ? "Fallback: all tracked picks" : (priorVersions.length ? `${priorVersions.length + 1} tracked versions` : "Current version only");
 
+  // ITEM #1 FIX — OOS RESULT DISPLAY (2026-07-08): reads the last persisted
+  // out-of-sample validation result (written by runOutOfSampleValidation, which runs
+  // periodically from the retraining pipeline hook and after manual settlement) for
+  // the currently selected league, so the report view can show it without
+  // recomputing it here — recomputing on every render would shift the train/test
+  // split each time, which we don't want.
+  const _oosSelectedLeague = String(document.getElementById("leagueSelect")?.value || "").toLowerCase();
+  let _oosStored = null;
+  try {
+    const _oosStore = JSON.parse(localStorage.getItem("BB_OOS_VALIDATION_RESULTS") || "{}");
+    _oosStored = _oosStore[_oosSelectedLeague] || null;
+  } catch(e) {}
+
   const reviewRows = [];
 
   if (selectedLeagueKey !== "unknown") {
@@ -9738,6 +9982,30 @@ function renderTrackerAnalytics() {
           <div class="tracker-kpi-label">Review status</div>
           <div class="tracker-kpi-value">${safeText(checkpointStatus)}</div>
           <div class="tracker-kpi-sub">${safeText(reviewVersionSub)}</div>
+        </div>
+      </div>
+
+      <div class="tracker-analytics-card">
+        <div class="tracker-analytics-card-head">
+          <div class="tracker-analytics-card-title">Out-of-sample validation</div>
+          <div class="tracker-analytics-card-meta">${_oosStored ? safeText(new Date(_oosStored.computedAt).toLocaleDateString()) : "Not yet available"}</div>
+        </div>
+        <div class="tracker-analytics-card-body">
+          ${_oosStored ? `
+            <div class="tracker-report-subtitle">Win rate on the most recent 30% of settled picks (held out from the training split), for ${safeText(_oosSelectedLeague.toUpperCase())}. This checks whether the model generalizes to games it wasn't tuned on, not just the picks used to calibrate it.</div>
+            <div class="tracker-kpi-grid">
+              <div class="tracker-kpi-card">
+                <div class="tracker-kpi-label">Test win rate</div>
+                <div class="tracker-kpi-value">${formatPct(_oosStored.winRate * 100)}</div>
+                <div class="tracker-kpi-sub">${Number(_oosStored.testSize || 0)} held-out picks</div>
+              </div>
+              <div class="tracker-kpi-card">
+                <div class="tracker-kpi-label">Training size</div>
+                <div class="tracker-kpi-value">${Number(_oosStored.trainSize || 0)}</div>
+                <div class="tracker-kpi-sub">Picks used to build the split</div>
+              </div>
+            </div>
+          ` : `<div class="tracker-empty-note">No out-of-sample check yet for ${safeText(_oosSelectedLeague || "this league")}. This runs automatically once enough settled picks exist (needs 30+ settled picks with a valid createdAt) and refreshes periodically during the retraining pipeline.</div>`}
         </div>
       </div>
 
@@ -15525,7 +15793,21 @@ function runOutOfSampleValidation(league) {
   const splitIdx = Math.floor(allPicks.length * 0.7);
   const testSet = allPicks.slice(splitIdx);
   const wins = testSet.filter(p => p.resultStatus === "win").length;
-  return { testSize: testSet.length, winRate: wins / testSet.length, trainSize: splitIdx };
+  const result = { testSize: testSet.length, winRate: wins / testSet.length, trainSize: splitIdx };
+  // ITEM #1 FIX — OOS RESULT PERSISTENCE (2026-07-08): runOutOfSampleValidation was
+  // previously fire-and-forget — its result only ever reached engineDebug's console
+  // log, with no way for the UI to show the most recent OOS check. Persists the last
+  // result per league to localStorage so renderTrackerAnalytics can display it in the
+  // report view without needing to recompute (recomputing there would also shift the
+  // train/test split boundaries on every render, which we don't want).
+  try {
+    const store = JSON.parse(localStorage.getItem("BB_OOS_VALIDATION_RESULTS") || "{}");
+    store[String(league || "unknown")] = { ...result, league: String(league || "unknown"), computedAt: new Date().toISOString() };
+    localStorage.setItem("BB_OOS_VALIDATION_RESULTS", JSON.stringify(store));
+  } catch(e) {
+    engineDebug("runOutOfSampleValidation failed to persist result: " + (e?.message || String(e)), { league, error: e });
+  }
+  return result;
 }
 
 function checkModelHealth(league) {
@@ -18506,6 +18788,10 @@ if (headerErrorBtn) {
 
       const trackerConfigBtn = document.getElementById("trackerConfigBtn");
       if (trackerConfigBtn) trackerConfigBtn.addEventListener("click", toggleTrackerConfigsView);
+
+      // ITEM #2 FIX — HEALTH DASHBOARD (2026-07-08): wires the new health button.
+      const trackerHealthBtn = document.getElementById("trackerHealthBtn");
+      if (trackerHealthBtn) trackerHealthBtn.addEventListener("click", toggleTrackerHealthView);
 
       const trackerCloseBtn = document.getElementById("trackerCloseBtn");
       if (trackerCloseBtn) trackerCloseBtn.addEventListener("click", closeTrackerModal);
