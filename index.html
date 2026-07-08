@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4157,10 +4156,12 @@ function buildGlobalModelState({ league, parsed, lines, injMultA = 1, injMultB =
   // The checkboxes themselves are now dead UI — a separate HTML-level cleanup, not
   // something this JS fix touches. Do not reintroduce checkbox-gated switching here
   // without also fixing computeFTProjection to match.]
-  // [LOCK: volatility trigger threshold aligned to VENUE_BLEND_CONFIG.minGames (6) —
+    // [LOCK: volatility trigger threshold aligned to VENUE_BLEND_CONFIG.minGames (6) —
   // VERIFIED. Must always match the qualifying floor used by computeVenueBlend, or
   // volatility and the real projection will silently disagree about whether venue
   // data applies for this game, which is exactly the bug this was fixed to prevent.]
+  // ITEM #7 FIX — BATCH 6: getFetchedSeries itself still reads g_massacreFetchContext
+  // internally (see its own definition) — not migrated in this pass, no behavior change.
   const aVenue = getFetchedSeries("A", "venue", "ft", "scored");
   const bVenue = getFetchedSeries("B", "venue", "ft", "scored");
   const aFTS = aVenue.length >= 6 ? aVenue : getOverallSeries("A", 25);
@@ -6455,6 +6456,14 @@ const AppState = {
     set inputErrors(v) { g_fetchInputErrors = v; },
     get auditIssues() { return g_fetchAuditIssues; },
     set auditIssues(v) { g_fetchAuditIssues = v; }
+  },
+  // ITEM #7 FIX — CENTRAL STATE STORE, BATCH 6 (Massacre Context): proxy slice onto
+  // g_massacreFetchContext. Getter/setter pass-through only — backing store unchanged.
+  // Partial migration: highest-traffic read/write sites only (projection functions,
+  // reset points, fetch-assignment). Remaining call sites migrate in a follow-up pass.
+  context: {
+    get data() { return g_massacreFetchContext; },
+    set data(v) { g_massacreFetchContext = v; }
   }
 };
 
@@ -12194,7 +12203,8 @@ function getOverallSeries(side, limit) {
   // silently ignoring the user's correction. Do not reverse this order.]
   const manual = readLooseSeries(fieldId);
   if (manual.length >= 2) return manual.slice(0, n);
-  const ctx = g_massacreFetchContext?.[side]?.overall;
+  // ITEM #7 FIX — BATCH 6: reads via AppState.context.data instead of g_massacreFetchContext directly.
+  const ctx = AppState.context.data?.[side]?.overall;
   const fetched = Array.isArray(ctx?.ftScored10) ? ctx.ftScored10.map(Number).filter(v => isFinite(v) && v > 0) : [];
   return fetched.slice(0, n);
 }
@@ -14250,7 +14260,8 @@ async function _removedFetchSofaScoreData() {
   if (_prevDash) _prevDash.remove();
   acknowledgeGlobalEngineAlert();
   setFetchAuditIssues([]);
-  g_massacreFetchContext = defaultMassacreFetchContext();
+  // ITEM #7 FIX — BATCH 6: writes via AppState.context.data instead of g_massacreFetchContext directly.
+  AppState.context.data = defaultMassacreFetchContext();
   // ITEM #7 FIX — BATCH 4: writes via AppState.injuries instead of g_injA/g_injB directly.
   AppState.injuries.A = defaultInjuryMeta();
   AppState.injuries.B = defaultInjuryMeta();
@@ -14276,8 +14287,9 @@ async function fetchESPN() {
   const teamBName = document.getElementById("teamBName").value.trim();
 
   // Reset massacre context
-  g_massacreFetchContext = defaultMassacreFetchContext();
-  g_massacreFetchContext.league = league;
+  // ITEM #7 FIX — BATCH 6: writes via AppState.context.data instead of g_massacreFetchContext directly.
+  AppState.context.data = defaultMassacreFetchContext();
+  AppState.context.data.league = league;
 
   // Clear market lines
   const marketFields = ["ftMarket", "h1Market", "teamAMarket", "teamBMarket", "q1Market", "q2Market", "q3Market", "q4Market", "h1TeamAMarket", "h1TeamBMarket", "q1TeamAMarket", "q1TeamBMarket", "highQTotalMarket", "lowQTotalMarket"];
@@ -14619,7 +14631,8 @@ async function fetchESPNCore(league, teamAName, teamBName) {
     // ITEM #7 FIX — BATCH 4: writes via AppState.injuries instead of g_injA/g_injB directly.
     AppState.injuries.A = injA; AppState.injuries.B = injB;
 
-    g_massacreFetchContext = {
+    // ITEM #7 FIX — BATCH 6: writes via AppState.context.data instead of g_massacreFetchContext directly.
+    AppState.context.data = {
       league,
       eventDate: String(selectedFixture?.dataset?.eventDate || ""),
       A: {
@@ -14659,11 +14672,13 @@ async function fetchESPNCore(league, teamAName, teamBName) {
       h2hGames: Array.isArray(h2hGames) ? h2hGames.slice(0, 10) : []
     };
 
-    if (aStats?.sos != null) g_massacreFetchContext.A.sos = aStats.sos;
-    if (bStats?.sos != null) g_massacreFetchContext.B.sos = bStats.sos;
+    // ITEM #7 FIX — BATCH 6: writes via AppState.context.data instead of g_massacreFetchContext directly.
+    if (aStats?.sos != null) AppState.context.data.A.sos = aStats.sos;
+    if (bStats?.sos != null) AppState.context.data.B.sos = bStats.sos;
 
-    renderInjuryBox("injuryBoxA", "injuryContentA", g_injA);
-    renderInjuryBox("injuryBoxB", "injuryContentB", g_injB);
+    // ITEM #7 FIX — BATCH 4: reads via AppState.injuries instead of g_injA/g_injB directly.
+    renderInjuryBox("injuryBoxA", "injuryContentA", AppState.injuries.A);
+    renderInjuryBox("injuryBoxB", "injuryContentB", AppState.injuries.B);
 
     updateIntelligencePack(league, {
       ftLine: parseMarketLine(document.getElementById("ftMarket")?.value || ""),
@@ -15140,8 +15155,9 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const leagueRatingBase = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
   let synPace = leaguePaceBase;
 
-  const ctxA = g_massacreFetchContext?.A || {};
-  const ctxB = g_massacreFetchContext?.B || {};
+  // ITEM #7 FIX — BATCH 6: reads via AppState.context.data instead of g_massacreFetchContext directly.
+  const ctxA = AppState.context.data?.A || {};
+  const ctxB = AppState.context.data?.B || {};
   const avgPaceA = avgOrNaN(ctxA.pace10);
   const avgPaceB = avgOrNaN(ctxB.pace10);
   // FIX #7: pace clamp is now actually applied to synPace (previously computed but never used)
@@ -15409,8 +15425,9 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
   const leagueRatingBase = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
 
-  const ctxA = g_massacreFetchContext?.A || {};
-  const ctxB = g_massacreFetchContext?.B || {};
+  // ITEM #7 FIX — BATCH 6: reads via AppState.context.data instead of g_massacreFetchContext directly.
+  const ctxA = AppState.context.data?.A || {};
+  const ctxB = AppState.context.data?.B || {};
   const avgPaceA = avgOrNaN(ctxA.pace10);
   const avgPaceB = avgOrNaN(ctxB.pace10);
   const clamp = getEffectivePaceClamp(league);
@@ -16678,7 +16695,8 @@ function getMassacreTeamContext(side, parsed) {
         venueH1Allowed: []
       };
 
-  const ctx = g_massacreFetchContext?.[side] || {};
+  // ITEM #7 FIX — BATCH 6: reads via AppState.context.data instead of g_massacreFetchContext directly.
+  const ctx = AppState.context.data?.[side] || {};
   const overall = ctx.overall || {};
   const venue = ctx.venue || {};
 
@@ -16856,10 +16874,11 @@ async function runEngine() {
   const currentLeagueForRun = leagueSelectEl ? leagueSelectEl.value : "";
 
   // Prevent cross‑league contamination: if stored context belongs to a different league, reset it
-  if (g_massacreFetchContext.league && g_massacreFetchContext.league !== currentLeagueForRun) {
-    engineDebug("runEngine: clearing stale massacre context", { old: g_massacreFetchContext.league, new: currentLeagueForRun });
-    g_massacreFetchContext = defaultMassacreFetchContext();
-    g_massacreFetchContext.league = currentLeagueForRun;
+  // ITEM #7 FIX — BATCH 6: reads/writes via AppState.context.data instead of g_massacreFetchContext directly.
+  if (AppState.context.data.league && AppState.context.data.league !== currentLeagueForRun) {
+    engineDebug("runEngine: clearing stale massacre context", { old: AppState.context.data.league, new: currentLeagueForRun });
+    AppState.context.data = defaultMassacreFetchContext();
+    AppState.context.data.league = currentLeagueForRun;
   }
   try {
     let ftSiloTunings = {}, h1SiloTunings = {}, allSiloTunings = {};
@@ -18661,11 +18680,14 @@ if (trackedToSave.length) {
 
   } catch (err) {
     console.error("[BB Engine] runEngine failed", err);
-    engineDebug("run failed", { error: String(err?.message || err) });
+    engineDebug("run failed", { error: String(err?.message || err), stack: err?.stack || "no stack" });
     if (table) {
       table.style.display = "table";
       table.innerHTML = "<tr><th>Pick</th><th>Projection</th><th>Edge</th><th>Model Grade</th><th>Prediction</th></tr>";
-      showRunError(table, "⚠ Unexpected engine error. Check the latest edit.");
+      // DIAGNOSTIC (temporary): surface the real error text instead of a generic
+      // message, so the actual failure point is visible without needing the debug
+      // panel. Revert to the generic message once the root cause is confirmed fixed.
+      showRunError(table, "⚠ Engine error: " + escapeHtml(String(err?.message || err)) + " — check 🔬 debug panel for stack trace.");
     }
   } finally {
     window.__engineRunInProgress = false;
@@ -18727,7 +18749,8 @@ if (trackedToSave.length) {
       selectedTeamIds = { A: null, B: null };
       g_lastFetchedTeams = { A: "", B: "" };
       g_fetchMeta = defaultFetchMeta();
-      g_massacreFetchContext = defaultMassacreFetchContext();
+      // ITEM #7 FIX — BATCH 6: writes via AppState.context.data instead of g_massacreFetchContext directly.
+      AppState.context.data = defaultMassacreFetchContext();
       Object.assign(g_h2hManualPreference, { ft: null, h1: null, q1: null, q2: null, q3: null, q4: null });
 
       const ls = document.getElementById("leagueSelect");
