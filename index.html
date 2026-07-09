@@ -1,3 +1,4 @@
+B
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13775,10 +13776,14 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
       coeff = models[league] || models[leagueGroup] || models[tierKey] || models["global"] || {};
     }
   } catch(e) {}
+  // AUDIT FIX — ||/?? SENTINEL BUG (2026-07-09): (volatilityRatio || 1.0) silently
+  // replaced a genuine volatilityRatio of 0 (a truly dead-stable series) with 1.0,
+  // killing the confidence boost a zero-volatility team should get. 0 is falsy but
+  // valid here, so this must use ?? (only replaces null/undefined), not ||.
   const logOdds =
     (coeff.intercept   ?? -0.2) +
     (coeff.edgePct     ??  8.0) * ((edgePct || 0) - 0.060) +
-    (coeff.volRatio    ?? -0.8) * ((volatilityRatio || 1.0) - 1.0) +
+    (coeff.volRatio    ?? -0.8) * ((volatilityRatio ?? 1.0) - 1.0) +
     (coeff.sampleFull  ??  0.4) * (sampleTier === "full" ? 1 : 0) +
     (coeff.h2h         ??  0.2) * (hasH2H ? 1 : 0) +
     (coeff.trap        ?? -1.2) * (trap ? 1 : 0);
@@ -19076,7 +19081,12 @@ const h1Calc = compute1HProjection({
         league
       });
 
-      return { proj: qProj, edge: qEdge, line: lineVal, pick: qPick, confidence: qConf, tier, projA, projB, hasH2H };
+      // AUDIT FIX — QUARTER VOLATILITY MISSING ON RESCALE (2026-07-09): stdDev(aS.concat(bS))
+      // is stashed here so the later H1/FT-anchor rescale block in runEngine (which
+      // recomputes q1-q4 confidence after adjusting edge) can reuse the exact same
+      // volatility figure instead of omitting it entirely and silently defaulting to a
+      // neutral 0.5 volRatio.
+      return { proj: qProj, edge: qEdge, line: lineVal, pick: qPick, confidence: qConf, tier, projA, projB, hasH2H, volatility: stdDev(aS.concat(bS)) };
     };
 
     // PATCHABLE ISSUE #2 FIX: pass config (with h2hFactor from the verified FT config)
@@ -19138,9 +19148,13 @@ const h1Calc = compute1HProjection({
             // ISSUE #1 FIX: fullModel/projectionOnly re-added here (previously omitted,
             // silently defaulting to falsy on every rescale, so a rescaled Q1 could never
             // earn the fullModel score bonus even with a strong sample).
+            // AUDIT FIX — QUARTER VOLATILITY MISSING ON RESCALE (2026-07-09): volatility
+            // was never passed here, so this rescaled Q1 grade silently used a neutral 0.5
+            // volRatio regardless of the quarter's actual data. Reuses q1.volatility
+            // (stdDev, stashed in computeQ's return object) with the correct q1 volLimit.
             q1.confidence = getConfidenceGrade({
               pick: q1.pick, line: q1.line, edge: q1.edge, sampleTier: q1.tier,
-              volLimit: getMarketVolLimit(league, "q1"), marketKey: "q1", hasH2H: q1.hasH2H,
+              volatility: q1.volatility, volLimit: getMarketVolLimit(league, "q1"), marketKey: "q1", hasH2H: q1.hasH2H,
               fullModel: q1.fullModel, projectionOnly: q1.projectionOnly,
               siblingEdge: h1Calc.h1Edge, league
             });
@@ -19159,9 +19173,11 @@ const h1Calc = compute1HProjection({
             // PATCHABLE ISSUE #3/#7 FIX: same volLimit/modelState fix as Q1 above.
             // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: same siblingEdge/league fix as Q1 above.
             // ISSUE #1 FIX: fullModel/projectionOnly re-added, matching Q1's fix above.
+            // AUDIT FIX — QUARTER VOLATILITY MISSING ON RESCALE (2026-07-09): see the
+            // matching Q1 fix above — reuses q2.volatility instead of defaulting to 0.5.
             q2.confidence = getConfidenceGrade({
               pick: q2.pick, line: q2.line, edge: q2.edge, sampleTier: q2.tier,
-              volLimit: getMarketVolLimit(league, "q2"), marketKey: "q2", hasH2H: q2.hasH2H,
+              volatility: q2.volatility, volLimit: getMarketVolLimit(league, "q2"), marketKey: "q2", hasH2H: q2.hasH2H,
               fullModel: q2.fullModel, projectionOnly: q2.projectionOnly,
               siblingEdge: h1Calc.h1Edge, league
             });
@@ -19191,9 +19207,11 @@ const h1Calc = compute1HProjection({
             // PATCHABLE ISSUE #3/#7 FIX: volLimit/modelState fix, matching Q1/Q2 above.
             // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: siblingEdge (ftCalc.ftEdge) and league added.
             // ISSUE #1 FIX: fullModel/projectionOnly re-added, matching Q1/Q2's fix above.
+            // AUDIT FIX — QUARTER VOLATILITY MISSING ON RESCALE (2026-07-09): see the
+            // matching Q1 fix above — reuses q3.volatility instead of defaulting to 0.5.
             q3.confidence = getConfidenceGrade({
               pick: q3.pick, line: q3.line, edge: q3.edge, sampleTier: q3.tier,
-              volLimit: getMarketVolLimit(league, "q3"), marketKey: "q3", hasH2H: q3.hasH2H,
+              volatility: q3.volatility, volLimit: getMarketVolLimit(league, "q3"), marketKey: "q3", hasH2H: q3.hasH2H,
               fullModel: q3.fullModel, projectionOnly: q3.projectionOnly,
               siblingEdge: ftCalc.ftEdge, league
             });
@@ -19212,9 +19230,11 @@ const h1Calc = compute1HProjection({
             // PATCHABLE ISSUE #3/#7 FIX: volLimit/modelState fix, matching Q1/Q2 above.
             // PATCHABLE ISSUE #4/#5 (UNLOCKED) FIX: siblingEdge (ftCalc.ftEdge) and league added.
             // ISSUE #1 FIX: fullModel/projectionOnly re-added, matching Q1/Q2/Q3's fix above.
+            // AUDIT FIX — QUARTER VOLATILITY MISSING ON RESCALE (2026-07-09): see the
+            // matching Q1 fix above — reuses q4.volatility instead of defaulting to 0.5.
             q4.confidence = getConfidenceGrade({
               pick: q4.pick, line: q4.line, edge: q4.edge, sampleTier: q4.tier,
-              volLimit: getMarketVolLimit(league, "q4"), marketKey: "q4", hasH2H: q4.hasH2H,
+              volatility: q4.volatility, volLimit: getMarketVolLimit(league, "q4"), marketKey: "q4", hasH2H: q4.hasH2H,
               fullModel: q4.fullModel, projectionOnly: q4.projectionOnly,
               siblingEdge: ftCalc.ftEdge, league
             });
@@ -19324,7 +19344,13 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       // reconciliation step inside getConfidenceGrade silently defaulted volRatio to a
       // neutral 1.0 for every H1 pick, instead of using H1's own measured volatility
       // (already computed in h1Calc as aVol1/bVol1) like FT and the other markets do.
-      volatility: Math.max(h1Calc.aVol1, h1Calc.bVol1),
+      // AUDIT FIX — VOLATILITY DOUBLE-SCALING (2026-07-09): aVol1/bVol1 are already
+      // ratios in [0,1] (from getVolatilityRatioForSeries), unlike ftCalc.aVol which is
+      // points-scale. Passing the ratio directly here made getConfidenceGrade divide by
+      // volLimit a SECOND time, collapsing H1 volatility toward ~0 and artificially
+      // boosting H1 confidence relative to FT. Multiplying back by volLimit restores the
+      // points-scale-in/divide-once-out pattern FT already uses correctly.
+      volatility: Math.max(h1Calc.aVol1, h1Calc.bVol1) * getMarketVolLimit(league, "h1"),
       volLimit: getMarketVolLimit(league, "h1"),
       marketKey: "h1",
       // [LOCK: q2Edge now passed — see matching lock at the FT q4Edge call above.
@@ -19355,8 +19381,14 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       // to FT/H1 (which pass their real, measured volatility). Now uses Team A's own
       // measured volatility (ftCalc.aVol, already computed as stdDev-based ratio*volLimit)
       // and the market-specific limit, consistent with how FT computes its volatility input.
+      // AUDIT FIX — VOLATILITY LIMIT MISMATCH (2026-07-09): ftCalc.aVol was computed
+      // inside computeFTProjection as aVolRatio * getMarketVolLimit(league,"ft") — it is
+      // scaled to FT's limit (~12 for NBA), not the team market's smaller limit (~6).
+      // Dividing by the team_a limit here roughly doubled the effective volRatio versus
+      // what was actually measured. Using the SAME limit that produced ftCalc.aVol (ft's)
+      // correctly cancels back out to the true ratio.
       volatility: ftCalc.aVol,
-      volLimit: getMarketVolLimit(league, "team_a"),
+      volLimit: getMarketVolLimit(league, "ft"),
       injuryNotes: [],
       marketKey: "team_a",
       // PATCHABLE ISSUE #7 FIX: modelState removed — getConfidenceGrade never read it.
@@ -19375,8 +19407,11 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: ftCalc.ftHasH2H,
       // ISSUE #9 FIX: same hardcoded volatility:0/volLimit:12 problem as Team A above,
       // fixed the same way using Team B's own measured volatility (ftCalc.bVol).
+      // AUDIT FIX — VOLATILITY LIMIT MISMATCH (2026-07-09): mirrors the Team A fix above.
+      // ftCalc.bVol is scaled to FT's volLimit, not team_b's smaller limit — using the
+      // same limit that produced ftCalc.bVol (ft's) correctly cancels back to the true ratio.
       volatility: ftCalc.bVol,
-      volLimit: getMarketVolLimit(league, "team_b"),
+      volLimit: getMarketVolLimit(league, "ft"),
       injuryNotes: [],
       marketKey: "team_b",
       // PATCHABLE ISSUE #7 FIX: modelState removed — getConfidenceGrade never read it.
