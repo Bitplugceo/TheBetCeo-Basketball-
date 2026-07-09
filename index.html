@@ -4220,6 +4220,17 @@ const MODEL_TUNING = {
 // of the tuning pipeline); scope:"global_only" means no per-league override is ever
 // allowed (e.g. structural constants that shouldn't vary by league).
 const TUNABLE_PARAM_REGISTRY = {
+  // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION (2026-07-09): h2hFactor previously
+  // lived only in the old TUNING_GRID/runRetrospectiveAnalysis system (ungated, raw
+  // netDelta > 1.5 promotion). Promoted to a real registry entry so it's tuned by
+  // runCoordinateAscentTuner instead — OOS train/val split, significance test, and
+  // calibration-quality gating, same as every other registry parameter.
+  h2hFactor: {
+    value: 1.0, min: 0.5, max: 1.0, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "team_a", "team_b"],
+    description: "Overall H2H blend scaling factor applied on top of getH2HWeight's output",
+    lastVerifiedAt: null
+  },
   h2hMaxWeight: {
     value: 0.30, min: 0.05, max: 0.50, type: "scalar",
     scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
@@ -4395,13 +4406,21 @@ const TUNABLE_PARAM_REGISTRY = {
     description: "Point edge threshold required for Quarter picks",
     lastVerifiedAt: null
   },
-  massacreBlendWeight: {
-    value: 0.3, min: 0.0, max: 0.8, type: "scalar",
-    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
-    description: "Blend weight used in massacre framework",
-    lastVerifiedAt: null
-  }
+  // [DELETED] massacreBlendWeight — ITEM #6 audit (2026-07-09): orphaned entry, no
+  // consumer anywhere in the file. Removed rather than left inert. See MASSACRE_TUNING
+  // above for the matching deletion note.
+  injuryOppBoostFactor_NOTE: null
 };
+delete TUNABLE_PARAM_REGISTRY.injuryOppBoostFactor_NOTE;
+// [LOCK: injuryOppBoostFactor / underEdgeFactor — KNOWN DUPLICATE SYSTEM, VERIFIED
+// 2026-07-09. Both keys exist in this registry AND in the older getTunableConstant()
+// system (INJURY_OPPONENT_BOOST_FACTOR / UNDER_EDGE_FACTOR globals, set at line ~4576/
+// ~13068, retuned via calibrateEngineConstants). The OLD system is still the live
+// source of truth for both; these two registry entries are currently inert. DO NOT
+// switch their read sites to getParam() before Phase 3 (Step 9 of the tuning-pipeline
+// build plan) reworks calibrateEngineConstants' promotion logic — doing it earlier
+// breaks the old retuning loop, which would keep testing candidate values into a
+// variable nothing downstream reads anymore. Consolidate only as part of that step.]
 
 const TUNABLE_PARAM_REGISTRY_STORAGE_KEY = "BB_TUNABLE_PARAM_REGISTRY_V1";
 
@@ -4925,23 +4944,28 @@ function evaluatePickWithParams(pick, paramOverrides) {
   try {
     let proj, lineVal, edge;
     const finalLines = lines;
+    // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION (2026-07-09): h2hFactor is now a
+    // tunable key (see keysToTune below), so its override must actually reach the calc —
+    // previously no config object was passed here at all, so a candidate h2hFactor value
+    // set via paramOverrides silently never affected FT/H1/team projections.
+    const _h2hFactorOverride = { h2hFactor: paramOverrides?.h2hFactor };
     if (marketKey === "ft") {
-      const calc = computeFTProjection({ league, parsed, lines: finalLines, injMultA, injMultB });
+      const calc = computeFTProjection({ league, parsed, lines: finalLines, injMultA, injMultB, config: _h2hFactorOverride });
       proj = calc.ftProj;
       lineVal = finalLines.ftLine;
       edge = calc.ftEdge;
     } else if (marketKey === "h1") {
-      const calc = compute1HProjection({ league, parsed, lines: finalLines, injMultA, injMultB });
+      const calc = compute1HProjection({ league, parsed, lines: finalLines, injMultA, injMultB, config: _h2hFactorOverride });
       proj = calc.h1Proj;
       lineVal = finalLines.h1Line;
       edge = calc.h1Edge;
     } else if (marketKey === "team_a") {
-      const calc = computeFTProjection({ league, parsed, lines: finalLines, injMultA, injMultB });
+      const calc = computeFTProjection({ league, parsed, lines: finalLines, injMultA, injMultB, config: _h2hFactorOverride });
       proj = calc.projAFT;
       lineVal = finalLines.aLine;
       edge = calc.aEdge;
     } else if (marketKey === "team_b") {
-      const calc = computeFTProjection({ league, parsed, lines: finalLines, injMultA, injMultB });
+      const calc = computeFTProjection({ league, parsed, lines: finalLines, injMultA, injMultB, config: _h2hFactorOverride });
       proj = calc.projBFT;
       lineVal = finalLines.bLine;
       edge = calc.bEdge;
@@ -5018,6 +5042,7 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
 
   const keysToTune = [
     "teamWeightBase",
+    "h2hFactor",
     "h2hMaxWeight",
     "h2hLookbackSeasons",
     "venueMinGames",
@@ -5037,6 +5062,10 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
 
   const candidateGrids = {
     teamWeightBase: [0.55, 0.60, 0.65, 0.70, 0.75],
+    // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION (2026-07-09): candidate set carried
+    // over unchanged from the old TUNING_GRID.h2hFactors, so results stay comparable to
+    // whatever that ungated system had already logged historically.
+    h2hFactor: [0.75, 1.0],
     h2hMaxWeight: [0.15, 0.20, 0.25, 0.30, 0.35, 0.40],
     h2hLookbackSeasons: [2, 3, 4, 5],
     venueMinGames: [4, 5, 6, 7, 8],
@@ -5170,7 +5199,15 @@ async function runRetrospectiveAnalysis(pick) {
   const numericActual = parseFloat(actualScore);
   if (!isFinite(numericActual)) return;
 
-  const { h2hFactors, recencyProfiles, edgeMults } = TUNING_GRID;
+  const { recencyProfiles, edgeMults } = TUNING_GRID;
+  // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION (2026-07-09): h2hFactor used to be
+  // swept as its own grid dimension here, in parallel with runCoordinateAscentTuner ALSO
+  // tuning h2hFactor (now a real registry entry) under proper OOS + calibration gating.
+  // Two systems silently disagreeing on the same live parameter was the real bug. Held
+  // fixed here at the registry-governed value; this loop still searches recencyProfile
+  // (not yet migrated to the gated tuner — separate follow-up) but no longer
+  // re-litigates h2hFactor with a weaker, ungated promotion rule.
+  const h2hFactors = [getParam("h2hFactor", league) ?? 1.0];
 
   for (const h2hFactor of h2hFactors) {
     for (const recencyProfile of recencyProfiles) {
@@ -5288,8 +5325,10 @@ function getLeagueLearnedParams(league) {
 const MASSACRE_TUNING = {
   lightThreshold: 10,
   heavyThreshold: 20,
-  nuclearThreshold: 30,
-  blendWeight: 0.3
+  nuclearThreshold: 30
+  // [DELETED] blendWeight — dead registry entry, ITEM #6 audit (2026-07-09): no
+  // function anywhere in this file ever read MASSACRE_TUNING.blendWeight or
+  // getParam("massacreBlendWeight"). Removed rather than left as a phantom knob.
 };
 
 const TEAM_MEMORY_RULES = {
@@ -5309,7 +5348,16 @@ function getLearnedBrutalityThresholds(league) {
   } catch(e) {
     engineDebug("getLearnedBrutalityThresholds failed: " + (e?.message || String(e)), { league, error: e });
   }
-  return { light: MASSACRE_TUNING.lightThreshold || 10, heavy: MASSACRE_TUNING.heavyThreshold || 20, nuclear: MASSACRE_TUNING.nuclearThreshold || 30 };
+  // ITEM #6 FIX — PARAMETER REGISTRY, PHASE 1 (WIRING): this fallback previously read
+  // MASSACRE_TUNING.lightThreshold/heavyThreshold/nuclearThreshold directly, leaving the
+  // massacreLightThreshold/massacreHeavyThreshold/massacreNuclearThreshold registry
+  // entries permanently inert. Now reads live from the registry (per-league override
+  // aware), with MASSACRE_TUNING kept only as the hard fallback-of-fallback.
+  return {
+    light: getParam("massacreLightThreshold", league) ?? MASSACRE_TUNING.lightThreshold ?? 10,
+    heavy: getParam("massacreHeavyThreshold", league) ?? MASSACRE_TUNING.heavyThreshold ?? 20,
+    nuclear: getParam("massacreNuclearThreshold", league) ?? MASSACRE_TUNING.nuclearThreshold ?? 30
+  };
 }
 
 const TRACKER_POLICY = {
@@ -16113,7 +16161,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
     // PATCHABLE ISSUE #1 FIX: h2hFactor was hardcoded to 1.0, silently discarding
     // config.h2hFactor (set by verified-config tuning) on every FT projection.
-    const _ftH2hFactor = isFinite(config?.h2hFactor) ? Number(config.h2hFactor) : 1.0;
+    // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION (2026-07-09): fallback (when no
+    // explicit config.h2hFactor is passed) now reads the registry-governed value instead
+    // of a hardcoded 1.0, so live picks (which don't go through the retrospective config
+    // override path) also benefit from whatever h2hFactor runCoordinateAscentTuner has
+    // promoted.
+    const _ftH2hFactor = isFinite(config?.h2hFactor) ? Number(config.h2hFactor) : (getParam("h2hFactor", league) ?? 1.0);
     const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "ft", ftSampleTier, Math.abs(aS - bS), league, leagueBase, _ftH2hFactor, {
       injMultA,
       injMultB,
@@ -16332,7 +16385,10 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
     // PATCHABLE ISSUE #1 FIX: h2hFactor was hardcoded to 1.0 here too, so the H1
     // market never saw the tuned config.h2hFactor either.
-    const _h1H2hFactor = isFinite(config?.h2hFactor) ? Number(config.h2hFactor) : 1.0;
+    // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION (2026-07-09): fallback now reads
+    // the registry-governed value instead of a hardcoded 1.0 — same reasoning as the FT
+    // fix above.
+    const _h1H2hFactor = isFinite(config?.h2hFactor) ? Number(config.h2hFactor) : (getParam("h2hFactor", league) ?? 1.0);
     const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "h1", h1SampleTier, Math.abs(projA1H - projB1H), league, leagueBase1H, _h1H2hFactor, {
       enabled: h1HasH2H,
       injMultA,
@@ -16409,10 +16465,18 @@ function getH2HSeasonDecayWeight(dateStr) {
   // Current season = 1.00 | -1 = 0.75 | -2 = 0.50 | -3 or older = 0.30.
   // Season boundary: October = start of new season year (Oct 2024 → 2025 season).
   // DO NOT hardcode to calendar year — basketball seasons straddle two calendar years.
-  if (!dateStr) return 0.75;
+  // ITEM #6 FIX — PARAMETER REGISTRY, PHASE 1 (WIRING): these four multipliers were
+  // hardcoded here, leaving h2hDecayCurrent/h2hDecayMinus1/h2hDecayMinus2/h2hDecayOlder
+  // permanently inert in the registry. Now reads live from the registry, with the
+  // original hardcoded values kept only as a hard fallback if a key is ever missing.
+  const _decayCurrent = getParam("h2hDecayCurrent") ?? 1.00;
+  const _decayMinus1 = getParam("h2hDecayMinus1") ?? 0.75;
+  const _decayMinus2 = getParam("h2hDecayMinus2") ?? 0.50;
+  const _decayOlder = getParam("h2hDecayOlder") ?? 0.30;
+  if (!dateStr) return _decayMinus1;
   try {
     const d = new Date(dateStr);
-    if (isNaN(d.getTime())) return 0.75;
+    if (isNaN(d.getTime())) return _decayMinus1;
     const gameYear = d.getUTCFullYear();
     const gameMonth = d.getUTCMonth(); // 0-based; Oct = 9
     const gameSeasonYear = gameMonth >= 9 ? gameYear + 1 : gameYear;
@@ -16420,11 +16484,11 @@ function getH2HSeasonDecayWeight(dateStr) {
     const nowYear = new Date().getUTCFullYear();
     const currentSeasonYear = nowMonth >= 9 ? nowYear + 1 : nowYear;
     const diff = currentSeasonYear - gameSeasonYear;
-    if (diff <= 0) return 1.00;
-    if (diff === 1) return 0.75;
-    if (diff === 2) return 0.50;
-    return 0.30;
-  } catch (_) { return 0.75; }
+    if (diff <= 0) return _decayCurrent;
+    if (diff === 1) return _decayMinus1;
+    if (diff === 2) return _decayMinus2;
+    return _decayOlder;
+  } catch (_) { return _decayMinus1; }
 }
 
 function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
