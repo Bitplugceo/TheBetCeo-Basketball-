@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4206,6 +4205,284 @@ const MODEL_TUNING = {
   h2hMaxWeight: 0.30,
   recencyWeights: [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16]
 };
+
+// ITEM #6 FIX — PARAMETER REGISTRY, PHASE 1 (2026-07-09): single source of truth for
+// every tunable constant in the engine, previously scattered across MODEL_TUNING,
+// PICK_RULES, VENUE_BLEND_CONFIG, MASSACRE_TUNING, LEAGUE_VOL_LIMITS, and inline
+// magic numbers inside computeFTProjection/compute1HProjection/computeQ/getH2HWeight.
+// This registry does NOT change any calculation by itself — it is read via
+// getTunableParam()/setTunableParam() (defined below), and existing code is wired to
+// those accessors incrementally in later patches. Until a given call site is migrated
+// to read from here, it continues using its own local default and this registry entry
+// is inert for that site. scope:"global" means the value applies to every league until
+// (and unless) a league earns its own override via league-specific promotion (Phase 2+
+// of the tuning pipeline); scope:"global_only" means no per-league override is ever
+// allowed (e.g. structural constants that shouldn't vary by league).
+const TUNABLE_PARAM_REGISTRY = {
+  h2hMaxWeight: {
+    value: 0.30, min: 0.05, max: 0.50, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Cap on H2H blend weight in getH2HWeight",
+    lastVerifiedAt: null
+  },
+  h2hLookbackSeasons: {
+    value: 4, min: 1, max: 6, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "How many prior seasons of H2H games to fetch (fetchH2HCore lookbackYears)",
+    lastVerifiedAt: null
+  },
+  h2hDecayCurrent: {
+    value: 1.00, min: 0.5, max: 1.0, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Season-decay weight for current-season H2H games (getH2HSeasonDecayWeight)",
+    lastVerifiedAt: null
+  },
+  h2hDecayMinus1: {
+    value: 0.75, min: 0.3, max: 1.0, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Season-decay weight for 1-season-old H2H games",
+    lastVerifiedAt: null
+  },
+  h2hDecayMinus2: {
+    value: 0.50, min: 0.1, max: 0.9, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Season-decay weight for 2-season-old H2H games",
+    lastVerifiedAt: null
+  },
+  h2hDecayOlder: {
+    value: 0.30, min: 0.05, max: 0.7, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Season-decay weight for 3+ season-old H2H games",
+    lastVerifiedAt: null
+  },
+  recencyWeights: {
+    value: [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16],
+    min: null, max: null, type: "weight_vector",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Per-game-index recency weighting for weightedRecentAverage",
+    lastVerifiedAt: null
+  },
+  teamWeightBase: {
+    value: 0.65, min: 0.40, max: 0.85, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
+    description: "Base own-scoring vs opponent-defense blend ratio (getDynamicWeights base.teamWeight)",
+    lastVerifiedAt: null
+  },
+  venueMinGames: {
+    value: 6, min: 3, max: 10, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1"],
+    description: "Minimum venue-split games required before venue blending activates (VENUE_BLEND_CONFIG.minGames)",
+    lastVerifiedAt: null
+  },
+  venueStrongGames: {
+    value: 10, min: 6, max: 15, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1"],
+    description: "Venue sample size for the strong-tier blend weight (VENUE_BLEND_CONFIG.strongGames)",
+    lastVerifiedAt: null
+  },
+  venueModerateWeight: {
+    value: 0.50, min: 0.20, max: 0.70, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1"],
+    description: "Venue blend weight at moderate sample tier (VENUE_BLEND_CONFIG.moderateVenueWeight)",
+    lastVerifiedAt: null
+  },
+  venueStrongWeight: {
+    value: 0.70, min: 0.40, max: 0.85, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1"],
+    description: "Venue blend weight at strong sample tier (VENUE_BLEND_CONFIG.strongVenueWeight)",
+    lastVerifiedAt: null
+  },
+  injuryOppBoostFactor: {
+    value: 0.2, min: 0.0, max: 0.5, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "How much an injured team's opponent projection increases (INJURY_OPPONENT_BOOST_FACTOR)",
+    lastVerifiedAt: null
+  },
+  underEdgeFactor: {
+    value: 1.2, min: 1.0, max: 1.6, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
+    description: "Multiplier making UNDER picks require a larger edge than OVER (UNDER_EDGE_FACTOR)",
+    lastVerifiedAt: null
+  },
+  paceClampMinNbaNcaa: {
+    value: 0.65, min: 0.5, max: 0.9, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Lower pace clamp bound for NBA/NCAA-tier leagues (getEffectivePaceClamp wide.min)",
+    lastVerifiedAt: null
+  },
+  paceClampMaxNbaNcaa: {
+    value: 1.35, min: 1.1, max: 1.5, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Upper pace clamp bound for NBA/NCAA-tier leagues (getEffectivePaceClamp wide.max)",
+    lastVerifiedAt: null
+  },
+  paceClampMinOther: {
+    value: 0.70, min: 0.5, max: 0.9, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Lower pace clamp bound for non-NBA/NCAA leagues",
+    lastVerifiedAt: null
+  },
+  paceClampMaxOther: {
+    value: 1.30, min: 1.1, max: 1.5, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Upper pace clamp bound for non-NBA/NCAA leagues",
+    lastVerifiedAt: null
+  },
+  massacreLightThreshold: {
+    value: 10, min: 5, max: 20, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Avg margin threshold for 'light' massacre severity (MASSACRE_TUNING.lightThreshold)",
+    lastVerifiedAt: null
+  },
+  massacreHeavyThreshold: {
+    value: 20, min: 12, max: 30, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Avg margin threshold for 'heavy' massacre severity (MASSACRE_TUNING.heavyThreshold)",
+    lastVerifiedAt: null
+  },
+  massacreNuclearThreshold: {
+    value: 30, min: 20, max: 45, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Avg margin threshold for 'nuclear' massacre severity (MASSACRE_TUNING.nuclearThreshold)",
+    lastVerifiedAt: null
+  },
+  confidenceAThresh: {
+    value: 0.66, min: 0.55, max: 0.80, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
+    description: "Win-probability cutoff for confidence grade A",
+    lastVerifiedAt: null
+  },
+  confidenceBThresh: {
+    value: 0.58, min: 0.50, max: 0.70, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
+    description: "Win-probability cutoff for confidence grade B",
+    lastVerifiedAt: null
+  },
+  confidenceCThresh: {
+    value: 0.51, min: 0.45, max: 0.60, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
+    description: "Win-probability cutoff for confidence grade C",
+    lastVerifiedAt: null
+  }
+};
+
+const TUNABLE_PARAM_REGISTRY_STORAGE_KEY = "BB_TUNABLE_PARAM_REGISTRY_V1";
+
+// ITEM #6 FIX — PARAMETER REGISTRY, PHASE 1: loads any previously-promoted values from
+// localStorage over the coded defaults above. Structured the same way the existing
+// BB_VERIFIED_CONFIG_*/BB_LEARNED_CONSTANTS stores work elsewhere in this file — additive,
+// non-destructive, falls back to the coded default per-key if a key is missing or corrupt.
+function loadTunableParamRegistryOverrides() {
+  try {
+    const raw = localStorage.getItem(TUNABLE_PARAM_REGISTRY_STORAGE_KEY);
+    if (!raw) return;
+    const stored = JSON.parse(raw);
+    if (!stored || typeof stored !== "object") return;
+    Object.keys(stored).forEach(key => {
+      if (TUNABLE_PARAM_REGISTRY[key] && stored[key] && "value" in stored[key]) {
+        TUNABLE_PARAM_REGISTRY[key].value = stored[key].value;
+        TUNABLE_PARAM_REGISTRY[key].lastVerifiedAt = stored[key].lastVerifiedAt || null;
+      }
+    });
+  } catch (e) {
+    engineDebug("loadTunableParamRegistryOverrides failed: " + (e?.message || String(e)), { error: e });
+  }
+}
+
+function saveTunableParamRegistryOverrides() {
+  try {
+    const out = {};
+    Object.keys(TUNABLE_PARAM_REGISTRY).forEach(key => {
+      out[key] = { value: TUNABLE_PARAM_REGISTRY[key].value, lastVerifiedAt: TUNABLE_PARAM_REGISTRY[key].lastVerifiedAt };
+    });
+    localStorage.setItem(TUNABLE_PARAM_REGISTRY_STORAGE_KEY, JSON.stringify(out));
+  } catch (e) {
+    engineDebug("saveTunableParamRegistryOverrides failed to persist: " + (e?.message || String(e)), { error: e });
+  }
+}
+
+// ITEM #6 FIX — PARAMETER REGISTRY, PHASE 1: per-league override store, kept separate
+// from the global registry above. Empty until Phase 2 (league-specific promotion) starts
+// writing to it. getTunableParam checks this first, falls back to the global registry
+// value when no league override exists for that key+league combination.
+const TUNABLE_PARAM_LEAGUE_OVERRIDES_KEY = "BB_TUNABLE_PARAM_LEAGUE_OVERRIDES_V1";
+let g_tunableParamLeagueOverrides = {};
+
+function loadTunableParamLeagueOverrides() {
+  try {
+    const raw = localStorage.getItem(TUNABLE_PARAM_LEAGUE_OVERRIDES_KEY);
+    g_tunableParamLeagueOverrides = raw ? (JSON.parse(raw) || {}) : {};
+  } catch (e) {
+    engineDebug("loadTunableParamLeagueOverrides failed: " + (e?.message || String(e)), { error: e });
+    g_tunableParamLeagueOverrides = {};
+  }
+}
+
+function saveTunableParamLeagueOverrides() {
+  try {
+    localStorage.setItem(TUNABLE_PARAM_LEAGUE_OVERRIDES_KEY, JSON.stringify(g_tunableParamLeagueOverrides));
+  } catch (e) {
+    engineDebug("saveTunableParamLeagueOverrides failed to persist: " + (e?.message || String(e)), { error: e });
+  }
+}
+
+// ITEM #6 FIX — PARAMETER REGISTRY, PHASE 1: the single accessor every projection
+// function will eventually be migrated to call instead of reading its own local
+// default/config override. Resolution order: league-specific override (if promoted
+// and this key allows league scope) -> global registry value -> hard fallback if the
+// key is somehow missing from the registry entirely (should not happen in practice).
+// league is optional; omit it (or pass falsy) to always get the global value.
+function getTunableParam(key, league) {
+  const entry = TUNABLE_PARAM_REGISTRY[key];
+  if (!entry) {
+    engineDebug("getTunableParam: unknown key '" + key + "' — check TUNABLE_PARAM_REGISTRY", { key, league });
+    return null;
+  }
+  if (league && entry.scope === "global") {
+    const leagueKey = String(league).toLowerCase();
+    const leagueEntry = g_tunableParamLeagueOverrides?.[leagueKey]?.[key];
+    if (leagueEntry && "value" in leagueEntry) return leagueEntry.value;
+  }
+  return entry.value;
+}
+
+// ITEM #6 FIX — PARAMETER REGISTRY, PHASE 1: writer used by the future tuner (Phase 3+)
+// to promote a new value. scopeLeague=null writes to the global registry; a league code
+// writes a league-specific override instead (only valid for scope:"global" keys, since
+// "global_only" keys are never allowed to vary by league). Values are clamped to the
+// registry's declared min/max as a hard safety floor against a runaway search proposing
+// something nonsensical (e.g. a negative volatility limit).
+function setTunableParam(key, newValue, scopeLeague, verifiedAt) {
+  const entry = TUNABLE_PARAM_REGISTRY[key];
+  if (!entry) {
+    engineDebug("setTunableParam: unknown key '" + key + "'", { key, newValue, scopeLeague });
+    return false;
+  }
+  let clampedValue = newValue;
+  if (entry.type === "scalar" && isFinite(entry.min) && isFinite(entry.max) && isFinite(newValue)) {
+    clampedValue = clampNumber(newValue, entry.min, entry.max);
+  }
+  const stamp = verifiedAt || new Date().toISOString();
+  if (scopeLeague) {
+    if (entry.scope !== "global") {
+      engineDebug("setTunableParam: key '" + key + "' does not allow league-level overrides", { key, scopeLeague });
+      return false;
+    }
+    const leagueKey = String(scopeLeague).toLowerCase();
+    if (!g_tunableParamLeagueOverrides[leagueKey]) g_tunableParamLeagueOverrides[leagueKey] = {};
+    g_tunableParamLeagueOverrides[leagueKey][key] = { value: clampedValue, lastVerifiedAt: stamp };
+    saveTunableParamLeagueOverrides();
+  } else {
+    entry.value = clampedValue;
+    entry.lastVerifiedAt = stamp;
+    saveTunableParamRegistryOverrides();
+  }
+  engineDebug("setTunableParam promoted", { key, newValue: clampedValue, scopeLeague: scopeLeague || "global", verifiedAt: stamp });
+  return true;
+}
+
+loadTunableParamRegistryOverrides();
+loadTunableParamLeagueOverrides();
 
 // PATCHABLE ISSUE #5 FIX: centralized the "injured team's opponent scores slightly
 // more" boost factor, previously a magic 0.2 hardcoded in 3 separate places
@@ -11363,6 +11640,16 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
       const side = sp.side;
       const marketLine = sp.line;
       const actual = parseFloat(sp.actualScore);
+      // ITEM #5 FIX — FULL-MARKET RETROSPECTIVE COVERAGE (2026-07-09): mirrors the
+      // same no_play guard added to settleTrackedPickFromCompetition. This manual-
+      // settle path grades shadow picks inline instead of calling that function, so
+      // it needs its own copy of the guard — without it, a NO PLAY shadow record
+      // settled via manual settlement would fall through to "loss" here too.
+      if (String(side).toLowerCase() === "no_play") {
+        sp.resultStatus = "no_play_settled";
+        sp.settledAt = new Date().toISOString();
+        continue;
+      }
       if (isFinite(actual) && isFinite(marketLine)) {
         let shadowStatus = "push";
         if (actual > marketLine) shadowStatus = side === "over" ? "win" : "loss";
@@ -11686,6 +11973,16 @@ function handleTrackedPicksActionClick(event) {
   }
 
   pick.actualScore = actual;
+  // ITEM #5 FIX — FULL-MARKET RETROSPECTIVE COVERAGE (2026-07-09): a NO PLAY shadow
+  // record has no over/under side by definition, so it must never fall into the
+  // win/loss grading below — that logic silently treats any non-"over" side as a
+  // loss, which would mark every NO PLAY as a fake loss. Give it its own distinct
+  // status so the real final score is still captured (for retrospective threshold
+  // testing) without polluting any win/loss/push count anywhere in the tracker.
+  if (String(pick.side).toLowerCase() === "no_play") {
+    pick.engineResultStatus = "no_play_settled";
+    return "no_play_settled";
+  }
   const pickSide = String(pick.side).toLowerCase();
 
   // 1. Grade the Engine against the Market Mid
@@ -16237,8 +16534,12 @@ function getTrackedInputSource(marketKey = "ft") {
 }
 
 function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixtureMeta, league, diagnostics }) {
-  // Issue 21: Keep the tracker clean — never save NO PLAY or ungraded picks (not even as shadow).
-  if (!pickRow || pickRow.pick === "NO PLAY" || !pickRow.confidence || pickRow.confidence === "NaN") return null;
+  // ITEM #5 FIX — FULL-MARKET RETROSPECTIVE COVERAGE (2026-07-09): NO PLAY picks are
+  // no longer dropped here. Every market the engine evaluated each run — including
+  // ones that didn't clear the edge threshold — is now captured so the retrospective
+  // tuner can test "would a different threshold have turned this into a correct call"
+  // against the real settled outcome. Only a genuinely empty row is rejected.
+  if (!pickRow) return null;
 
   const fixtureMeta = { ...originalFixtureMeta };
   const exoticNoLineMarkets = ["player", "w_ou", "race", "high_q", "low_q", "htft", "margin_team", "margin_any", "high_q_ou", "low_q_ou", "other"];
@@ -16266,7 +16567,12 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
 
   // SNAPSHOT STORAGE: capture all inputs for retrospective analysis
   const snapshot = (function() {
-    if (!pickRow || pickRow.pick === "NO PLAY" || !pickRow.marketKey) return null;
+    // ITEM #5 FIX — FULL-MARKET RETROSPECTIVE COVERAGE (2026-07-09): snapshot capture
+    // no longer skips NO PLAY picks. The retrospective tuner needs this snapshot to
+    // replay a NO PLAY market under candidate parameter values and check whether a
+    // different config would have turned it into a correct call — without it, no-play
+    // markets are permanently invisible to tuning no matter how many settle.
+    if (!pickRow || !pickRow.marketKey) return null;
     const rawInputs = {};
     try {
       const parsedSnapshot = {
@@ -16334,6 +16640,12 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
       let side = getPickSideFromText(pickRow.pick);
       if (!side) {
         if (isExoticNoLine) side = "exotic";
+        // ITEM #5 FIX — FULL-MARKET RETROSPECTIVE COVERAGE (2026-07-09): a NO PLAY
+        // pick has no over/under side by definition, but it is still a real market
+        // the engine evaluated and should be captured as a non-actionable shadow
+        // record rather than dropped. Anything else with no side and no exotic
+        // exemption is genuinely unusable and is still rejected.
+        else if (pickRow.pick === "NO PLAY") side = "no_play";
         else return null;
       }
       const grade = String(pickRow.confidence || "—").toUpperCase();
