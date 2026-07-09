@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13985,6 +13986,54 @@ function updateIntelligencePack(leagueOverride = "", linesOverride = null, parse
   return null;
 }
 
+// ITEM #23 FIX — CROSS-SIGNAL AGREEMENT / CONFLICT SCORE (2026-07-09): before this,
+// FT-recency trend, H1-recency trend, and H2H direction were all blended into one
+// final projection number with no record of whether they agreed or fought each
+// other on the way there — a case where all three signals point the same direction
+// looked identical, numerically, to a case where they contradicted and happened to
+// average out to the same edge. This computes each signal's direction independently
+// (recent-3 vs season average for FT/H1/quarters, H2H average vs season average) and
+// reports how many agree, so a pick can be flagged as "2/2 signals agree" vs
+// "1/2 signals agree" even when the final edge number is the same. Diagnostic-only:
+// does not change any projection or edge value, only reports agreement for display
+// and for confidence reasoning.
+function getCrossSignalAgreement(side, marketKey, parsed) {
+  const signals = [];
+
+  const fullSeries = marketKey === "ft" ? getOverallSeries(side, 10) : getManualSeries(side, marketKey, parsed);
+  if (Array.isArray(fullSeries) && fullSeries.length >= 5) {
+    const recentAvg = avgOrNaN(fullSeries.slice(0, 3));
+    const seasonAvg = avgOrNaN(fullSeries);
+    if (isFinite(recentAvg) && isFinite(seasonAvg) && seasonAvg > 0) {
+      const diff = recentAvg - seasonAvg;
+      if (Math.abs(diff / seasonAvg) > 0.02) {
+        signals.push({ source: "recency", direction: diff > 0 ? "over" : "under" });
+      }
+    }
+  }
+
+  const matchup = getMatchupDeltaSignal(side, marketKey, parsed);
+  if (matchup && Math.abs(matchup.deltaPct) > 2) {
+    signals.push({ source: "h2h", direction: matchup.delta > 0 ? "over" : "under" });
+  }
+
+  if (!signals.length) {
+    return { signalCount: 0, agreeCount: 0, conflictDetected: false, signals: [] };
+  }
+
+  const overCount = signals.filter(s => s.direction === "over").length;
+  const underCount = signals.filter(s => s.direction === "under").length;
+  const agreeCount = Math.max(overCount, underCount);
+
+  return {
+    signalCount: signals.length,
+    agreeCount,
+    conflictDetected: overCount > 0 && underCount > 0,
+    dominantDirection: overCount === underCount ? "split" : (overCount > underCount ? "over" : "under"),
+    signals
+  };
+}
+
 function applyIntelligenceLayerToPicks(picks, intelligencePack, league) {
   // FIX #5: Edge multipliers REMOVED from this function to prevent double-counting.
   // Intel signals are already applied inside computeFTProjection and compute1HProjection
@@ -16343,6 +16392,45 @@ function getPickExplanationFactors(p, isLock) {
 
   factors.push(p.hasH2H ? "Head-to-head history: included in the blend." : "Head-to-head history: not used (too few qualifying H2H games).");
 
+  // ITEM #24 FIX — SURFACE MATCHUP-DELTA & CROSS-SIGNAL LABELS (2026-07-09): pulls the
+  // diagnostic-only signals from getMatchupDeltaSignal/getCrossSignalAgreement/
+  // getTeamQuarterShapeSignal (added above) and turns them into plain-language
+  // factors here, the same way massacre/tracker/leagueTrust factors already are below.
+  // Reads team names straight from the DOM (same pattern getTeamQuarterShapeSignal's
+  // other call sites already use) rather than threading new fields through the entire
+  // pick object, so this stays additive and does not touch the projection pipeline.
+  try {
+    const _leagueForFactors = document.getElementById("leagueSelect")?.value || "";
+    const _parsedForFactors = buildLooseParsedState();
+    if (p.marketKey === "ft" || p.marketKey === "h1" || (p.marketKey && p.marketKey.startsWith("q"))) {
+      ["A", "B"].forEach(side => {
+        const teamLabel = side === "A" ? (p.homeTeam || "Team A") : (p.awayTeam || "Team B");
+        const matchupSignal = getMatchupDeltaSignal(side, p.marketKey, _parsedForFactors);
+        if (matchupSignal && Math.abs(matchupSignal.deltaPct) >= 3) {
+          factors.push(`📐 Matchup delta: ${teamLabel} averages ${matchupSignal.direction === "elevated" ? "+" : ""}${matchupSignal.deltaPct}% vs season average in this specific matchup (${matchupSignal.sampleSize} H2H games).`);
+        }
+      });
+      const agreement = getCrossSignalAgreement("A", p.marketKey, _parsedForFactors);
+      if (agreement.signalCount >= 2) {
+        factors.push(agreement.conflictDetected
+          ? `⚠ Signal conflict: recency and matchup history disagree on direction for this market.`
+          : `✓ Signal agreement: ${agreement.agreeCount}/${agreement.signalCount} independent signals point the same direction (${agreement.dominantDirection}).`);
+      }
+    }
+    if (p.marketKey && p.marketKey.startsWith("q")) {
+      ["A", "B"].forEach(side => {
+        const teamLabel = side === "A" ? (p.homeTeam || "Team A") : (p.awayTeam || "Team B");
+        const teamNameForShape = document.getElementById(side === "A" ? "teamAName" : "teamBName")?.value?.trim() || "";
+        const shapeSignal = getTeamQuarterShapeSignal(_leagueForFactors, teamNameForShape, p.marketKey);
+        if (shapeSignal && shapeSignal.direction !== "neutral") {
+          factors.push(`🧬 ${teamLabel} tends to ${shapeSignal.direction === "fast" ? "score more" : "fade"} in ${p.marketKey.toUpperCase()} relative to its own average (${shapeSignal.share}% share, ${shapeSignal.sampleSize} games).`);
+        }
+      });
+    }
+  } catch (_factorErr) {
+    // Diagnostic display only — never let a labeling error break the pick row itself.
+  }
+
   if (p.marketKey === "ft" || p.marketKey === "h1" || p.marketKey === "team_a") {
     if (p.aVenueEnabled) factors.push("Team A venue split: blended in (home/away sample qualified).");
   }
@@ -17068,6 +17156,42 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
   return { A: rawA, B: rawB };
 }
 
+// ITEM #21 FIX — MATCHUP DELTA ISOLATION (2026-07-09): isolates how much a team's
+// scoring in THIS specific H2H matchup deviates from that same team's own season
+// average for the same market, expressed as both a point delta and a percentage.
+// This is distinct from getH2HWeight's blending (which folds H2H into the final
+// projection number) — this function surfaces the raw signal itself ("Atlanta
+// scores 5% below normal against Seattle specifically") so it can be displayed
+// and reasoned about on its own, not just silently absorbed into one blended
+// number. Gated at 2+ H2H games (the same minimum getH2HWeight itself requires).
+function getMatchupDeltaSignal(side, marketKey, parsed) {
+  const h2hSeries = getH2HSeries(side, marketKey, parsed);
+  if (!Array.isArray(h2hSeries) || h2hSeries.length < 2) return null;
+
+  const seasonSeries = marketKey === "ft"
+    ? getOverallSeries(side, 10)
+    : getManualSeries(side, marketKey, parsed);
+  if (!Array.isArray(seasonSeries) || seasonSeries.length < 2) return null;
+
+  const h2hAvg = avgOrNaN(h2hSeries);
+  const seasonAvg = avgOrNaN(seasonSeries);
+  if (!isFinite(h2hAvg) || !isFinite(seasonAvg) || seasonAvg <= 0) return null;
+
+  const delta = h2hAvg - seasonAvg;
+  const deltaPct = (delta / seasonAvg) * 100;
+
+  return {
+    side,
+    marketKey,
+    h2hAvg: Number(h2hAvg.toFixed(1)),
+    seasonAvg: Number(seasonAvg.toFixed(1)),
+    delta: Number(delta.toFixed(1)),
+    deltaPct: Number(deltaPct.toFixed(1)),
+    sampleSize: h2hSeries.length,
+    direction: delta > 0 ? "elevated" : delta < 0 ? "suppressed" : "neutral"
+  };
+}
+
 
 function getMassacreMarketWindowSet() {
   return ["ft", "h1", "q1", "q2", "q3", "q4"];
@@ -17189,6 +17313,45 @@ function getMassacreProfile(series, teamName) {
     severity,
     rescueEligible: streak >= 4 && absMargin > 15
   };
+}
+
+// ITEM #22 FIX — PER-QUARTER VOLATILITY PROFILE (2026-07-09): getTeamQuarterShapeSignal
+// already tracks each quarter's SHARE of a team's total (is this quarter reliably
+// bigger/smaller than an even 25% split). This is the missing companion signal: how
+// VOLATILE is that team specifically within each quarter, using the same stdDev()
+// helper already used everywhere else in this file. A team can have a perfectly
+// average Q2 scoring rate while still being wildly inconsistent game-to-game in that
+// same quarter — the share-based signal alone cannot see that. Read-only / diagnostic:
+// this does not feed into any projection by itself, it is a labeled trait for display,
+// same as the existing massacre "streak" profile.
+function getQuarterVolatilityProfile(side, parsed) {
+  const quarters = ["q1", "q2", "q3", "q4"];
+  const out = {};
+  quarters.forEach(qKey => {
+    const series = getManualSeries(side, qKey, parsed);
+    if (!Array.isArray(series) || series.length < 3) {
+      out[qKey] = null;
+      return;
+    }
+    const mean = avgOrNaN(series);
+    const sd = stdDev(series);
+    out[qKey] = {
+      mean: isFinite(mean) ? Number(mean.toFixed(1)) : null,
+      stdDev: Number(sd.toFixed(1)),
+      coefVar: isFinite(mean) && mean > 0 ? Number((sd / mean).toFixed(3)) : null,
+      sampleSize: series.length
+    };
+  });
+
+  const valid = quarters.filter(q => out[q] && isFinite(out[q].coefVar));
+  if (valid.length >= 2) {
+    const mostVolatile = valid.reduce((a, b) => out[a].coefVar >= out[b].coefVar ? a : b);
+    const leastVolatile = valid.reduce((a, b) => out[a].coefVar <= out[b].coefVar ? a : b);
+    out.mostVolatileQuarter = mostVolatile;
+    out.leastVolatileQuarter = leastVolatile;
+  }
+
+  return out;
 }
 
 function rescueBestMassacreLean(picks) {
