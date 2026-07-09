@@ -1,4 +1,3 @@
-B
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4845,8 +4844,17 @@ function calibrateEngineConstants() {
     // and "netDelta=3 over 150 picks" as equally convincing. UNVERIFIED CALIBRATION:
     // the 2x multiplier is a reasoned approximation, not independently re-derived —
     // tune it once enough real promotions have been logged to check it against.
+    // AUDIT FIX #6 — MULTIPLE-COMPARISONS CORRECTION (2026-07-09): the base 2x
+    // multiplier above assumed a single comparison, but this loop actually tests
+    // every value in TUNABLE_CONSTANTS_GRID[constantName] (5 candidates each) as a
+    // candidate replacement, so the true false-positive rate across those implicit
+    // comparisons is understated. Scales the multiplier by the same conservative
+    // sqrt(1 + ln(gridSize)) approximation used in runCoordinateAscentTuner, so the
+    // bar rises with the number of candidates actually swept for this constant.
+    const _gridSizeForConstant = (TUNABLE_CONSTANTS_GRID[constantName] || []).length || 1;
+    const _correctedConstantMultiplier = 2 * Math.sqrt(1 + Math.log(Math.max(2, _gridSizeForConstant)));
     const isSignificant = best && isFinite(best.netDelta) && isFinite(best.count) && best.count > 0
-      && Math.abs(best.netDelta) > 2 * Math.sqrt(best.count);
+      && Math.abs(best.netDelta) > _correctedConstantMultiplier * Math.sqrt(best.count);
     if (best && isSignificant) {
       setTunableConstant(constantName, best.value, best.netDelta, best.count);
       const _paramKey = constantName === "INJURY_OPPONENT_BOOST_FACTOR" ? "injuryOppBoostFactor" : "underEdgeFactor";
@@ -5016,7 +5024,15 @@ function logPromotionEvent(league, paramKey, oldValue, newValue, zScore, brier) 
   }
 }
 
-function testConfigurationSignificance(challengerRecord, baselineRecord) {
+// AUDIT FIX #6 — MULTIPLE-COMPARISONS CORRECTION (2026-07-09): requiredZ now accepts an
+// optional caller-supplied critical value instead of a hardcoded 1.0. Sweeping many
+// candidate values for the same parameter (as runCoordinateAscentTuner does) means the
+// naive single-comparison z>=1.0 threshold understates how often a "significant" result
+// would appear by chance alone. Callers that test multiple candidates per parameter should
+// pass a stricter requiredZ (see the call site in runCoordinateAscentTuner for the
+// conservative approximation used). Defaults to 1.0 so any other call site's behavior is
+// unchanged unless it explicitly opts in.
+function testConfigurationSignificance(challengerRecord, baselineRecord, requiredZ = 1.0) {
   const nc = challengerRecord.wins + challengerRecord.losses;
   const nb = baselineRecord.wins + baselineRecord.losses;
   if (nc < 5 || nb < 5) return { significant: false, z: 0 };
@@ -5032,7 +5048,7 @@ function testConfigurationSignificance(challengerRecord, baselineRecord) {
   const se = Math.sqrt(pooledP * (1 - pooledP) * (1 / nc + 1 / nb));
   const z = (pc - pb) / se;
 
-  return { significant: z >= 1.0, z };
+  return { significant: z >= requiredZ, z, requiredZ };
 }
 
 function calculateCalibrationMetrics(evaluationResults) {
@@ -5337,7 +5353,16 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
 
         const winRateImproves = challengerWR >= baselineWR;
 
-        const sigTest = testConfigurationSignificance(challengerValRecord, baselineValRecord);
+        // AUDIT FIX #6 — MULTIPLE-COMPARISONS CORRECTION (2026-07-09): this loop tests
+        // every value in `grid` as a candidate for `key`, so the naive z>=1.0 single-test
+        // threshold understates the true false-positive rate across grid.length implicit
+        // comparisons. Scales the required critical z by a conservative
+        // sqrt(1 + ln(grid.length)) approximation (not an exact Bonferroni inverse-normal
+        // correction, but strictly stricter than the uncorrected threshold and strictly
+        // increasing in the number of candidates tested) so promotions are held to a
+        // higher bar the more values were swept for this parameter.
+        const _correctedRequiredZ = 1.0 * Math.sqrt(1 + Math.log(Math.max(2, grid.length)));
+        const sigTest = testConfigurationSignificance(challengerValRecord, baselineValRecord, _correctedRequiredZ);
 
         const calibrationOk = challengerValCalibration.brier <= baselineValCalibration.brier + 0.002;
 
@@ -8791,11 +8816,20 @@ function getDateAwareOrFallbackAverage(series, side, marketKey) {
   return weightedRecentAverage(clean);
 }
 
+    // AUDIT FIX #1 — SAMPLE (NOT POPULATION) STANDARD DEVIATION (2026-07-09): this
+    // divided by clean.length (population variance) instead of clean.length - 1
+    // (sample variance / Bessel's correction). At the engine's actual sample sizes
+    // (n=5-10 "full" tier), the population formula understates true variance by a
+    // meaningful margin, which fed getVolatilityRatioForSeries -> volRatio ->
+    // getConfidenceWinProbability and systematically overstated confidence in exactly
+    // the low-sample regime the engine spends most of its time in. Guards n<2 by
+    // returning 0 (sample variance is undefined for a single point) instead of
+    // dividing by zero.
     function stdDev(arr) {
   const clean = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
-  if (!clean.length) return 0;
+  if (clean.length < 2) return 0;
   const mean = clean.reduce((a, b) => a + b, 0) / clean.length;
-  const variance = clean.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / clean.length;
+  const variance = clean.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / (clean.length - 1);
   return Math.sqrt(variance);
 }
 
@@ -11879,21 +11913,29 @@ function clampNumber(val, min, max) {
 // pick per run no matter how many layers fire. Every pipeline stage that adjusts confidence
 // from historical/tracker/team/massacre signal should route through this instead of calling
 // bumpConfidenceGrade directly.
+// AUDIT FIX #3 — STRONGEST-SIGNAL SELECTION, NOT FIRST-APPLIED (2026-07-09): the
+// original budget above was consumed on a first-come-first-served basis in call order
+// (tracker -> intelligence -> massacre), so a weak generic signal (e.g. a rest-day
+// penalty from the intelligence layer) could lock out a stronger, more specific signal
+// (e.g. a real streak from the massacre framework) simply by running first. This now
+// stores the ORIGINAL grade before any shift (pickRow._baseGradeBeforeShift) and, on
+// every call, re-grades from that original base using whichever single proposed shift
+// has the largest magnitude seen so far this run — order of calls no longer matters,
+// only signal strength does.
 const CONFIDENCE_SHIFT_TOTAL_CAP = 1;
 function applyGuardedConfidenceShift(pickRow, requestedShift, source) {
   if (!pickRow || !requestedShift) return;
-  const usedSoFar = Number(pickRow._cumulativeGradeShift || 0);
-  const remainingUp = CONFIDENCE_SHIFT_TOTAL_CAP - Math.max(0, usedSoFar);
-  const remainingDown = CONFIDENCE_SHIFT_TOTAL_CAP - Math.max(0, -usedSoFar);
-  let allowedShift = requestedShift;
-  if (requestedShift > 0) allowedShift = Math.min(requestedShift, Math.max(0, remainingUp));
-  else if (requestedShift < 0) allowedShift = -Math.min(-requestedShift, Math.max(0, remainingDown));
-  if (allowedShift === 0) {
-    engineDebug("confidence shift blocked by decorrelation cap", { source, requestedShift, usedSoFar });
+  if (pickRow._baseGradeBeforeShift === undefined) {
+    pickRow._baseGradeBeforeShift = pickRow.confidence || "D";
+  }
+  const priorShift = Number(pickRow._cumulativeGradeShift || 0);
+  const clampedRequested = clampNumber(requestedShift, -CONFIDENCE_SHIFT_TOTAL_CAP, CONFIDENCE_SHIFT_TOTAL_CAP);
+  if (Math.abs(clampedRequested) <= Math.abs(priorShift)) {
+    engineDebug("confidence shift blocked by decorrelation cap (weaker signal)", { source, requestedShift, priorShift });
     return;
   }
-  pickRow.confidence = bumpConfidenceGrade(pickRow.confidence || "D", allowedShift);
-  pickRow._cumulativeGradeShift = usedSoFar + allowedShift;
+  pickRow._cumulativeGradeShift = clampedRequested;
+  pickRow.confidence = bumpConfidenceGrade(pickRow._baseGradeBeforeShift, clampedRequested);
 }
 
 // [DELETED] settledTrackerScore – unused function
@@ -13473,10 +13515,18 @@ function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", diverg
   return proj;
 }
 
+// AUDIT FIX #11 — VOLATILITY RATIO CAP RAISED (2026-07-09): the cap was hardcoded at
+// 1.0, so any team with stdDev >= leagueVolLimit was indistinguishable from a team at
+// exactly 1.01x that limit in every downstream consumer (dynamic weights, confidence
+// grading, H2H damping). Raised to 2.5 so genuinely extreme-volatility teams (blowout-
+// prone, injury-churned rosters) keep discriminating power instead of being clipped to
+// the same value as a team barely over the limit. 2.5 is a reasoned ceiling, not
+// independently re-derived from data — revisit once enough settled picks exist at the
+// high end of this range to check it against outcomes.
 function getVolatilityRatioForSeries(series, leagueVolLimit) {
   const sd = stdDev(Array.isArray(series) ? series : []);
   const limit = Number(leagueVolLimit) || 12;
-  return Math.min(1, sd / limit);
+  return Math.min(2.5, sd / limit);
 }
 
 
@@ -17070,13 +17120,25 @@ function getMarketVolLimit(league, marketKey) {
   // roughly double/quadruple the real half/quarter scoring range, artificially
   // suppressing the volatility adjustment and H2H dampening for those markets.
   const key = String(marketKey || "").toLowerCase();
-  if (key === "h1" || key === "h1_team_a" || key === "h1_team_b") return base * 0.5;
+  // AUDIT FIX #2 — VARIANCE-ADDITIVE SUB-GAME SCALING (2026-07-09): the 0.5/0.25
+  // factors scaled the volatility limit linearly by each market's share of total
+  // points, but if a full game is modeled as a sum of ~4 roughly-independent periods,
+  // variance scales additively (Var[sum] = sum of Vars for independent components),
+  // not linearly in point-share. Under that model a half's sigma should be
+  // FT-sigma/sqrt(2) (~0.7071x) and a quarter's sigma should be FT-sigma/2 (0.5x) —
+  // not /2 and /4. The prior factors were tighter than an independent-periods model
+  // justifies, penalizing quarter/H1 confidence grades relative to FT for equivalent
+  // real variability. Periods aren't perfectly independent (garbage time, foul
+  // trouble correlate across quarters), so this remains an approximation, not an
+  // exact derivation — but it is the correct first-order model, not an arbitrary
+  // point-share guess.
+  if (key === "h1" || key === "h1_team_a" || key === "h1_team_b") return base * 0.7071;
   // FIX #5: team_a/team_b previously fell through to the full FT-scale limit
   // unscaled, even though team totals are roughly half of FT totals (e.g. ~110 vs
   // ~220), which artificially halved the volatility ratio (stdDev/limit) for team
   // markets and produced overconfident confidence grades on Team Total picks.
   if (key === "team_a" || key === "team_b") return base * 0.5;
-  if (key.startsWith("q")) return base * 0.25;
+  if (key.startsWith("q")) return base * 0.5;
   return base;
 }
 
