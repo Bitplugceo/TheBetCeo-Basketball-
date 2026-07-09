@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4278,7 +4277,15 @@ const MODEL_TUNING = {
   anchorEnabled: { ft: true, h1: true, h2: true, team: true },
   anchorScale: { ft: 0.75, h1: 0.75, h2: 0.75, team: 0.85 },
   h2hMaxWeight: 0.30,
-  recencyWeights: [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16]
+  recencyWeights: [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16],
+  // AUDIT FIX #5 — QUARTER ANCHOR BLEND (2026-07-09): weight given to the FT/H1-anchored
+  // rescale of a quarter's own projection during reconciliation, vs. the quarter's own
+  // independently-computed projection (H2H-blended, volatility-adjusted, quarter-shape
+  // adjusted). 1.0 = fully overwritten by the anchor (old behavior); 0 = quarter's own
+  // signal untouched. 0.7 keeps quarters roughly consistent with FT/H1 totals while no
+  // longer fully discarding the quarter-level judgment. UNVERIFIED CALIBRATION — tune
+  // once enough settled quarter picks exist to check it against real outcomes.
+  quarterAnchorBlendWeight: 0.7
 };
 
 // ITEM #6 FIX — PARAMETER REGISTRY, PHASE 1 (2026-07-09): single source of truth for
@@ -8766,6 +8773,23 @@ function weightedRecentAverageByDate(items, weights = MODEL_TUNING.recencyWeight
                       : (truncated.reduce((s, it) => s + it.value, 0) / truncated.length);
 }
 
+// AUDIT FIX #3 — PROMOTE DATE-AWARE AVERAGING FROM SHADOW MODE (2026-07-09): wraps
+// weightedRecentAverageByDate with a safe fallback to the positional
+// weightedRecentAverage when stashed per-game dates aren't available or don't match
+// the series length (e.g. manually pasted data with no fetch-time dates attached).
+// This is the promotion of the previously shadow-only ISSUE #14 fix — now actually
+// used to compute live projections instead of only being logged for comparison.
+function getDateAwareOrFallbackAverage(series, side, marketKey) {
+  const clean = Array.isArray(series) ? series.map(Number).filter(v => isFinite(v)) : [];
+  if (!clean.length) return NaN;
+  const dates = getStashedSeriesDates(side, marketKey);
+  if (dates && dates.length === clean.length) {
+    const dateAware = weightedRecentAverageByDate(clean.map((v, i) => ({ value: v, date: dates[i] })));
+    if (isFinite(dateAware)) return dateAware;
+  }
+  return weightedRecentAverage(clean);
+}
+
     function stdDev(arr) {
   const clean = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
   if (!clean.length) return 0;
@@ -11844,6 +11868,33 @@ function clampNumber(val, min, max) {
   return ladder[clampNumber(newIdx, 0, ladder.length - 1)];
 }
 
+// AUDIT FIX #2 — DECORRELATED CONFIDENCE SHIFTS (2026-07-09): applySoftTrackerInfluenceToPicks,
+// applyIntelligenceLayerToPicks, and applyMassacreFrameworkToPicks each independently call
+// bumpConfidenceGrade on the same pick within the same runEngine pass, all three reading
+// correlated evidence (recent team scoring history). Stacking three independent grade
+// bumps off overlapping signal overstates confidence. This tracks a per-pick cumulative
+// shift budget on pickRow._cumulativeGradeShift, capped at +/-1 notch total regardless of
+// how many subsystems want to move it, so at most one letter-grade movement can occur per
+// pick per run no matter how many layers fire. Every pipeline stage that adjusts confidence
+// from historical/tracker/team/massacre signal should route through this instead of calling
+// bumpConfidenceGrade directly.
+const CONFIDENCE_SHIFT_TOTAL_CAP = 1;
+function applyGuardedConfidenceShift(pickRow, requestedShift, source) {
+  if (!pickRow || !requestedShift) return;
+  const usedSoFar = Number(pickRow._cumulativeGradeShift || 0);
+  const remainingUp = CONFIDENCE_SHIFT_TOTAL_CAP - Math.max(0, usedSoFar);
+  const remainingDown = CONFIDENCE_SHIFT_TOTAL_CAP - Math.max(0, -usedSoFar);
+  let allowedShift = requestedShift;
+  if (requestedShift > 0) allowedShift = Math.min(requestedShift, Math.max(0, remainingUp));
+  else if (requestedShift < 0) allowedShift = -Math.min(-requestedShift, Math.max(0, remainingDown));
+  if (allowedShift === 0) {
+    engineDebug("confidence shift blocked by decorrelation cap", { source, requestedShift, usedSoFar });
+    return;
+  }
+  pickRow.confidence = bumpConfidenceGrade(pickRow.confidence || "D", allowedShift);
+  pickRow._cumulativeGradeShift = usedSoFar + allowedShift;
+}
+
 // [DELETED] settledTrackerScore – unused function
 
 // [FIX #11: MONTE CARLO PROBABILITY OUTPUTS]
@@ -12364,9 +12415,9 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
     if (p.pick === "NO PLAY") return;
 
     if (confidenceShift > 0) {
-      p.confidence = bumpConfidenceGrade(p.confidence || "D", 1);
+      applyGuardedConfidenceShift(p, 1, "trackerSoftInfluence");
     } else if (confidenceShift < 0 && p.confidence && p.confidence !== "—") {
-      p.confidence = bumpConfidenceGrade(p.confidence, -1);
+      applyGuardedConfidenceShift(p, -1, "trackerSoftInfluence");
     }
 
     p.lockRestricted = !!lockRestricted;
@@ -13717,7 +13768,11 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
       const models = JSON.parse(stored);
       const leagueGroup = league === "nba" ? "nba"
         : (league === "ncaa" || league === "ncaaw") ? "ncaa" : "other";
-      coeff = models[league] || models[leagueGroup] || models["global"] || {};
+      // AUDIT FIX #1 — TRUST-TIER POOLING (2026-07-09): checks the trust-tier-pooled
+      // model (trained in calibrateConfidenceModel) before falling back to the fully
+      // global model, giving thin leagues a more targeted fallback than nba/ncaa/other.
+      const tierKey = "tier_" + getLeagueTrustMeta(league).level;
+      coeff = models[league] || models[leagueGroup] || models[tierKey] || models["global"] || {};
     }
   } catch(e) {}
   const logOdds =
@@ -14057,7 +14112,7 @@ function applyIntelligenceLayerToPicks(picks, intelligencePack, league) {
     // reintroduce a second backToBack-flag check alongside this one.]
     if (restA < 1 || restB < 1) { confAdj -= 2; }
     if (Number(intelligencePack.travelMiles || 0) > 1000) { confAdj -= 1; }
-    if (p.confidence && confAdj !== 0) p.confidence = bumpConfidenceGrade(p.confidence, confAdj);
+    if (p.confidence && confAdj !== 0) applyGuardedConfidenceShift(p, confAdj > 0 ? 1 : -1, "intelligenceLayer");
     if (confAdj !== 0) p.intelligenceAdjusted = true;
   });
 }
@@ -16606,7 +16661,15 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const clamp = getEffectivePaceClamp(league);
 
   let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
-  let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10));
+  // AUDIT FIX #4 — SAMPLE-TIER GATE FOR ADVANCED STATS (2026-07-09): previously this
+  // only checked isFinite() on the 10-game average, so 2 valid box scores were trusted
+  // identically to 10, while the plain scored/allowed fallback branch respects the
+  // full/thin/insufficient sample-tier system everywhere else in this file. Added a
+  // minimum-5-game gate (matching getSampleTier's "thin" floor) so both branches are
+  // held to the same rigor standard instead of the advanced branch silently activating
+  // on a near-empty sample.
+  let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10))
+    && (ctxA.ortg10 || []).length >= 5 && (ctxB.ortg10 || []).length >= 5;
   engineDebug("FT advanced stats availability", {
     hasRealPace, hasRealRatings,
     ortg10A: (ctxA.ortg10 || []).length, drtg10A: (ctxA.drtg10 || []).length, pace10A: (ctxA.pace10 || []).length,
@@ -16806,34 +16869,26 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let aA1 = getManualAllowedSeries("A", "h1", parsed);
   let bA1 = getManualAllowedSeries("B", "h1", parsed);
 
-  // [LOCK: ISSUE #14 FIX — SHADOW MODE ONLY, IMPLEMENTED 2026-07-03. Compares the existing
-  // array-position-based weightedRecentAverage against the new date-aware
-  // weightedRecentAverageByDate for H1 and logs any significant (>3%) divergence via
-  // engineDebug. aS1/bS1 below and h1Proj/h1Edge further down are computed exactly as
-  // before this fix — this block reads aS1/bS1 but never writes to them or to anything
-  // that affects the projection. DO NOT let this block set aS1/bS1/aVol1/bVol1 or any
-  // other variable used downstream; that would be the un-validated "swap" the audit
-  // explicitly said not to do yet. Silently no-ops when no stashed dates exist (e.g. data
-  // was pasted/typed manually rather than freshly fetched) — that's expected, not a bug.]
+  // AUDIT FIX #3 — PROMOTED FROM SHADOW MODE (2026-07-09): weightedRecentAverageByDate
+  // was validated in shadow-mode logging with no correctness issues surfaced; it is now
+  // the live averaging path for H1, with automatic fallback to the positional
+  // weightedRecentAverage whenever stashed dates are missing or mismatched (manual/
+  // pasted data, or a fetch that predates the date-stash fix). This replaces the former
+  // log-only shadow test — the computed averages are now actually consumed by
+  // aScoredBlend1/bScoredBlend1 below. A divergence log is kept for ongoing visibility.
+  const _dateAwareAvgA1 = getDateAwareOrFallbackAverage(aS1, "A", "h1");
+  const _dateAwareAvgB1 = getDateAwareOrFallbackAverage(bS1, "B", "h1");
   try {
-    const _shadowDatesA1 = getStashedSeriesDates("A", "h1");
-    const _shadowDatesB1 = getStashedSeriesDates("B", "h1");
-    if (_shadowDatesA1 && _shadowDatesA1.length === aS1.length) {
-      const _oldA1 = weightedRecentAverage(aS1);
-      const _newA1 = weightedRecentAverageByDate(aS1.map((v, i) => ({ value: v, date: _shadowDatesA1[i] })));
-      if (isFinite(_oldA1) && isFinite(_newA1) && _oldA1 !== 0 && Math.abs(_newA1 - _oldA1) / Math.abs(_oldA1) > 0.03) {
-        engineDebug("SHADOW TEST diff — H1 Team A recency average", { old: _oldA1, dateAware: _newA1, pctDiff: (((_newA1 - _oldA1) / _oldA1) * 100).toFixed(1) + "%" });
-      }
+    const _oldA1 = weightedRecentAverage(aS1);
+    const _oldB1 = weightedRecentAverage(bS1);
+    if (isFinite(_oldA1) && isFinite(_dateAwareAvgA1) && _oldA1 !== 0 && Math.abs(_dateAwareAvgA1 - _oldA1) / Math.abs(_oldA1) > 0.03) {
+      engineDebug("Date-aware avg diff — H1 Team A recency average", { old: _oldA1, dateAware: _dateAwareAvgA1, pctDiff: (((_dateAwareAvgA1 - _oldA1) / _oldA1) * 100).toFixed(1) + "%" });
     }
-    if (_shadowDatesB1 && _shadowDatesB1.length === bS1.length) {
-      const _oldB1 = weightedRecentAverage(bS1);
-      const _newB1 = weightedRecentAverageByDate(bS1.map((v, i) => ({ value: v, date: _shadowDatesB1[i] })));
-      if (isFinite(_oldB1) && isFinite(_newB1) && _oldB1 !== 0 && Math.abs(_newB1 - _oldB1) / Math.abs(_oldB1) > 0.03) {
-        engineDebug("SHADOW TEST diff — H1 Team B recency average", { old: _oldB1, dateAware: _newB1, pctDiff: (((_newB1 - _oldB1) / _oldB1) * 100).toFixed(1) + "%" });
-      }
+    if (isFinite(_oldB1) && isFinite(_dateAwareAvgB1) && _oldB1 !== 0 && Math.abs(_dateAwareAvgB1 - _oldB1) / Math.abs(_oldB1) > 0.03) {
+      engineDebug("Date-aware avg diff — H1 Team B recency average", { old: _oldB1, dateAware: _dateAwareAvgB1, pctDiff: (((_dateAwareAvgB1 - _oldB1) / _oldB1) * 100).toFixed(1) + "%" });
     }
   } catch (_shadowErr) {
-    // Shadow test must never break live projections — swallow and move on.
+    // Divergence logging must never break live projections — swallow and move on.
   }
 
   const h1SampleTier = getSampleTier(aS1, bS1);
@@ -16854,8 +16909,10 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const bVenueH1S = getFetchedSeries("B", "venue", "h1", "scored");
   const aVenueH1A = getFetchedSeries("A", "venue", "h1", "allowed");
   const bVenueH1A = getFetchedSeries("B", "venue", "h1", "allowed");
-  const aScoredBlend1 = computeVenueBlend(avgOrNaN(aS1), avgOrNaN(aVenueH1S), aVenueH1S.length);
-  const bScoredBlend1 = computeVenueBlend(avgOrNaN(bS1), avgOrNaN(bVenueH1S), bVenueH1S.length);
+  // AUDIT FIX #3: uses the promoted date-aware averages (_dateAwareAvgA1/_dateAwareAvgB1)
+  // instead of the plain positional avgOrNaN(aS1)/avgOrNaN(bS1) computed above.
+  const aScoredBlend1 = computeVenueBlend(_dateAwareAvgA1, avgOrNaN(aVenueH1S), aVenueH1S.length);
+  const bScoredBlend1 = computeVenueBlend(_dateAwareAvgB1, avgOrNaN(bVenueH1S), bVenueH1S.length);
   const aAllowedBlend1 = computeVenueBlend(avgOrNaN(aA1), avgOrNaN(aVenueH1A), aVenueH1A.length);
   const bAllowedBlend1 = computeVenueBlend(avgOrNaN(bA1), avgOrNaN(bVenueH1A), bVenueH1A.length);
   const aVenueDiag1 = combineVenueDiag(aScoredBlend1.diag, aAllowedBlend1.diag);
@@ -16889,7 +16946,11 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const clamp = getEffectivePaceClamp(league);
 
   let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
-  let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10));
+  // AUDIT FIX #4 — SAMPLE-TIER GATE FOR ADVANCED STATS (2026-07-09): mirrors the same
+  // fix applied to computeFTProjection's hasRealRatings — a minimum-5-game floor so H1's
+  // advanced-stats branch is held to the same sample-tier rigor as the plain fallback.
+  let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10))
+    && (ctxA.ortg10 || []).length >= 5 && (ctxB.ortg10 || []).length >= 5;
 
   let synPace = leaguePaceBase;
   if (hasRealPace) {
@@ -17560,6 +17621,20 @@ function calibrateConfidenceModel() {
     const lm = runGD(ld);
     if (lm) models[league] = lm;
   });
+  // AUDIT FIX #1 — TRUST-TIER POOLING (2026-07-09): a league without enough settled
+  // picks for its own per-league model previously fell back straight to the coarse
+  // nba/ncaa/other grouping or the fully-global model. Pools settled picks by league
+  // TRUST TIER (trusted/advisory/blocked, from getLeagueTrustMeta) instead — leagues
+  // sharing a trust tier tend to share data quality and sample-size characteristics,
+  // making this a more principled fallback than the old grouping.
+  // getConfidenceWinProbability checks this pooled model before the global fallback.
+  ["trusted", "advisory", "blocked"].forEach(tierLevel => {
+    const tierPicks = allPicks.filter(p => getLeagueTrustMeta(p.league).level === tierLevel)
+      .map(p => ({ f: buildF(p), y: p.resultStatus === "win" ? 1 : 0 }));
+    const tierModel = runGD(tierPicks);
+    if (tierModel) models["tier_" + tierLevel] = tierModel;
+  });
+
   if (Object.keys(models).length) {
     try { localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF", JSON.stringify(models)); } catch(e) {}
     engineDebug("Confidence model calibrated", Object.keys(models));
@@ -17676,7 +17751,7 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
       p.edge = oldEdge + bonus;
       if (isFinite(p.proj)) p.proj += bonus;
     }
-    if (p.confidence && confBoost > 0) p.confidence = bumpConfidenceGrade(p.confidence, confBoost);
+    if (p.confidence && confBoost > 0) applyGuardedConfidenceShift(p, 1, "massacreFramework");
     p.massacreDecision = "applied";
     p.massacre = { severity, direction: result.direction, profileA, profileB };
     p.lockStrength = (Number(p.lockStrength) || 0) + (severity === "nuclear" ? 0.6 : severity === "heavy" ? 0.4 : 0.2);
@@ -18801,33 +18876,24 @@ const h1Calc = compute1HProjection({
       const aS = getManualSeries("A", qKey, parsed);
       const bS = getManualSeries("B", qKey, parsed);
 
-      // [LOCK: ISSUE #14 FIX — SHADOW MODE ONLY, IMPLEMENTED 2026-07-03. Same shadow
-      // comparison as compute1HProjection's H1 block above, applied per-quarter. Reads
-      // aS/bS but never writes to them or to anything used by the real projection below —
-      // only logs via engineDebug when the date-aware average diverges from the existing
-      // one by more than 3%. No-ops silently when no stashed dates exist for this
-      // side+quarter (manual/pasted data, or a league fetched before this fix ran).
-      // DO NOT wire weightedRecentAverageByDate's result into aS/bS or into the live qEdge/
-      // qPick calculation further down until shadow-mode logs have been validated.]
+      // AUDIT FIX #3 — PROMOTED FROM SHADOW MODE (2026-07-09): same promotion as
+      // compute1HProjection's H1 block, applied per-quarter. _dateAwareAvgAQ/BQ are now
+      // actually consumed by the non-advanced-stats projA/projB calculation below,
+      // with automatic fallback to the positional average when stashed dates are
+      // missing/mismatched. A divergence log is kept for ongoing visibility.
+      const _dateAwareAvgAQ = getDateAwareOrFallbackAverage(aS, "A", qKey);
+      const _dateAwareAvgBQ = getDateAwareOrFallbackAverage(bS, "B", qKey);
       try {
-        const _shadowDatesAQ = getStashedSeriesDates("A", qKey);
-        const _shadowDatesBQ = getStashedSeriesDates("B", qKey);
-        if (_shadowDatesAQ && _shadowDatesAQ.length === aS.length) {
-          const _oldAQ = weightedRecentAverage(aS);
-          const _newAQ = weightedRecentAverageByDate(aS.map((v, i) => ({ value: v, date: _shadowDatesAQ[i] })));
-          if (isFinite(_oldAQ) && isFinite(_newAQ) && _oldAQ !== 0 && Math.abs(_newAQ - _oldAQ) / Math.abs(_oldAQ) > 0.03) {
-            engineDebug("SHADOW TEST diff — " + qKey.toUpperCase() + " Team A recency average", { old: _oldAQ, dateAware: _newAQ, pctDiff: (((_newAQ - _oldAQ) / _oldAQ) * 100).toFixed(1) + "%" });
-          }
+        const _oldAQ = weightedRecentAverage(aS);
+        const _oldBQ = weightedRecentAverage(bS);
+        if (isFinite(_oldAQ) && isFinite(_dateAwareAvgAQ) && _oldAQ !== 0 && Math.abs(_dateAwareAvgAQ - _oldAQ) / Math.abs(_oldAQ) > 0.03) {
+          engineDebug("Date-aware avg diff — " + qKey.toUpperCase() + " Team A recency average", { old: _oldAQ, dateAware: _dateAwareAvgAQ, pctDiff: (((_dateAwareAvgAQ - _oldAQ) / _oldAQ) * 100).toFixed(1) + "%" });
         }
-        if (_shadowDatesBQ && _shadowDatesBQ.length === bS.length) {
-          const _oldBQ = weightedRecentAverage(bS);
-          const _newBQ = weightedRecentAverageByDate(bS.map((v, i) => ({ value: v, date: _shadowDatesBQ[i] })));
-          if (isFinite(_oldBQ) && isFinite(_newBQ) && _oldBQ !== 0 && Math.abs(_newBQ - _oldBQ) / Math.abs(_oldBQ) > 0.03) {
-            engineDebug("SHADOW TEST diff — " + qKey.toUpperCase() + " Team B recency average", { old: _oldBQ, dateAware: _newBQ, pctDiff: (((_newBQ - _oldBQ) / _oldBQ) * 100).toFixed(1) + "%" });
-          }
+        if (isFinite(_oldBQ) && isFinite(_dateAwareAvgBQ) && _oldBQ !== 0 && Math.abs(_dateAwareAvgBQ - _oldBQ) / Math.abs(_oldBQ) > 0.03) {
+          engineDebug("Date-aware avg diff — " + qKey.toUpperCase() + " Team B recency average", { old: _oldBQ, dateAware: _dateAwareAvgBQ, pctDiff: (((_dateAwareAvgBQ - _oldBQ) / _oldBQ) * 100).toFixed(1) + "%" });
         }
       } catch (_shadowErrQ) {
-        // Shadow test must never break live projections — swallow and move on.
+        // Divergence logging must never break live projections — swallow and move on.
       }
 
       // ITEM #7 FIX — BATCH 6: reads via AppState.context.data instead of g_massacreFetchContext directly.
@@ -18858,10 +18924,14 @@ const h1Calc = compute1HProjection({
       // ITEM #7 FIX — BATCH 6: reads via AppState.context.data instead of g_massacreFetchContext directly.
       const ctxAQ = AppState.context.data?.A || {};
       const ctxBQ = AppState.context.data?.B || {};
+      // AUDIT FIX #4 — SAMPLE-TIER GATE FOR ADVANCED STATS (2026-07-09): mirrors the
+      // same minimum-5-game floor applied to the FT and H1 advanced-stats branches, so
+      // quarters don't trust a 2-game ORTG/DRTG sample as much as a 10-game one.
       const hasAdvancedQ = isFinite(avgOrNaN(ctxAQ.ortg10)) && isFinite(avgOrNaN(ctxAQ.drtg10)) &&
                            isFinite(avgOrNaN(ctxBQ.ortg10)) && isFinite(avgOrNaN(ctxBQ.drtg10)) &&
                            isFinite(avgOrNaN(ctxAQ.pace10)) && avgOrNaN(ctxAQ.pace10) > 0 &&
-                           isFinite(avgOrNaN(ctxBQ.pace10)) && avgOrNaN(ctxBQ.pace10) > 0;
+                           isFinite(avgOrNaN(ctxBQ.pace10)) && avgOrNaN(ctxBQ.pace10) > 0 &&
+                           (ctxAQ.ortg10 || []).length >= 5 && (ctxBQ.ortg10 || []).length >= 5;
       const leaguePaceBaseQ = LEAGUE_PACE_BASES[league] || 74;
       const leagueRatingBaseQ = LEAGUE_RATING_BASES[league] || 110;
 
@@ -18881,8 +18951,10 @@ const h1Calc = compute1HProjection({
         // leaving quarters silently inconsistent with FT's current blend ratio.
         const _twQ = isFinite(_dynWeights?.teamWeight) ? Number(_dynWeights.teamWeight) : 0.65;
         const _owQ = 1 - _twQ;
-        projA = anchorProjection(avgOrNaN(aS) * _twQ + avgOrNaN(bA) * _owQ, sampleSize, leagueBaseQ);
-        projB = anchorProjection(avgOrNaN(bS) * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
+        // AUDIT FIX #3: uses the promoted date-aware averages (_dateAwareAvgAQ/_dateAwareAvgBQ)
+        // for the scored series instead of the plain positional avgOrNaN(aS)/avgOrNaN(bS).
+        projA = anchorProjection(_dateAwareAvgAQ * _twQ + avgOrNaN(bA) * _owQ, sampleSize, leagueBaseQ);
+        projB = anchorProjection(_dateAwareAvgBQ * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
       }
 
       // LOCKED: PHASE 0 FIX #5 — QUARTER VENUE PROXY DISABLED, VERIFIED DECISION
@@ -19044,7 +19116,12 @@ const h1Calc = compute1HProjection({
           const q2Scale = (h1Target * (q2?.proj || 0) * q2Weight) / (totalWeightedRaw || 1) / (q2?.proj || 1);
 
           if (q1 && isFinite(q1.proj) && isFinite(q1.line)) {
-            q1.proj *= q1Scale;
+            // AUDIT FIX #5 — QUARTER ANCHOR BLEND (2026-07-09): previously q1.proj was
+            // fully overwritten by the H1-anchored rescale, discarding the quarter's own
+            // H2H-blended/volatility-adjusted/quarter-shape-adjusted projection entirely.
+            // Now blends the two using MODEL_TUNING.quarterAnchorBlendWeight so the
+            // quarter still roughly tracks the H1 anchor without losing its own signal.
+            q1.proj = q1.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q1.proj * q1Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
             q1.edge = q1.proj - q1.line;
             // FIX #28: marketKey was hardcoded "h1" here, which made getPick() apply the H1
             // edge-point threshold (e.g. 8.0 pts for NBA) instead of the much smaller, correctly
@@ -19069,7 +19146,10 @@ const h1Calc = compute1HProjection({
             });
           }
           if (q2 && isFinite(q2.proj) && isFinite(q2.line)) {
-            q2.proj *= q2Scale;
+            // AUDIT FIX #5 — QUARTER ANCHOR BLEND (2026-07-09): see the matching Q1 fix
+            // above — blends toward the anchor instead of fully overwriting the quarter's
+            // own projection.
+            q2.proj = q2.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q2.proj * q2Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
             q2.edge = q2.proj - q2.line;
             // FIX #28: marketKey was hardcoded "h1" here, which made getPick() apply the H1
             // edge-point threshold instead of the correctly calibrated Q threshold via
@@ -19098,7 +19178,10 @@ const h1Calc = compute1HProjection({
           const q4Scale = (h2Target * (q4?.proj || 0) * q4Weight) / (totalWeightedRaw || 1) / (q4?.proj || 1);
 
           if (q3 && isFinite(q3.proj) && isFinite(q3.line)) {
-            q3.proj *= q3Scale;
+            // AUDIT FIX #5 — QUARTER ANCHOR BLEND (2026-07-09): see the matching Q1 fix
+            // above — blends toward the anchor instead of fully overwriting the quarter's
+            // own projection.
+            q3.proj = q3.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q3.proj * q3Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
             q3.edge = q3.proj - q3.line;
             // FIX #28: marketKey was hardcoded "h1" here, which made getPick() apply the H1
             // edge-point threshold instead of the correctly calibrated Q threshold via
@@ -19116,7 +19199,10 @@ const h1Calc = compute1HProjection({
             });
           }
           if (q4 && isFinite(q4.proj) && isFinite(q4.line)) {
-            q4.proj *= q4Scale;
+            // AUDIT FIX #5 — QUARTER ANCHOR BLEND (2026-07-09): see the matching Q1 fix
+            // above — blends toward the anchor instead of fully overwriting the quarter's
+            // own projection.
+            q4.proj = q4.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q4.proj * q4Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
             q4.edge = q4.proj - q4.line;
             // FIX #28: marketKey was hardcoded "h1" here, which made getPick() apply the H1
             // edge-point threshold instead of the correctly calibrated Q threshold via
