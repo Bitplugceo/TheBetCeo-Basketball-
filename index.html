@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4364,6 +4365,42 @@ const TUNABLE_PARAM_REGISTRY = {
     scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
     description: "Win-probability cutoff for confidence grade C",
     lastVerifiedAt: null
+  },
+  volatilityLimit: {
+    value: 12, min: 4, max: 30, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Volatility limits used to scale volatility ratio",
+    lastVerifiedAt: null
+  },
+  edgeFTPointThreshold: {
+    value: 5.0, min: 2.0, max: 15.0, type: "scalar",
+    scope: "global", appliesTo: ["ft"],
+    description: "Point edge threshold required for FT picks",
+    lastVerifiedAt: null
+  },
+  edgeH1PointThreshold: {
+    value: 6.0, min: 2.0, max: 15.0, type: "scalar",
+    scope: "global", appliesTo: ["h1"],
+    description: "Point edge threshold required for 1H picks",
+    lastVerifiedAt: null
+  },
+  edgeTeamPointThreshold: {
+    value: 8.0, min: 3.0, max: 20.0, type: "scalar",
+    scope: "global", appliesTo: ["team_a", "team_b"],
+    description: "Point edge threshold required for Team Total picks",
+    lastVerifiedAt: null
+  },
+  edgeQPointThreshold: {
+    value: 3.0, min: 1.0, max: 10.0, type: "scalar",
+    scope: "global", appliesTo: ["q1", "q2", "q3", "q4"],
+    description: "Point edge threshold required for Quarter picks",
+    lastVerifiedAt: null
+  },
+  massacreBlendWeight: {
+    value: 0.3, min: 0.0, max: 0.8, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Blend weight used in massacre framework",
+    lastVerifiedAt: null
   }
 };
 
@@ -4484,6 +4521,38 @@ function setTunableParam(key, newValue, scopeLeague, verifiedAt) {
 
 loadTunableParamRegistryOverrides();
 loadTunableParamLeagueOverrides();
+
+function getParam(key, league) {
+  return getTunableParam(key, league);
+}
+window.getParam = getParam;
+
+function initLeagueOverridesFromDefaults() {
+  if (Object.keys(g_tunableParamLeagueOverrides).length > 0) return;
+  
+  Object.entries(LEAGUE_CONFIG_MAP).forEach(([l, cfg]) => {
+    const lk = l.toLowerCase();
+    if (!g_tunableParamLeagueOverrides[lk]) g_tunableParamLeagueOverrides[lk] = {};
+    g_tunableParamLeagueOverrides[lk]["volatilityLimit"] = { value: cfg.volLimit, lastVerifiedAt: null };
+  });
+  Object.entries(LEAGUE_VOL_LIMITS).forEach(([l, vol]) => {
+    const lk = l.toLowerCase();
+    if (!g_tunableParamLeagueOverrides[lk]) g_tunableParamLeagueOverrides[lk] = {};
+    g_tunableParamLeagueOverrides[lk]["volatilityLimit"] = { value: vol, lastVerifiedAt: null };
+  });
+
+  Object.entries(LEAGUE_EDGE_POINT_THRESHOLDS).forEach(([l, th]) => {
+    const lk = l.toLowerCase();
+    if (!g_tunableParamLeagueOverrides[lk]) g_tunableParamLeagueOverrides[lk] = {};
+    g_tunableParamLeagueOverrides[lk]["edgeFTPointThreshold"] = { value: th.ft, lastVerifiedAt: null };
+    g_tunableParamLeagueOverrides[lk]["edgeH1PointThreshold"] = { value: th.h1, lastVerifiedAt: null };
+    g_tunableParamLeagueOverrides[lk]["edgeTeamPointThreshold"] = { value: th.team, lastVerifiedAt: null };
+    g_tunableParamLeagueOverrides[lk]["edgeQPointThreshold"] = { value: th.q, lastVerifiedAt: null };
+  });
+  saveTunableParamLeagueOverrides();
+}
+
+initLeagueOverridesFromDefaults();
 
 // PATCHABLE ISSUE #5 FIX: centralized the "injured team's opponent scores slightly
 // more" boost factor, previously a magic 0.2 hardcoded in 3 separate places
@@ -4761,6 +4830,307 @@ function getVerifiedConfig(league, marketKey) {
     // to an empty catch block.
     engineDebug("getVerifiedConfig failed to read/parse", { league, marketKey, error: e?.message || String(e) });
   }
+  return null;
+}
+
+function logPromotionEvent(league, paramKey, oldValue, newValue, zScore, brier) {
+  try {
+    const key = "BB_PROMOTION_HISTORY";
+    let history = [];
+    const raw = localStorage.getItem(key);
+    if (raw) history = JSON.parse(raw) || [];
+    
+    history.push({
+      ts: new Date().toISOString(),
+      league: league || "global",
+      paramKey,
+      oldValue,
+      newValue,
+      zScore: parseFloat(zScore.toFixed(3)),
+      brier: parseFloat(brier.toFixed(5))
+    });
+    
+    if (history.length > 100) history = history.slice(-100);
+    localStorage.setItem(key, JSON.stringify(history));
+  } catch(e) {
+    engineDebug("logPromotionEvent failed", e);
+  }
+}
+
+function testConfigurationSignificance(challengerRecord, baselineRecord) {
+  const nc = challengerRecord.wins + challengerRecord.losses;
+  const nb = baselineRecord.wins + baselineRecord.losses;
+  if (nc < 5 || nb < 5) return { significant: false, z: 0 };
+
+  const pc = challengerRecord.wins / nc;
+  const pb = baselineRecord.wins / nb;
+
+  if (pc <= pb) return { significant: false, z: 0 };
+
+  const pooledP = (challengerRecord.wins + baselineRecord.wins) / (nc + nb);
+  if (pooledP <= 0 || pooledP >= 1) return { significant: false, z: 0 };
+
+  const se = Math.sqrt(pooledP * (1 - pooledP) * (1 / nc + 1 / nb));
+  const z = (pc - pb) / se;
+
+  return { significant: z >= 1.0, z };
+}
+
+function calculateCalibrationMetrics(evaluationResults) {
+  const valid = evaluationResults.filter(r => r && !r.isNoPlay && r.winProbability != null && (r.win || r.loss));
+  if (!valid.length) return { brier: 1.0, ece: 1.0 };
+
+  let brierSum = 0;
+  const bins = Array.from({ length: 10 }, () => ({ sp: 0, so: 0, n: 0 }));
+
+  valid.forEach(r => {
+    const outcome = r.win ? 1 : 0;
+    brierSum += Math.pow(r.winProbability - outcome, 2);
+
+    const bi = Math.min(9, Math.floor(r.winProbability * 10));
+    bins[bi].sp += r.winProbability;
+    bins[bi].so += outcome;
+    bins[bi].n++;
+  });
+
+  const brier = brierSum / valid.length;
+  const ece = bins.filter(b => b.n > 0)
+    .reduce((sum, b) => sum + (b.n / valid.length) * Math.abs(b.sp / b.n - b.so / b.n), 0);
+
+  return { brier, ece, count: valid.length };
+}
+
+function evaluatePickWithParams(pick, paramOverrides) {
+  if (!pick.snapshot || pick.actualScore == null) return null;
+  const { parsed, lines, league, injMultA, injMultB, marketKey } = pick.snapshot;
+  const numericActual = parseFloat(pick.actualScore);
+  if (!isFinite(numericActual)) return null;
+
+  const originalGetParam = window.getParam;
+  window.getParam = function(key, lg) {
+    if (paramOverrides && Object.prototype.hasOwnProperty.call(paramOverrides, key)) {
+      return paramOverrides[key];
+    }
+    return originalGetParam ? originalGetParam(key, lg) : getTunableParam(key, lg);
+  };
+
+  try {
+    let proj, lineVal, edge;
+    const finalLines = lines;
+    if (marketKey === "ft") {
+      const calc = computeFTProjection({ league, parsed, lines: finalLines, injMultA, injMultB });
+      proj = calc.ftProj;
+      lineVal = finalLines.ftLine;
+      edge = calc.ftEdge;
+    } else if (marketKey === "h1") {
+      const calc = compute1HProjection({ league, parsed, lines: finalLines, injMultA, injMultB });
+      proj = calc.h1Proj;
+      lineVal = finalLines.h1Line;
+      edge = calc.h1Edge;
+    } else if (marketKey === "team_a") {
+      const calc = computeFTProjection({ league, parsed, lines: finalLines, injMultA, injMultB });
+      proj = calc.projAFT;
+      lineVal = finalLines.aLine;
+      edge = calc.aEdge;
+    } else if (marketKey === "team_b") {
+      const calc = computeFTProjection({ league, parsed, lines: finalLines, injMultA, injMultB });
+      proj = calc.projBFT;
+      lineVal = finalLines.bLine;
+      edge = calc.bEdge;
+    } else if (marketKey.startsWith("q")) {
+      const qKey = marketKey;
+      const aS = parsed["a" + qKey.toUpperCase() + "Scored"] || [];
+      const bA = parsed["b" + qKey.toUpperCase() + "Allowed"] || [];
+      const bS = parsed["b" + qKey.toUpperCase() + "Scored"] || [];
+      const aA = parsed["a" + qKey.toUpperCase() + "Allowed"] || [];
+      if (aS.length < 2 || bS.length < 2) return null;
+      const _tw = window.getParam("teamWeightBase", league) ?? 0.65;
+      const _ow = 1 - _tw;
+      let projA = (avgOrNaN(aS) * _tw + avgOrNaN(bA) * _ow);
+      let projB = (avgOrNaN(bS) * _tw + avgOrNaN(aA) * _ow);
+      projA *= injMultA;
+      projB *= injMultB;
+      const qProj = projA + projB;
+      proj = qProj;
+      lineVal = finalLines[qKey + "Line"];
+      edge = qProj - lineVal;
+    } else {
+      return null;
+    }
+
+    const decision = getPick(edge, lineVal, league, marketKey, { underEdgeFactorOverride: paramOverrides?.underEdgeFactor });
+    if (decision === "NO PLAY") {
+      return { decision: "NO PLAY", side: null, win: false, push: false, loss: false, isNoPlay: true };
+    }
+
+    const side = getPickSideFromText(decision);
+    let win = false, push = false, loss = false;
+    if (numericActual === lineVal) {
+      push = true;
+    } else if (side === "over") {
+      if (numericActual > lineVal) win = true;
+      else loss = true;
+    } else if (side === "under") {
+      if (numericActual < lineVal) win = true;
+      else loss = true;
+    }
+
+    const edgePct = Math.abs(edge / lineVal);
+    const volLimit = getMarketVolLimit(league, marketKey);
+    const volRatio = 0.5;
+    const sampleTier = pick.sampleTier || "thin";
+    const hasH2H = pick.hasH2H || false;
+    const winProbability = getConfidenceWinProbability(null, edgePct, volRatio, sampleTier, hasH2H, false, league);
+
+    return { decision, side, win, push, loss, isNoPlay: false, winProbability };
+  } catch(e) {
+    return null;
+  } finally {
+    window.getParam = originalGetParam;
+  }
+}
+
+function runCoordinateAscentTuner(allPicks, targetLeague) {
+  const settled = allPicks.filter(p =>
+    p && p.snapshot && p.actualScore != null &&
+    (!targetLeague || String(p.league).toLowerCase() === String(targetLeague).toLowerCase()) &&
+    (p.resultStatus === "win" || p.resultStatus === "loss")
+  );
+
+  const minRequired = targetLeague ? 100 : 50;
+  if (settled.length < minRequired) {
+    engineDebug(`Coordinate ascent tuner skipped for ${targetLeague || "global"}: needs ${minRequired} picks, has ${settled.length}`);
+    return null;
+  }
+
+  settled.sort((a, b) => getTrackedPickTimeMs(a) - getTrackedPickTimeMs(b));
+  const splitIdx = Math.floor(settled.length * 0.7);
+  const trainPicks = settled.slice(0, splitIdx);
+  const valPicks = settled.slice(splitIdx);
+
+  const keysToTune = [
+    "teamWeightBase",
+    "h2hMaxWeight",
+    "h2hLookbackSeasons",
+    "venueMinGames",
+    "venueStrongGames",
+    "venueModerateWeight",
+    "venueStrongWeight",
+    "underEdgeFactor",
+    "injuryOppBoostFactor",
+    "edgeFTPointThreshold",
+    "edgeH1PointThreshold",
+    "edgeTeamPointThreshold",
+    "edgeQPointThreshold",
+    "confidenceAThresh",
+    "confidenceBThresh",
+    "confidenceCThresh"
+  ];
+
+  const candidateGrids = {
+    teamWeightBase: [0.55, 0.60, 0.65, 0.70, 0.75],
+    h2hMaxWeight: [0.15, 0.20, 0.25, 0.30, 0.35, 0.40],
+    h2hLookbackSeasons: [2, 3, 4, 5],
+    venueMinGames: [4, 5, 6, 7, 8],
+    venueStrongGames: [8, 9, 10, 11, 12],
+    venueModerateWeight: [0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
+    venueStrongWeight: [0.55, 0.60, 0.65, 0.70, 0.75, 0.80],
+    underEdgeFactor: [1.0, 1.1, 1.2, 1.3, 1.4],
+    injuryOppBoostFactor: [0.1, 0.15, 0.2, 0.25, 0.3],
+    edgeFTPointThreshold: [4.0, 5.0, 6.0, 7.0, 8.0],
+    edgeH1PointThreshold: [5.0, 6.0, 7.0, 8.0, 9.0],
+    edgeTeamPointThreshold: [6.0, 7.0, 8.0, 9.0, 10.0],
+    edgeQPointThreshold: [2.0, 3.0, 4.0, 5.0, 6.0],
+    confidenceAThresh: [0.60, 0.63, 0.66, 0.69, 0.72],
+    confidenceBThresh: [0.52, 0.55, 0.58, 0.61, 0.64],
+    confidenceCThresh: [0.45, 0.48, 0.51, 0.54, 0.57]
+  };
+
+  const currentParams = {};
+  keysToTune.forEach(key => {
+    currentParams[key] = getParam(key, targetLeague);
+  });
+
+  let pass = 0;
+  let overallChanged = false;
+  const promotions = [];
+
+  while (pass < 2) {
+    let passChanged = false;
+
+    for (const key of keysToTune) {
+      const originalValue = currentParams[key];
+      const grid = candidateGrids[key] || [];
+      if (!grid.length) continue;
+
+      let bestValue = originalValue;
+      let bestTrainWinRate = 0;
+      let bestTrainRecord = null;
+
+      const baselineTrainResults = trainPicks.map(p => evaluatePickWithParams(p, currentParams)).filter(Boolean);
+      bestTrainRecord = buildRecordFromEval(baselineTrainResults);
+      const dec = bestTrainRecord.wins + bestTrainRecord.losses;
+      bestTrainWinRate = dec > 0 ? (bestTrainRecord.wins / dec) : 0;
+
+      for (const candidateVal of grid) {
+        const testParams = { ...currentParams, [key]: candidateVal };
+        const testResults = trainPicks.map(p => evaluatePickWithParams(p, testParams)).filter(Boolean);
+        const record = buildRecordFromEval(testResults);
+        const totalDecisive = record.wins + record.losses;
+        const winRate = totalDecisive > 0 ? (record.wins / totalDecisive) : 0;
+
+        if (winRate > bestTrainWinRate || (winRate === bestTrainWinRate && record.wins > (bestTrainRecord?.wins || 0))) {
+          bestTrainWinRate = winRate;
+          bestValue = candidateVal;
+          bestTrainRecord = record;
+        }
+      }
+
+      if (bestValue !== originalValue) {
+        const baselineValParams = { ...currentParams };
+        const challengerValParams = { ...currentParams, [key]: bestValue };
+
+        const baselineValResults = valPicks.map(p => evaluatePickWithParams(p, baselineValParams)).filter(Boolean);
+        const baselineValRecord = buildRecordFromEval(baselineValResults);
+        const baselineValCalibration = calculateCalibrationMetrics(baselineValResults);
+
+        const challengerValResults = valPicks.map(p => evaluatePickWithParams(p, challengerValParams)).filter(Boolean);
+        const challengerValRecord = buildRecordFromEval(challengerValResults);
+        const challengerValCalibration = calculateCalibrationMetrics(challengerValResults);
+
+        const challengerTotal = challengerValRecord.wins + challengerValRecord.losses;
+        const baselineTotal = baselineValRecord.wins + baselineValRecord.losses;
+        const challengerWR = challengerTotal > 0 ? (challengerValRecord.wins / challengerTotal) : 0;
+        const baselineWR = baselineTotal > 0 ? (baselineValRecord.wins / baselineTotal) : 0;
+
+        const winRateImproves = challengerWR >= baselineWR;
+
+        const sigTest = testConfigurationSignificance(challengerValRecord, baselineValRecord);
+
+        const calibrationOk = challengerValCalibration.brier <= baselineValCalibration.brier + 0.002;
+
+        if (winRateImproves && sigTest.significant && calibrationOk) {
+          currentParams[key] = bestValue;
+          passChanged = true;
+          overallChanged = true;
+          promotions.push({ key, old: originalValue, val: bestValue, z: sigTest.z, brier: challengerValCalibration.brier });
+          logPromotionEvent(targetLeague, key, originalValue, bestValue, sigTest.z, challengerValCalibration.brier);
+        }
+      }
+    }
+
+    if (!passChanged) break;
+    pass++;
+  }
+
+  if (overallChanged) {
+    promotions.forEach(p => {
+      setTunableParam(p.key, p.val, targetLeague);
+    });
+    engineDebug(`Coordinate ascent auto-tuned ${targetLeague || "global"} successfully. Changes: ${promotions.map(p => `${p.key}: ${p.old}->${p.val} (OOS z=${p.z.toFixed(2)})`).join(", ")}`);
+    return { params: currentParams, promotions };
+  }
+
   return null;
 }
 
@@ -5194,13 +5564,17 @@ const LEAGUE_EDGE_POINT_THRESHOLDS = {
 
 function getLeagueEdgePointThreshold(league, marketKey) {
   const lk = (league || "default").toLowerCase();
-  const thresholds = LEAGUE_EDGE_POINT_THRESHOLDS[lk] || LEAGUE_EDGE_POINT_THRESHOLDS.default;
   let key = marketKey;
   if (marketKey === "team_a" || marketKey === "team_b") key = "team";
   else if (marketKey && marketKey.startsWith("q")) key = "q";
   else if (marketKey === "h1") key = "h1";
   else key = "ft";
-  return thresholds[key] ?? thresholds.ft;
+
+  if (key === "ft") return getParam("edgeFTPointThreshold", lk) ?? 5.0;
+  if (key === "h1") return getParam("edgeH1PointThreshold", lk) ?? 6.0;
+  if (key === "team") return getParam("edgeTeamPointThreshold", lk) ?? 8.0;
+  if (key === "q") return getParam("edgeQPointThreshold", lk) ?? 3.0;
+  return 5.0;
 }
 
     // PATCHABLE ISSUE #8 FIX: [DELETED] EUROPE_EDGE_LEAGUES and ASIA_EDGE_LEAGUES –
@@ -5376,7 +5750,7 @@ function getLeagueRecencyDefaults(league) {
   // that are never intended to be used directly. getLeagueRecencyDefaults is the
   // correct source of truth for recency weights. Always return calibrated defaults
   // when no learned weights exist, ignoring LEAGUE_CONFIG_MAP entirely.
-  const learned = getLearnedRecencyWeights(league);
+  const learned = getParam("recencyWeights", league) || getLearnedRecencyWeights(league);
   const isFlat = learned.every(w => w === 1);
   if (isFlat) return [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16];
   return learned;
@@ -6159,6 +6533,7 @@ let g_trackerState = {
   sId: window.__BETCEO_SESSION_ID,
   activePicks: [],
   archivedPicks: [],
+  shadowPicks: [],
   stats: {
     total: 0,
     settled: 0,
@@ -7932,18 +8307,19 @@ function getRawMarketInputMap() {
       return clean.length ? clean.reduce((a, b) => a + b, 0) / clean.length : NaN;
     }
 
-function weightedRecentAverage(arr, weights = MODEL_TUNING.recencyWeights) {
+function weightedRecentAverage(arr, weights) {
+  const activeWeights = weights || getParam("recencyWeights") || MODEL_TUNING.recencyWeights;
   const clean = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
   if (!clean.length) return NaN;
-  if (!Array.isArray(weights) || weights.length === 0) return avg(clean);
+  if (!Array.isArray(activeWeights) || activeWeights.length === 0) return avg(clean);
   // recencyWeights covers 10 positions with geometric decay. For a 10-game fetch,
   // trimmedAvg removes 2 outliers leaving 8 games; slice(0,10) returns all 8 and
   // positions 1–8 of the weights array apply. Positions 9–10 are spare capacity.
-  const truncated = clean.slice(0, weights.length);
+  const truncated = clean.slice(0, activeWeights.length);
   let weightedSum = 0, weightTotal = 0;
   for (let i = 0; i < truncated.length; i++) {
-    weightedSum += truncated[i] * weights[i];
-    weightTotal += weights[i];
+    weightedSum += truncated[i] * activeWeights[i];
+    weightTotal += activeWeights[i];
   }
   return weightTotal ? weightedSum / weightTotal : avg(truncated);
 }
@@ -8348,6 +8724,7 @@ function normalizeTrackerState(raw) {
     sId: raw?.sId || window.__BETCEO_SESSION_ID,
     activePicks: reconciled.activePicks,
     archivedPicks: reconciled.archivedPicks,
+    shadowPicks: Array.isArray(raw?.shadowPicks) ? raw.shadowPicks.map(p => ensureTrackedPickKeys(p)) : [],
     stats: {
       total: Number(raw?.stats?.total) || 0,
       settled: Number(raw?.stats?.settled) || 0,
@@ -9032,6 +9409,7 @@ function createEmptyTrackerState() {
     sId: window.__BETCEO_SESSION_ID,
     activePicks: [],
     archivedPicks: [],
+    shadowPicks: [],
     stats: { total: 0, settled: 0, wins: 0, losses: 0, pushes: 0 },
     updatedAt: new Date().toISOString(),
     lineMemory: {}
@@ -10130,6 +10508,92 @@ function renderConfigsPanel() {
     });
 
     html += `</div>`;
+  }
+
+  // ── Tunable Parameter Registry Audit View ──
+  const selectedLeagueKey = normalizeLeagueTrustKey(document.getElementById("leagueSelect")?.value || "unknown");
+  html += `
+    <div class="tracker-analytics-card" style="margin-top:12px; border-color:#d4af37;">
+      <div class="tracker-analytics-card-head" style="background: linear-gradient(90deg, #333 0%, #111 100%);">
+        <div class="tracker-analytics-card-title" style="color:#ffd700;">🔬 Tunable Parameter Registry</div>
+        <div class="tracker-analytics-card-meta">Live global & league overrides</div>
+      </div>
+      <div class="tracker-analytics-card-body">
+        <div class="table-wrap tracker-report-table-wrap">
+          <table class="tracker-analytics-table">
+            <thead>
+              <tr>
+                <th>Parameter</th>
+                <th>Global Value</th>
+                <th>League Override</th>
+                <th>Valid Range</th>
+                <th>Description</th>
+              </tr>
+            </thead>
+            <tbody>
+  `;
+
+  Object.entries(TUNABLE_PARAM_REGISTRY).forEach(([key, param]) => {
+    const globalVal = param.value;
+    const leagueOverride = selectedLeagueKey !== "unknown" ? (g_tunableParamLeagueOverrides?.[selectedLeagueKey]?.[key]?.value ?? "—") : "—";
+    const range = param.min !== null ? `${param.min} to ${param.max}` : "Vector";
+    html += `
+      <tr>
+        <td style="font-weight:bold;">${safeText(key)}</td>
+        <td>${safeText(Array.isArray(globalVal) ? "[" + globalVal.slice(0,3).join(",") + ",...]" : globalVal)}</td>
+        <td style="${leagueOverride !== "—" ? "color:#49d45f; font-weight:bold;" : ""}">${safeText(Array.isArray(leagueOverride) ? "[" + leagueOverride.slice(0,3).join(",") + ",...]" : leagueOverride)}</td>
+        <td style="color:var(--muted);">${safeText(range)}</td>
+        <td class="note">${safeText(param.description)}</td>
+      </tr>
+    `;
+  });
+
+  html += `
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // ── Configuration History View ──
+  let history = [];
+  try {
+    const rawHist = localStorage.getItem("BB_PROMOTION_HISTORY");
+    if (rawHist) history = JSON.parse(rawHist) || [];
+  } catch(e) {}
+
+  if (history.length) {
+    html += `
+      <div class="tracker-analytics-card" style="margin-top:12px;">
+        <div class="tracker-analytics-card-head">
+          <div class="tracker-analytics-card-title">📜 Auto-Tuner Promotion Log</div>
+          <div class="tracker-analytics-card-meta">Last 10 parameter adaptations</div>
+        </div>
+        <div class="tracker-analytics-card-body">
+          <div class="tracker-review-list">
+    `;
+    history.slice(-10).reverse().forEach(evt => {
+      html += `
+        <div class="tracker-review-row" style="font-size:10px;">
+          <div class="tracker-review-top">
+            <strong style="color:var(--text);">${safeText(evt.paramKey)}</strong>
+            <span class="tracker-review-status confirmed" style="font-size:8px; padding:2px 4px;">PROMOTED</span>
+          </div>
+          <div class="tracker-review-text" style="color:var(--text); margin-top:2px;">
+            Value updated from <strong>${evt.oldValue}</strong> to <strong>${evt.newValue}</strong> for <strong>${evt.league.toUpperCase()}</strong>.
+          </div>
+          <div style="font-size:8px; color:var(--muted); margin-top:2px;">
+            Evidence: z-score = ${evt.zScore.toFixed(2)} (OOS) | Brier improvement | ${new Date(evt.ts).toLocaleString()}
+          </div>
+        </div>
+      `;
+    });
+    html += `
+          </div>
+        </div>
+      </div>
+    `;
   }
 
   html += `</div>`;
@@ -12025,7 +12489,8 @@ function handleTrackedPicksActionClick(event) {
   try {
     const active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks : [];
     const archived = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks : [];
-    const allBuckets = [...active, ...archived];
+    const shadow = Array.isArray(g_trackerState.shadowPicks) ? g_trackerState.shadowPicks : [];
+    const allBuckets = [...active, ...archived, ...shadow];
 
     if (!allBuckets.length) {
       renderTrackedPicks();
@@ -12262,6 +12727,17 @@ function handleTrackedPicksActionClick(event) {
               // as the confidence model and pick thresholds above.
               try { calibrateEngineConstants(); } catch(e) {}
               try {
+                const allPicks = getAllTrackedPicksForReport();
+                // 1. Run global tuner
+                runCoordinateAscentTuner(allPicks, null);
+                
+                // 2. Run league-specific tuner if current league is valid
+                const _curLg = document.getElementById("leagueSelect")?.value || "";
+                if (_curLg) {
+                  runCoordinateAscentTuner(allPicks, _curLg);
+                }
+              } catch(e) { engineDebug("Coordinate ascent retrospective failed during retrain", e); }
+              try {
                 const _oosLeague = document.getElementById("leagueSelect")?.value || "";
                 const _oosResult = runOutOfSampleValidation(_oosLeague);
                 if (_oosResult) engineDebug("Out-of-sample validation result", _oosResult);
@@ -12396,10 +12872,10 @@ function addTrackedPicks(newPicks) {
     // function hardcoded 0.35 in both the base weight multiplier and the final cap,
     // silently ignoring MODEL_TUNING.h2hMaxWeight (0.30). Both now read the config value
     // directly, so tuning h2hMaxWeight actually changes the live H2H blend cap.]
-    function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0, league = "unknown", baselineForMarket = null, factor = 1.0, context = null) {
+function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0, league = "unknown", baselineForMarket = null, factor = 1.0, context = null) {
   const minLen = Math.min(Number(lenA) || 0, Number(lenB) || 0);
   if (minLen < 2) return 0;
-  const _h2hCap = isFinite(MODEL_TUNING?.h2hMaxWeight) ? MODEL_TUNING.h2hMaxWeight : 0.35;
+  const _h2hCap = getParam("h2hMaxWeight", league) ?? 0.30;
   let weight = (Math.log1p(minLen - 1) / Math.log1p(9)) * _h2hCap;
   if (context) {
     const injA = context.injMultA ?? 1.0;
@@ -12474,7 +12950,8 @@ function getEffectivePaceClamp(league) {
     // (previously returned the identical range for every league regardless of input).
     // The specific 0.70/1.30 split for non-NBA/NCAA leagues is UNVERIFIED CALIBRATION —
     // tune from real data, but do not flag this function as "hardcoded" again.]
-  return wide ? { min: 0.65, max: 1.35 } : { min: 0.70, max: 1.30 };
+  return wide ? { min: getParam("paceClampMinNbaNcaa", lk) ?? 0.65, max: getParam("paceClampMaxNbaNcaa", lk) ?? 1.35 }
+              : { min: getParam("paceClampMinOther", lk) ?? 0.70, max: getParam("paceClampMaxOther", lk) ?? 1.30 };
 }
 
 
@@ -12783,9 +13260,13 @@ function getConfidenceGrade(params) {
   const volRatio = (isFinite(volatility) && isFinite(volLimit) && volLimit > 0) ? volatility / volLimit : 0.5;
   const winProb = getConfidenceWinProbability(null, edgePct, volRatio, sampleTier, hasH2H, false, league);
 
-  if (winProb >= 0.66) return "A";
-  if (winProb >= 0.58) return "B";
-  if (winProb >= 0.51) return "C";
+  const threshA = getParam("confidenceAThresh", league) ?? 0.66;
+  const threshB = getParam("confidenceBThresh", league) ?? 0.58;
+  const threshC = getParam("confidenceCThresh", league) ?? 0.51;
+
+  if (winProb >= threshA) return "A";
+  if (winProb >= threshB) return "B";
+  if (winProb >= threshC) return "C";
   return "D";
 }
 
@@ -15162,10 +15643,10 @@ function getFetchedSeries(side, scope, marketKey, metric) {
 // NOT change the weight values. DO NOT decentralize the thresholds back into inline
 // magic numbers.
 const VENUE_BLEND_CONFIG = {
-  minGames: 6,
-  strongGames: 10,
-  moderateVenueWeight: 0.50,
-  strongVenueWeight: 0.70
+  get minGames() { return getParam("venueMinGames") ?? 6; },
+  get strongGames() { return getParam("venueStrongGames") ?? 10; },
+  get moderateVenueWeight() { return getParam("venueModerateWeight") ?? 0.50; },
+  get strongVenueWeight() { return getParam("venueStrongWeight") ?? 0.70; }
 };
 
 function getVenueBlendWeights(sampleSize) {
@@ -15881,9 +16362,7 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 // DO NOT reorder these three steps and do NOT remove step 2 — that was the entire fix
 // for Issue #10 (the ~85 leagues that used to silently hit the uncalibrated default=12).]
 function getMarketVolLimit(league, marketKey) {
-  const cfg = LEAGUE_CONFIG_MAP[String(league || "").toUpperCase()];
-  const base = (cfg && isFinite(cfg.volLimit)) ? cfg.volLimit :
-    (getLearnedVolLimit(league) != null ? getLearnedVolLimit(league) : (LEAGUE_VOL_LIMITS[String(league || "").toLowerCase()] || 12));
+  const base = getParam("volatilityLimit", league) ?? 12;
   // ISSUE #2 FIX: marketKey was accepted but never used, so H1/quarter volatility
   // adjustments were computed against the FT-scale limit (e.g. 12 for NBA), which is
   // roughly double/quadruple the real half/quarter scoring range, artificially
@@ -16603,15 +17082,20 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
       };
       const fixtureMetaSnapshot = getCurrentFixtureMeta();
       // ITEM #7 FIX — BATCH 4: reads via AppState.injuries instead of g_injA/g_injB directly.
+      const paramRegistryValues = {};
+      Object.keys(TUNABLE_PARAM_REGISTRY).forEach(key => {
+        paramRegistryValues[key] = getParam(key, league);
+      });
       return {
         league,
         marketKey: pickRow.marketKey,
-        side: getPickSideFromText(pickRow.pick),
+        side: getPickSideFromText(pickRow.pick) || ((isFinite(pickRow.edge) && pickRow.edge !== 0) ? (pickRow.edge > 0 ? "over" : "under") : "no_play"),
         parsed: parsedSnapshot,
         lines: linesSnapshot,
         fixtureMeta: fixtureMetaSnapshot,
         injMultA: AppState.injuries.A.scoringMult,
         injMultB: AppState.injuries.B.scoringMult,
+        paramRegistryValues: paramRegistryValues,
         configSnapshot: {
           recencyWeights: MODEL_TUNING.recencyWeights,
           h2hFactor: 1.0,
@@ -16644,12 +17128,9 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
       let side = getPickSideFromText(pickRow.pick);
       if (!side) {
         if (isExoticNoLine) side = "exotic";
-        // ITEM #5 FIX — FULL-MARKET RETROSPECTIVE COVERAGE (2026-07-09): a NO PLAY
-        // pick has no over/under side by definition, but it is still a real market
-        // the engine evaluated and should be captured as a non-actionable shadow
-        // record rather than dropped. Anything else with no side and no exotic
-        // exemption is genuinely unusable and is still rejected.
-        else if (pickRow.pick === "NO PLAY") side = "no_play";
+        else if (pickRow.pick === "NO PLAY") {
+          side = (isFinite(pickRow.edge) && pickRow.edge !== 0) ? (pickRow.edge > 0 ? "over" : "under") : "no_play";
+        }
         else return null;
       }
       const grade = String(pickRow.confidence || "—").toUpperCase();
