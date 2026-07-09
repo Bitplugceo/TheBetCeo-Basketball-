@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4592,7 +4593,12 @@ function initLeagueOverridesFromDefaults() {
 // back to the original 0.2 default when no calibrated value has been locked in yet.
 // Declared `let` (not `const`) so calibrateEngineConstants() can update it in place
 // once enough settled picks confirm a better value.
-let INJURY_OPPONENT_BOOST_FACTOR = getTunableConstant("INJURY_OPPONENT_BOOST_FACTOR", 0.2);
+// ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION (2026-07-09): registry value
+// (injuryOppBoostFactor) now takes priority over the old learned-constants store,
+// since the registry is the gated, sqrt-scaled-significance-tested source of truth
+// going forward. Falls back to getTunableConstant's value, then the hardcoded 0.2
+// default, only if the registry entry itself is somehow missing.
+let INJURY_OPPONENT_BOOST_FACTOR = getParam("injuryOppBoostFactor") ?? getTunableConstant("INJURY_OPPONENT_BOOST_FACTOR", 0.2);
 
 // ========== RETROSPECTIVE TUNING GRID ==========
 // Issue 13: Reduced to 2 H2H factors × 3 recency profiles. edgeMult/injuryMult removed.
@@ -4747,10 +4753,25 @@ function calibrateEngineConstants() {
 
   ["INJURY_OPPONENT_BOOST_FACTOR", "UNDER_EDGE_FACTOR"].forEach(constantName => {
     const best = selectBestConstantValue(constantName, 15);
-    if (best && best.netDelta > 2) {
+    // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION, STEP 9 (2026-07-09): replaced
+    // the bare "netDelta > 2" promotion gate with a sample-size-adjusted significance
+    // check. Each tested pick contributes -1/0/+1 to netDelta (see
+    // updateConstantCandidateScore), so under a null hypothesis of "this candidate
+    // is no better than the current default," netDelta behaves like a sum of
+    // roughly-independent -1/0/+1 draws with variance ~2/3 per draw. Requiring
+    // |netDelta| > 2*sqrt(count) approximates a ~95% one-sided z-test on that sum,
+    // replacing the old constant threshold that treated "netDelta=3 over 15 picks"
+    // and "netDelta=3 over 150 picks" as equally convincing. UNVERIFIED CALIBRATION:
+    // the 2x multiplier is a reasoned approximation, not independently re-derived —
+    // tune it once enough real promotions have been logged to check it against.
+    const isSignificant = best && isFinite(best.netDelta) && isFinite(best.count) && best.count > 0
+      && Math.abs(best.netDelta) > 2 * Math.sqrt(best.count);
+    if (best && isSignificant) {
       setTunableConstant(constantName, best.value, best.netDelta, best.count);
-      INJURY_OPPONENT_BOOST_FACTOR = getTunableConstant("INJURY_OPPONENT_BOOST_FACTOR", INJURY_OPPONENT_BOOST_FACTOR);
-      UNDER_EDGE_FACTOR = getTunableConstant("UNDER_EDGE_FACTOR", UNDER_EDGE_FACTOR);
+      const _paramKey = constantName === "INJURY_OPPONENT_BOOST_FACTOR" ? "injuryOppBoostFactor" : "underEdgeFactor";
+      setTunableParam(_paramKey, best.value, null, new Date().toISOString());
+      INJURY_OPPONENT_BOOST_FACTOR = getParam("injuryOppBoostFactor") ?? getTunableConstant("INJURY_OPPONENT_BOOST_FACTOR", INJURY_OPPONENT_BOOST_FACTOR);
+      UNDER_EDGE_FACTOR = getParam("underEdgeFactor") ?? getTunableConstant("UNDER_EDGE_FACTOR", UNDER_EDGE_FACTOR);
       engineDebug("Engine constant recalibrated", { constantName, newValue: best.value, netDelta: best.netDelta, sampleCount: best.count });
     }
   });
@@ -5282,12 +5303,24 @@ if (aS.length < 2 || bS.length < 2) continue;
       }
     }
   // After processing, check if we have enough settled picks to lock a config
+  // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION, STEP 6/8/9 (2026-07-09): raised
+  // the lock-readiness bar to match the OOS-gated coordinate-ascent tuner's own
+  // minimums (50 global / 100 league, see runCoordinateAscentTuner) instead of the
+  // much lower 20/8 bar this path used on its own — this path has no train/val split
+  // of its own, so it needs a larger total sample before promoting anything to
+  // compensate for not holding out a validation set. Also replaced the bare
+  // "netDelta > 1.5" gate with the same sample-size-adjusted significance check used
+  // in calibrateEngineConstants (|netDelta| > 2*sqrt(sampleCount), a ~95%
+  // z-test-style approximation), so this ungated legacy path can no longer promote
+  // a config off a handful of lucky picks the way it previously could.
   const _mktPicks = getTotalSettledCountForLeagueMarket(league, marketKey);
   const _lgPicks  = getTotalSettledCountForLeague(league);
-  const _lockReady = _mktPicks >= 20 || (_lgPicks >= 40 && _mktPicks >= 8);
+  const _lockReady = _mktPicks >= 100 || (_lgPicks >= 50 && _mktPicks >= 20);
   if (_lockReady) {
     const best = selectBestConfig(league, marketKey);
-    if (best && best.netDelta > 1.5) {
+    const _bestIsSignificant = best && isFinite(best.netDelta) && isFinite(best.sampleCount) && best.sampleCount > 0
+      && Math.abs(best.netDelta) > 2 * Math.sqrt(best.sampleCount);
+    if (best && _bestIsSignificant) {
       storeVerifiedConfig(league, marketKey, best.configKey, best.netDelta, best.sampleCount);
     }
   }
@@ -10588,6 +10621,7 @@ function renderConfigsPanel() {
                 <th>Global Value</th>
                 <th>League Override</th>
                 <th>Valid Range</th>
+                <th>Last Challenged</th>
                 <th>Description</th>
               </tr>
             </thead>
@@ -10598,12 +10632,21 @@ function renderConfigsPanel() {
     const globalVal = param.value;
     const leagueOverride = selectedLeagueKey !== "unknown" ? (g_tunableParamLeagueOverrides?.[selectedLeagueKey]?.[key]?.value ?? "—") : "—";
     const range = param.min !== null ? `${param.min} to ${param.max}` : "Vector";
+    // ITEM #6 FIX — PARAMETER REGISTRY, STEP 13 (2026-07-09): surfaces lastVerifiedAt
+    // (already tracked by setTunableParam/setTunableConstant on every promotion) as a
+    // "Last Challenged" column, closing the remaining gap in the audit view —
+    // previously this timestamp was stored but never displayed here.
+    const leagueVerifiedAt = selectedLeagueKey !== "unknown" ? g_tunableParamLeagueOverrides?.[selectedLeagueKey]?.[key]?.lastVerifiedAt : null;
+    const lastChallenged = leagueVerifiedAt || param.lastVerifiedAt
+      ? new Date(leagueVerifiedAt || param.lastVerifiedAt).toLocaleDateString()
+      : "Never";
     html += `
       <tr>
         <td style="font-weight:bold;">${safeText(key)}</td>
         <td>${safeText(Array.isArray(globalVal) ? "[" + globalVal.slice(0,3).join(",") + ",...]" : globalVal)}</td>
         <td style="${leagueOverride !== "—" ? "color:#49d45f; font-weight:bold;" : ""}">${safeText(Array.isArray(leagueOverride) ? "[" + leagueOverride.slice(0,3).join(",") + ",...]" : leagueOverride)}</td>
         <td style="color:var(--muted);">${safeText(range)}</td>
+        <td style="color:var(--muted);">${safeText(lastChallenged)}</td>
         <td class="note">${safeText(param.description)}</td>
       </tr>
     `;
@@ -13113,7 +13156,12 @@ function probTeamOverThreshold(teamScores, threshold) {
 // back to the original 1.2 default when no calibrated value has been locked in yet.
 // Declared `let` (not `const`) so calibrateEngineConstants() can update it in place
 // once enough settled picks confirm a better value.
-let UNDER_EDGE_FACTOR = getTunableConstant("UNDER_EDGE_FACTOR", 1.2);
+// ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION (2026-07-09): registry value
+// (underEdgeFactor) now takes priority over the old learned-constants store, since
+// the registry is the gated, sqrt-scaled-significance-tested source of truth going
+// forward. Falls back to getTunableConstant's value, then the hardcoded 1.2 default,
+// only if the registry entry itself is somehow missing.
+let UNDER_EDGE_FACTOR = getParam("underEdgeFactor") ?? getTunableConstant("UNDER_EDGE_FACTOR", 1.2);
 
 function getPick(edge, line, league, marketKey, context = {}) {
   if (!line || isNaN(edge) || isNaN(line) || line <= 0) return "NO PLAY";
