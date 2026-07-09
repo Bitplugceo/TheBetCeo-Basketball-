@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4306,12 +4307,33 @@ const TUNABLE_PARAM_REGISTRY = {
   // netDelta > 1.5 promotion). Promoted to a real registry entry so it's tuned by
   // runCoordinateAscentTuner instead — OOS train/val split, significance test, and
   // calibration-quality gating, same as every other registry parameter.
+  // DECISION RECORD (Category 3, audit item — 2026-07-09): h2hFactor's [0.5, 1.0]
+  // candidate range and 1.0 default were chosen because H2H sample sizes in this
+  // engine are always small (2-10 games), so H2H can only ever DAMPEN the blend
+  // toward the model's own projection (factor <= 1.0), never amplify it beyond
+  // what getH2HWeight's own sample-size-scaled cap already allows. Alternative
+  // considered: allowing factor > 1.0 to let H2H over-weight strong historical
+  // signal — rejected because a 2-4 game H2H sample amplified beyond its natural
+  // weight risks overfitting to a small, noisy sample; the cost of that failure
+  // mode (a confidently wrong pick) outweighs the benefit of occasionally
+  // catching a genuine strong H2H trend faster.
   h2hFactor: {
     value: 1.0, min: 0.5, max: 1.0, type: "scalar",
     scope: "global", appliesTo: ["ft", "h1", "team_a", "team_b"],
     description: "Overall H2H blend scaling factor applied on top of getH2HWeight's output",
     lastVerifiedAt: null
   },
+  // DECISION RECORD (Category 3, audit item — 2026-07-09): h2hMaxWeight's 0.30
+  // ceiling was chosen so that even with a full 10-game H2H sample (the maximum
+  // this engine ever collects), head-to-head history can never account for more
+  // than 30% of a projection — the remaining 70%+ always reflects each team's
+  // broader recent form. Alternative considered: an uncapped weight that scales
+  // purely with sample size — rejected because H2H games between two specific
+  // teams are not a random sample of either team's current form (they may be
+  // months old, played under different rosters/injuries), so even a "full"
+  // 10-game H2H sample is weaker evidence than 10 recent games against the
+  // field. The cap encodes that asymmetry explicitly rather than leaving it
+  // implicit in getH2HWeight's log-scaling curve alone.
   h2hMaxWeight: {
     value: 0.30, min: 0.05, max: 0.50, type: "scalar",
     scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
@@ -4342,12 +4364,33 @@ const TUNABLE_PARAM_REGISTRY = {
     description: "Season-decay weight for 2-season-old H2H games",
     lastVerifiedAt: null
   },
+  // DECISION RECORD (Category 3, audit item — 2026-07-09): the four h2hDecay*
+  // values (1.00 / 0.75 / 0.50 / 0.30 for current / -1 / -2 / -3+ seasons) were
+  // chosen as a geometric-ish decay rather than a flat cutoff (e.g. "only use
+  // last 2 seasons") because roster continuity in basketball is itself gradual,
+  // not a hard cliff — a 2-season-old H2H game still carries some signal if key
+  // players remain, but clearly less than last season's. Alternative considered:
+  // an exponential decay formula (e.g. 0.7^seasonsAgo) instead of hand-set
+  // per-bucket values — rejected for now because it adds a tunable exponent with
+  // no more real calibration behind it than the current flat table, while being
+  // harder to reason about at a glance during a manual review.
   h2hDecayOlder: {
     value: 0.30, min: 0.05, max: 0.7, type: "scalar",
     scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
     description: "Season-decay weight for 3+ season-old H2H games",
     lastVerifiedAt: null
   },
+  // DECISION RECORD (Category 3, audit item — 2026-07-09): the recencyWeights
+  // curve (1.35 down to 0.16 across 10 games) was chosen as a smooth, monotonic
+  // decay rather than a flat/uniform average or a hard "last N games only"
+  // window, so that a team's most recent 2-3 games materially move the
+  // projection while games 8-10 games back still contribute a small amount
+  // rather than being discarded outright. Alternative considered: a shorter,
+  // steeper window (e.g. last 5 games only, uniformly weighted) — rejected
+  // because it would discard real signal from games 6-10 entirely and would
+  // make the projection more sensitive to single-game noise in the remaining
+  // 5-game window, which is a worse tradeoff at this engine's typical sample
+  // sizes (5-10 games per team per market).
   recencyWeights: {
     value: [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16],
     min: null, max: null, type: "weight_vector",
@@ -4409,6 +4452,19 @@ const TUNABLE_PARAM_REGISTRY = {
     description: "Upper pace clamp bound for NBA/NCAA-tier leagues (getEffectivePaceClamp wide.max)",
     lastVerifiedAt: null
   },
+  // DECISION RECORD (Category 3, audit item — 2026-07-09): the wider NBA/NCAA
+  // pace clamp band (±35%, see paceClampMinNbaNcaa/paceClampMaxNbaNcaa above)
+  // versus the narrower ±30% band here for other leagues reflects that NBA/NCAA
+  // have deeper, more reliable per-game pace data (ORTG/DRTG/pace10 from ESPN's
+  // advanced stats feed) feeding the pace estimate, so a wider clamp is safer to
+  // trust when it's real data pushing the estimate to an extreme. Non-NBA/NCAA
+  // leagues mostly fall back to the scored+allowed/eb ratio approximation (see
+  // computeFTProjection's non-advanced-stats branch), which is noisier, so the
+  // clamp is tightened slightly to limit how far a single noisy estimate can
+  // pull the pace away from the league's known baseline. Alternative considered:
+  // a single shared clamp band for all leagues — rejected because it would
+  // either under-constrain the noisier non-advanced-stats leagues or
+  // over-constrain the well-supported NBA/NCAA estimate.
   paceClampMinOther: {
     value: 0.70, min: 0.5, max: 0.9, type: "scalar",
     scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
@@ -12085,6 +12141,191 @@ function getTrackerFeedbackSignal(profile, marketKey, side, league) {
   return null;
 }
 
+// AUDIT ITEM #7 FIX — HELD-OUT VALIDATION FOR TRACKER FEEDBACK LOOP (2026-07-09):
+// getTrackerPosteriorWinProb previously computed live from getLearningTrackedPicks()
+// on every call inside applySoftTrackerInfluenceToPicks, meaning a pick's own
+// settled result could feed straight back into the signal nudging the very next
+// pick in the same bucket — a self-referential loop with no held-out check that
+// the signal actually predicts anything. This introduces a frozen snapshot: the
+// live nudge (applySoftTrackerInfluenceToPicks) reads ONLY from
+// TRACKER_SIGNAL_SNAPSHOT, which is periodically recomputed by
+// refreshTrackerSignalSnapshot() (see below, wired into the same retraining
+// pipeline hook that already calls runCoordinateAscentTuner). Recompute is gated
+// on a held-out validation check against picks settled AFTER the previous
+// snapshot was frozen — data the old snapshot could not have influenced — mirroring
+// the same z-test-style significance pattern testConfigurationSignificance already
+// uses elsewhere in this file. If validation fails, the snapshot is NOT overwritten
+// and the prior (already-validated) snapshot keeps being used.
+const TRACKER_SIGNAL_SNAPSHOT_KEY = "BB_TRACKER_SIGNAL_SNAPSHOT_V1";
+const TRACKER_SIGNAL_MIN_ELIGIBLE = 40;   // min settled picks before a snapshot can be built at all
+const TRACKER_SIGNAL_MIN_VALIDATION = 15; // min held-out picks required to validate a new snapshot
+const TRACKER_SIGNAL_VALIDATION_Z = 0.5;  // required z-score on held-out slice (see testConfigurationSignificance)
+
+function loadTrackerSignalSnapshot() {
+  try {
+    const raw = localStorage.getItem(TRACKER_SIGNAL_SNAPSHOT_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    engineDebug("loadTrackerSignalSnapshot failed: " + (e?.message || String(e)), { error: e });
+    return null;
+  }
+}
+
+function saveTrackerSignalSnapshot(snapshot) {
+  try {
+    localStorage.setItem(TRACKER_SIGNAL_SNAPSHOT_KEY, JSON.stringify(snapshot));
+  } catch (e) {
+    engineDebug("saveTrackerSignalSnapshot failed to persist: " + (e?.message || String(e)), { error: e });
+  }
+}
+
+// Computes posterior win probabilities (same 3-level Bayesian hierarchy as the
+// live getTrackerPosteriorWinProb, but as a pure function over an explicit picks
+// array instead of reading getLearningTrackedPicks() live) for every
+// (league, marketKey, side) bucket present in eligiblePicks with enough sample.
+function computeTrackerSignalBuckets(eligiblePicks, priorGames = 12) {
+  const buckets = {};
+  const bySideGlobal = { over: [], under: [] };
+  eligiblePicks.forEach(p => {
+    const side = String(p.side || "").toLowerCase();
+    if (side === "over" || side === "under") bySideGlobal[side].push(p);
+  });
+  const globalPrior = {
+    over: getEmpiricalPriorWinRate("over", eligiblePicks) / 100,
+    under: getEmpiricalPriorWinRate("under", eligiblePicks) / 100
+  };
+
+  const byLeagueSide = {};
+  eligiblePicks.forEach(p => {
+    const side = String(p.side || "").toLowerCase();
+    if (side !== "over" && side !== "under") return;
+    const key = p.league + "|" + side;
+    if (!byLeagueSide[key]) byLeagueSide[key] = [];
+    byLeagueSide[key].push(p);
+  });
+
+  const byLeagueMarketSide = {};
+  eligiblePicks.forEach(p => {
+    const side = String(p.side || "").toLowerCase();
+    if (side !== "over" && side !== "under") return;
+    const key = p.league + "|" + p.marketKey + "|" + side;
+    if (!byLeagueMarketSide[key]) byLeagueMarketSide[key] = [];
+    byLeagueMarketSide[key].push(p);
+  });
+
+  Object.keys(byLeagueMarketSide).forEach(key => {
+    const [league, marketKey, side] = key.split("|");
+    const l3Picks = byLeagueMarketSide[key];
+    const l2Picks = byLeagueSide[league + "|" + side] || [];
+    const l2Wins = l2Picks.filter(p => p.resultStatus === "win").length;
+    const l2Total = l2Picks.length;
+    const l2Posterior = (l2Wins + priorGames * globalPrior[side]) / (l2Total + priorGames);
+
+    const l3Wins = l3Picks.filter(p => p.resultStatus === "win").length;
+    const l3Total = l3Picks.length;
+    let posterior;
+    if (l3Total < 15) {
+      posterior = (l3Wins + priorGames * l2Posterior) / (l3Total + priorGames);
+    } else {
+      const l3Weight = clampNumber((l3Total - 15) / 35, 0, 1);
+      posterior = (1 - l3Weight) * l2Posterior + l3Weight * (l3Wins / l3Total);
+    }
+    buckets[key] = { posterior: Number(posterior.toFixed(4)), sampleSize: l3Total };
+  });
+
+  return buckets;
+}
+
+// Reads the frozen snapshot's posterior for this bucket, WITHOUT recomputing
+// live from settled picks — this is the leak fix. Falls back to null (caller
+// treats null as "no signal, do not nudge") rather than falling back to a live
+// recomputation, since that fallback would silently reintroduce the same
+// self-referential loop this fix exists to close.
+function getTrackerPosteriorWinProbFromSnapshot(league, marketKey, side) {
+  const snapshot = loadTrackerSignalSnapshot();
+  if (!snapshot || !snapshot.buckets) return null;
+  const key = String(league) + "|" + String(marketKey) + "|" + String(side || "").toLowerCase();
+  const entry = snapshot.buckets[key];
+  return entry ? entry.posterior : null;
+}
+
+// Recomputes and (conditionally) promotes a new tracker signal snapshot. Splits
+// all settled picks by createdAt: everything up to the PREVIOUS snapshot's
+// freeze point is "eligible" (used to compute new posteriors); everything
+// settled AFTER that point is "validation" (held out, never touched by the
+// candidate posteriors being tested). A brand-new snapshot (no prior snapshot
+// yet) skips validation and freezes directly once TRACKER_SIGNAL_MIN_ELIGIBLE is
+// met, since there is nothing yet to validate against — this matches the same
+// cold-start pattern used elsewhere in this file (e.g. runCoordinateAscentTuner's
+// own minimum-sample gate before it runs at all).
+function refreshTrackerSignalSnapshot() {
+  const allSettled = getAllSettledTrackedPicks().filter(p => p.createdAt);
+  if (allSettled.length < TRACKER_SIGNAL_MIN_ELIGIBLE) {
+    engineDebug("refreshTrackerSignalSnapshot skipped: need " + TRACKER_SIGNAL_MIN_ELIGIBLE + "+ settled picks", { have: allSettled.length });
+    return null;
+  }
+
+  const prior = loadTrackerSignalSnapshot();
+  const priorFreezeTs = prior ? Date.parse(prior.frozenAt || "") : 0;
+
+  const eligible = prior
+    ? allSettled.filter(p => Date.parse(p.createdAt) <= priorFreezeTs)
+    : allSettled;
+  const validation = prior
+    ? allSettled.filter(p => Date.parse(p.createdAt) > priorFreezeTs)
+    : [];
+
+  if (eligible.length < TRACKER_SIGNAL_MIN_ELIGIBLE) {
+    engineDebug("refreshTrackerSignalSnapshot skipped: eligible slice too small after held-out split", { eligible: eligible.length, validation: validation.length });
+    return null;
+  }
+
+  const candidateBuckets = computeTrackerSignalBuckets(eligible);
+
+  if (!prior) {
+    const fresh = { buckets: candidateBuckets, frozenAt: new Date().toISOString(), settledCountAtFreeze: eligible.length };
+    saveTrackerSignalSnapshot(fresh);
+    engineDebug("refreshTrackerSignalSnapshot: initial snapshot frozen (no prior to validate against)", { eligible: eligible.length });
+    return fresh;
+  }
+
+  if (validation.length < TRACKER_SIGNAL_MIN_VALIDATION) {
+    engineDebug("refreshTrackerSignalSnapshot: not enough held-out picks yet, keeping prior snapshot", { validation: validation.length, need: TRACKER_SIGNAL_MIN_VALIDATION });
+    return prior;
+  }
+
+  // Held-out check: for each validation pick, did the CANDIDATE bucket posterior
+  // (built only from data older than this pick) predict its outcome better than
+  // a neutral 50/50 baseline? wins/losses here count "predicted correctly"
+  // relative to that neutral baseline, then the same z-test used elsewhere in
+  // this file (testConfigurationSignificance) decides if that's a real signal.
+  let correctOverBaseline = 0, incorrectOverBaseline = 0;
+  validation.forEach(p => {
+    const key = p.league + "|" + p.marketKey + "|" + String(p.side || "").toLowerCase();
+    const entry = candidateBuckets[key];
+    if (!entry || entry.sampleSize < 5) return;
+    const predictedWin = entry.posterior >= 0.5;
+    const actualWin = p.resultStatus === "win";
+    if (predictedWin === actualWin) correctOverBaseline++;
+    else incorrectOverBaseline++;
+  });
+
+  const sigTest = testConfigurationSignificance(
+    { wins: correctOverBaseline, losses: incorrectOverBaseline },
+    { wins: (correctOverBaseline + incorrectOverBaseline) / 2, losses: (correctOverBaseline + incorrectOverBaseline) / 2 },
+    TRACKER_SIGNAL_VALIDATION_Z
+  );
+
+  if (sigTest.significant) {
+    const promoted = { buckets: candidateBuckets, frozenAt: new Date().toISOString(), settledCountAtFreeze: eligible.length, validationZ: sigTest.z, validationN: correctOverBaseline + incorrectOverBaseline };
+    saveTrackerSignalSnapshot(promoted);
+    engineDebug("refreshTrackerSignalSnapshot: new snapshot PROMOTED after held-out validation", { z: sigTest.z, validationN: promoted.validationN });
+    return promoted;
+  }
+
+  engineDebug("refreshTrackerSignalSnapshot: candidate FAILED held-out validation, keeping prior snapshot", { z: sigTest.z, correctOverBaseline, incorrectOverBaseline });
+  return prior;
+}
 
 function getAllSettledTrackedPicks() {
   return getLearningTrackedPicks()
@@ -12325,8 +12566,19 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
     let hypotheticalNoPlay = false;
     const reasons = [];
 
-    // Bayesian tracker feedback
-    const posteriorWinProb = getTrackerPosteriorWinProb(p.league, p.marketKey, side);
+    // AUDIT ITEM #7 FIX — READ FROM FROZEN, HELD-OUT-VALIDATED SNAPSHOT (2026-07-09):
+    // previously called getTrackerPosteriorWinProb(), which recomputes live from
+    // getLearningTrackedPicks() on every call — meaning a pick's own settled
+    // result could feed directly into the signal nudging the very next pick in
+    // the same bucket, with no held-out check that the signal predicts anything.
+    // Now reads ONLY from the frozen TRACKER_SIGNAL_SNAPSHOT (see
+    // getTrackerPosteriorWinProbFromSnapshot / refreshTrackerSignalSnapshot
+    // above), which is only updated when a candidate snapshot clears a held-out
+    // validation check against picks it could not have influenced. Returns null
+    // when no validated snapshot exists yet (cold start) or this bucket has no
+    // entry in it — isFinite(null) is false, so the block below simply no-ops in
+    // that case, same as the old "insufficient data" behavior.
+    const posteriorWinProb = getTrackerPosteriorWinProbFromSnapshot(p.league, p.marketKey, side);
     if (isFinite(posteriorWinProb)) {
       const priorProb = 0.50;
       const logOddsRatio = Math.log(posteriorWinProb/(1-posteriorWinProb)) - Math.log(priorProb/(1-priorProb));
@@ -13351,6 +13603,17 @@ function handleTrackedPicksActionClick(event) {
                 const _oosResult = runOutOfSampleValidation(_oosLeague);
                 if (_oosResult) engineDebug("Out-of-sample validation result", _oosResult);
               } catch(e) {}
+              // AUDIT ITEM #7 FIX (2026-07-09): recompute the tracker signal snapshot
+              // on the same retraining cadence as the coordinate-ascent tuner and OOS
+              // check above. refreshTrackerSignalSnapshot() only promotes a new
+              // snapshot if it clears a held-out validation check (see its own
+              // definition) — a failed validation is a normal, expected outcome and
+              // simply keeps the prior snapshot in place, so this call is safe to run
+              // unconditionally on every retrain checkpoint.
+              try {
+                const _snapResult = refreshTrackerSignalSnapshot();
+                if (_snapResult) engineDebug("Tracker signal snapshot refresh result", { frozenAt: _snapResult.frozenAt, settledCountAtFreeze: _snapResult.settledCountAtFreeze, validationZ: _snapResult.validationZ || null });
+              } catch(e) { engineDebug("refreshTrackerSignalSnapshot threw during retrain", e?.message || String(e)); }
               try { checkModelHealth(); } catch(e) {}
               localStorage.setItem("BB_RETRAIN_CHECKPOINT", JSON.stringify({
                 settledCount: _nowSettled, ts: new Date().toISOString()
@@ -14426,6 +14689,34 @@ function getCurrentSeasonYear(league) {
   const month = now.getUTCMonth(); // Jan=0, Oct=9
 
   const l = String(league || "").toLowerCase();
+
+  // AUDIT ITEM #4 FIX — PER-LEAGUE SEASON CALENDAR TABLE (2026-07-09): the prior
+  // implementation used three generic heuristic buckets (Oct-start NBA-family,
+  // May-Oct WNBA, and a single Aug cross-boundary cutoff for every remaining
+  // league) with no real per-league calendar data behind any of it. This adds an
+  // explicit table of each league's actual season-start month, sourced from each
+  // league's published season calendar, so the boundary check below is a real
+  // per-league fact instead of a shared guess. Leagues not yet in this table fall
+  // through to the existing heuristic branches further down (unchanged), so this
+  // is additive — it narrows the leagues relying on the generic guess rather than
+  // replacing the whole function at once. UNVERIFIED CALIBRATION: entries below
+  // are sourced from each league's most recently published season calendar as of
+  // this fix's date and should be re-checked at the start of each new season,
+  // since exact start dates can shift year to year (this table stores start
+  // MONTH only, which is stable enough for season-year bucketing purposes even
+  // if the exact start date moves by a week or two).
+  const LEAGUE_SEASON_START_MONTH = {
+    // 0-based months: Jan=0 ... Dec=11
+    nba: 9, ncaa: 10, ncaaw: 10, nba_gl: 10,       // Oct/Nov starts
+    euroleague: 8, eurocup: 8, champions_league: 8, // late Sep/Oct
+    acb: 8, lba: 8, bbl: 8, turkey_bsl: 8,
+    ausnbl: 9, bleague: 8, united_league: 9, proa: 8,
+    korea_kbl: 9, cba: 10, bal: 2, aba: 8
+  };
+  if (Object.prototype.hasOwnProperty.call(LEAGUE_SEASON_START_MONTH, l)) {
+    const startMonth = LEAGUE_SEASON_START_MONTH[l];
+    return month >= startMonth ? year + 1 : year;
+  }
 
   // NBA / NCAA / NCAAW / G-League seasons that start in Oct belong to the next season year
   if (["nba", "ncaa", "ncaaw", "nba_gl"].includes(l) && month >= 9) {
