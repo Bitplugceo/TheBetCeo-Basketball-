@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5190,8 +5189,13 @@ function updateEnginePerformanceScore() {
     const badge = document.getElementById("enginePerfPct");
     const fill = document.getElementById("enginePerfFill");
     if (!badge || !fill) return null;
+    // BATTERY CLEANUP FIX (2026-07-10): hide the whole battery wrap when there's
+    // no data yet, instead of showing an empty shell + "—" next to the header's
+    // close button — that empty shell was the visual clutter being reported.
+    const enginePerfWrap = document.getElementById("engineHealthBatteryWrap");
 
     if (decisive.length < MIN_N) {
+      if (enginePerfWrap) enginePerfWrap.style.display = "none";
       badge.textContent = "—";
       fill.style.width = "0%";
       fill.style.background = "rgba(255,255,255,0.35)";
@@ -5212,9 +5216,15 @@ function updateEnginePerformanceScore() {
 
     const score = Math.round(brier === null ? winComponent : (0.6 * winComponent + 0.4 * brierComponent));
 
+    // BATTERY COLOR FIX (2026-07-10): green near 100, fading to white through the
+    // mid range, red below 50 — replaces the old flat 80/60 traffic-light cutoffs
+    // per explicit design request. DO NOT revert to the 80/60/else scheme.
+    if (enginePerfWrap) enginePerfWrap.style.display = "flex";
+    const batteryColor = score < 50 ? "#e0433a" : score < 80 ? "#ffffff" : "#49d45f";
+
     badge.textContent = score + "%";
     fill.style.width = score + "%";
-    fill.style.background = score >= 80 ? "#49d45f" : score >= 60 ? "#e0a52c" : "#e0433a";
+    fill.style.background = batteryColor;
     badge.title = `Rolling ${decisive.length}-pick performance · win rate ${(winRate*100).toFixed(0)}% · Brier ${brier !== null ? brier.toFixed(3) : "n/a"}`;
 
     try {
@@ -12814,9 +12824,14 @@ function getTrackedLeagueApiBase(league) {
   if (l === "ncaa") return "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball";
   if (l === "ncaaw") return "https://site.api.espn.com/apis/site/v2/sports/basketball/womens-college-basketball";
   if (l === "nba_gl") return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba-g-league";
-  // [REVERTED 2026-07-04: NBA Summer League] No confirmed working ESPN site-API slug
-  // for this event — nba_summer now runs entirely through manual entry, so this
-  // resolver is intentionally not given one. Re-add here if a real slug is confirmed.
+  // [RE-WIRED 2026-07-10: NBA Summer League] ESPN's core API confirms the Las Vegas
+  // tournament's slug is "nba-summer-las-vegas" (separate from nba-summer-utah/
+  // orlando/sacramento, smaller concurrent mini-tourneys this single dropdown option
+  // does not cover). site.api.espn.com/apis/site/v2 mirrors core-API slugs 1:1 for
+  // every other league in this file, so this is wired on that basis — VERIFY the
+  // first live fetch actually returns real games before trusting picks from this
+  // league; revert to manual-entry-only if it 404s or returns the wrong tournament.
+  if (l === "nba_summer") return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba-summer-las-vegas";
   if (ESPN_INTL_SLUGS[l]) return "https://site.api.espn.com/apis/site/v2/sports/basketball/" + ESPN_INTL_SLUGS[l];
   return "";
 }
@@ -14796,6 +14811,9 @@ if (!league) {
         nba: "nba", wnba: "wnba", wnba_pre: "wnba",
         ncaa: "mens-college-basketball", ncaaw: "womens-college-basketball",
         nba_gl: "nba-g-league",
+        // [RE-WIRED 2026-07-10: NBA Summer League] See matching note in
+        // getTrackedLeagueApiBase — same slug, VERIFY on first live fetch.
+        nba_summer: "nba-summer-las-vegas",
         euroleague: "euroleague", eurocup: "eurocup",
         champions_league: "basketball-champions-league",
         turkey_bsl: "turkish-bsl", acb: "spanish-liga-acb",
@@ -15040,7 +15058,7 @@ updateIntelligencePack();
       validateFetchSection();
 
           if (!val) { closeDrop(dropId); return; }
-          const espnLeagues = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"];
+          const espnLeagues = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","nba_summer"];
           if (!espnLeagues.includes(league)) { closeDrop(dropId); return; }
 
       if (g_teamSearchControllers[side]) {
@@ -15901,7 +15919,7 @@ const cls =
       selectedTeamIds = { A: null, B: null };
       validateFetchSection();
 
-        const espnLeagues = new Set(["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"]);
+        const espnLeagues = new Set(["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","nba_summer"]);
   if (espnLeagues.has(league)) {
     await loadFixturesESPN(league, offset, myToken);
   } else {
@@ -15916,6 +15934,8 @@ const cls =
       const _FIXTURE_SLUG_MAP = {
         ncaa: "mens-college-basketball", ncaaw: "womens-college-basketball",
         nba_gl: "nba-g-league", wnba: "wnba", wnba_pre: "wnba",
+        // [RE-WIRED 2026-07-10: NBA Summer League] See getTrackedLeagueApiBase note.
+        nba_summer: "nba-summer-las-vegas",
         euroleague: "euroleague", eurocup: "eurocup",
         champions_league: "basketball-champions-league",
         turkey_bsl: "turkish-bsl", acb: "spanish-liga-acb",
@@ -16233,10 +16253,10 @@ async function fetchESPN() {
   // Determine if this league is one of the ESPN‑supported ones
   // LOCK: Only the Big 5 (NBA, WNBA, WNBA Pre, NCAA M, NCAA W, NBA G League) use ESPN auto-fetch.
   // All other leagues are manual entry via SofaScore Player Lookup — do not re-add intl leagues here.
-  // [REVERTED 2026-07-04: NBA Summer League] ESPN's site-API slug for this event is
-  // unconfirmed (see optgroup comment) — silently returned zero games. Routed through
-  // manual entry like every other non-Big-5 league until a working slug is verified.
-  const espnLeagues = new Set(["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl"]);
+  // [RE-WIRED 2026-07-10: NBA Summer League] Slug "nba-summer-las-vegas" confirmed via
+  // ESPN's core API league list — see getTrackedLeagueApiBase/getLeagueBase notes.
+  // VERIFY the first live fetch before trusting picks from this league.
+  const espnLeagues = new Set(["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","nba_summer"]);
   if (espnLeagues.has(league)) {
     await fetchESPNCore(league, teamAName, teamBName);
   } else {
@@ -16266,6 +16286,8 @@ async function fetchESPNCore(league, teamAName, teamBName) {
     const _FETCH_SLUG_MAP = {
         ncaa: "mens-college-basketball", ncaaw: "womens-college-basketball",
         nba_gl: "nba-g-league", wnba: "wnba", wnba_pre: "wnba",
+        // [RE-WIRED 2026-07-10: NBA Summer League] See getTrackedLeagueApiBase note.
+        nba_summer: "nba-summer-las-vegas",
         euroleague: "euroleague", eurocup: "eurocup",
         champions_league: "basketball-champions-league",
         turkey_bsl: "turkish-bsl", acb: "spanish-liga-acb",
