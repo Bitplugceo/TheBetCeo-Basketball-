@@ -190,11 +190,17 @@ body.dark-mode {
   opacity: 1 !important;
 }
 
-.header-error-btn {
+.header-center {
   position: absolute;
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.header-error-btn {
   background: none !important;
   border: none !important;
   box-shadow: none !important;
@@ -210,6 +216,48 @@ body.dark-mode {
 .header-error-btn.active {
   opacity: 1;
   pointer-events: auto;
+}
+
+.engine-battery {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: 0.3px;
+}
+
+.engine-battery-shell {
+  width: 22px;
+  height: 11px;
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  border-radius: 2px;
+  position: relative;
+  padding: 1px;
+}
+
+.engine-battery-shell::after {
+  content: '';
+  position: absolute;
+  right: -3px;
+  top: 3px;
+  width: 2px;
+  height: 5px;
+  background: rgba(255, 255, 255, 0.85);
+  border-radius: 0 1px 1px 0;
+}
+
+.engine-battery-fill {
+  height: 100%;
+  border-radius: 1px;
+  background: #49d45f;
+  transition: width 0.4s ease, background-color 0.4s ease;
+}
+
+.engine-battery-pct {
+  min-width: 26px;
+  text-align: left;
 }
 
 
@@ -2441,7 +2489,13 @@ body.dark-mode .tracker-analytics-section-head {
  <header class="app-header">
   <span class="brand-name">TheBetCeo ⚡️</span>
 
-<button class="header-error-btn" type="button" id="headerErrorBtn" title="Show fetch/input issues">⚠️</button>
+<span class="header-center">
+  <button class="header-error-btn" type="button" id="headerErrorBtn" title="Show fetch/input issues">⚠️</button>
+  <span class="engine-battery" title="Rolling engine performance">
+    <span class="engine-battery-shell"><span class="engine-battery-fill" id="enginePerfFill" style="width:0%;"></span></span>
+    <span class="engine-battery-pct" id="enginePerfPct">—</span>
+  </span>
+</span>
 
   <span class="brand-right">
 
@@ -4784,7 +4838,7 @@ function getCandidateScoreKey(config) {
   return `h2h${h2hFactor}_rec${recencyId}_pace${paceDampening}_edge${edgeMult}_inj${injuryMult}`;
 }
 
-function updateCandidateScore(league, marketKey, config, delta) {
+function updateCandidateScore(league, marketKey, config, delta, winProbability, outcome) {
   const key = getCandidateScoreKey(config);
   const storageKey = `BB_CANDIDATE_SCORES_${league}_${marketKey}`;
   let scores = {};
@@ -4794,9 +4848,20 @@ function updateCandidateScore(league, marketKey, config, delta) {
   } catch(e) {
     engineDebug("updateCandidateScore failed to read candidate scores: " + (e?.message || String(e)), { league, marketKey, error: e });
   }
-  if (!scores[key]) scores[key] = { netDelta: 0, count: 0 };
+  if (!scores[key]) scores[key] = { netDelta: 0, count: 0, brierSum: 0, brierCount: 0 };
   scores[key].netDelta += delta;
   scores[key].count++;
+  // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION, STEP 10 (2026-07-09): accumulate a
+  // running Brier-score sum per candidate config alongside netDelta, so selectBestConfig
+  // can gate promotion on calibration quality instead of win-count alone — mirroring the
+  // Brier check already enforced inside runCoordinateAscentTuner. winProbability/outcome
+  // are optional so existing callers that don't pass them keep working unchanged.
+  if (isFinite(winProbability) && (outcome === 0 || outcome === 1)) {
+    if (!isFinite(scores[key].brierSum)) scores[key].brierSum = 0;
+    if (!isFinite(scores[key].brierCount)) scores[key].brierCount = 0;
+    scores[key].brierSum += Math.pow(winProbability - outcome, 2);
+    scores[key].brierCount++;
+  }
   try {
     localStorage.setItem(storageKey, JSON.stringify(scores));
   } catch(e) {
@@ -4824,13 +4889,32 @@ function selectBestConfig(league, marketKey) {
     engineDebug("selectBestConfig failed to read candidate scores: " + (e?.message || String(e)), { league, marketKey, error: e });
     return null;
   }
+  // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION, STEP 10 (2026-07-09): calibration-
+  // quality gate for this legacy selection path, mirroring the Brier-based guard already
+  // enforced inside runCoordinateAscentTuner. A candidate can no longer be promoted purely
+  // for winning more picks if it makes the model's confidence grades less honest than the
+  // untouched default combo — compared against that default's own brierSum/brierCount
+  // accumulator (now tracked by updateCandidateScore for every candidate, including it).
+  const baselineKey = getCandidateScoreKey({
+    h2hFactor: getParam("h2hFactor", league) ?? 1.0,
+    recencyProfile: TUNING_GRID.recencyProfiles[0],
+    paceDampening: 0.35,
+    edgeMult: 1.0,
+    injuryMult: 1.0
+  });
+  const baselineEntry = scores[baselineKey];
+  const baselineBrier = (baselineEntry && (baselineEntry.brierCount || 0) > 0)
+    ? baselineEntry.brierSum / baselineEntry.brierCount
+    : null;
   // Require at least 8 tested picks; rank by efficiency (netDelta per tested pick)
   const qualified = Object.entries(scores)
     .filter(([, d]) => (d.count || 0) >= 8 && (d.netDelta || 0) > 0)
     .map(([key, d]) => ({
       key, netDelta: d.netDelta || 0, count: d.count || 0,
-      efficiency: (d.netDelta || 0) / Math.max(1, d.count || 1)
+      efficiency: (d.netDelta || 0) / Math.max(1, d.count || 1),
+      brier: (d.brierCount || 0) > 0 ? (d.brierSum / d.brierCount) : null
     }))
+    .filter(c => baselineBrier === null || c.brier === null || c.brier <= baselineBrier + 0.002)
     .sort((a, b) => b.efficiency - a.efficiency);
   if (!qualified.length) return null;
   const best = qualified[0];
@@ -4945,6 +5029,69 @@ function calculateCalibrationMetrics(evaluationResults) {
     .reduce((sum, b) => sum + (b.n / valid.length) * Math.abs(b.sp / b.n - b.so / b.n), 0);
 
   return { brier, ece, count: valid.length };
+}
+
+// ITEM #7 FIX — HEADER PERFORMANCE BADGE (2026-07-09): reads the existing
+// bb_engine_accuracy_log (already populated after every settlement batch — see the
+// [FIX #9: CALIBRATION METRICS] block in refreshTrackedPickResults) and derives a
+// single 0-100 "how well is the engine doing right now" score from a blend of rolling
+// win rate and Brier calibration. Self-contained and side-effect-light by design: it
+// only reads existing storage and writes the display + a BB_ENGINE_PERFORMANCE record,
+// it never touches any tuning parameter itself. The actual "get sharper" behavior
+// still goes through the existing OOS/significance/calibration-gated tuner — this
+// function only decides how urgently that gated tuner should be invoked (see the
+// dynamic retrain-checkpoint threshold in the [FIX #12: RETRAINING PIPELINE HOOK]
+// block), never bypasses it. Safe to call on every page load and after every
+// settlement batch.
+function updateEnginePerformanceScore() {
+  try {
+    const MIN_N = 10;
+    let log = [];
+    try { log = JSON.parse(localStorage.getItem("bb_engine_accuracy_log")) || []; } catch(_) {}
+    const decisive = log.filter(e => e.result === "win" || e.result === "loss").slice(-100);
+    const withProb = decisive.filter(e => e.brierContrib !== null && isFinite(e.brierContrib));
+
+    const badge = document.getElementById("enginePerfPct");
+    const fill = document.getElementById("enginePerfFill");
+    if (!badge || !fill) return null;
+
+    if (decisive.length < MIN_N) {
+      badge.textContent = "—";
+      fill.style.width = "0%";
+      fill.style.background = "rgba(255,255,255,0.35)";
+      badge.title = "Gathering data — needs " + MIN_N + "+ settled picks";
+      return null;
+    }
+
+    const wins = decisive.filter(e => e.result === "win").length;
+    const winRate = wins / decisive.length;
+    const brier = withProb.length >= MIN_N
+      ? withProb.reduce((s, e) => s + e.brierContrib, 0) / withProb.length
+      : null;
+
+    // winRate 45%-65% -> 0-100 (realistic edge range for a model beating a fair line)
+    const winComponent = Math.max(0, Math.min(1, (winRate - 0.45) / 0.20)) * 100;
+    // brier 0.30 (poor) -> 0, 0.15 (strong) -> 100; lean fully on winRate if brier n/a
+    const brierComponent = brier === null ? winComponent : Math.max(0, Math.min(1, (0.30 - brier) / 0.15)) * 100;
+
+    const score = Math.round(brier === null ? winComponent : (0.6 * winComponent + 0.4 * brierComponent));
+
+    badge.textContent = score + "%";
+    fill.style.width = score + "%";
+    fill.style.background = score >= 80 ? "#49d45f" : score >= 60 ? "#e0a52c" : "#e0433a";
+    badge.title = `Rolling ${decisive.length}-pick performance · win rate ${(winRate*100).toFixed(0)}% · Brier ${brier !== null ? brier.toFixed(3) : "n/a"}`;
+
+    try {
+      localStorage.setItem("BB_ENGINE_PERFORMANCE", JSON.stringify({
+        score, winRate: parseFloat(winRate.toFixed(3)), brier, n: decisive.length, ts: new Date().toISOString()
+      }));
+    } catch(_) {}
+
+    return score;
+  } catch(e) {
+    engineDebug("updateEnginePerformanceScore failed", e);
+    return null;
+  }
 }
 
 function evaluatePickWithParams(pick, paramOverrides) {
@@ -5310,7 +5457,19 @@ if (aS.length < 2 || bS.length < 2) continue;
 
             const delta = wouldWin ? (isWin ? 0 : 1) : (isWin ? -1 : 0);
             if (delta !== 0) {
-              updateCandidateScore(league, marketKey, config, delta);
+              // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION, STEP 10 (2026-07-09):
+              // derive a winProbability for this candidate/pick pair (same
+              // getConfidenceWinProbability call evaluatePickWithParams uses) so
+              // updateCandidateScore can accumulate a real Brier signal per candidate,
+              // not just netDelta. wouldWin is the calibration outcome (1/0), independent
+              // of isWin (the actual historical result), matching what this candidate
+              // config itself would have predicted.
+              const _edgePct = isFinite(edge) && isFinite(line) && line ? Math.abs(edge / line) : 0;
+              const _volRatio = 0.5;
+              const _sampleTier = pick.sampleTier || "thin";
+              const _hasH2H = pick.hasH2H || false;
+              const _winProbability = getConfidenceWinProbability(null, _edgePct, _volRatio, _sampleTier, _hasH2H, false, league);
+              updateCandidateScore(league, marketKey, config, delta, _winProbability, wouldWin ? 1 : 0);
             }
           }
         }
@@ -12829,12 +12988,29 @@ function handleTrackedPicksActionClick(event) {
             }));
           }
         } catch(_ce) {}
+        // ITEM #7 FIX — HEADER PERFORMANCE BADGE (2026-07-09): refresh the header
+        // battery badge on every settlement batch, independent of whether the Brier
+        // block above had enough entries to run (updateEnginePerformanceScore reads
+        // the accuracy log itself and shows "—" if there still isn't enough data).
+        try { updateEnginePerformanceScore(); } catch(_pe) {}
         // [FIX #12: RETRAINING PIPELINE HOOK — trigger every 25 new settled picks]
+        // ITEM #7 FIX — ADAPTIVE RETRAIN CADENCE (2026-07-09): the checkpoint interval
+        // now tightens to 10 settled picks (instead of the default 25) when the header
+        // performance score is currently below 60 — the engine "studies" more often
+        // while it's struggling. This ONLY changes how soon the tuner gets invoked; it
+        // does not touch runCoordinateAscentTuner's 50/100-pick minimums, its 70/30 OOS
+        // split, testConfigurationSignificance, or the calibrationOk Brier check —
+        // every promotion still has to clear the exact same bar regardless of cadence.
         try {
           const _ckpt = JSON.parse(localStorage.getItem("BB_RETRAIN_CHECKPOINT") || "{}");
           const _nowSettled = getAllSettledTrackedPicks().length;
           const _prevSettled = Number(_ckpt.settledCount || 0);
-          if (_nowSettled - _prevSettled >= 25) {
+          let _retrainEvery = 25;
+          try {
+            const _perf = JSON.parse(localStorage.getItem("BB_ENGINE_PERFORMANCE") || "null");
+            if (_perf && isFinite(_perf.score) && _perf.score < 60) _retrainEvery = 10;
+          } catch(_pf) {}
+          if (_nowSettled - _prevSettled >= _retrainEvery) {
             setTimeout(() => {
               try { if (typeof window.calibrateMassacreCoefficients === 'function') window.calibrateMassacreCoefficients(); } catch(e) {}
               try { calibrateConfidenceModel(); } catch(e) {}
@@ -20056,6 +20232,11 @@ const isWnba = leagueVal === "wnba" || leagueVal === "wnba_pre";
       if (ensureFreshBuild()) return;
 
       makeSectionsCollapsible();
+
+      // ITEM #7 FIX — HEADER PERFORMANCE BADGE (2026-07-09): render from whatever is
+      // already in localStorage as soon as the app opens, so the header battery badge
+      // doesn't sit empty until the next settlement batch happens to run.
+      try { updateEnginePerformanceScore(); } catch(_pe) {}
 
       const themeToggleBtn = document.getElementById("themeToggleBtn");
       if (themeToggleBtn) themeToggleBtn.addEventListener("click", toggleTheme);
