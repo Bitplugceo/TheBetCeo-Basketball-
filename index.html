@@ -1,4 +1,3 @@
-V
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3767,6 +3766,16 @@ function parseSofascoreIndividual(side) {
           AppState.context.data.A.q2Allowed = stats.q2AllowedList.slice(0, 10);
           AppState.context.data.A.q3Allowed = stats.q3AllowedList.slice(0, 10);
           AppState.context.data.A.q4Allowed = stats.q4AllowedList.slice(0, 10);
+          // ITEM #10 FIX — QUARTER-SHAPE FINGERPRINT: hook for the manual/SofaScore path.
+          // Uses the real team name (ssTeamAName, falling back to the main teamAName
+          // field) since manual leagues never get a synced ESPN-style team ID, so name
+          // is the only stable key available across both fetch paths.
+          updateTeamQuarterShapeProfile(
+            document.getElementById("leagueSelect")?.value || "",
+            document.getElementById("ssTeamAName")?.value?.trim() || document.getElementById("teamAName")?.value?.trim() || "",
+            stats.q1ScoredList.slice(0, 10), stats.q2ScoredList.slice(0, 10),
+            stats.q3ScoredList.slice(0, 10), stats.q4ScoredList.slice(0, 10)
+          );
         }
         // [LOCK: MANUAL-LEAGUE AUTO-FILL BADGE FIX — VERIFIED. The ESPN big-5 fetch path
         // already showed aAutoTag on successful fetch; this SofaScore manual-league path
@@ -3840,6 +3849,15 @@ function parseSofascoreIndividual(side) {
           AppState.context.data.B.q2Allowed = stats.q2AllowedList.slice(0, 10);
           AppState.context.data.B.q3Allowed = stats.q3AllowedList.slice(0, 10);
           AppState.context.data.B.q4Allowed = stats.q4AllowedList.slice(0, 10);
+          // ITEM #10 FIX — QUARTER-SHAPE FINGERPRINT: hook for the manual/SofaScore path,
+          // mirrored for side B. Uses the real team name (ssTeamBName, falling back to the
+          // main teamBName field) since manual leagues never get a synced ESPN-style ID.
+          updateTeamQuarterShapeProfile(
+            document.getElementById("leagueSelect")?.value || "",
+            document.getElementById("ssTeamBName")?.value?.trim() || document.getElementById("teamBName")?.value?.trim() || "",
+            stats.q1ScoredList.slice(0, 10), stats.q2ScoredList.slice(0, 10),
+            stats.q3ScoredList.slice(0, 10), stats.q4ScoredList.slice(0, 10)
+          );
         }
         // [LOCK: MANUAL-LEAGUE AUTO-FILL BADGE FIX — VERIFIED. Same fix as aAutoTag above,
         // mirrored for side B. Applies to ALL manual leagues, not a per-league special case.]
@@ -6117,6 +6135,108 @@ function getLearnedVolLimit(league) {
   const sd = Math.sqrt(variance);
   if (!isFinite(sd) || sd <= 0) return null;
   return Math.min(VOL_CACHE_MAX_LIMIT, Math.max(VOL_CACHE_MIN_LIMIT, Math.round(sd * 10) / 10));
+}
+
+// ITEM #10 FIX — QUARTER-SHAPE FINGERPRINT (2026-07-09): tracks each team's own
+// scoring DISTRIBUTION across quarters (e.g. "starts fast, fades in Q2") as a
+// z-score against that team's own baseline share, not against league averages —
+// so it works identically for ESPN leagues and manual/SofaScore leagues, since it
+// only needs the same q1Scored..q4Scored arrays already collected for both paths.
+// Keyed by league+normalized team name (not team ID) so it survives fixture-less
+// manual entry, where no ESPN/SofaScore ID is ever synced into selectedTeamIds.
+// Gated the same way as every other learned signal in this file: a shape claim is
+// not read anywhere until QSHAPE_MIN_GAMES real games have contributed to it.
+const QSHAPE_STORAGE_KEY = "BB_TEAM_QSHAPE_V1";
+const QSHAPE_MIN_GAMES = 6;
+
+function getTeamQuarterShapeKey(league, teamName) {
+  return String(league || "unknown").toLowerCase() + "|" + normalizeTeamName(teamName || "");
+}
+
+function loadQuarterShapeStore() {
+  try {
+    const raw = localStorage.getItem(QSHAPE_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return (parsed && typeof parsed === "object") ? parsed : {};
+  } catch (e) {
+    engineDebug("loadQuarterShapeStore failed: " + (e?.message || String(e)), { error: e });
+    return {};
+  }
+}
+
+function saveQuarterShapeStore(store) {
+  try {
+    localStorage.setItem(QSHAPE_STORAGE_KEY, JSON.stringify(store));
+  } catch (e) {
+    engineDebug("saveQuarterShapeStore failed to persist", { error: e });
+  }
+}
+
+// Updates a team's quarter-shape profile from one fresh fetch/paste of q1-q4 series.
+// Uses Welford-style running mean per quarter share (not raw points), so a team's
+// pace/scoring level doesn't matter — only what FRACTION of their own total each
+// quarter represents. Additive-only: never overwrites, only accumulates.
+function updateTeamQuarterShapeProfile(league, teamName, q1s, q2s, q3s, q4s) {
+  const key = getTeamQuarterShapeKey(league, teamName);
+  if (!key) return;
+  const n = Math.min(
+    Array.isArray(q1s) ? q1s.length : 0,
+    Array.isArray(q2s) ? q2s.length : 0,
+    Array.isArray(q3s) ? q3s.length : 0,
+    Array.isArray(q4s) ? q4s.length : 0
+  );
+  if (n < 2) return;
+
+  const store = loadQuarterShapeStore();
+  const entry = store[key] || { n: 0, meanShare: [0.25, 0.25, 0.25, 0.25], m2: [0, 0, 0, 0] };
+
+  for (let i = 0; i < n; i++) {
+    const q1 = Number(q1s[i]), q2 = Number(q2s[i]), q3 = Number(q3s[i]), q4 = Number(q4s[i]);
+    const total = q1 + q2 + q3 + q4;
+    if (!isFinite(total) || total <= 0) continue;
+    const shares = [q1 / total, q2 / total, q3 / total, q4 / total];
+    entry.n += 1;
+    for (let qi = 0; qi < 4; qi++) {
+      const delta = shares[qi] - entry.meanShare[qi];
+      entry.meanShare[qi] += delta / entry.n;
+      const delta2 = shares[qi] - entry.meanShare[qi];
+      entry.m2[qi] += delta * delta2;
+    }
+  }
+
+  entry.updatedAt = new Date().toISOString();
+  store[key] = entry;
+  saveQuarterShapeStore(store);
+}
+
+// Returns a bounded nudge (-1..1 scaled by getBucketReliabilityScore-style gating)
+// for a given quarter, or null if the team doesn't yet have enough games logged.
+// Positive = this team reliably scores MORE of its total in this quarter than an
+// even 25% split; negative = reliably LESS (a "fade").
+function getTeamQuarterShapeSignal(league, teamName, qKey) {
+  const key = getTeamQuarterShapeKey(league, teamName);
+  const store = loadQuarterShapeStore();
+  const entry = store[key];
+  if (!entry || entry.n < QSHAPE_MIN_GAMES) return null;
+
+  const qIdx = { q1: 0, q2: 1, q3: 2, q4: 3 }[String(qKey || "").toLowerCase()];
+  if (qIdx === undefined) return null;
+
+  const share = entry.meanShare[qIdx];
+  const variance = entry.n > 1 ? entry.m2[qIdx] / (entry.n - 1) : 0;
+  const stdErr = Math.sqrt(Math.max(variance, 0.0001) / entry.n);
+  if (!isFinite(stdErr) || stdErr <= 0) return null;
+
+  // z-score of this quarter's share vs. the neutral 25% expectation, same
+  // "how many standard errors above/below null" pattern used everywhere else
+  // in this file's confidence math (see getBucketSignalStrength).
+  const z = (share - 0.25) / stdErr;
+  return {
+    z: Number(z.toFixed(2)),
+    share: Number((share * 100).toFixed(1)),
+    sampleSize: entry.n,
+    direction: z >= 1.0 ? "fast" : z <= -1.0 ? "fade" : "neutral"
+  };
 }
 
 const LEAGUE_CONFIG_MAP = {
@@ -11998,6 +12118,90 @@ function evaluateTeamMemoryForPick(pickRow, fixtureMeta) {
   };
 }
 
+// ITEM #11 FIX — MATCHUP MEMORY / "NEMESIS" EFFECT (2026-07-09): evaluateTeamMemoryForPick
+// (above) tracks a TEAM's own settled-pick record in isolation. This tracks the exact
+// TEAM-vs-TEAM pairing — e.g. a team that is otherwise strong but has a specific,
+// reproducible problem against one opponent (bad matchup, style clash, etc.), which a
+// single-team record can never surface since it averages across every opponent faced.
+// Built entirely from getAllSettledTrackedPicks() (real settled results, actual scores),
+// so it works identically for ESPN leagues and manual leagues — it needs nothing beyond
+// what every settled tracked pick already stores (homeTeam/awayTeam/actualScore/line/side).
+// Gated with the same sample-size-adjusted significance check used everywhere else in
+// this file (see calibrateEngineConstants' |netDelta| > 2*sqrt(n) pattern) rather than a
+// flat win-rate threshold, since head-to-head samples are always small and a flat
+// percentage gate would treat a 3-0 head-to-head record as proven fact.
+const MATCHUP_MEMORY_MIN_GAMES = 4;
+
+function getMatchupMemoryKey(teamAKey, teamBKey) {
+  if (!teamAKey || !teamBKey) return "";
+  return [teamAKey, teamBKey].sort().join(" vs ");
+}
+
+// Scans settled picks for this exact pairing (regardless of which side was home/away
+// that game) and returns, per team, how that team's actual scoring performed against
+// this specific opponent relative to its own market line at the time — i.e. did this
+// team under/over-deliver specifically against this opponent more than it does generally.
+function getMatchupMemoryRecord(teamAName, teamBName, league) {
+  const teamAKey = normalizeTeamName(teamAName);
+  const teamBKey = normalizeTeamName(teamBName);
+  if (!teamAKey || !teamBKey || teamAKey === teamBKey) return null;
+
+  const settled = getAllSettledTrackedPicks().filter(p =>
+    String(p.league || "").toLowerCase() === String(league || "").toLowerCase() &&
+    p.marketKey === "ft" &&
+    isFinite(Number(p.actualScore ?? p.rawActualScore))
+  );
+
+  const relevant = settled.filter(p => {
+    const hk = p.homeTeamKey || normalizeTeamName(p.homeTeam || "");
+    const ak = p.awayTeamKey || normalizeTeamName(p.awayTeam || "");
+    return (hk === teamAKey && ak === teamBKey) || (hk === teamBKey && ak === teamAKey);
+  });
+
+  if (relevant.length < MATCHUP_MEMORY_MIN_GAMES) {
+    return { key: getMatchupMemoryKey(teamAKey, teamBKey), sampleSize: relevant.length, qualified: false };
+  }
+
+  const wins = relevant.filter(p => p.resultStatus === "win").length;
+  const losses = relevant.filter(p => p.resultStatus === "loss").length;
+  const decisive = wins + losses;
+  if (decisive < MATCHUP_MEMORY_MIN_GAMES) {
+    return { key: getMatchupMemoryKey(teamAKey, teamBKey), sampleSize: relevant.length, qualified: false };
+  }
+
+  const netDelta = wins - losses;
+  const isSignificant = Math.abs(netDelta) > 2 * Math.sqrt(decisive);
+
+  return {
+    key: getMatchupMemoryKey(teamAKey, teamBKey),
+    sampleSize: decisive,
+    qualified: isSignificant,
+    netDelta,
+    direction: netDelta > 0 ? "favorable_history" : "unfavorable_history"
+  };
+}
+
+// Pick-level wrapper mirroring evaluateTeamMemoryForPick's shape, so it drops into
+// applySoftTrackerInfluenceToPicks the same way. Only ever dampens confidence toward
+// caution on the side of the matchup's documented weak team — it does not flip a pick,
+// since a 4-6 game nemesis sample should narrow confidence, not override the model.
+function evaluateMatchupMemoryForPick(pickRow, fixtureMeta) {
+  const marketKey = getMarketKeyFromName(pickRow?.name, pickRow?.marketKey);
+  if (marketKey !== "ft" && marketKey !== "h1" && !marketKey?.startsWith("q")) return null;
+
+  const homeTeam = fixtureMeta?.homeTeam || "";
+  const awayTeam = fixtureMeta?.awayTeam || "";
+  const record = getMatchupMemoryRecord(homeTeam, awayTeam, pickRow.league);
+  if (!record || !record.qualified) return null;
+
+  return {
+    matchupKey: record.key,
+    sampleSize: record.sampleSize,
+    direction: record.direction,
+    shouldDowngrade: record.direction === "unfavorable_history"
+  };
+}
+
 function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation = null) {
   if (!TRACKER_SOFT_EFFECTS.enabled || !Array.isArray(picks) || !picks.length) return;
 
@@ -12099,6 +12303,21 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
         hypotheticalNoPlay = true;
         lockRestricted = true;
         reasons.push("team no-play caution");
+      }
+    }
+
+    // ITEM #11 FIX — MATCHUP MEMORY / "NEMESIS" EFFECT: same gating pattern as
+    // teamMemory above (sample-size-significant only), but keyed to the EXACT
+    // opponent pairing instead of the team in isolation. Only ever downgrades
+    // confidence on the side of the matchup's documented weak team — never
+    // blocks or flips a pick off a small H2H sample.
+    const matchupMemory = evaluateMatchupMemoryForPick(p, fixtureMeta);
+    if (matchupMemory) {
+      p.matchupMemory = matchupMemory;
+      if (matchupMemory.shouldDowngrade) {
+        confidenceShift -= 1;
+        lockRestricted = true;
+        reasons.push("nemesis matchup history (" + matchupMemory.sampleSize + " games)");
       }
     }
 
@@ -15517,6 +15736,18 @@ async function fetchESPNCore(league, teamAName, teamBName) {
     if (aStats?.scored?.length) updateLeagueVolCache(league, aStats.scored);
     if (bStats?.scored?.length) updateLeagueVolCache(league, bStats.scored);
 
+    // ITEM #10 FIX — QUARTER-SHAPE FINGERPRINT: hook for the ESPN big-5 + NCAA path,
+    // mirroring the volatility-cache hook immediately above. Uses the real team name
+    // (already resolved for this fetch) rather than teamAId/teamBId so the profile
+    // matches the same key scheme the manual/SofaScore path uses (see
+    // parseSofascoreIndividual), since manual leagues never get a synced ESPN-style ID.
+    if (aStats?.q1Scored?.length >= 2) {
+      updateTeamQuarterShapeProfile(league, teamAName, aStats.q1Scored, aStats.q2Scored, aStats.q3Scored, aStats.q4Scored);
+    }
+    if (bStats?.q1Scored?.length >= 2) {
+      updateTeamQuarterShapeProfile(league, teamBName, bStats.q1Scored, bStats.q2Scored, bStats.q3Scored, bStats.q4Scored);
+    }
+
     // [LOCK: ISSUE #14 FIX — VERIFIED 2026-07-03. Stash per-game dates for the shadow-mode
     // diagnostics in compute1HProjection and the computeQ closure in runEngine. Diagnostic
     // plumbing only — does not affect aStats/bStats, the DOM fields they populate below, or
@@ -16376,7 +16607,16 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const _aVolRatio = getVolatilityRatioForSeries(aFTS, volLimit);
   const _bVolRatio = getVolatilityRatioForSeries(bFTS, volLimit);
-  const _ftVolRatio = Math.max(_aVolRatio, _bVolRatio);
+  const _ftVolRatioRaw = Math.max(_aVolRatio, _bVolRatio);
+  // ITEM #12 FIX — SOS WIRING: schedule strength was fetched (fetchScheduleCore's
+  // sos field) and stored on the massacre context but never read anywhere, so a
+  // team's real numbers against a weak schedule got the exact same trust as the
+  // same numbers against a strong schedule. Nudges the volatility ratio used for
+  // confidence grading: weak SOS (<0.45) discounts trust, strong SOS (>0.55) adds it.
+  const _ftSosAvg = meanFromList([ctxA?.sos, ctxB?.sos]);
+  const _ftVolRatio = isFinite(_ftSosAvg)
+    ? clampNumber(_ftVolRatioRaw + (0.5 - _ftSosAvg) * 0.5, 0, 1.5)
+    : _ftVolRatioRaw;
 
   // FIX #5: Intel signals applied ONCE here only. applyIntelligenceLayerToPicks
   // (called later in runEngine) must NOT re-apply the same signals to avoid double-counting.
@@ -18553,6 +18793,22 @@ const h1Calc = compute1HProjection({
         });
         projA = (projA * (1 - hw)) + (avgOrNaN(decayH2HA) * hw);
         projB = (projB * (1 - hw)) + (avgOrNaN(decayH2HB) * hw);
+      }
+
+      // ITEM #10 FIX — QUARTER-SHAPE FINGERPRINT: nudges each team's quarter projection
+      // toward its own learned tendency (e.g. reliably fast-starting or fading in this
+      // specific quarter), gated on QSHAPE_MIN_GAMES so a thin sample can never move a
+      // pick. Nudge is capped at +/-6% of that team's own quarter projection so it can
+      // only refine, never dominate, the underlying scored/allowed/H2H blend above.
+      const teamANameForShape = document.getElementById("teamAName")?.value?.trim() || "";
+      const teamBNameForShape = document.getElementById("teamBName")?.value?.trim() || "";
+      const shapeSignalA = getTeamQuarterShapeSignal(league, teamANameForShape, qKey);
+      const shapeSignalB = getTeamQuarterShapeSignal(league, teamBNameForShape, qKey);
+      if (shapeSignalA && shapeSignalA.direction !== "neutral") {
+        projA *= (1 + clampNumber(shapeSignalA.z, -3, 3) * 0.02);
+      }
+      if (shapeSignalB && shapeSignalB.direction !== "neutral") {
+        projB *= (1 + clampNumber(shapeSignalB.z, -3, 3) * 0.02);
       }
 
       const qProj = projA + projB;
