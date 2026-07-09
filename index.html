@@ -1,4 +1,4 @@
-A
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -722,6 +722,27 @@ td {
   background: var(--panel-soft-2) !important;
   color: var(--muted) !important;
   font-weight: 700 !important;
+}
+
+/* AUDIT ITEM #5 FIX — PROVISIONAL CALIBRATION BADGE (2026-07-09): small inline
+   marker shown next to a confidence grade when that league's grade has not yet
+   cleared the per-league calibration sample threshold (see
+   getLeagueCalibrationMeta / BB_CALIBRATION_METRICS_BY_LEAGUE). Deliberately a
+   distinct visual (dashed border, muted color, "?" glyph) rather than reusing any
+   pass/fail color already used for confidence grades themselves, so it reads as
+   "trustworthiness of this grade is unverified" rather than as a grade value. */
+.conf-provisional-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 4px;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1.4;
+  color: var(--muted);
+  border: 1px dashed var(--muted);
+  border-radius: 0;
+  vertical-align: middle;
+  cursor: help;
 }
 
     body.dark-mode .conf-none {
@@ -6423,6 +6444,23 @@ function getLeagueTrustMeta(league) {
   };
 }
 
+// AUDIT ITEM #5 FIX — PER-LEAGUE CALIBRATION LOOKUP (2026-07-09): thin read helper
+// over BB_CALIBRATION_METRICS_BY_LEAGUE (populated by refreshTrackedPickResults'
+// per-league calibration block). Returns a safe "unknown" shape when no data exists
+// yet for this league at all (distinct from "provisional", which means data exists
+// but hasn't cleared the sample-size bar) so callers never have to null-check.
+function getLeagueCalibrationMeta(league) {
+  const lk = String(league || "").toLowerCase();
+  try {
+    const raw = localStorage.getItem("BB_CALIBRATION_METRICS_BY_LEAGUE");
+    const store = raw ? JSON.parse(raw) : {};
+    if (store && store[lk]) return store[lk];
+  } catch (e) {
+    engineDebug("getLeagueCalibrationMeta failed to read store: " + (e?.message || String(e)), { league: lk, error: e });
+  }
+  return { calibrationStatus: "unknown", brierScore: null, ece: null, n: 0, minRequired: 20, bins: null, ts: null };
+}
+
 function getLeagueTrustCssClass(level) {
   const key = String(level || "advisory").toLowerCase();
   if (key === "trusted") return "trust-trusted";
@@ -6783,7 +6821,7 @@ const TRACKER_SAVE_DEBOUNCE_MS = 10000;
 const TRACKER_SAVE_RETRY_BASE_MS = 1500;
 const TRACKER_SAVE_RETRY_MAX_MS = 15000;
 const TRACKER_NETWORK_TIMEOUT_MS = BB_CONFIG.timeouts.fetch;
-const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_D";
+const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_E";
 const ENGINE_MODEL_VERSION = "engine_v2_final";
 const TRACKER_LEARNING_ENABLED = true;
 
@@ -13534,7 +13572,7 @@ function handleTrackedPicksActionClick(event) {
         try { localStorage.setItem(_ACCLOG, JSON.stringify(_log)); } catch(_) {}
         // [FIX #9: Compute rolling Brier score + ECE from entries with winProb]
         try {
-          const _bEntries = _log.filter(e => e.brierContrib !== null && isFinite(e.brierContrib));
+      const _bEntries = _log.filter(e => e.brierContrib !== null && isFinite(e.brierContrib));
           if (_bEntries.length >= 20) {
             const _recent = _bEntries.slice(-100);
             const _brier = _recent.reduce((s, e) => s + e.brierContrib, 0) / _recent.length;
@@ -13555,6 +13593,71 @@ function handleTrackedPicksActionClick(event) {
             }));
           }
         } catch(_ce) {}
+        // AUDIT ITEM #5 FIX — PER-LEAGUE CALIBRATION REPORT (2026-07-09): the block
+        // above pools every league into one global Brier/ECE number, so a
+        // well-calibrated NBA model and a barely-calibrated manual league get
+        // averaged together into a figure that doesn't tell anyone whether THEIR
+        // league is trustworthy. This computes the same Brier score + ECE +
+        // reliability-diagram bins, scoped per league, and stores a
+        // "calibrationStatus" (calibrated/provisional/unknown) per league so the UI
+        // can show a real "this grade is provisional for this league" indicator
+        // instead of presenting every grade with the same visual weight. Reuses the
+        // same 20-sample minimum already used for the global metric above, just
+        // applied per league instead of pooled across leagues.
+        try {
+          const CALIBRATION_MIN_SAMPLE = 20;
+          const _byLeague = {};
+          _log.filter(e => e.brierContrib !== null && isFinite(e.brierContrib) && e.league).forEach(e => {
+            const lk = String(e.league).toLowerCase();
+            if (!_byLeague[lk]) _byLeague[lk] = [];
+            _byLeague[lk].push(e);
+          });
+
+          const _perLeagueStore = {};
+          try {
+            const _existingRaw = localStorage.getItem("BB_CALIBRATION_METRICS_BY_LEAGUE");
+            if (_existingRaw) Object.assign(_perLeagueStore, JSON.parse(_existingRaw));
+          } catch(_readErr) {}
+
+          Object.keys(_byLeague).forEach(lk => {
+            const entries = _byLeague[lk].slice(-100);
+            if (entries.length < CALIBRATION_MIN_SAMPLE) {
+              _perLeagueStore[lk] = {
+                calibrationStatus: "provisional",
+                brierScore: null,
+                ece: null,
+                n: entries.length,
+                minRequired: CALIBRATION_MIN_SAMPLE,
+                bins: null,
+                ts: new Date().toISOString()
+              };
+              return;
+            }
+            const brierL = entries.reduce((s, e) => s + e.brierContrib, 0) / entries.length;
+            const binsL = Array.from({ length: 10 }, () => ({ sp: 0, so: 0, n: 0 }));
+            entries.forEach(e => {
+              const bi = Math.min(9, Math.floor(e.winProb * 10));
+              binsL[bi].sp += e.winProb;
+              binsL[bi].so += (e.result === "win" ? 1 : 0);
+              binsL[bi].n++;
+            });
+            const eceL = binsL.filter(b => b.n > 0)
+              .reduce((s, b) => s + (b.n / entries.length) * Math.abs(b.sp / b.n - b.so / b.n), 0);
+            _perLeagueStore[lk] = {
+              calibrationStatus: "calibrated",
+              brierScore: parseFloat(brierL.toFixed(4)),
+              ece: parseFloat(eceL.toFixed(4)),
+              n: entries.length,
+              minRequired: CALIBRATION_MIN_SAMPLE,
+              bins: binsL.map(b => ({ n: b.n, avgPredicted: b.n ? parseFloat((b.sp / b.n).toFixed(3)) : null, avgActual: b.n ? parseFloat((b.so / b.n).toFixed(3)) : null })),
+              ts: new Date().toISOString()
+            };
+          });
+
+          localStorage.setItem("BB_CALIBRATION_METRICS_BY_LEAGUE", JSON.stringify(_perLeagueStore));
+        } catch(_ceLeague) {
+          engineDebug("per-league calibration computation failed: " + (_ceLeague?.message || String(_ceLeague)), { error: _ceLeague });
+        }
         // ITEM #7 FIX — HEADER PERFORMANCE BADGE (2026-07-09): refresh the header
         // battery badge on every settlement batch, independent of whether the Brier
         // block above had enough entries to run (updateEnginePerformanceScore reads
@@ -18639,6 +18742,28 @@ async function executeRetrospectiveBacktest(gameId) {
                         const _confDisplay = isNoPlay ? "NaN" : confText;
                         tdConf.className = isNoPlay ? "conf-none" : getConfidenceClass(confText);
     tdConf.textContent = _confDisplay;
+    // AUDIT ITEM #5 FIX — INLINE PROVISIONAL CALIBRATION BADGE (2026-07-09): shows
+    // a "?" badge next to the grade whenever this league's calibration status is
+    // "provisional" or "unknown" (not enough settled picks yet to compute a real
+    // per-league Brier score/ECE) or "calibrated" but the pick's own league string
+    // is missing — i.e. whenever the grade being shown has NOT been checked against
+    // real settled outcomes for this league. Deliberately does not fire for NO PLAY
+    // rows, since there's no grade to caveat there. This is the visible half of the
+    // #5 audit fix — the person looking at the pick sees, at the moment it matters,
+    // whether this grade's letter has actually been validated for this league or is
+    // still an unverified default.
+    if (!isNoPlay && p.league) {
+      const _calMeta = getLeagueCalibrationMeta(p.league);
+      if (_calMeta.calibrationStatus !== "calibrated") {
+        const badge = document.createElement("span");
+        badge.className = "conf-provisional-badge";
+        badge.textContent = "?";
+        const _n = _calMeta.n || 0;
+        const _need = _calMeta.minRequired || 20;
+        badge.title = "Provisional grade: " + p.league.toUpperCase() + " has only " + _n + " of " + _need + " settled picks needed to verify this grade's calibration. Treat as unverified until enough results exist.";
+        tdConf.appendChild(badge);
+      }
+    }
     row.appendChild(tdConf);
 
     const tdPred = document.createElement("td");
