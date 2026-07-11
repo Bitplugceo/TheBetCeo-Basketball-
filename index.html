@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -15369,6 +15370,72 @@ btn.addEventListener("click", () => { section.classList.toggle("collapsed"); });
 
     // V3 + V6 + V7: shared fetch core using LEAGUE_FETCH_RULES
 
+// [WIRED: NBA SUMMER LEAGUE FIX 2026-07-11] ESPN has no confirmed /teams/{id}/schedule
+// resource for nba-summer-las-vegas — a public community thread asking about this exact
+// endpoint has never been answered, and this engine's own live test confirmed it: the
+// scoreboard endpoint returns real games/team IDs, but the schedule sub-resource returns
+// nothing for those same IDs. Summer league squads are short-lived tournament rosters, not
+// persistent ESPN team entities, so they likely have no schedule resource at all. Fix:
+// scan the /scoreboard?dates=YYYYMMDD endpoint (already confirmed working — it's what
+// powers the fixture picker) across the tournament's known July window instead, and
+// reconstruct each team's completed games from those results. DO NOT revert to calling
+// /teams/{id}/schedule for nba_summer — that call is confirmed to return nothing.
+async function fetchNbaSummerGameRefsViaScoreboard(base, teamId) {
+  const tId = String(teamId);
+  const year = new Date().getFullYear();
+  const startDate = new Date(year, 6, 1);
+  const endDate = new Date(year, 6, 31);
+  const dateKeys = [];
+  for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+    dateKeys.push(getDateKeyLocal(d));
+  }
+
+  const jobs = dateKeys.map(dateKey => {
+    const key = `${base}:sbscan:${dateKey}`;
+    return _schedCache.has(key)
+      ? _schedCache.get(key)
+      : (() => {
+          const p = proxyFetch(`${base}/scoreboard?dates=${dateKey}&limit=200`).catch(err => {
+            _schedCache.delete(key);
+            return null;
+          });
+          cacheSet(_schedCache, key, p);
+          return p;
+        })();
+  });
+
+  const payloads = await Promise.allSettled(jobs);
+  const refs = [];
+  payloads.forEach(result => {
+    if (result.status !== "fulfilled" || !result.value) return;
+    const events = result.value?.events || [];
+    for (const ev of events) {
+      if (!ev?.id) continue;
+      const comp = ev?.competitions?.[0];
+      if (!comp) continue;
+      const done =
+        comp?.status?.type?.completed ||
+        comp?.status?.type?.name === "STATUS_FINAL" ||
+        comp?.status?.type?.state === "post";
+      if (!done || (comp?.competitors || []).length < 2) continue;
+      const competitors = comp.competitors;
+      const mine = competitors.find(x => matchesTeam(x, tId));
+      const opp = mine ? competitors.find(x => x !== mine) : null;
+      if (!mine || !opp) continue;
+      const ps = s => typeof s === "object" ? parseFloat(s.value ?? s.displayValue ?? 0) : parseFloat(s);
+      refs.push({
+        id: String(ev.id),
+        date: ev.date || "",
+        rawS: ps(mine?.score),
+        rawA: ps(opp?.score),
+        venue: mine?.homeAway || "",
+        oppId: String(opp?.team?.id || "")
+      });
+    }
+  });
+  return refs;
+}
+
 async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFallback = true) {
   const rules = LEAGUE_FETCH_RULES[leagueKey];
   if (!rules) return null;
@@ -15377,6 +15444,10 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
   const gameRefs = [];
   const currentSeason = getCurrentSeasonYear(leagueKey);
 
+  if (leagueKey === "nba_summer") {
+    const summerRefs = await fetchNbaSummerGameRefsViaScoreboard(base, teamId);
+    summerRefs.forEach(r => gameRefs.push(r));
+  } else {
   const _schedJobList = [];
   const _schedMeta = [];
   for (let i = 0; i < rules.recentSeasons; i++) {
@@ -15447,6 +15518,7 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
       });
     }
   });
+  }
 
   if (!gameRefs.length) return null;
 
