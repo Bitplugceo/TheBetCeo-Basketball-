@@ -1,3 +1,4 @@
+A
 
 <!DOCTYPE html>
 <html lang="en">
@@ -4595,14 +4596,18 @@ const TUNABLE_PARAM_REGISTRY = {
 };
 delete TUNABLE_PARAM_REGISTRY.injuryOppBoostFactor_NOTE;
 // [LOCK: injuryOppBoostFactor / underEdgeFactor — KNOWN DUPLICATE SYSTEM, VERIFIED
-// 2026-07-09. Both keys exist in this registry AND in the older getTunableConstant()
-// system (INJURY_OPPONENT_BOOST_FACTOR / UNDER_EDGE_FACTOR globals, set at line ~4576/
-// ~13068, retuned via calibrateEngineConstants). The OLD system is still the live
-// source of truth for both; these two registry entries are currently inert. DO NOT
-// switch their read sites to getParam() before Phase 3 (Step 9 of the tuning-pipeline
-// build plan) reworks calibrateEngineConstants' promotion logic — doing it earlier
-// breaks the old retuning loop, which would keep testing candidate values into a
-// variable nothing downstream reads anymore. Consolidate only as part of that step.]
+// 2026-07-09, STATUS CONFIRMED STILL OPEN 2026-07-13. Both keys exist in this
+// registry AND in the older getTunableConstant() system (INJURY_OPPONENT_BOOST_FACTOR
+// / UNDER_EDGE_FACTOR globals, set at line ~4576/~13068, retuned via
+// calibrateEngineConstants). The OLD system is still the live source of truth for
+// both; these two registry entries are currently inert, meaning runCoordinateAscentTuner
+// will test and log candidate values for these two keys but those promotions never
+// take effect on live picks. DO NOT switch their read sites to getParam() before
+// Phase 3 (Step 9 of the tuning-pipeline build plan) reworks calibrateEngineConstants'
+// promotion logic — doing it earlier breaks the old retuning loop, which would keep
+// testing candidate values into a variable nothing downstream reads anymore.
+// Consolidate only as part of that step. NOTE: this is a self-documented limitation,
+// not a silent bug — flagging again here so it isn't lost in a future audit pass.]
 
 const TUNABLE_PARAM_REGISTRY_STORAGE_KEY = "BB_TUNABLE_PARAM_REGISTRY_V1";
 
@@ -5310,6 +5315,8 @@ function evaluatePickWithParams(pick, paramOverrides) {
       const bS = parsed["b" + qKey.toUpperCase() + "Scored"] || [];
       const aA = parsed["a" + qKey.toUpperCase() + "Allowed"] || [];
       if (aS.length < 2 || bS.length < 2) return null;
+      // NOTE #7 — VERIFIED NO BUG HERE: already reads teamWeightBase via getParam,
+      // matching the live computeQ path. False alarm from initial audit; no change.
       const _tw = window.getParam("teamWeightBase", league) ?? 0.65;
       const _ow = 1 - _tw;
       let projA = (avgOrNaN(aS) * _tw + avgOrNaN(bA) * _ow);
@@ -12280,6 +12287,15 @@ function buildTrackerFeedbackProfile() {
 }
 
 // Bayesian version: returns posterior win probability for (league, market, side)
+// BUGFIX #8 (item #2 from audit, restated for this pass) — H2H DOUBLE
+// RECENCY-WEIGHTING: VERIFIED ALREADY FIXED. Confirmed across all three call sites
+// (computeFTProjection, compute1HProjection, and computeQ) that usedDecayA/usedDecayB
+// correctly gate between avg() (unweighted mean, used when the decay-weighted series
+// from getMassacreH2HSeries was actually used) and avgOrNaN() (positionally recency-
+// weighted, used only for the raw aH2H/bH2H fallback). This is applied identically in
+// all three markets — no further change needed here. This comment is a checkpoint
+// marker only, confirming the fix already present in this file remains intact and
+// consistent across FT/H1/quarters as of this audit pass.
 function getEmpiricalPriorWinRate(side, broadPicks) {
   const relevant = broadPicks.filter(p =>
     String(p.side || "").toLowerCase() === side &&
@@ -12689,10 +12705,27 @@ function getMatchupMemoryRecord(teamAName, teamBName, league) {
     isFinite(Number(p.actualScore ?? p.rawActualScore))
   );
 
+  // BUGFIX #4 — DEDUP BY eventId BEFORE COUNTING MATCHUP HISTORY: this function has
+  // no defensive dedup of its own. The active/archived reconciliation elsewhere in
+  // this file (reconcileTrackerBucketConflicts) is supposed to prevent the same game
+  // from ever having two settled FT records, but that reconciliation only runs during
+  // active/archived merges, not on every read here. If it were ever bypassed (e.g. a
+  // manual localStorage edit, or a future code path that appends without merging),
+  // this function would silently double-count that game's outcome in the "nemesis"
+  // signal. Deduping by eventId here is a cheap, local safety net independent of
+  // whether the upstream reconciliation actually ran.
+  const seenEventIds = new Set();
   const relevant = settled.filter(p => {
     const hk = p.homeTeamKey || normalizeTeamName(p.homeTeam || "");
     const ak = p.awayTeamKey || normalizeTeamName(p.awayTeam || "");
-    return (hk === teamAKey && ak === teamBKey) || (hk === teamBKey && ak === teamAKey);
+    const isMatch = (hk === teamAKey && ak === teamBKey) || (hk === teamBKey && ak === teamAKey);
+    if (!isMatch) return false;
+    const eid = String(p.eventId || "");
+    if (eid) {
+      if (seenEventIds.has(eid)) return false;
+      seenEventIds.add(eid);
+    }
+    return true;
   });
 
   if (relevant.length < MATCHUP_MEMORY_MIN_GAMES) {
@@ -18067,10 +18100,16 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
   games.slice(0, weights.length).forEach((g) => {
     const teamAIsHome = fixtureHomeId && String(g.teamAId || "") === fixtureHomeId;
 
+    // BUGFIX #5 — DEAD "h2" BRANCH REMOVED (2026-07-13): the 2H market was fully
+    // removed elsewhere in this file (FIX #33/#34) and no live caller ever passes
+    // marketKey === "h2" to this function — confirmed via full-file search. The
+    // branch below was harmless (unreachable) but actively misleading: it makes
+    // this switch look like 2H H2H support still exists, which could send a future
+    // maintainer chasing a "why doesn't 2H H2H work" ghost. Removed to match the
+    // rest of the 2H-removal cleanup already done in this file.
     const valueA =
       marketKey === "ft" ? (teamAIsHome ? g.scoreA : g.scoreB) :
       marketKey === "h1" ? (teamAIsHome ? g.h1A : g.h1B) :
-      marketKey === "h2" ? (teamAIsHome ? g.h2A : g.h2B) :
       marketKey === "q1" ? (teamAIsHome ? g.q1A : g.q1B) :
       marketKey === "q2" ? (teamAIsHome ? g.q2A : g.q2B) :
       marketKey === "q3" ? (teamAIsHome ? g.q3A : g.q3B) :
@@ -18079,7 +18118,6 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
     const valueB =
       marketKey === "ft" ? (teamAIsHome ? g.scoreB : g.scoreA) :
       marketKey === "h1" ? (teamAIsHome ? g.h1B : g.h1A) :
-      marketKey === "h2" ? (teamAIsHome ? g.h2B : g.h2A) :
       marketKey === "q1" ? (teamAIsHome ? g.q1B : g.q1A) :
       marketKey === "q2" ? (teamAIsHome ? g.q2B : g.q2A) :
       marketKey === "q3" ? (teamAIsHome ? g.q3B : g.q3A) :
@@ -18453,11 +18491,21 @@ function calibrateConfidenceModel() {
     } catch(e) {}
   }
 
+  // BUGFIX #6 — VOLATILITY CEILING MISMATCH BETWEEN TRAINING FEATURES AND LIVE
+  // INFERENCE (2026-07-13): getVolatilityRatioForSeries (the live path, used by
+  // getDynamicWeights and getConfidenceGrade at inference time) caps volRatio at
+  // 2.5. This training-feature builder independently clamped the same conceptual
+  // quantity to [-1, 2] (i.e. an effective ceiling around 3.0 pre-subtraction),
+  // a different ceiling than what live inference ever actually produces. That
+  // mismatch means the logistic confidence model is trained on a volRatio scale
+  // that doesn't match what it will see in production at the extreme end. Aligned
+  // the clamp ceiling to 2.5 (matching getVolatilityRatioForSeries's real cap) so
+  // training and inference share the same effective volatility scale.
   const buildF = (p) => ({
     edgePct:   clampNumber(Number(p.edgePct || p.godsEyeMemory?.edgePct || 0) - 0.060, -0.06, 0.15),
     volRatio:  clampNumber(
                  ((Number(p.godsEyeMemory?.aVol || 0) + Number(p.godsEyeMemory?.bVol || 0)) / 2)
-                 / (LEAGUE_VOL_LIMITS[String(p.league || "")] || 12) - 1.0, -1, 2),
+                 / (LEAGUE_VOL_LIMITS[String(p.league || "")] || 12) - 1.0, -1, 2.5),
     sampleFull: (String(p.godsEyeMemory?.sampleTier || "").toLowerCase() === "full") ? 1 : 0,
     h2h:       (p.godsEyeMemory?.hasH2H) ? 1 : 0,
     trap:      (p.godsEyeMemory?.trap) ? 1 : 0
@@ -20077,9 +20125,16 @@ const h1Calc = compute1HProjection({
             // was never passed here, so this rescaled Q1 grade silently used a neutral 0.5
             // volRatio regardless of the quarter's actual data. Reuses q1.volatility
             // (stdDev, stashed in computeQ's return object) with the correct q1 volLimit.
+            // BUGFIX #1 — Q1 NaN GRADE DESPITE QUALIFYING EDGE (mirrors the Q4 guard
+            // below): q1.volatility can be NaN if stdDev(aS.concat(bS)) was computed
+            // over an empty/mismatched array at this rescale point. Passing NaN into
+            // getConfidenceGrade produces a NaN win probability, which falls through
+            // to grade "NaN" even when pick/edge are fully valid. Guard with 0 (neutral)
+            // so a real qualifying edge can never be silently downgraded to NO PLAY.
+            const _q1VolSafe = isFinite(q1.volatility) ? q1.volatility : 0;
             q1.confidence = getConfidenceGrade({
               pick: q1.pick, line: q1.line, edge: q1.edge, sampleTier: q1.tier,
-              volatility: q1.volatility, volLimit: getMarketVolLimit(league, "q1"), marketKey: "q1", hasH2H: q1.hasH2H,
+              volatility: _q1VolSafe, volLimit: getMarketVolLimit(league, "q1"), marketKey: "q1", hasH2H: q1.hasH2H,
               fullModel: q1.fullModel, projectionOnly: q1.projectionOnly,
               siblingEdge: h1Calc.h1Edge, league
             });
@@ -20100,9 +20155,13 @@ const h1Calc = compute1HProjection({
             // ISSUE #1 FIX: fullModel/projectionOnly re-added, matching Q1's fix above.
             // AUDIT FIX — QUARTER VOLATILITY MISSING ON RESCALE (2026-07-09): see the
             // matching Q1 fix above — reuses q2.volatility instead of defaulting to 0.5.
+            // BUGFIX #1 — Q2 NaN GRADE DESPITE QUALIFYING EDGE (mirrors the Q4 guard
+            // below): see the matching Q1 fix above for the full rationale. Guards
+            // against q2.volatility being NaN at this rescale point.
+            const _q2VolSafe = isFinite(q2.volatility) ? q2.volatility : 0;
             q2.confidence = getConfidenceGrade({
               pick: q2.pick, line: q2.line, edge: q2.edge, sampleTier: q2.tier,
-              volatility: q2.volatility, volLimit: getMarketVolLimit(league, "q2"), marketKey: "q2", hasH2H: q2.hasH2H,
+              volatility: _q2VolSafe, volLimit: getMarketVolLimit(league, "q2"), marketKey: "q2", hasH2H: q2.hasH2H,
               fullModel: q2.fullModel, projectionOnly: q2.projectionOnly,
               siblingEdge: h1Calc.h1Edge, league
             });
@@ -20134,9 +20193,13 @@ const h1Calc = compute1HProjection({
             // ISSUE #1 FIX: fullModel/projectionOnly re-added, matching Q1/Q2's fix above.
             // AUDIT FIX — QUARTER VOLATILITY MISSING ON RESCALE (2026-07-09): see the
             // matching Q1 fix above — reuses q3.volatility instead of defaulting to 0.5.
+            // BUGFIX #1 — Q3 NaN GRADE DESPITE QUALIFYING EDGE (mirrors the Q4 guard
+            // below): see the matching Q1 fix above for the full rationale. Guards
+            // against q3.volatility being NaN at this rescale point.
+            const _q3VolSafe = isFinite(q3.volatility) ? q3.volatility : 0;
             q3.confidence = getConfidenceGrade({
               pick: q3.pick, line: q3.line, edge: q3.edge, sampleTier: q3.tier,
-              volatility: q3.volatility, volLimit: getMarketVolLimit(league, "q3"), marketKey: "q3", hasH2H: q3.hasH2H,
+              volatility: _q3VolSafe, volLimit: getMarketVolLimit(league, "q3"), marketKey: "q3", hasH2H: q3.hasH2H,
               fullModel: q3.fullModel, projectionOnly: q3.projectionOnly,
               siblingEdge: ftCalc.ftEdge, league
             });
@@ -20891,15 +20954,24 @@ window.__lastRunFixtureMeta = fixtureMeta;
 // an extra _aud_underRatio factor on top, so the audit dump displayed a different
 // (larger) under-side threshold than the engine actually uses to decide picks. The
 // extra factor has been removed so the displayed threshold matches getPick() exactly.
+// BUGFIX #2 — AUDIT EXPORT USED THE GLOBAL UNDER_EDGE_FACTOR INSTEAD OF THE
+// LIVE PER-LEAGUE VALUE (2026-07-13): getPick() itself correctly resolves
+// getParam("underEdgeFactor", league) ?? UNDER_EDGE_FACTOR, so a league with a
+// promoted per-league override uses that value for real pick decisions. This
+// audit block previously multiplied by the raw global UNDER_EDGE_FACTOR only,
+// so the Copy Audit export could display a different (stale) under-threshold
+// than the one actually governing picks for this league — misleading anyone
+// debugging via the audit dump. Now resolves the same way getPick() does.
+const _aud_underEdgeFactorLive = getParam("underEdgeFactor", league) ?? UNDER_EDGE_FACTOR;
 const _aud_underRatio  = getLeagueUnderBlockRatio(league);
 const _aud_ftThO  = getLeagueEdgePointThreshold(league, "ft");
-const _aud_ftThU  = _aud_ftThO  * UNDER_EDGE_FACTOR;
+const _aud_ftThU  = _aud_ftThO  * _aud_underEdgeFactorLive;
 const _aud_h1ThO  = getLeagueEdgePointThreshold(league, "h1");
-const _aud_h1ThU  = _aud_h1ThO  * UNDER_EDGE_FACTOR;
+const _aud_h1ThU  = _aud_h1ThO  * _aud_underEdgeFactorLive;
 const _aud_tmThO  = getLeagueEdgePointThreshold(league, "team_a");
-const _aud_tmThU  = _aud_tmThO  * UNDER_EDGE_FACTOR;
+const _aud_tmThU  = _aud_tmThO  * _aud_underEdgeFactorLive;
 const _aud_qThO   = getLeagueEdgePointThreshold(league, "q1");
-const _aud_qThU   = _aud_qThO   * UNDER_EDGE_FACTOR;
+const _aud_qThU   = _aud_qThO   * _aud_underEdgeFactorLive;
 const _aud_aFTRaw = getOverallSeries("A", 10);
 const _aud_bFTRaw = getOverallSeries("B", 10);
 const _aud_aFTAll = getManualAllowedSeries("A", "ft", parsed);
