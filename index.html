@@ -1,3 +1,4 @@
+W
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4211,7 +4212,16 @@ const BB_CONFIG = {
 function getDynamicWeights(sampleTier, volatility, league) {
   const base = { teamWeight: 0.65, oppWeight: 0.35 };
   const sampleShrink = sampleTier === "full" ? 0 : (sampleTier === "thin" ? 0.5 : 0.85);
-  const volRatio = isFinite(Number(volatility)) ? clampNumber(Number(volatility), 0, 1) : 0.5;
+  // AUDIT FIX #3 — VOLATILITY CAP CLAMPED RIGHT BACK DOWN (2026-07-13): this clamped
+  // volatility to [0,1] before getVolatilityRatioForSeries's own ceiling was raised to
+  // 2.5 for extreme-variance teams — any ratio above 1.0 was silently treated exactly
+  // like a team at 1.0, undoing the wider range the moment it reached this consumer.
+  // Widened to match getVolatilityRatioForSeries's actual ceiling (2.5); the overall
+  // shrink is still hard-capped at 0.95 by the clampNumber call below, so this cannot
+  // push team/oppWeight past their existing safety bound — it only lets a genuinely
+  // extreme-volatility team shrink further toward 50/50 than a merely elevated one,
+  // instead of both landing on the same shrink value.
+  const volRatio = isFinite(Number(volatility)) ? clampNumber(Number(volatility), 0, 2.5) : 0.5;
   const volShrink = volRatio * 0.3;
   const isTrustedLeague = LEAGUE_TRUST_PROFILES?.trusted?.includes(String(league || "").toLowerCase());
   const leagueShrink = isTrustedLeague ? 0 : 0.05;
@@ -12090,18 +12100,34 @@ function clampNumber(val, min, max) {
 // has the largest magnitude seen so far this run — order of calls no longer matters,
 // only signal strength does.
 const CONFIDENCE_SHIFT_TOTAL_CAP = 1;
-function applyGuardedConfidenceShift(pickRow, requestedShift, source) {
+// AUDIT FIX #4 — "STRONGEST SIGNAL WINS" WAS ACTUALLY "FIRST SIGNAL WINS" (2026-07-13):
+// every call site below requested exactly +1 or -1 regardless of how strong its own
+// underlying signal was (a nuclear massacre streak and a routine rest-day penalty both
+// requested magnitude 1), so comparing requestedShift after it was clamped to
+// [-1, 1] always produced a tie, and ties lost to whichever source ran first (tracker
+// -> intelligence -> massacre, in call order). Added an optional `strength` parameter:
+// callers that have a real underlying magnitude (tracker's confidenceShift, intel's
+// confAdj, massacre's confBoost) now pass it here, and priorStrength/requestedStrength
+// are compared instead of the post-clamp shift, so a nuclear-tier signal (strength 2)
+// correctly beats a routine one-factor signal (strength 1) no matter which ran first.
+// The actual grade movement is still capped at one notch via CONFIDENCE_SHIFT_TOTAL_CAP
+// — only which signal is allowed to claim that one notch changes. Callers that omit
+// `strength` fall back to Math.abs(requestedShift), preserving old behavior for any
+// call site not yet updated.
+function applyGuardedConfidenceShift(pickRow, requestedShift, source, strength) {
   if (!pickRow || !requestedShift) return;
   if (pickRow._baseGradeBeforeShift === undefined) {
     pickRow._baseGradeBeforeShift = pickRow.confidence || "D";
   }
-  const priorShift = Number(pickRow._cumulativeGradeShift || 0);
-  const clampedRequested = clampNumber(requestedShift, -CONFIDENCE_SHIFT_TOTAL_CAP, CONFIDENCE_SHIFT_TOTAL_CAP);
-  if (Math.abs(clampedRequested) <= Math.abs(priorShift)) {
-    engineDebug("confidence shift blocked by decorrelation cap (weaker signal)", { source, requestedShift, priorShift });
+  const requestedStrength = isFinite(strength) ? Math.abs(strength) : Math.abs(requestedShift);
+  const priorStrength = Number(pickRow._cumulativeGradeStrength || 0);
+  if (requestedStrength <= priorStrength) {
+    engineDebug("confidence shift blocked by decorrelation cap (weaker signal)", { source, requestedShift, requestedStrength, priorStrength });
     return;
   }
+  const clampedRequested = clampNumber(requestedShift, -CONFIDENCE_SHIFT_TOTAL_CAP, CONFIDENCE_SHIFT_TOTAL_CAP);
   pickRow._cumulativeGradeShift = clampedRequested;
+  pickRow._cumulativeGradeStrength = requestedStrength;
   pickRow.confidence = bumpConfidenceGrade(pickRow._baseGradeBeforeShift, clampedRequested);
 }
 
@@ -12820,10 +12846,14 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
 
     if (p.pick === "NO PLAY") return;
 
+    // AUDIT FIX #4 — pass the real signal magnitude (confidenceShift can reach ±3 when
+    // tracker posterior, team memory, and matchup memory all point the same way) as
+    // `strength`, instead of letting every tracker-driven shift flatten to magnitude 1
+    // like every other source. See applyGuardedConfidenceShift for the full fix.
     if (confidenceShift > 0) {
-      applyGuardedConfidenceShift(p, 1, "trackerSoftInfluence");
+      applyGuardedConfidenceShift(p, 1, "trackerSoftInfluence", confidenceShift);
     } else if (confidenceShift < 0 && p.confidence && p.confidence !== "—") {
-      applyGuardedConfidenceShift(p, -1, "trackerSoftInfluence");
+      applyGuardedConfidenceShift(p, -1, "trackerSoftInfluence", confidenceShift);
     }
 
     p.lockRestricted = !!lockRestricted;
@@ -14628,7 +14658,10 @@ function applyIntelligenceLayerToPicks(picks, intelligencePack, league) {
     // reintroduce a second backToBack-flag check alongside this one.]
     if (restA < 1 || restB < 1) { confAdj -= 2; }
     if (Number(intelligencePack.travelMiles || 0) > 1000) { confAdj -= 1; }
-    if (p.confidence && confAdj !== 0) applyGuardedConfidenceShift(p, confAdj > 0 ? 1 : -1, "intelligenceLayer");
+    // AUDIT FIX #4 — pass confAdj itself as the strength (it can reach magnitude 3 when
+    // both back-to-back and long travel apply), instead of always requesting magnitude 1.
+    // See applyGuardedConfidenceShift for the full fix.
+    if (p.confidence && confAdj !== 0) applyGuardedConfidenceShift(p, confAdj > 0 ? 1 : -1, "intelligenceLayer", confAdj);
     if (confAdj !== 0) p.intelligenceAdjusted = true;
   });
 }
@@ -17374,7 +17407,14 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   // projection under different candidate boost factors using each pick's stored snapshot,
   // without needing to touch the module-level learned constant. Falls back to the
   // learned/default INJURY_OPPONENT_BOOST_FACTOR when no override is supplied.
-  const _injOppBoostFactor = isFinite(config?.injuryOppBoostFactor) ? Number(config.injuryOppBoostFactor) : INJURY_OPPONENT_BOOST_FACTOR;
+  // AUDIT FIX #5 — PER-LEAGUE injuryOppBoostFactor NEVER CONSULTED (2026-07-13): the
+  // fallback below used to read the module-level INJURY_OPPONENT_BOOST_FACTOR directly,
+  // which is only ever initialized/updated from the GLOBAL registry value (getParam
+  // called with no league argument at page load and inside calibrateEngineConstants).
+  // Any per-league override runCoordinateAscentTuner promotes for this key lives in
+  // g_tunableParamLeagueOverrides and was never being read here. Now reads the live
+  // per-league value first, falling back to the stale global only if no override exists.
+  const _injOppBoostFactor = isFinite(config?.injuryOppBoostFactor) ? Number(config.injuryOppBoostFactor) : (getParam("injuryOppBoostFactor", league) ?? INJURY_OPPONENT_BOOST_FACTOR);
   if (injMultA < 1) bS *= (1 + (1 - injMultA) * _injOppBoostFactor);
   if (injMultB < 1) aS *= (1 + (1 - injMultB) * _injOppBoostFactor);
 
@@ -17387,8 +17427,15 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   // same numbers against a strong schedule. Nudges the volatility ratio used for
   // confidence grading: weak SOS (<0.45) discounts trust, strong SOS (>0.55) adds it.
   const _ftSosAvg = meanFromList([ctxA?.sos, ctxB?.sos]);
+  // AUDIT FIX #3 — VOLATILITY CAP CLAMPED RIGHT BACK DOWN (2026-07-13): this SOS-
+  // adjusted branch clamped the result to [0,1.5], while the uncapped branch just
+  // below (no SOS data) could still pass through up to 2.5 from _ftVolRatioRaw — so
+  // an extreme-volatility team with real SOS data on file was silently capped lower
+  // than the exact same team would be with SOS data missing. Widened to match
+  // getVolatilityRatioForSeries's actual ceiling (2.5) so both branches agree and an
+  // extreme-volatility team's confidence grade genuinely reflects it either way.
   const _ftVolRatio = isFinite(_ftSosAvg)
-    ? clampNumber(_ftVolRatioRaw + (0.5 - _ftSosAvg) * 0.5, 0, 1.5)
+    ? clampNumber(_ftVolRatioRaw + (0.5 - _ftSosAvg) * 0.5, 0, 2.5)
     : _ftVolRatioRaw;
 
   // FIX #5: Intel signals applied ONCE here only. applyIntelligenceLayerToPicks
@@ -17411,6 +17458,18 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const massacreH2H = getMassacreH2HSeries("ft", getCurrentFixtureMeta(), parsed);
     const decayH2HA = massacreH2H.A.length >= 2 ? massacreH2H.A : aH2H;
     const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
+    // AUDIT FIX #2 — H2H DOUBLE RECENCY-WEIGHTING (2026-07-13): decayH2HA/decayH2HB
+    // above are already season-decay-weighted by getMassacreH2HSeries (each value
+    // scaled by age weight, normalized by mean weight) — that IS this series'
+    // recency signal. Averaging a decay-weighted series with avgOrNaN() (which routes
+    // through trimmedAvg -> weightedRecentAverage and applies the positional
+    // [1.35,1.20,1.00,...] curve on top, built for a 10-game season series, not a
+    // <=5-game decayed H2H list) double-applies recency and over-weights the single
+    // most recent meeting. usedDecayA/usedDecayB track whether the decay-weighted
+    // series was actually used, vs. the raw aH2H/bH2H fallback (not decay-weighted,
+    // still correctly averaged with positional recency weighting below).
+    const usedDecayA = massacreH2H.A.length >= 2;
+    const usedDecayB = massacreH2H.B.length >= 2;
     // PATCHABLE ISSUE #1 FIX: h2hFactor was hardcoded to 1.0, silently discarding
     // config.h2hFactor (set by verified-config tuning) on every FT projection.
     // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION (2026-07-09): fallback (when no
@@ -17426,8 +17485,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       blowoutGap: Math.abs(aS - bS),
       paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
     });
-    projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgOrNaN(decayH2HA) * hw) : avgOrNaN(decayH2HA);
-    projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgOrNaN(decayH2HB) * hw) : avgOrNaN(decayH2HB);
+    const avgH2HA = usedDecayA ? avg(decayH2HA) : avgOrNaN(decayH2HA);
+    const avgH2HB = usedDecayB ? avg(decayH2HB) : avgOrNaN(decayH2HB);
+    projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgH2HA * hw) : avgH2HA;
+    projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgH2HB * hw) : avgH2HB;
   }
   let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
 
@@ -17633,6 +17694,14 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const massacreH2H = getMassacreH2HSeries("h1", getCurrentFixtureMeta(), parsed);
     const decayH2HA = massacreH2H.A.length >= 2 ? massacreH2H.A : aH2H;
     const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
+    // AUDIT FIX #2 — H2H DOUBLE RECENCY-WEIGHTING (2026-07-13): see the matching fix
+    // in computeFTProjection. decayH2HA/decayH2HB are already season-decay-weighted;
+    // averaging them with avgOrNaN()'s positional recency curve double-applies
+    // recency. usedDecayA/usedDecayB track whether the decay-weighted series was
+    // actually used, vs. the raw aH2H/bH2H fallback (still correctly averaged with
+    // positional recency weighting below).
+    const usedDecayA = massacreH2H.A.length >= 2;
+    const usedDecayB = massacreH2H.B.length >= 2;
     // PATCHABLE ISSUE #1 FIX: h2hFactor was hardcoded to 1.0 here too, so the H1
     // market never saw the tuned config.h2hFactor either.
     // ITEM #6 FIX — PARAMETER REGISTRY CONSOLIDATION (2026-07-09): fallback now reads
@@ -17647,8 +17716,10 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       blowoutGap: Math.abs(projA1H - projB1H),
       paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
     });
-    projA1H = isFinite(projA1H) ? (projA1H * (1 - hw) + avgOrNaN(decayH2HA) * hw) : avgOrNaN(decayH2HA);
-    projB1H = isFinite(projB1H) ? (projB1H * (1 - hw) + avgOrNaN(decayH2HB) * hw) : avgOrNaN(decayH2HB);
+    const avgH2HA = usedDecayA ? avg(decayH2HA) : avgOrNaN(decayH2HA);
+    const avgH2HB = usedDecayB ? avg(decayH2HB) : avgOrNaN(decayH2HB);
+    projA1H = isFinite(projA1H) ? (projA1H * (1 - hw) + avgH2HA * hw) : avgH2HA;
+    projB1H = isFinite(projB1H) ? (projB1H * (1 - hw) + avgH2HB * hw) : avgH2HB;
   }
   let h1Proj = (isFinite(projA1H) ? projA1H : 0) + (isFinite(projB1H) ? projB1H : 0);
 
@@ -18385,7 +18456,10 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
       p.edge = oldEdge + bonus;
       if (isFinite(p.proj)) p.proj += bonus;
     }
-    if (p.confidence && confBoost > 0) applyGuardedConfidenceShift(p, 1, "massacreFramework");
+    // AUDIT FIX #4 — pass confBoost itself as the strength (2 for a nuclear-tier
+    // streak, 1 for heavy), instead of always requesting magnitude 1 regardless of
+    // severity. See applyGuardedConfidenceShift for the full fix.
+    if (p.confidence && confBoost > 0) applyGuardedConfidenceShift(p, 1, "massacreFramework", confBoost);
     p.massacreDecision = "applied";
     p.massacre = { severity, direction: result.direction, profileA, profileB };
     p.lockStrength = (Number(p.lockStrength) || 0) + (severity === "nuclear" ? 0.6 : severity === "heavy" ? 0.4 : 0.2);
@@ -19620,8 +19694,16 @@ const h1Calc = compute1HProjection({
       // projections inconsistent with FT/H1 for the same game and same injury. Mirrors
       // the exact FT/H1 formula. DO NOT remove.]
       // PATCHABLE ISSUE #5 FIX: use the centralized INJURY_OPPONENT_BOOST_FACTOR constant.
-      if (injA < 1) projB *= (1 + (1 - injA) * INJURY_OPPONENT_BOOST_FACTOR);
-      if (injB < 1) projA *= (1 + (1 - injB) * INJURY_OPPONENT_BOOST_FACTOR);
+      // AUDIT FIX #5 — PER-LEAGUE injuryOppBoostFactor NEVER CONSULTED (2026-07-13):
+      // the module-level INJURY_OPPONENT_BOOST_FACTOR is set once at page load via
+      // getParam("injuryOppBoostFactor") with no league argument, so any per-league
+      // override runCoordinateAscentTuner later promotes for this key is stored in
+      // g_tunableParamLeagueOverrides but never reaches this call site. Reads the
+      // live per-league value at the point of use instead, falling back to the
+      // stale global only if no league override exists.
+      const _qInjOppBoostFactor = getParam("injuryOppBoostFactor", league) ?? INJURY_OPPONENT_BOOST_FACTOR;
+      if (injA < 1) projB *= (1 + (1 - injA) * _qInjOppBoostFactor);
+      if (injB < 1) projA *= (1 + (1 - injB) * _qInjOppBoostFactor);
 
       const aH2H = getH2HSeries("A", qKey, parsed);
       const bH2H = getH2HSeries("B", qKey, parsed);
@@ -19648,6 +19730,14 @@ const h1Calc = compute1HProjection({
         const massacreH2HQ = getMassacreH2HSeries(qKey, getCurrentFixtureMeta(), parsed);
         const decayH2HA = massacreH2HQ.A.length >= 2 ? massacreH2HQ.A : aH2H;
         const decayH2HB = massacreH2HQ.B.length >= 2 ? massacreH2HQ.B : bH2H;
+        // AUDIT FIX #2 — H2H DOUBLE RECENCY-WEIGHTING (2026-07-13): see the matching
+        // fix in computeFTProjection/compute1HProjection. decayH2HA/decayH2HB are
+        // already season-decay-weighted; averaging them with avgOrNaN()'s positional
+        // recency curve double-applies recency. usedDecayA/usedDecayB track whether the
+        // decay-weighted series was actually used, vs. the raw aH2H/bH2H fallback
+        // (still correctly averaged with positional recency weighting below).
+        const usedDecayA = massacreH2HQ.A.length >= 2;
+        const usedDecayB = massacreH2HQ.B.length >= 2;
         const qVolRatio = getVolatilityRatioForSeries(aS.concat(bS), volLimit);
         // PATCHABLE ISSUE #2 FIX: computeQ never accepted config, so h2hFactor never
         // reached quarters at all. config is now a real parameter (see signature fix).
@@ -19660,8 +19750,10 @@ const h1Calc = compute1HProjection({
           blowoutGap: Math.abs(projA - projB),
           paceGapRisk: Math.abs((avgOrNaN(ctxAQ.pace10) || 74) - (avgOrNaN(ctxBQ.pace10) || 74)) > 6
         });
-        projA = (projA * (1 - hw)) + (avgOrNaN(decayH2HA) * hw);
-        projB = (projB * (1 - hw)) + (avgOrNaN(decayH2HB) * hw);
+        const avgH2HA = usedDecayA ? avg(decayH2HA) : avgOrNaN(decayH2HA);
+        const avgH2HB = usedDecayB ? avg(decayH2HB) : avgOrNaN(decayH2HB);
+        projA = (projA * (1 - hw)) + (avgH2HA * hw);
+        projB = (projB * (1 - hw)) + (avgH2HB * hw);
       }
 
       // ITEM #10 FIX — QUARTER-SHAPE FINGERPRINT: nudges each team's quarter projection
@@ -20395,6 +20487,23 @@ await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtur
         return;
       }
 
+      // AUDIT FIX #1 — TRACKER/MASSACRE/INTEL "NO PLAY" VETO REVERSAL (2026-07-13):
+      // applySoftTrackerInfluenceToPicks (and other gates upstream) can set
+      // p.pick = "NO PLAY" with an explanatory p.note (e.g. "Tracker caution — weak
+      // team/market signal") without ever touching p.edge. This block used to
+      // unconditionally recompute p.pick = getPick(p.edge, ...) for every pick,
+      // which silently regenerated the original OVER/UNDER from the untouched edge
+      // and undid the veto — the note stayed attached but the actual pick, display
+      // text, and downstream tracker save all reverted to a normal actionable pick.
+      // Any pick that already carries a NO PLAY + note from an earlier gate is now
+      // preserved as-is instead of being recomputed. DO NOT remove this guard.
+      if (p.pick === "NO PLAY" && p.note) {
+        p.confidence = "—";
+        p.displayPick = "NO PLAY";
+        p.bufferedPickText = "NO PLAY";
+        return;
+      }
+
       const volRatio = ftCalc.ftVolRatio ?? 0.5;
       const context = {
         volRatio,
@@ -20622,11 +20731,23 @@ const _aud_trust       = getLeagueTrustMeta(league);
 const _aud_settledPicks = (typeof g_trackerDerivedState !== "undefined") ? (g_trackerDerivedState?.settledPicks || 0) : 0;
 // ISSUE #13 FIX: this previously hardcoded its own fallback ({aThresh:5, bThresh:1.4,
 // cThresh:1}), different from getConfidenceGradeThresholds()'s fallback ({aThresh:4,
-// bThresh:1.0, cThresh:0.5}) used by the live engine. On a fresh install before any
-// calibration has run, the audit dump would show different thresholds than the engine
-// actually graded with. Now calls the same helper the engine uses, so they can never
-// drift apart again.
-const _aud_gradeThresholds = getConfidenceGradeThresholds();
+// bThresh:1.0, cThresh:0.5}) used by the live engine at the time. That claim is no
+// longer true and is corrected below.
+// AUDIT FIX #5 — STALE THRESHOLDS IN THE COPY-AUDIT EXPORT (2026-07-13):
+// getConfidenceGrade was later rewritten (see "ITEM #1 FIX — LOGISTIC REGRESSION FULL
+// REPLACEMENT" on that function) to grade purely off a logistic win-probability model
+// compared against getParam("confidenceAThresh"/"confidenceBThresh"/"confidenceCThresh",
+// league) — a 0-1 win-probability scale, nothing to do with getConfidenceGradeThresholds()'s
+// old 0-4-ish heuristic point-score scale. calibrateConfidenceModel() still computes and
+// writes BB_CONFIDENCE_THRESHOLDS every retrain cycle purely as vestigial output nothing
+// reads for grading anymore, so getConfidenceGradeThresholds() no longer reflects how
+// grades are actually assigned. Pulls the real, live per-league thresholds instead, so
+// the audit export matches what getConfidenceGrade actually compares winProb against.
+const _aud_gradeThresholds = {
+  aThresh: getParam("confidenceAThresh", league) ?? 0.66,
+  bThresh: getParam("confidenceBThresh", league) ?? 0.58,
+  cThresh: getParam("confidenceCThresh", league) ?? 0.51
+};
 // ─────────────────────────────────────────────────────────────────────────
 
 window.__LAST_AUDIT_STATE = {
