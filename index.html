@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -14303,6 +14304,23 @@ function getConfidenceGrade(params) {
   const volRatio = (isFinite(volatility) && isFinite(volLimit) && volLimit > 0) ? volatility / volLimit : 0.5;
   const winProb = getConfidenceWinProbability(null, edgePct, volRatio, sampleTier, hasH2H, false, league);
 
+  // BUGFIX — DEFENSIVE NaN GUARD FOR WIN PROBABILITY (2026-07-13): if any upstream
+  // input (volatility, a corrupted BB_CONFIDENCE_MODEL_COEFF entry, an unexpected
+  // league key, etc.) ever produces a non-finite winProb here, every threshold
+  // comparison below silently evaluates false and this function falls through to
+  // "D" even when the pick/edge were fully valid — the caller never sees a warning,
+  // it just looks like a real D-grade to the tracker and the UI. Rather than let
+  // that silently masquerade as a legitimate grade, treat a non-finite winProb the
+  // same way "no valid pick" is treated: return the explicit "NaN" no-play sentinel
+  // (see the earlier check in this function) and log so the root cause is visible
+  // in the debug panel instead of vanishing into an ordinary-looking "D".
+  if (!isFinite(winProb)) {
+    engineDebug("getConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
+      league, marketKey: params?.marketKey, edgePct, volRatio, sampleTier, hasH2H
+    });
+    return "NaN";
+  }
+
   const threshA = getParam("confidenceAThresh", league) ?? 0.66;
   const threshB = getParam("confidenceBThresh", league) ?? 0.58;
   const threshC = getParam("confidenceCThresh", league) ?? 0.51;
@@ -19813,9 +19831,20 @@ const h1Calc = compute1HProjection({
             // ISSUE #1 FIX: fullModel/projectionOnly re-added, matching Q1/Q2/Q3's fix above.
             // AUDIT FIX — QUARTER VOLATILITY MISSING ON RESCALE (2026-07-09): see the
             // matching Q1 fix above — reuses q4.volatility instead of defaulting to 0.5.
+            // BUGFIX — Q4 NaN GRADE DESPITE QUALIFYING EDGE (2026-07-13): q4.volatility
+            // was only ever set inside the original computeQ() return object. If this
+            // rescale path ran on a q4 object whose volatility field was NaN/undefined
+            // (e.g. stdDev computed over an empty concat when aS/bS resolution differed
+            // between the initial computeQ pass and this rescale context), getConfidenceGrade
+            // silently produced volRatio = NaN, which propagates through the logistic model
+            // to a NaN win probability and therefore falls through to grade "NaN" even when
+            // pick/edge are fully valid. Guard by falling back to 0 (neutral/no additional
+            // uncertainty) whenever q4.volatility is not a finite number, so a real qualifying
+            // edge can never be silently downgraded to NO PLAY by a missing volatility value.
+            const _q4VolSafe = isFinite(q4.volatility) ? q4.volatility : 0;
             q4.confidence = getConfidenceGrade({
               pick: q4.pick, line: q4.line, edge: q4.edge, sampleTier: q4.tier,
-              volatility: q4.volatility, volLimit: getMarketVolLimit(league, "q4"), marketKey: "q4", hasH2H: q4.hasH2H,
+              volatility: _q4VolSafe, volLimit: getMarketVolLimit(league, "q4"), marketKey: "q4", hasH2H: q4.hasH2H,
               fullModel: q4.fullModel, projectionOnly: q4.projectionOnly,
               siblingEdge: ftCalc.ftEdge, league
             });
