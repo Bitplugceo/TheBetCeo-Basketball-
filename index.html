@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5980,6 +5979,28 @@ const LEAGUE_EDGE_POINT_THRESHOLDS = {
   default:            { ft: 4.5, h1: 4.0, team: 4.5, q: 2.5 }
 };
 
+// [LOCK: PER-LEAGUE-ONLY EDGE THRESHOLD — VERIFIED FIX 2026-07-13. Previously
+// this read getParam(paramKey, lk), which falls back to the GLOBAL registry
+// value (TUNABLE_PARAM_REGISTRY[paramKey].value) whenever this league has no
+// per-league override recorded. Two compounding bugs made that fallback
+// dangerous: (1) initLeagueOverridesFromDefaults() only seeds a league's static
+// default into g_tunableParamLeagueOverrides on the very first boot ever, and
+// early-returns entirely the moment ANY league already has override data — so a
+// league can end up with no per-league override at all; (2) the GLOBAL registry
+// value for these four edge-threshold keys is a single number tuned across every
+// league's pooled settled picks regardless of that league's own scoring scale,
+// so it is not a meaningful substitute for a specific league's hand-calibrated
+// LEAGUE_EDGE_POINT_THRESHOLDS value. Observed failure: a WNBA FT pick with a
+// real 5.80pt edge (3.21% edgePct, full sample, H2H present) — above the
+// hand-calibrated wnba threshold of 5.5 — was blocked as NO PLAY because it
+// silently inherited a promoted GLOBAL threshold of 7.0 (same root cause blocked
+// the 1H pick too, edge 5.42 vs a corrupted 8.0 threshold instead of the real
+// 5.0). Fix: read the per-league override directly (only ever written by a
+// per-league-validated promotion requiring its own 100-settled-pick bar in
+// runCoordinateAscentTuner), and fall back straight to this league's static
+// LEAGUE_EDGE_POINT_THRESHOLDS value — never the pooled global value — when no
+// such per-league override exists. DO NOT revert to getParam()'s global fallback
+// for these four keys.]
 function getLeagueEdgePointThreshold(league, marketKey) {
   const lk = (league || "default").toLowerCase();
   let key = marketKey;
@@ -5988,11 +6009,20 @@ function getLeagueEdgePointThreshold(league, marketKey) {
   else if (marketKey === "h1") key = "h1";
   else key = "ft";
 
-  if (key === "ft") return getParam("edgeFTPointThreshold", lk) ?? 5.0;
-  if (key === "h1") return getParam("edgeH1PointThreshold", lk) ?? 6.0;
-  if (key === "team") return getParam("edgeTeamPointThreshold", lk) ?? 8.0;
-  if (key === "q") return getParam("edgeQPointThreshold", lk) ?? 3.0;
-  return 5.0;
+  const paramKey =
+    key === "ft"   ? "edgeFTPointThreshold" :
+    key === "h1"   ? "edgeH1PointThreshold" :
+    key === "team" ? "edgeTeamPointThreshold" :
+    key === "q"    ? "edgeQPointThreshold" : null;
+  const staticRow = LEAGUE_EDGE_POINT_THRESHOLDS[lk] || LEAGUE_EDGE_POINT_THRESHOLDS.default;
+  const staticVal = Number(staticRow?.[key]);
+  const staticDefault = isFinite(staticVal) && staticVal > 0 ? staticVal : 5.0;
+
+  const leagueOverride = paramKey ? g_tunableParamLeagueOverrides?.[lk]?.[paramKey] : null;
+  if (leagueOverride && isFinite(Number(leagueOverride.value)) && Number(leagueOverride.value) > 0) {
+    return Number(leagueOverride.value);
+  }
+  return staticDefault;
 }
 
     // PATCHABLE ISSUE #8 FIX: [DELETED] EUROPE_EDGE_LEAGUES and ASIA_EDGE_LEAGUES –
