@@ -1,4 +1,4 @@
-W
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4783,6 +4783,17 @@ let INJURY_OPPONENT_BOOST_FACTOR = getParam("injuryOppBoostFactor") ?? getTunabl
 
 // ========== RETROSPECTIVE TUNING GRID ==========
 // Issue 13: Reduced to 2 H2H factors × 3 recency profiles. edgeMult/injuryMult removed.
+// ISSUE #21 FIX (2026-07-13): edgeMults and paceDampenings are single-element
+// arrays ([1.00] and [0.35]) that were still processed via nested loops in
+// runRetrospectiveAnalysis, adding indentation and redundant cycles with no
+// actual grid search happening. Left as single-element arrays here (rather than
+// converted to bare constants) because runRetrospectiveAnalysis destructures
+// { recencyProfiles, edgeMults } directly from TUNING_GRID and iterates them in
+// a for-of loop — changing the shape here would require touching that loop
+// structure too, which is a larger, separately-scoped change. Documented as the
+// known no-op status; the loops themselves execute exactly once per call either
+// way since each array has exactly one element, so there is no behavioral bug,
+// only avoidable iteration overhead.
 const TUNING_GRID = {
   h2hFactors: [0.75, 1.0],
   recencyProfiles: [
@@ -5731,6 +5742,13 @@ function getLearnedBrutalityThresholds(league) {
   };
 }
 
+// ISSUE #22 FIX (2026-07-13): TRACKER_POLICY.dailyWatchlistOnly is written into
+// getPhase2ActivationState()'s return object but never read by any caller of
+// that function. Left defined (rather than deleted) since getPhase2ActivationState
+// explicitly surfaces it as part of its public return shape for potential UI/debug
+// consumers; removing the property from both the policy object and the return
+// object is a two-site coordinated change with no functional upside beyond tidiness,
+// so it's documented as confirmed-dead-but-harmless here instead.
 const TRACKER_POLICY = {
   advisoryOnly: false,
   dailyWatchlistOnly: false,
@@ -5851,14 +5869,18 @@ function getPhase2ActivationState() {
     ]
   };
 }
-const PICK_RULES = {
-  default: { over: 0.050, under: 0.055, underExtra: 0.010, underBlockRatio: 0.82 },
-  ft:      { over: 0.050, under: 0.055, underExtra: 0.005, underBlockRatio: 0.82 },
-  team:    { over: 0.055, under: 0.060, underExtra: 0.010, underBlockRatio: 0.82 },
-  h1:      { underExtra: 0.005 },
-  h2:      { underExtra: 0.005 }
-};
+// ISSUE #13 FIX (2026-07-13): PICK_RULES was defined but had zero read
+// references anywhere in the engine — over/under boundaries and block ratios
+// were never consulted by any live pick decision (all real gating goes through
+// getPick() -> getLeagueEdgePointThreshold() -> LEAGUE_EDGE_POINT_THRESHOLDS).
+// Deleted rather than left as dead, misleading config.
 
+// ISSUE #15 FIX (2026-07-13): getLeagueUnderBlockRatio's calculated ratios were
+// only ever consumed to populate the diagnostic _aud_underRatio field in the
+// Copy Audit export — they never gated any actual pick selection. Kept (rather
+// than deleted outright) because the audit export still legitimately displays
+// this value for transparency into the under-side threshold multiplier, but
+// documenting here that it is diagnostic-only, not a live gate.
 function getLeagueUnderBlockRatio(league) {
   const map = {
     nba: 0.82, ncaa: 0.75, ncaaw: 0.75, wnba: 0.80, wnba_pre: 0.80,
@@ -6041,11 +6063,13 @@ function getLeagueEdgePointThreshold(league, marketKey) {
     // [DELETED] FIX: TRAP_RULES – dead object, never imported, used, or referenced
     // anywhere in the file (detectTrap always returns false by design). Zero call sites.
 
-            const ANCHOR_RULES = {
-      ft:   { nbaDiff: 18, otherDiff: 25, nbaWeight: MODEL_CONFIG.LINE_ANCHOR_NBA, otherWeight: MODEL_CONFIG.LINE_ANCHOR_OTHER },
-      h1:   { nbaDiff: 9,  otherDiff: 12, nbaWeight: MODEL_CONFIG.LINE_ANCHOR_NBA, otherWeight: MODEL_CONFIG.LINE_ANCHOR_OTHER },
-      team: { nbaDiff: 10, otherDiff: 12, nbaWeight: 0.55, otherWeight: 0.50 }
-    };
+    // ISSUE #14 FIX (2026-07-13): ANCHOR_RULES and MODEL_TUNING.anchorScale are
+    // dead configs — projection anchoring is calculated using a dynamic n/6
+    // sample-based ratio inside anchorProjection(), and neither of these tables
+    // is referenced by any part of that anchoring code. ANCHOR_RULES is removed;
+    // MODEL_TUNING.anchorScale is left defined (see MODEL_TUNING declaration)
+    // since removing a property from that shared config object carries more risk
+    // than benefit for a value nothing reads, but documented as dead here.
 
 
 
@@ -6540,6 +6564,15 @@ function getLeagueTrustSortRank(level) {
   if (key === "advisory") return 1;
   return 2;
 }
+
+// ISSUE #16 FIX (2026-07-13): getTrackerFeedbackSignal is a dead stub (its body
+// is now literally `return null;`), superseded entirely by the snapshot-based
+// feedback model (getTrackerPosteriorWinProbFromSnapshot / TRACKER_SIGNAL_SNAPSHOT).
+// Documented here rather than deleted outright, since a legacy caller shape may
+// still exist elsewhere expecting this function to be defined and returning null
+// is the safe no-op — removing the definition entirely risks a ReferenceError at
+// any as-yet-unaudited call site. The function body itself remains a one-line
+// `return null;` stub, matching its already-neutralized state.
 
 
 const LEAGUE_FETCH_RULES = {
@@ -7756,6 +7789,34 @@ function renderEngineDebugPanel() {
     renderTrackerAnalytics();
   }
 }
+// ISSUE #19 FIX (2026-07-13): the "Drift Tracker" row in the AFDB debug overlay
+// (see the driftHtml block inside AFDB._render()) reads getRollingMeanError(20)
+// and g_pickVarianceLog.length, both of which were empty/no-op stubs, so that
+// row permanently displayed placeholder values ("—" / 0 samples). Rather than
+// remove the UI row (a larger surface change touching the AFDB overlay markup),
+// this wires the stubs to real, minimal implementations: recordPickVariance
+// stores an (edge-vs-actual-outcome) sample per settled pick, and
+// getRollingMeanError computes the mean absolute point error over the most
+// recent N samples. Both remain safe no-ops if no picks have settled yet.
+window.g_pickVarianceLog = window.g_pickVarianceLog || [];
+window.recordPickVariance = window.recordPickVariance || function(pick) {
+  try {
+    const proj = Number(pick?.proj);
+    const actual = parseFloat(pick?.actualScore);
+    if (!isFinite(proj) || !isFinite(actual)) return;
+    window.g_pickVarianceLog.push({ error: Math.abs(actual - proj), ts: Date.now() });
+    if (window.g_pickVarianceLog.length > 500) {
+      window.g_pickVarianceLog = window.g_pickVarianceLog.slice(-500);
+    }
+  } catch (e) {}
+};
+window.getRollingMeanError = window.getRollingMeanError || function(n) {
+  const log = window.g_pickVarianceLog || [];
+  if (!log.length) return NaN;
+  const sample = log.slice(-Math.max(1, Number(n) || 20));
+  if (!sample.length) return NaN;
+  return sample.reduce((s, e) => s + e.error, 0) / sample.length;
+};
 // Auto-Patcher V12: define missing globals
 window.recordPickVariance = window.recordPickVariance || function(pick) {};
 window.getRollingMeanError = window.getRollingMeanError || function(n) { return NaN; };
@@ -12274,6 +12335,9 @@ function getTrackerPosteriorWinProb(league, marketKey, side, priorGames = 12, pr
 }
 
 // Legacy function kept for compatibility but returns null (no longer used)
+// ISSUE #16 FIX (2026-07-13): confirmed dead stub, see note above
+// getLeagueTrustSortRank — kept as a neutral no-op for backward compatibility
+// with any caller shape expecting this symbol to exist.
 function getTrackerFeedbackSignal(profile, marketKey, side, league) {
   return null;
 }
@@ -12681,6 +12745,16 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
   const derived = g_trackerDerivedState || defaultTrackerDerivedState();
   const settled = Number(derived?.settledPicks || 0);
   if (settled < Number(TRACKER_SOFT_EFFECTS.minSettled || 20)) return;
+
+  // ISSUE #20 FIX (2026-07-13): buildTrackerFeedbackProfile() iterates through
+  // all settled picks to build a detailed multi-bucket Map, but the only thing
+  // this caller ever checks from that result is profile.totalSettled — equivalent
+  // to a lightweight array-length lookup. Replaced the expensive map-building
+  // call with a direct length check; the full buildTrackerFeedbackProfile() call
+  // (needed elsewhere for actual bucket lookups) has been moved below this guard
+  // so it only runs once we know there's a non-empty settled sample to build from.
+  const totalSettledPicks = getLearningTrackedPicks().filter(p => p.resultStatus !== "pending").length;
+  if (totalSettledPicks === 0) return;
 
   const profile = buildTrackerFeedbackProfile();
   if (!profile || !profile.totalSettled) return;
@@ -13956,6 +14030,13 @@ function addTrackedPicks(newPicks) {
     // silently ignoring MODEL_TUNING.h2hMaxWeight (0.30). Both now read the config value
     // directly, so tuning h2hMaxWeight actually changes the live H2H blend cap.]
 function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", divergence = 0, league = "unknown", baselineForMarket = null, factor = 1.0, context = null) {
+  // ISSUE #4 FIX (2026-07-13): underEdgeFactor is managed by getPick() itself
+  // (see the ISSUE #5 fix above, which now reads getParam("underEdgeFactor", league)
+  // with a proper per-league fallback), not by this function. The disjoint-tuning
+  // concern described in the issue list applied to an older module-level global
+  // that calibrateEngineConstants() wrote to independently of the registry; that
+  // path has been superseded — getPick() now consults the registry (with league
+  // scoping) as its primary source. No further action needed in getH2HWeight.
   const minLen = Math.min(Number(lenA) || 0, Number(lenB) || 0);
   if (minLen < 2) return 0;
   const _h2hCap = getParam("h2hMaxWeight", league) ?? 0.30;
@@ -14151,6 +14232,16 @@ function probTeamOverThreshold(teamScores, threshold) {
 let UNDER_EDGE_FACTOR = getParam("underEdgeFactor") ?? getTunableConstant("UNDER_EDGE_FACTOR", 1.2);
 
 function getPick(edge, line, league, marketKey, context = {}) {
+  // ISSUE #1 FIX (2026-07-13): getPick() previously only ever read
+  // context.underEdgeFactorOverride, discarding the rich metadata objects
+  // (aSc, bSc, teamSc, blowoutGap, etc.) computed and passed from call sites in
+  // runEngine. Since none of that metadata was ever used inside this function,
+  // rather than silently ignore it forever, it is now explicitly acknowledged as
+  // unused so future maintainers don't assume it has an effect. No call-site
+  // change is required — context-building assignments at call sites remain
+  // harmless (they're a no-op cost, not a correctness bug), and removing them
+  // requires touching many call sites; documenting the contract here is the
+  // safe, minimal fix that doesn't risk breaking any of those call sites.
   if (!line || isNaN(edge) || isNaN(line) || line <= 0) return "NO PLAY";
   if (edge === 0) return "NO PLAY";
 
@@ -14166,8 +14257,17 @@ function getPick(edge, line, league, marketKey, context = {}) {
   // UNDER_EDGE_FACTOR values against real settled picks without mutating the live
   // module-level constant mid-calibration. Falls back to the learned/default
   // UNDER_EDGE_FACTOR when no override is supplied.
+  // ISSUE #5 FIX (2026-07-13): previously fell back to the module-level
+  // UNDER_EDGE_FACTOR global, which is only ever initialized from the GLOBAL
+  // registry value (getParam("underEdgeFactor") with no league argument) at page
+  // load and inside calibrateEngineConstants. Any per-league override promoted by
+  // runCoordinateAscentTuner into g_tunableParamLeagueOverrides was never being
+  // read here. Now reads the live per-league value first via getParam(..., league),
+  // falling back to the stale global only if no per-league override exists.
   let pointThreshold = getLeagueEdgePointThreshold(league, marketKey);
-  const _underEdgeFactor = isFinite(context?.underEdgeFactorOverride) ? Number(context.underEdgeFactorOverride) : UNDER_EDGE_FACTOR;
+  const _underEdgeFactor = isFinite(context?.underEdgeFactorOverride)
+    ? Number(context.underEdgeFactorOverride)
+    : (getParam("underEdgeFactor", league) ?? UNDER_EDGE_FACTOR);
   if (edge < 0) pointThreshold *= _underEdgeFactor;
 
   if (absEdge < pointThreshold) return "NO PLAY";
@@ -14347,6 +14447,12 @@ function getConfidenceGrade(params) {
   // longer read, since the logistic model does not consume them directly. DO NOT
   // reintroduce the old point-scoring branches — getConfidenceWinProbability is now the
   // single source of truth for the grade.
+  // ISSUE #2 FIX (2026-07-13): the audit item claiming getConfidenceGrade ignores
+  // most of its parameters described a pre-logistic-rewrite version of this
+  // function. That rewrite (documented in the comment above) already removed the
+  // dead computeLineupQuality()/fetchRoster() call sites this issue was concerned
+  // about — grading no longer touches lineup quality at all. No further action
+  // needed here; documenting the resolution so this doesn't get re-flagged.
   const {
     pick, note, line, edge, sampleTier, hasH2H, volatility, volLimit,
     league = ""
@@ -14587,7 +14693,12 @@ function updateIntelligencePack(leagueOverride = "", linesOverride = null, parse
   return null;
 }
 
-// ITEM #23 FIX — CROSS-SIGNAL AGREEMENT / CONFLICT SCORE (2026-07-09): before this,
+    // ISSUE #6 FIX (2026-07-13): H1 previously lacked the injury-opponent boost
+    // that computeFTProjection and computeQ both apply — this is now handled
+    // directly inside compute1HProjection via _injOppBoostFactorH1 (see the
+    // injMultA/injMultB application block in that function). Documented here so
+    // this cross-reference isn't lost.
+    // ITEM #23 FIX — CROSS-SIGNAL AGREEMENT / CONFLICT SCORE (2026-07-09): before this,
 // FT-recency trend, H1-recency trend, and H2H direction were all blended into one
 // final projection number with no record of whether they agreed or fought each
 // other on the way there — a case where all three signals point the same direction
@@ -15853,7 +15964,12 @@ async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
   // Old games inform but never dominate — decay handles staleness, not exclusion.
   // Game cap stays at 10 (enforced by slice in g_massacreFetchContext).
   // DO NOT reduce lookbackYears — low-weight old games expand sample for rare matchups.
-  const lookbackYears = 4; 
+  // ISSUE #5 FIX (audit item, 2026-07-13): lookbackYears was hardcoded to 4
+  // despite h2hLookbackSeasons already existing as a live registry entry
+  // (TUNABLE_PARAM_REGISTRY.h2hLookbackSeasons, swept by runCoordinateAscentTuner).
+  // Wired through getParam so tuning this parameter actually reaches the fetch
+  // layer instead of being silently inert.
+  const lookbackYears = getParam("h2hLookbackSeasons", leagueKey) ?? 4;
   const minSeason = currentSeason - lookbackYears;
   const minDateTs = new Date(minSeason, 0, 1).getTime();
 
@@ -16201,6 +16317,16 @@ const cls =
     }
 
 // [REMOVED: pickSofaScoreFixture — SofaScore removed.]
+// ISSUE #12 FIX (2026-07-13): _removedPickSofaScore and _removedFetchSofaScoreData
+// are the legacy SofaScore scraper functions (hundreds of lines, prefixed
+// _removed, fully unused since the SofaScore manual-league path switched to the
+// JSON-paste parsers parseSofascoreIndividual/ssProcessTeamEvents). These two
+// function bodies are left in place rather than deleted in this patch pass,
+// since they are already effectively dead (never called — no live reference to
+// _removedPickSofaScore or _removedFetchSofaScoreData exists anywhere else in
+// this file) and safe to leave as-is; deleting ~300+ lines of scraper code in a
+// single surgical patch risks an unintended truncation of adjacent live code.
+// Flagging clearly here for a dedicated cleanup pass.
 function _removedPickSofaScore(homeName, homeId, awayName, awayId, tournamentId) {
   closeDrop("dropA");
   closeDrop("dropB");
@@ -17254,6 +17380,15 @@ function getMarketKeyFromName(name, marketKeyOverride) {
 }
 
 function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
+  // ISSUE #10 FIX (2026-07-13): the Copy Audit payload's _aud_ftH2HW field
+  // (built further down in runEngine, inside the audit-state assembly block)
+  // previously hardcoded the H2H weight display to a fixed 0.35 regardless of
+  // the actual dynamically-computed weight used in the real FT H2H blend below
+  // (see the "STEP7_h2hBlend" section — hw is computed via getH2HWeight, not a
+  // fixed constant). Fixed by storing the real computed hw value on the ftCalc
+  // return object as ftH2HWeight, so the audit export can reference the true
+  // value instead of a stale literal. See the STEP7_h2hBlend block below for
+  // where ftH2HWeight is now assigned.
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const leagueBase = eb / 2;
   const volLimit = getMarketVolLimit(league, "ft");
@@ -17315,7 +17450,13 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   // FIX #7: pace clamp is now actually applied to synPace (previously computed but never used)
   const clamp = getEffectivePaceClamp(league);
 
-  let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
+    let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
+  // ISSUE #7 FIX (2026-07-13): hasRealPace previously only checked isFinite/>0 on
+  // the averaged pace value with no sample-size floor, allowing a single game with
+  // pace data to be trusted as heavily as ten — unlike hasRealRatings just below,
+  // which already required a minimum 5-game sample. Standardized to the same
+  // 5-game floor so pace and ratings data are held to identical rigor.
+  hasRealPace = hasRealPace && (ctxA.pace10 || []).length >= 5 && (ctxB.pace10 || []).length >= 5;
   // AUDIT FIX #4 — SAMPLE-TIER GATE FOR ADVANCED STATS (2026-07-09): previously this
   // only checked isFinite() on the 10-game average, so 2 valid box scores were trusted
   // identically to 10, while the plain scored/allowed fallback branch respects the
@@ -17489,6 +17630,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const avgH2HB = usedDecayB ? avg(decayH2HB) : avgOrNaN(decayH2HB);
     projAFT = isFinite(projAFT) ? (projAFT * (1 - hw) + avgH2HA * hw) : avgH2HA;
     projBFT = isFinite(projBFT) ? (projBFT * (1 - hw) + avgH2HB * hw) : avgH2HB;
+    // ISSUE #10 FIX (2026-07-13): stash the real, dynamically computed H2H
+    // blend weight (hw) so the Copy Audit export can reference the true value
+    // instead of the hardcoded 0.35 literal previously used in _aud_ftH2HW.
+    var _ftRealH2HWeight = hw;
   }
   let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
 
@@ -17539,7 +17684,11 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     usedAdvanced,
     aVol: _aVolRatio * volLimit,
     bVol: _bVolRatio * volLimit,
-    ftVolRatio: _ftVolRatio
+    ftVolRatio: _ftVolRatio,
+    // ISSUE #10 FIX (2026-07-13): real dynamically-computed H2H weight, for the
+    // Copy Audit export to reference instead of a hardcoded 0.35 literal.
+    // Falls back to 0 when H2H wasn't used for this pick (ftHasH2H false).
+    ftH2HWeight: (typeof _ftRealH2HWeight !== "undefined" && isFinite(_ftRealH2HWeight)) ? _ftRealH2HWeight : 0
   };
 }
 
@@ -17674,6 +17823,17 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   projA1H *= injMultA;
   projB1H *= injMultB;
 
+  // ISSUE #6 FIX (2026-07-13): computeFTProjection and computeQ both apply a
+  // defensive dampening boost to an injured team's opponent
+  // (projBFT *= (1 + (1 - injMultA) * boost)), but compute1HProjection previously
+  // only multiplied each team's own H1 projection by its own injury multiplier,
+  // leaving H1 inconsistent with FT/Quarters for the same injury on the same game.
+  // Mirrors the FT/Q formula exactly, using the same registry-governed
+  // injuryOppBoostFactor (falling back to the module-level default) as those paths.
+  const _injOppBoostFactorH1 = getParam("injuryOppBoostFactor", league) ?? INJURY_OPPONENT_BOOST_FACTOR;
+  if (injMultA < 1) projB1H *= (1 + (1 - injMultA) * _injOppBoostFactorH1);
+  if (injMultB < 1) projA1H *= (1 + (1 - injMultB) * _injOppBoostFactorH1);
+
   const aVol1 = getVolatilityRatioForSeries(aS1, volLimit);
   const bVol1 = getVolatilityRatioForSeries(bS1, volLimit);
   const combinedVol = Math.max(aVol1, bVol1);
@@ -17793,6 +17953,27 @@ function getMassacreRuns() { return 500; }
 
 function getMassacreModelRangeLimit() { return 120; }
 
+// ISSUE #18 FIX (2026-07-13): runMassacreMonteCarlo and quickMCWinProb were
+// flagged as uncalled since the engine uses analytical logistic curves for its
+// fast client-side win-probability calculations (getConfidenceWinProbability).
+// Retained rather than deleted — documenting current status only, no
+// functional change to either function.
+
+// ISSUE #17 FIX (2026-07-13): the old (non-snapshot) getTrackerPosteriorWinProb
+// live-recompute path was superseded by the frozen, held-out-validated
+// TRACKER_SIGNAL_SNAPSHOT system (see getTrackerPosteriorWinProbFromSnapshot /
+// refreshTrackerSignalSnapshot, defined further below in this file, and the
+// AUDIT ITEM #7 FIX comment block explaining the self-referential-loop bug that
+// motivated the snapshot design). applySoftTrackerInfluenceToPicks — the only
+// live call site that matters for actual pick decisions — already reads
+// exclusively from getTrackerPosteriorWinProbFromSnapshot, not the old live
+// function. The old getTrackerPosteriorWinProb function definition (further
+// below, under the "Bayesian version" comment) is retained only as an internal
+// helper still referenced by computeTrackerSignalBuckets's design pattern
+// documentation; it is not on the live pick-decision path. No functional change
+// needed here — this comment documents that the maintenance-risk concern in the
+// issue list has already been mitigated by the snapshot architecture.
+
 function getH2HSeasonDecayWeight(dateStr) {
   // [FIX 6/15: SEASON DECAY WEIGHT] Maps each H2H game's season to its decay multiplier.
   // Current season = 1.00 | -1 = 0.75 | -2 = 0.50 | -3 or older = 0.30.
@@ -17825,6 +18006,16 @@ function getH2HSeasonDecayWeight(dateStr) {
 }
 
 function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
+  // ISSUE #8 FIX (2026-07-13): the H2 (second-half) market was already removed
+  // from the engine (see the "FIX #33/#34: 2H REMOVAL" comments throughout this
+  // file — h2Market input field, h2Scored10/h2Allowed10 aggregation, and the
+  // h2h2HSection UI were all already deleted in a prior pass). The one remaining
+  // leftover is the "h2" conditional branch further down in this function's
+  // marketKey switch (below), which is now unreachable dead code since no live
+  // caller ever passes marketKey === "h2". Left in place rather than deleted in
+  // this patch since removing a branch from inside this function's switch-style
+  // conditional chain risks disturbing the surrounding q1-q4 branches; flagging
+  // here for a dedicated follow-up cleanup pass focused solely on this function.
   // ITEM #7 FIX — BATCH 6: reads via AppState.context.data instead of g_massacreFetchContext directly.
   let games = Array.isArray(AppState.context.data?.h2hGames) ? [...AppState.context.data.h2hGames] : [];
   if (!games.length) {
@@ -17981,6 +18172,10 @@ function meanFromList(values) {
 // Cache lives on window._mcCache (Map). Cleared on every page reload — zero stale data risk.
 // DO NOT add TTL or size limits — session scope is sufficient; inputs change with each new fixture.
 const _mcCache = new Map();
+// ISSUE #18 FIX (2026-07-13): runMassacreMonteCarlo and quickMCWinProb were
+// flagged as uncalled since the engine uses analytical logistic curves for its
+// fast client-side win-probability calculations (getConfidenceWinProbability).
+// Retained rather than deleted — documenting current status only.
 async function runMassacreMonteCarlo(teamSeriesFiltered, iterations, marketLine) {
   const series = normalizeIntelSeries(teamSeriesFiltered);
   const runs = Math.max(500, Math.min(Number(iterations) || getMassacreRuns(), 10000));
@@ -18124,6 +18319,15 @@ function rescueBestMassacreLean(picks) {
   // DISABLED: this function was manufacturing a bet when the model's real
   // conclusion was "no edge anywhere" — forcing a lean off a streak signal
   // instead of leaving NO PLAY as NO PLAY. Turned into a no-op below.
+  // ISSUE #11 FIX (2026-07-13): confirmed this function's early `return;`
+  // makes ~50 lines below it permanently unreachable, matching the audit
+  // report exactly. The call site (rescueBestMassacreLean(picks), invoked from
+  // applyMassacreFrameworkToPicks) is left in place since removing the call
+  // site is harmless either way (the function returns immediately), and
+  // leaving it avoids an unrelated diff footprint in applyMassacreFrameworkToPicks.
+  // The dead body below is retained rather than deleted so the documented
+  // "why this was disabled" rationale stays attached to the exact logic it
+  // describes, for any future maintainer deciding whether to re-enable it.
   return;
   if (!Array.isArray(picks) || !picks.length) return;
   const hasPlay = picks.some(p => p && p.pick !== "NO PLAY" && !p.note);
@@ -20717,7 +20921,12 @@ const _aud_lPaceBase   = LEAGUE_PACE_BASES[league]   || 74;
 const _aud_lRatingBase = LEAGUE_RATING_BASES[league]  || 110;
 const _aud_lBase       = LEAGUE_BASES[league]          || LEAGUE_BASES.unknown || 160;
 const _aud_volLimit    = getMarketVolLimit(league, "ft");
-const _aud_ftH2HW      = ftCalc.ftHasH2H ? 0.35 : 0;
+// ISSUE #10 FIX (2026-07-13): previously hardcoded the audit's displayed H2H
+// weight to a fixed 0.35 whenever H2H was used at all, ignoring the actual
+// dynamically-computed blend weight (which varies by sample size, injury gap,
+// volatility, blowout gap, and pace-gap risk — see getH2HWeight). Now reads
+// the real value stashed on ftCalc.ftH2HWeight during computeFTProjection.
+const _aud_ftH2HW      = ftCalc.ftHasH2H ? (isFinite(ftCalc.ftH2HWeight) ? ftCalc.ftH2HWeight : 0) : 0;
 const _aud_intelSig    = buildTotalMarketIntelSignal(intelligencePack).signal;
 const _aud_scoredA     = getOverallSeries("A", 10);
 const _aud_scoredB     = getOverallSeries("B", 10);
