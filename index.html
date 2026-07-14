@@ -1,4 +1,3 @@
-L
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3986,6 +3985,11 @@ function parseSofascoreIndividual(side) {
     else if (st && !isFirstPaste) { st.style.color = "#2f8f4a"; st.textContent = "✅ H2H updated from additional JSON for team " + side; }
     if (pasteEl) pasteEl.value = "";
 
+    // ENGINE A/B INPUT-FIELD SYNC: manual/SofaScore paste also lands full-length
+    // data in the DOM above — strip to the most recent 5 immediately if Engine B
+    // is currently active, same as the ESPN auto-fetch path.
+    applyEngineModeToInputFields();
+
     openSection("marketSection");
     openSection("teamASection");
     openSection("teamBSection");
@@ -4205,11 +4209,59 @@ try {
   if (_storedEngineMode === "A" || _storedEngineMode === "B") ENGINE_MODE = _storedEngineMode;
 } catch (e) {}
 
+// ENGINE A/B INPUT-FIELD SYNC: when Engine B is active, the visible Scored/Allowed
+// input boxes are physically truncated to the most recent 5 comma-separated values
+// (arrays are stored recent-first throughout this file), so what the user sees in
+// the textboxes matches what applyEngineModeSeriesCap feeds into averaging/volatility/
+// sample-tier logic. Market line fields (ftMarket/h1Market/teamAMarket/etc.) are never
+// touched. Full original values are stashed in g_engineModeFieldBackup and restored
+// verbatim when switching back to Engine A. Any time a field still shows more than 5
+// values while Engine B is active (fresh fetch, manual paste, re-toggle), that full
+// value is re-captured as the new backup before truncating, so the backup never goes
+// stale after a re-fetch.
+let g_engineModeFieldBackup = {};
+const ENGINE_MODE_CAPPED_FIELD_IDS = [
+  "aFTScored", "aFTAllowed", "bFTScored", "bFTAllowed",
+  "a1HScored", "a1HAllowed", "b1HScored", "b1HAllowed",
+  "aQ1Scored", "aQ1Allowed", "aQ2Scored", "aQ2Allowed",
+  "aQ3Scored", "aQ3Allowed", "aQ4Scored", "aQ4Allowed",
+  "bQ1Scored", "bQ1Allowed", "bQ2Scored", "bQ2Allowed",
+  "bQ3Scored", "bQ3Allowed", "bQ4Scored", "bQ4Allowed",
+  "aFTScoredHome", "aFTAllowedHome", "aFTScoredAway", "aFTAllowedAway",
+  "bFTScoredHome", "bFTAllowedHome", "bFTScoredAway", "bFTAllowedAway"
+];
+
+function applyEngineModeToInputFields() {
+  if (ENGINE_MODE === "B") {
+    ENGINE_MODE_CAPPED_FIELD_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const raw = String(el.value || "");
+      if (!raw.trim()) return;
+      const parts = raw.split(",").map(v => v.trim()).filter(Boolean);
+      if (parts.length > 5) {
+        // Full (un-truncated) data just landed in this field — this is the value to
+        // preserve for later restoration, overwriting any older backup for this id.
+        g_engineModeFieldBackup[id] = raw;
+        el.value = parts.slice(0, 5).join(",");
+      }
+    });
+  } else {
+    ENGINE_MODE_CAPPED_FIELD_IDS.forEach(id => {
+      if (!(id in g_engineModeFieldBackup)) return;
+      const el = document.getElementById(id);
+      if (el) el.value = g_engineModeFieldBackup[id];
+      delete g_engineModeFieldBackup[id];
+    });
+  }
+}
+
 function setEngineMode(mode) {
   const clean = (mode === "B") ? "B" : "A";
   ENGINE_MODE = clean;
   try { localStorage.setItem(ENGINE_MODE_STORAGE_KEY, clean); } catch (e) {}
   if (typeof engineDebug === "function") engineDebug("Engine mode switched", { mode: clean });
+  applyEngineModeToInputFields();
   renderEngineModeButton();
   return clean;
 }
@@ -17173,6 +17225,12 @@ async function fetchESPNCore(league, teamAName, teamBName) {
 
     const fetchAuditIssues = buildFetchAuditIssues({ league, teamAName, teamBName, aStats, bStats, h2hGames });
     setFetchAuditIssues(fetchAuditIssues);
+
+    // ENGINE A/B INPUT-FIELD SYNC: freshly fetched data always lands in the DOM at
+    // full length (up to 10 games) above — if Engine B is currently active, strip the
+    // visible boxes down to the most recent 5 immediately so the UI never shows 10
+    // values while Engine B is only calculating on 5.
+    applyEngineModeToInputFields();
 
     const aGameCount = Math.min(aStats?.scored?.length || 0, aStats?.allowed?.length || 0);
     const bGameCount = Math.min(bStats?.scored?.length || 0, bStats?.allowed?.length || 0);
