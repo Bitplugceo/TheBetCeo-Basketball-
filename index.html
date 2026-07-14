@@ -1,5 +1,3 @@
-A
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2536,6 +2534,7 @@ body.dark-mode .tracker-analytics-section-head {
     <button class="theme-toggle" type="button" id="themeToggleBtn" title="Toggle dark/light mode">🏀</button>
     <button class="theme-toggle" type="button" id="trackerToggleBtn" title="Open tracked picks">📊</button>
     <button class="theme-toggle" type="button" id="afdbBtn" title="Auto-Fetch Debugger" onclick="if(typeof AFDB!=='undefined'&&AFDB.open)AFDB.open()">🔬</button>
+    <button class="theme-toggle" type="button" id="engineModeBtn" title="Toggle Engine A/B">A</button>
     PREDICTIONS
   </span>
 </header>
@@ -4183,7 +4182,73 @@ const BB_CONFIG = {
   version: "Path-A-v1"
 };
 
+// ENGINE A/B FIX — STAGE 1 (2026-07-14): global mode switch. "A" is the existing,
+// unmodified engine (weightedRecentAverage: last 10 games, recency-weighted,
+// trimmed-average via trimmedAvg). "B" is a stripped-down variant: last 5 games
+// only, no recency weighting, no outlier trimming — a flat arithmetic mean.
+// Persisted so the toggle survives a page reload. This flag alone does not yet
+// change any math — see the ENGINE_MODE branch added inside weightedRecentAverage
+// further down in this file, which is the single point every FT/H1/quarter/H2H
+// averaging call already routes through (via trimmedAvg -> weightedRecentAverage).
+// Stage 2 will add the UI toggle button and the dual-save/compare tracking logic;
+// this stage only lays the foundation so Engine B's math exists and is switchable
+// from the console (window.setEngineMode("B")) ahead of the UI landing.
+const ENGINE_MODE_STORAGE_KEY = "BB_ENGINE_MODE";
+let ENGINE_MODE = "A";
+try {
+  const _storedEngineMode = localStorage.getItem(ENGINE_MODE_STORAGE_KEY);
+  if (_storedEngineMode === "A" || _storedEngineMode === "B") ENGINE_MODE = _storedEngineMode;
+} catch (e) {}
 
+function setEngineMode(mode) {
+  const clean = (mode === "B") ? "B" : "A";
+  ENGINE_MODE = clean;
+  try { localStorage.setItem(ENGINE_MODE_STORAGE_KEY, clean); } catch (e) {}
+  if (typeof engineDebug === "function") engineDebug("Engine mode switched", { mode: clean });
+  renderEngineModeButton();
+  return clean;
+}
+window.setEngineMode = setEngineMode;
+window.getEngineMode = function () { return ENGINE_MODE; };
+
+// ENGINE A/B FIX — STAGE 2: header button reflects current mode and, when Engine
+// B has been auto-locked-in (see checkEngineABAutoLock further down), disables
+// further manual toggling back to A since at that point A's rules have been
+// stripped per the user's own stated instruction ("stripping all the A rules out").
+function renderEngineModeButton() {
+  const btn = document.getElementById("engineModeBtn");
+  if (!btn) return;
+  const locked = (function () {
+    try { return localStorage.getItem("BB_ENGINE_AB_LOCKED") === "1"; } catch (e) { return false; }
+  })();
+  btn.textContent = ENGINE_MODE;
+  btn.title = locked
+    ? "Engine locked to " + ENGINE_MODE + " (auto-selected winner)"
+    : "Toggle Engine A/B (currently " + ENGINE_MODE + ")";
+  btn.style.opacity = locked ? "0.6" : "1";
+  btn.disabled = locked;
+}
+
+function toggleEngineMode() {
+  const locked = (function () {
+    try { return localStorage.getItem("BB_ENGINE_AB_LOCKED") === "1"; } catch (e) { return false; }
+  })();
+  if (locked) return;
+  setEngineMode(ENGINE_MODE === "A" ? "B" : "A");
+}
+
+// ENGINE A/B FIX — STAGE 1: Engine B's averaging primitive. Takes only the most
+// recent 5 entries (arrays are already stored recent-first throughout this file,
+// same convention weightedRecentAverage relies on), applies NO recency weighting
+// and NO outlier trimming, and returns a flat arithmetic mean. Mirrors avg()'s
+// own isFinite-filtering safety (see the NON-FINITE FILTER lock on avg() further
+// down) so a bad upstream value can't silently propagate as NaN here either.
+function simpleAverage(arr) {
+  const clean = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
+  if (!clean.length) return NaN;
+  const last5 = clean.slice(0, 5);
+  return last5.reduce((a, b) => a + b, 0) / last5.length;
+}
 
     // Issue 3/14: getDynamicWeights returns calibrated fixed weights used by computeFTProjection
 // via config.teamWeight. The blend ratio (0.65 own-scoring / 0.35 opponent-defense) is now
@@ -8998,6 +9063,13 @@ function trimmedAvg(arr) {
   // meant for the 2nd. With sample sizes this small (<=10 games), trimming outliers adds
   // more distortion than it removes, so it has been dropped entirely in favor of plain
   // recency weighting, which already down-weights old/anomalous games naturally.
+  // ENGINE A/B FIX — STAGE 1: this is the single choke point nearly every FT/H1/
+  // quarter/H2H/venue averaging call in the file already routes through (directly,
+  // or via avgOrNaN -> trimmedAvg). Branching here means Engine B's "last 5, flat
+  // mean, no recency weighting, no trimming" rule applies everywhere at once
+  // without having to touch each of those call sites individually. Engine A's path
+  // (weightedRecentAverage) is completely unchanged.
+  if (ENGINE_MODE === "B") return simpleAverage(work);
   return weightedRecentAverage(work);
 }
 
@@ -10794,6 +10866,81 @@ let g_lastRenderedTrackerView = null;
 // debug log, tracker save failure count, approximate localStorage footprint, and
 // the last retraining pipeline checkpoint. Read-only — does not compute anything
 // new, just surfaces existing state.
+// ENGINE A/B FIX — STAGE 2: scans settled FT picks that carry an engineABSnapshot
+// (see runEngine + buildTrackedPickPayload) and grades each engine's own
+// proj/edge against the SAME real final score for that same game — a genuine
+// matched-pick comparison, not two independent samples. A "decision" only counts
+// once both engines' edges clear the real getPick() threshold for that league/
+// market (an engine that would have said NO PLAY isn't graded as a win or loss
+// for that pick — it simply didn't participate in that comparison round).
+function getEngineABComparison() {
+  const settled = getAllSettledTrackedPicks().filter(p =>
+    p.marketKey === "ft" &&
+    p.engineABSnapshot &&
+    isFinite(parseFloat(p.actualScore)) &&
+    isFinite(Number(p.lineAtPick ?? p.line))
+  );
+
+  let aWins = 0, bWins = 0, matched = 0;
+  const rows = [];
+
+  settled.forEach(p => {
+    const actual = parseFloat(p.actualScore);
+    const line = Number(p.lineAtPick ?? p.line);
+    const snap = p.engineABSnapshot;
+    if (!snap || !snap.A || !snap.B) return;
+
+    const aEdge = Number(snap.A.edge);
+    const bEdge = Number(snap.B.edge);
+    if (!isFinite(aEdge) || !isFinite(bEdge)) return;
+
+    const aPickText = getPick(aEdge, line, p.league, "ft", {});
+    const bPickText = getPick(bEdge, line, p.league, "ft", {});
+    const aSide = getPickSideFromText(aPickText);
+    const bSide = getPickSideFromText(bPickText);
+    if (!aSide || !bSide) return; // one or both engines said NO PLAY on this game
+
+    const aCorrect = aSide === "over" ? actual > line : actual < line;
+    const bCorrect = bSide === "over" ? actual > line : actual < line;
+
+    matched++;
+    if (aCorrect) aWins++;
+    if (bCorrect) bWins++;
+
+    rows.push({
+      eventId: p.eventId, homeTeam: p.homeTeam, awayTeam: p.awayTeam,
+      line, actual, aSide, bSide, aCorrect, bCorrect
+    });
+  });
+
+  return { matched, aWins, bWins, rows };
+}
+
+// ENGINE A/B FIX — STAGE 2: per the user's explicit instruction — once Engine B
+// has accumulated 10 matched decisions against Engine A and has strictly more
+// wins, permanently lock the engine to B (setEngineMode("B")) and set a lock
+// flag so the header toggle can no longer be flipped back to A, since at that
+// point Engine A's rules are considered retired for this install. Called after
+// every settlement batch (same place calibration/retraining hooks already run)
+// so this check happens automatically without a manual trigger.
+function checkEngineABAutoLock() {
+  try {
+    if (localStorage.getItem("BB_ENGINE_AB_LOCKED") === "1") return;
+  } catch (e) {}
+
+  const cmp = getEngineABComparison();
+  if (cmp.matched < 10) return;
+
+  if (cmp.bWins > cmp.aWins) {
+    setEngineMode("B");
+    try { localStorage.setItem("BB_ENGINE_AB_LOCKED", "1"); } catch (e) {}
+    engineDebug("Engine A/B: Engine B won matched comparison — locked to B permanently", cmp);
+    renderEngineModeButton();
+  } else {
+    engineDebug("Engine A/B: 10 matched picks reached, Engine A held or tied — mode stays switchable", cmp);
+  }
+}
+
 function getEngineHealthSnapshot() {
   const league = document.getElementById("leagueSelect")?.value || "";
   const modelHealth = league ? checkModelHealth(league) : null;
@@ -11607,6 +11754,35 @@ function renderTrackerAnalytics() {
           <div class="tracker-kpi-label">Review status</div>
           <div class="tracker-kpi-value">${safeText(checkpointStatus)}</div>
           <div class="tracker-kpi-sub">${safeText(reviewVersionSub)}</div>
+        </div>
+      </div>
+
+      <div class="tracker-analytics-card">
+        <div class="tracker-analytics-card-head">
+          <div class="tracker-analytics-card-title">Engine A vs Engine B</div>
+          <div class="tracker-analytics-card-meta">${(function(){ try { return localStorage.getItem("BB_ENGINE_AB_LOCKED") === "1" ? "LOCKED to " + ENGINE_MODE : "Active: " + ENGINE_MODE; } catch(e) { return "Active: " + ENGINE_MODE; } })()}</div>
+        </div>
+        <div class="tracker-analytics-card-body">
+          ${(function(){
+            const cmp = (typeof getEngineABComparison === "function") ? getEngineABComparison() : { matched: 0, aWins: 0, bWins: 0 };
+            const need = Math.max(0, 10 - cmp.matched);
+            return `
+            <div class="tracker-report-subtitle">Matched FT picks only — both engines graded against the same real final score for the same game. Engine B = last 5 games, flat average, no recency weighting, no trimming. Auto-locks to B once 10 matched picks exist and B is strictly ahead.</div>
+            <div class="tracker-kpi-grid">
+              <div class="tracker-kpi-card">
+                <div class="tracker-kpi-label">Engine A wins</div>
+                <div class="tracker-kpi-value">${cmp.aWins}</div>
+                <div class="tracker-kpi-sub">of ${cmp.matched} matched picks</div>
+              </div>
+              <div class="tracker-kpi-card">
+                <div class="tracker-kpi-label">Engine B wins</div>
+                <div class="tracker-kpi-value">${cmp.bWins}</div>
+                <div class="tracker-kpi-sub">of ${cmp.matched} matched picks</div>
+              </div>
+            </div>
+            <div class="tracker-empty-note" style="margin-top:8px;">${need > 0 ? need + " more matched picks needed before auto-lock decision." : "Decision threshold reached — check header 🅰/🅱 button for lock status."}</div>
+            `;
+          })()}
         </div>
       </div>
 
@@ -13932,6 +14108,7 @@ function handleTrackedPicksActionClick(event) {
                 const _snapResult = refreshTrackerSignalSnapshot();
                 if (_snapResult) engineDebug("Tracker signal snapshot refresh result", { frozenAt: _snapResult.frozenAt, settledCountAtFreeze: _snapResult.settledCountAtFreeze, validationZ: _snapResult.validationZ || null });
               } catch(e) { engineDebug("refreshTrackerSignalSnapshot threw during retrain", e?.message || String(e)); }
+              try { checkEngineABAutoLock(); } catch(e) { engineDebug("checkEngineABAutoLock threw during retrain", e?.message || String(e)); }
               try { checkModelHealth(); } catch(e) {}
               localStorage.setItem("BB_RETRAIN_CHECKPOINT", JSON.stringify({
                 settledCount: _nowSettled, ts: new Date().toISOString()
@@ -19097,6 +19274,14 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     isLock,
     isABQualified,
     trackerBucket: "raw",
+    // ENGINE A/B FIX — STAGE 2: attaches the per-run Engine A vs Engine B FT
+    // snapshot (see engineABSnapshot built in runEngine) onto every saved pick,
+    // regardless of market, so settlement can later grade both engines against
+    // the same real outcome for a true matched-pick comparison. Read defensively
+    // since engineABSnapshot is only ever built inside runEngine's FT branch;
+    // falls back to null rather than throwing if this payload is ever built from
+    // a context where it wasn't computed.
+    engineABSnapshot: (typeof engineABSnapshot !== "undefined" && engineABSnapshot) ? engineABSnapshot : null,
     sampleTier,
     projectionOnly,
     hasH2H,
@@ -19782,6 +19967,46 @@ const ftCalc = computeFTProjection({
   config: { ...ftConfigOverride, teamWeight: _dynWeights.teamWeight, oppWeight: _dynWeights.oppWeight }
 });
 ftCalc.volatilityBlock = false;
+
+// ENGINE A/B FIX — STAGE 2: compute the FT market a second time under the OTHER
+// engine mode (whichever one is not currently active) so every run captures both
+// an Engine A and an Engine B FT projection/edge/pick side-by-side, regardless of
+// which mode is actively driving the displayed picks. This is diagnostic-only —
+// it never touches ftCalc/finalLines/the displayed picks, it only records what the
+// other engine WOULD have said, for later matched-pick comparison. Temporarily
+// flips ENGINE_MODE for the duration of this one extra computeFTProjection call
+// (weightedRecentAverage/trimmedAvg branch on ENGINE_MODE — see Stage 1), then
+// restores it immediately so nothing else in this run is affected.
+const _otherEngineMode = ENGINE_MODE === "A" ? "B" : "A";
+const _savedEngineModeForShadow = ENGINE_MODE;
+ENGINE_MODE = _otherEngineMode;
+let _shadowFtCalc = null;
+try {
+  _shadowFtCalc = computeFTProjection({
+    league,
+    parsed,
+    lines: finalLines,
+    injMultA: AppState.injuries.A.scoringMult,
+    injMultB: AppState.injuries.B.scoringMult,
+    config: { ...ftConfigOverride, teamWeight: _dynWeights.teamWeight, oppWeight: _dynWeights.oppWeight }
+  });
+} catch (e) {
+  engineDebug("Engine A/B shadow FT computation failed", { error: e?.message || String(e) });
+} finally {
+  ENGINE_MODE = _savedEngineModeForShadow;
+}
+
+const engineABSnapshot = {
+  activeMode: ENGINE_MODE,
+  A: {
+    proj: ENGINE_MODE === "A" ? ftCalc.ftProj : _shadowFtCalc?.ftProj,
+    edge: ENGINE_MODE === "A" ? ftCalc.ftEdge : _shadowFtCalc?.ftEdge
+  },
+  B: {
+    proj: ENGINE_MODE === "B" ? ftCalc.ftProj : _shadowFtCalc?.ftProj,
+    edge: ENGINE_MODE === "B" ? ftCalc.ftEdge : _shadowFtCalc?.ftEdge
+  }
+};
 
 MODEL_TUNING.recencyWeights = h1ConfigOverride.recencyProfile || _runH1Weights;
 // ITEM #7 FIX — BATCH 4: reads via AppState.injuries instead of g_injA/g_injB directly.
@@ -21189,11 +21414,16 @@ window.__LAST_AUDIT_STATE = {
     leagueEdgePointThresholds: LEAGUE_EDGE_POINT_THRESHOLDS,
     modelConfig: MODEL_CONFIG,
     modelTuning:   MODEL_TUNING,
-    anchorRules:   ANCHOR_RULES,
+    // ANCHOR_RULES/PICK_RULES refs removed here — both objects were already
+    // deleted from the engine in prior patches (see their own [DELETED] lock
+    // comments elsewhere in this file). Referencing them here threw
+    // "Can't find variable: ANCHOR_RULES" on every single Run. LOCKED: do not
+    // re-add references to either deleted object without re-adding the object
+    // itself first.
     massacreTuning:    MASSACRE_TUNING,
     teamMemoryRules:   TEAM_MEMORY_RULES,
     trackerSoftEffects: TRACKER_SOFT_EFFECTS,
-    pickRules: PICK_RULES,
+    engineMode: ENGINE_MODE,
     leagueTrustMeta: _aud_trust,
     h2hFixedWeight: 0.35,
     h2hTeamWeight:  0.65,
@@ -21976,6 +22206,12 @@ if (fetchBtn) fetchBtn.addEventListener("click", withErrorBoundary(fetchESPN, "f
 
       const clearBtn = document.getElementById("clearBtn");
       if (clearBtn) clearBtn.addEventListener("click", clearAll);
+
+      // ENGINE A/B FIX — STAGE 2: wire the header toggle button and paint its
+      // initial state (mode + locked/unlocked) as soon as the DOM is ready.
+      const engineModeBtn = document.getElementById("engineModeBtn");
+      if (engineModeBtn) engineModeBtn.addEventListener("click", toggleEngineMode);
+      renderEngineModeButton();
 
       document.querySelectorAll(".section").forEach(s => {
         s.classList.add("collapsed");
