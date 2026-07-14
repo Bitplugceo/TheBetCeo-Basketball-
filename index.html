@@ -1,3 +1,4 @@
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -14698,14 +14699,21 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
       const tierKey = "tier_" + getLeagueTrustMeta(league).level;
       coeff = models[league] || models[leagueGroup] || models[tierKey] || models["global"] || {};
     }
-  } catch(e) {}
+    } catch(e) {}
   // AUDIT FIX — ||/?? SENTINEL BUG (2026-07-09): (volatilityRatio || 1.0) silently
   // replaced a genuine volatilityRatio of 0 (a truly dead-stable series) with 1.0,
   // killing the confidence boost a zero-volatility team should get. 0 is falsy but
   // valid here, so this must use ?? (only replaces null/undefined), not ||.
+  // BUGFIX — THIN-SAMPLE EDGE OVERRIDE (audit item #3): edgePct's coefficient (~8.0)
+  // previously applied at full strength regardless of sampleTier, so a large edge on a
+  // thin/insufficient sample could still push winProbability into A-grade territory
+  // despite the much smaller +0.4 sampleFull term meant to penalize thin data. Dampens
+  // the edgePct contribution itself when sampleTier is not "full", so a big edge on a
+  // weak sample can no longer overpower the sample-quality signal.
+  const _sampleDampen = sampleTier === "full" ? 1.0 : (sampleTier === "thin" ? 0.6 : 0.35);
   const logOdds =
     (coeff.intercept   ?? -0.2) +
-    (coeff.edgePct     ??  8.0) * ((edgePct || 0) - 0.060) +
+    (coeff.edgePct     ??  8.0) * ((edgePct || 0) - 0.060) * _sampleDampen +
     (coeff.volRatio    ?? -0.8) * ((volatilityRatio ?? 1.0) - 1.0) +
     (coeff.sampleFull  ??  0.4) * (sampleTier === "full" ? 1 : 0) +
     (coeff.h2h         ??  0.2) * (hasH2H ? 1 : 0) +
@@ -20360,9 +20368,17 @@ const h1Calc = compute1HProjection({
       // / ftCalc.ftProjectionOnly — the same values already passed downstream into the Q1-Q4
       // display payloads (see the Q1/Q2/Q3/Q4 payload builders below), so this now matches
       // what was already being displayed as if it were quarter-specific.]
+      // BUGFIX — Q-INITIAL-PASS NaN GRADE DESPITE QUALIFYING EDGE (audit item #1): this
+      // initial computeQ pass never guarded stdDev(aS.concat(bS)) against NaN/empty input
+      // the way the later rescale block in runEngine does (see its own _q1VolSafe/
+      // _q2VolSafe/_q3VolSafe/_q4VolSafe guards). A NaN volatility here silently produces
+      // a NaN win probability inside getConfidenceGrade, which falls through to grade
+      // "NaN" (NO PLAY) even when pick/edge are fully valid. Falls back to 0 (neutral)
+      // whenever the computed volatility is not finite.
+      const _qVolSafe = isFinite(stdDev(aS.concat(bS))) ? stdDev(aS.concat(bS)) : 0;
       const qConf = getConfidenceGrade({
         pick: qPick, line: lineVal, edge: qEdge, sampleTier: tier,
-        volatility: stdDev(aS.concat(bS)), volLimit,
+        volatility: _qVolSafe, volLimit,
         fullModel: ftCalc.ftFullModel, projectionOnly: ftCalc.ftProjectionOnly,
         // FIX #27: marketKey was hardcoded "h1" for every quarter (q1-q4), which is wrong —
         // it happened to be numerically harmless here only because q2Edge/q4Edge are never
@@ -21131,6 +21147,19 @@ await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtur
           const hasH2H = p.hasH2H ?? false;
           
           p.winProbability = getConfidenceWinProbability(grade, edgePct, volRatio, sampleTier, hasH2H, false, league);
+
+          // BUGFIX — PICK/PROBABILITY DECOUPLING (audit item #2): getPick() decides
+          // OVER/UNDER purely from raw point-edge vs. a threshold, entirely independent
+          // of this winProbability estimate. That let a live pick be issued on the side
+          // this same model considers <50% likely to win, with no signal anywhere in the
+          // UI that the two systems disagreed. Flags that contradiction explicitly on the
+          // pick object instead of silently displaying a normal-looking pick.
+          const _pickSideForProbCheck = getPickSideFromText(p.pick);
+          if (_pickSideForProbCheck && isFinite(p.winProbability) && p.winProbability < 0.5) {
+            p.probabilityMismatchFlag = true;
+            p.probabilityMismatchReason = "Model-estimated win probability (" + (p.winProbability * 100).toFixed(1) + "%) is below 50% for the picked side — pick/edge threshold and win-probability model disagree.";
+            engineDebug("WARN: pick/probability mismatch", { market: p.marketKey, pick: p.pick, winProbability: p.winProbability });
+          }
         }
       });
     }
