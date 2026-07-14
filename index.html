@@ -1,3 +1,4 @@
+L
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4265,6 +4266,25 @@ function simpleAverage(arr) {
   if (!clean.length) return NaN;
   const last5 = clean.slice(0, 5);
   return last5.reduce((a, b) => a + b, 0) / last5.length;
+}
+
+// ENGINE A/B FIX — STAGE 3 (2026-07-14): single choke point for "how many games
+// does this run actually see." Engine B is supposed to mean "last 5 games only,"
+// but until now that truncation only happened inside simpleAverage() at the very
+// end of the pipeline — every series-fetching function upstream (getOverallSeries,
+// getManualSeries, getManualAllowedSeries, getFetchedSeries, getH2HSeries) still
+// returned up to 10 games, and those full 10-game arrays were what actually reached
+// stdDev(), getVolatilityRatioForSeries(), getSampleTier(), and every diagnostic/
+// audit field — so Engine B's own STEP1_sampleSizes, volatility, and sample tier
+// all silently reported n=10 even though the mean itself was computed over 5. Any
+// caller that fetches a series for use under Engine B should pass it through this
+// function immediately after fetching, before it reaches averaging, volatility, or
+// sample-tier logic. No-op under Engine A. DO NOT skip this at any series-fetch
+// call site while Engine B is meant to be a genuine 5-game model.
+function applyEngineModeSeriesCap(arr) {
+  const clean = Array.isArray(arr) ? arr : [];
+  if (ENGINE_MODE === "B") return clean.slice(0, 5);
+  return clean;
 }
 
     // Issue 3/14: getDynamicWeights returns calibrated fixed weights used by computeFTProjection
@@ -14419,11 +14439,11 @@ function getOverallSeries(side, limit) {
   // Previously preferred stale cached fetch data over a manual edit to the field,
   // silently ignoring the user's correction. Do not reverse this order.]
   const manual = readLooseSeries(fieldId);
-  if (manual.length >= 2) return manual.slice(0, n);
+  if (manual.length >= 2) return applyEngineModeSeriesCap(manual.slice(0, n));
   // ITEM #7 FIX — BATCH 6: reads via AppState.context.data instead of g_massacreFetchContext directly.
   const ctx = AppState.context.data?.[side]?.overall;
   const fetched = Array.isArray(ctx?.ftScored10) ? ctx.ftScored10.map(Number).filter(v => isFinite(v) && v > 0) : [];
-  return fetched.slice(0, n);
+  return applyEngineModeSeriesCap(fetched.slice(0, n));
 }
 
 // Helper: probability that a team's recent scores exceed a threshold
@@ -17268,7 +17288,7 @@ function getFetchedSeries(side, scope, marketKey, metric) {
   const prefix = marketKey; 
   const suffix = metric === "allowed" ? "Allowed10" : "Scored10"; 
   const arr = ctx?.[prefix + suffix]; 
-  return Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v) && v > 0).slice(0, 10) : []; 
+  return Array.isArray(arr) ? applyEngineModeSeriesCap(arr.map(Number).filter(v => isFinite(v) && v > 0).slice(0, 10)) : []; 
 }
 
 // [LOCK: ADAPTIVE VENUE BLEND SYSTEM — VERIFIED, user-directed design, do not alter]
@@ -17340,11 +17360,11 @@ function getManualSeries(side, marketKey, parsed) {
   // series come from computeFTProjection's own aFTS/bFTS reads, never from this function.
   // The old "ft" branch below was unreachable dead code. DO NOT re-add an "ft" branch
   // without wiring an actual caller for it first.]
-  if (side === "A" && marketKey === "h1") return safeArr(parsed.a1HScored) || [];
-  if (side === "B" && marketKey === "h1") return safeArr(parsed.b1HScored) || [];
+  if (side === "A" && marketKey === "h1") return applyEngineModeSeriesCap(safeArr(parsed.a1HScored) || []);
+  if (side === "B" && marketKey === "h1") return applyEngineModeSeriesCap(safeArr(parsed.b1HScored) || []);
   if (marketKey.startsWith("q")) {
     const pKey = side.toLowerCase() + marketKey.toUpperCase() + "Scored";
-    if (parsed[pKey] && parsed[pKey].length) return safeArr(parsed[pKey]);
+    if (parsed[pKey] && parsed[pKey].length) return applyEngineModeSeriesCap(safeArr(parsed[pKey]));
   }
   // [LOCK: QUARTER FETCH FALLBACK KEY — VERIFIED CORRECT, do not "fix" this again.
   // g_massacreFetchContext[side].q1Scored/.q2Scored/.q3Scored/.q4Scored are set directly
@@ -17354,16 +17374,16 @@ function getManualSeries(side, marketKey, parsed) {
   // ITEM #7 FIX — BATCH 6: reads via AppState.context.data instead of g_massacreFetchContext directly.
   const qKey = marketKey + "Scored";
   const qData = AppState.context.data[side][qKey];
-  if (Array.isArray(qData) && qData.length) return qData;
+  if (Array.isArray(qData) && qData.length) return applyEngineModeSeriesCap(qData);
   return [];
 }
 
 function getManualAllowedSeries(side, marketKey, parsed) {
   if (!parsed) return [];
-  if (side === "A" && marketKey === "ft") return safeArr(parsed.aFTAllowed) || [];
-  if (side === "B" && marketKey === "ft") return safeArr(parsed.bFTAllowed) || [];
-  if (side === "A" && marketKey === "h1") return safeArr(parsed.a1HAllowed) || [];
-  if (side === "B" && marketKey === "h1") return safeArr(parsed.b1HAllowed) || [];
+  if (side === "A" && marketKey === "ft") return applyEngineModeSeriesCap(safeArr(parsed.aFTAllowed) || []);
+  if (side === "B" && marketKey === "ft") return applyEngineModeSeriesCap(safeArr(parsed.bFTAllowed) || []);
+  if (side === "A" && marketKey === "h1") return applyEngineModeSeriesCap(safeArr(parsed.a1HAllowed) || []);
+  if (side === "B" && marketKey === "h1") return applyEngineModeSeriesCap(safeArr(parsed.b1HAllowed) || []);
   return [];
 }
 
@@ -17381,6 +17401,12 @@ function getH2HSeries(side, marketKey, parsed) {
     if (parsed[pKey] && parsed[pKey].length) return safeArr(parsed[pKey]);
   }
   return [];
+  // NOTE: H2H series are intentionally left uncapped by applyEngineModeSeriesCap.
+  // H2H games are a separate, small (2-10 game) sample of meetings between these
+  // two specific teams, not "recent form" — Engine A vs B's last-10-vs-last-5
+  // distinction is about each team's own recent scoring history, not head-to-head
+  // history. Capping H2H to 5 under Engine B would arbitrarily discard real
+  // meetings with no connection to what Engine B is supposed to change.
 }
 
 
@@ -21294,6 +21320,11 @@ window.__LAST_AUDIT_STATE = {
     engineModeDescription: ENGINE_MODE === "B"
       ? "Engine B: last 5 games only, flat arithmetic mean, NO recency weighting, NO outlier trimming."
       : "Engine A: last 10 games, recency-weighted average with outlier trimming (weightedRecentAverage/trimmedAvg).",
+    // ENGINE A/B FIX — STAGE 3: this note confirms that under Engine B, the series-fetch
+    // functions (getOverallSeries/getManualSeries/getManualAllowedSeries/getFetchedSeries)
+    // now genuinely cap every scored/allowed series at 5 games via applyEngineModeSeriesCap
+    // before it reaches averaging, volatility, or sample-tier logic — so STEP1 sample sizes
+    // elsewhere in this dump should read 5, not 10, whenever engineMode is "B".
     engineABLocked: (function () { try { return localStorage.getItem("BB_ENGINE_AB_LOCKED") === "1"; } catch (e) { return false; } })(),
     leagueTrustLevel: _aud_trust.level,
     leagueTrustMode: _aud_trust.mode,
