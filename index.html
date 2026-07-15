@@ -1,4 +1,3 @@
-K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2535,6 +2534,7 @@ body.dark-mode .tracker-analytics-section-head {
     <button class="theme-toggle" type="button" id="themeToggleBtn" title="Toggle dark/light mode">🏀</button>
     <button class="theme-toggle" type="button" id="trackerToggleBtn" title="Open tracked picks">📊</button>
     <button class="theme-toggle" type="button" id="afdbBtn" title="Auto-Fetch Debugger" onclick="if(typeof AFDB!=='undefined'&&AFDB.open)AFDB.open()">🔬</button>
+    <button class="theme-toggle" type="button" id="engineModeBtn" title="Toggle Engine A/B">A</button>
     PREDICTIONS
   </span>
 </header>
@@ -3006,11 +3006,6 @@ body.dark-mode .tracker-analytics-section-head {
   <div class="actions">
     <button id="runBtn" type="button">Run</button>
     <button id="clearBtn" type="button">Clear</button>
-    <!-- ENGINE A/B FIX — TOGGLE RELOCATED (2026-07-14): moved from the header
-         brand-right area into the actions row, directly before the copy buttons,
-         per explicit placement request. Styled to match the gold copy-button
-         pair so it doesn't look out of place sitting next to them. -->
-    <button id="engineModeBtn" type="button" title="Toggle Engine A/B" style="background: #d4af37 !important; color: #111 !important; box-shadow: 0 2px 8px rgba(212, 175, 55, 0.35) !important; font-weight: 900 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">A</button>
     <button id="auditCopyBtn" type="button" title="Copy Audit" style="background: #d4af37 !important; color: #111 !important; box-shadow: 0 2px 8px rgba(212, 175, 55, 0.35) !important; font-weight: 700 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">📋</button>
     <button id="inputsCopyBtn" type="button" title="Copy Inputs &amp; Market Lines" style="background: #d4af37 !important; color: #111 !important; box-shadow: 0 2px 8px rgba(212, 175, 55, 0.35) !important; font-weight: 700 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">🗒️</button>
 
@@ -3193,7 +3188,11 @@ try {
     if (typeof runMassacreMonteCarlo !== 'function') issues.push("CRITICAL: Monte Carlo Worker bridge is broken.");
 
     try {
-      const testWeight = getDynamicWeights("full", 5, "nba");
+      // ISSUE 2 FIX: getDynamicWeights applies a volatility shrink whenever volatility > 0
+      // (see its own volRatio/volShrink logic), so passing 5 here got clamped to 2.5 and
+      // pulled teamWeight down to 0.5375 on every single load — a false-positive integrity
+      // failure. Use a baseline volatility of 0 to isolate the calibrated 0.65 base weight.
+      const testWeight = getDynamicWeights("full", 0, "nba");
       if (testWeight.teamWeight !== 0.65) issues.push("INTEGRITY: getDynamicWeights returned unexpected teamWeight.");
     } catch(e) {
       issues.push("INTEGRITY: Math engine failed internal sanity test.");
@@ -3986,11 +3985,6 @@ function parseSofascoreIndividual(side) {
     else if (st && !isFirstPaste) { st.style.color = "#2f8f4a"; st.textContent = "✅ H2H updated from additional JSON for team " + side; }
     if (pasteEl) pasteEl.value = "";
 
-    // ENGINE A/B INPUT-FIELD SYNC: manual/SofaScore paste also lands full-length
-    // data in the DOM above — strip to the most recent 5 immediately if Engine B
-    // is currently active, same as the ESPN auto-fetch path.
-    applyEngineModeToInputFields();
-
     openSection("marketSection");
     openSection("teamASection");
     openSection("teamBSection");
@@ -4210,59 +4204,11 @@ try {
   if (_storedEngineMode === "A" || _storedEngineMode === "B") ENGINE_MODE = _storedEngineMode;
 } catch (e) {}
 
-// ENGINE A/B INPUT-FIELD SYNC: when Engine B is active, the visible Scored/Allowed
-// input boxes are physically truncated to the most recent 5 comma-separated values
-// (arrays are stored recent-first throughout this file), so what the user sees in
-// the textboxes matches what applyEngineModeSeriesCap feeds into averaging/volatility/
-// sample-tier logic. Market line fields (ftMarket/h1Market/teamAMarket/etc.) are never
-// touched. Full original values are stashed in g_engineModeFieldBackup and restored
-// verbatim when switching back to Engine A. Any time a field still shows more than 5
-// values while Engine B is active (fresh fetch, manual paste, re-toggle), that full
-// value is re-captured as the new backup before truncating, so the backup never goes
-// stale after a re-fetch.
-let g_engineModeFieldBackup = {};
-const ENGINE_MODE_CAPPED_FIELD_IDS = [
-  "aFTScored", "aFTAllowed", "bFTScored", "bFTAllowed",
-  "a1HScored", "a1HAllowed", "b1HScored", "b1HAllowed",
-  "aQ1Scored", "aQ1Allowed", "aQ2Scored", "aQ2Allowed",
-  "aQ3Scored", "aQ3Allowed", "aQ4Scored", "aQ4Allowed",
-  "bQ1Scored", "bQ1Allowed", "bQ2Scored", "bQ2Allowed",
-  "bQ3Scored", "bQ3Allowed", "bQ4Scored", "bQ4Allowed",
-  "aFTScoredHome", "aFTAllowedHome", "aFTScoredAway", "aFTAllowedAway",
-  "bFTScoredHome", "bFTAllowedHome", "bFTScoredAway", "bFTAllowedAway"
-];
-
-function applyEngineModeToInputFields() {
-  if (ENGINE_MODE === "B") {
-    ENGINE_MODE_CAPPED_FIELD_IDS.forEach(id => {
-      const el = document.getElementById(id);
-      if (!el) return;
-      const raw = String(el.value || "");
-      if (!raw.trim()) return;
-      const parts = raw.split(",").map(v => v.trim()).filter(Boolean);
-      if (parts.length > 5) {
-        // Full (un-truncated) data just landed in this field — this is the value to
-        // preserve for later restoration, overwriting any older backup for this id.
-        g_engineModeFieldBackup[id] = raw;
-        el.value = parts.slice(0, 5).join(",");
-      }
-    });
-  } else {
-    ENGINE_MODE_CAPPED_FIELD_IDS.forEach(id => {
-      if (!(id in g_engineModeFieldBackup)) return;
-      const el = document.getElementById(id);
-      if (el) el.value = g_engineModeFieldBackup[id];
-      delete g_engineModeFieldBackup[id];
-    });
-  }
-}
-
 function setEngineMode(mode) {
   const clean = (mode === "B") ? "B" : "A";
   ENGINE_MODE = clean;
   try { localStorage.setItem(ENGINE_MODE_STORAGE_KEY, clean); } catch (e) {}
   if (typeof engineDebug === "function") engineDebug("Engine mode switched", { mode: clean });
-  applyEngineModeToInputFields();
   renderEngineModeButton();
   return clean;
 }
@@ -4293,19 +4239,6 @@ function toggleEngineMode() {
   })();
   if (locked) return;
   setEngineMode(ENGINE_MODE === "A" ? "B" : "A");
-
-  // ENGINE A/B FIX — IMMEDIATE ACTIVATION (2026-07-14): if a results table is
-  // already showing from a prior Run, the mode switch must take effect right
-  // away rather than sitting inert until the user manually clicks Run again.
-  // Guarded so this only fires when there's something on screen worth
-  // recomputing (avoids a spurious/empty run right after page load or Clear),
-  // and skipped entirely if an engine run is already mid-flight to avoid a
-  // double-run race with whatever triggered that run.
-  const resultsTable = document.getElementById("results");
-  const hasVisibleResults = resultsTable && resultsTable.style.display !== "none" && resultsTable.rows.length > 1;
-  if (hasVisibleResults && !window.__engineRunInProgress && typeof runEngine === "function") {
-    withErrorBoundary(runEngine, "runEngine_engineModeToggle")();
-  }
 }
 
 // ENGINE A/B FIX — STAGE 1: Engine B's averaging primitive. Takes only the most
@@ -4319,25 +4252,6 @@ function simpleAverage(arr) {
   if (!clean.length) return NaN;
   const last5 = clean.slice(0, 5);
   return last5.reduce((a, b) => a + b, 0) / last5.length;
-}
-
-// ENGINE A/B FIX — STAGE 3 (2026-07-14): single choke point for "how many games
-// does this run actually see." Engine B is supposed to mean "last 5 games only,"
-// but until now that truncation only happened inside simpleAverage() at the very
-// end of the pipeline — every series-fetching function upstream (getOverallSeries,
-// getManualSeries, getManualAllowedSeries, getFetchedSeries, getH2HSeries) still
-// returned up to 10 games, and those full 10-game arrays were what actually reached
-// stdDev(), getVolatilityRatioForSeries(), getSampleTier(), and every diagnostic/
-// audit field — so Engine B's own STEP1_sampleSizes, volatility, and sample tier
-// all silently reported n=10 even though the mean itself was computed over 5. Any
-// caller that fetches a series for use under Engine B should pass it through this
-// function immediately after fetching, before it reaches averaging, volatility, or
-// sample-tier logic. No-op under Engine A. DO NOT skip this at any series-fetch
-// call site while Engine B is meant to be a genuine 5-game model.
-function applyEngineModeSeriesCap(arr) {
-  const clean = Array.isArray(arr) ? arr : [];
-  if (ENGINE_MODE === "B") return clean.slice(0, 5);
-  return clean;
 }
 
     // Issue 3/14: getDynamicWeights returns calibrated fixed weights used by computeFTProjection
@@ -14492,11 +14406,11 @@ function getOverallSeries(side, limit) {
   // Previously preferred stale cached fetch data over a manual edit to the field,
   // silently ignoring the user's correction. Do not reverse this order.]
   const manual = readLooseSeries(fieldId);
-  if (manual.length >= 2) return applyEngineModeSeriesCap(manual.slice(0, n));
+  if (manual.length >= 2) return manual.slice(0, n);
   // ITEM #7 FIX — BATCH 6: reads via AppState.context.data instead of g_massacreFetchContext directly.
   const ctx = AppState.context.data?.[side]?.overall;
   const fetched = Array.isArray(ctx?.ftScored10) ? ctx.ftScored10.map(Number).filter(v => isFinite(v) && v > 0) : [];
-  return applyEngineModeSeriesCap(fetched.slice(0, n));
+  return fetched.slice(0, n);
 }
 
 // Helper: probability that a team's recent scores exceed a threshold
@@ -14699,21 +14613,14 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
       const tierKey = "tier_" + getLeagueTrustMeta(league).level;
       coeff = models[league] || models[leagueGroup] || models[tierKey] || models["global"] || {};
     }
-    } catch(e) {}
+  } catch(e) {}
   // AUDIT FIX — ||/?? SENTINEL BUG (2026-07-09): (volatilityRatio || 1.0) silently
   // replaced a genuine volatilityRatio of 0 (a truly dead-stable series) with 1.0,
   // killing the confidence boost a zero-volatility team should get. 0 is falsy but
   // valid here, so this must use ?? (only replaces null/undefined), not ||.
-  // BUGFIX — THIN-SAMPLE EDGE OVERRIDE (audit item #3): edgePct's coefficient (~8.0)
-  // previously applied at full strength regardless of sampleTier, so a large edge on a
-  // thin/insufficient sample could still push winProbability into A-grade territory
-  // despite the much smaller +0.4 sampleFull term meant to penalize thin data. Dampens
-  // the edgePct contribution itself when sampleTier is not "full", so a big edge on a
-  // weak sample can no longer overpower the sample-quality signal.
-  const _sampleDampen = sampleTier === "full" ? 1.0 : (sampleTier === "thin" ? 0.6 : 0.35);
   const logOdds =
     (coeff.intercept   ?? -0.2) +
-    (coeff.edgePct     ??  8.0) * ((edgePct || 0) - 0.060) * _sampleDampen +
+    (coeff.edgePct     ??  8.0) * ((edgePct || 0) - 0.060) +
     (coeff.volRatio    ?? -0.8) * ((volatilityRatio ?? 1.0) - 1.0) +
     (coeff.sampleFull  ??  0.4) * (sampleTier === "full" ? 1 : 0) +
     (coeff.h2h         ??  0.2) * (hasH2H ? 1 : 0) +
@@ -17234,12 +17141,6 @@ async function fetchESPNCore(league, teamAName, teamBName) {
     const fetchAuditIssues = buildFetchAuditIssues({ league, teamAName, teamBName, aStats, bStats, h2hGames });
     setFetchAuditIssues(fetchAuditIssues);
 
-    // ENGINE A/B INPUT-FIELD SYNC: freshly fetched data always lands in the DOM at
-    // full length (up to 10 games) above — if Engine B is currently active, strip the
-    // visible boxes down to the most recent 5 immediately so the UI never shows 10
-    // values while Engine B is only calculating on 5.
-    applyEngineModeToInputFields();
-
     const aGameCount = Math.min(aStats?.scored?.length || 0, aStats?.allowed?.length || 0);
     const bGameCount = Math.min(bStats?.scored?.length || 0, bStats?.allowed?.length || 0);
     const allGood = aGameCount >= 5 && bGameCount >= 5;
@@ -17354,7 +17255,7 @@ function getFetchedSeries(side, scope, marketKey, metric) {
   const prefix = marketKey; 
   const suffix = metric === "allowed" ? "Allowed10" : "Scored10"; 
   const arr = ctx?.[prefix + suffix]; 
-  return Array.isArray(arr) ? applyEngineModeSeriesCap(arr.map(Number).filter(v => isFinite(v) && v > 0).slice(0, 10)) : []; 
+  return Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v) && v > 0).slice(0, 10) : []; 
 }
 
 // [LOCK: ADAPTIVE VENUE BLEND SYSTEM — VERIFIED, user-directed design, do not alter]
@@ -17426,11 +17327,11 @@ function getManualSeries(side, marketKey, parsed) {
   // series come from computeFTProjection's own aFTS/bFTS reads, never from this function.
   // The old "ft" branch below was unreachable dead code. DO NOT re-add an "ft" branch
   // without wiring an actual caller for it first.]
-  if (side === "A" && marketKey === "h1") return applyEngineModeSeriesCap(safeArr(parsed.a1HScored) || []);
-  if (side === "B" && marketKey === "h1") return applyEngineModeSeriesCap(safeArr(parsed.b1HScored) || []);
+  if (side === "A" && marketKey === "h1") return safeArr(parsed.a1HScored) || [];
+  if (side === "B" && marketKey === "h1") return safeArr(parsed.b1HScored) || [];
   if (marketKey.startsWith("q")) {
     const pKey = side.toLowerCase() + marketKey.toUpperCase() + "Scored";
-    if (parsed[pKey] && parsed[pKey].length) return applyEngineModeSeriesCap(safeArr(parsed[pKey]));
+    if (parsed[pKey] && parsed[pKey].length) return safeArr(parsed[pKey]);
   }
   // [LOCK: QUARTER FETCH FALLBACK KEY — VERIFIED CORRECT, do not "fix" this again.
   // g_massacreFetchContext[side].q1Scored/.q2Scored/.q3Scored/.q4Scored are set directly
@@ -17440,16 +17341,16 @@ function getManualSeries(side, marketKey, parsed) {
   // ITEM #7 FIX — BATCH 6: reads via AppState.context.data instead of g_massacreFetchContext directly.
   const qKey = marketKey + "Scored";
   const qData = AppState.context.data[side][qKey];
-  if (Array.isArray(qData) && qData.length) return applyEngineModeSeriesCap(qData);
+  if (Array.isArray(qData) && qData.length) return qData;
   return [];
 }
 
 function getManualAllowedSeries(side, marketKey, parsed) {
   if (!parsed) return [];
-  if (side === "A" && marketKey === "ft") return applyEngineModeSeriesCap(safeArr(parsed.aFTAllowed) || []);
-  if (side === "B" && marketKey === "ft") return applyEngineModeSeriesCap(safeArr(parsed.bFTAllowed) || []);
-  if (side === "A" && marketKey === "h1") return applyEngineModeSeriesCap(safeArr(parsed.a1HAllowed) || []);
-  if (side === "B" && marketKey === "h1") return applyEngineModeSeriesCap(safeArr(parsed.b1HAllowed) || []);
+  if (side === "A" && marketKey === "ft") return safeArr(parsed.aFTAllowed) || [];
+  if (side === "B" && marketKey === "ft") return safeArr(parsed.bFTAllowed) || [];
+  if (side === "A" && marketKey === "h1") return safeArr(parsed.a1HAllowed) || [];
+  if (side === "B" && marketKey === "h1") return safeArr(parsed.b1HAllowed) || [];
   return [];
 }
 
@@ -17467,12 +17368,6 @@ function getH2HSeries(side, marketKey, parsed) {
     if (parsed[pKey] && parsed[pKey].length) return safeArr(parsed[pKey]);
   }
   return [];
-  // NOTE: H2H series are intentionally left uncapped by applyEngineModeSeriesCap.
-  // H2H games are a separate, small (2-10 game) sample of meetings between these
-  // two specific teams, not "recent form" — Engine A vs B's last-10-vs-last-5
-  // distinction is about each team's own recent scoring history, not head-to-head
-  // history. Capping H2H to 5 under Engine B would arbitrarily discard real
-  // meetings with no connection to what Engine B is supposed to change.
 }
 
 
@@ -18787,8 +18682,16 @@ function calibrateConfidenceModel() {
   // that doesn't match what it will see in production at the extreme end. Aligned
   // the clamp ceiling to 2.5 (matching getVolatilityRatioForSeries's real cap) so
   // training and inference share the same effective volatility scale.
+  // ISSUE 12 FIX — edgePct SCALE MISMATCH (TRAINING VS. INFERENCE): p.edgePct (and its
+  // godsEyeMemory mirror) is stored as a PERCENTAGE by ensureTrackedPickKeys (e.g. 5.0
+  // for a 5% edge), but getConfidenceWinProbability — the live inference path this
+  // model is trained to match — expects a FRACTION (0.05 for 5%) before subtracting
+  // the 0.060 baseline. Without the /100 conversion, a real 5.0 value became
+  // 5.0 - 0.06 = 4.94, clamped straight to the 0.15 ceiling for nearly every historical
+  // pick, destroying the training signal. Divide by 100 first so this feature is on the
+  // same fractional scale the live model actually uses.
   const buildF = (p) => ({
-    edgePct:   clampNumber(Number(p.edgePct || p.godsEyeMemory?.edgePct || 0) - 0.060, -0.06, 0.15),
+    edgePct:   clampNumber(Number(p.edgePct || p.godsEyeMemory?.edgePct || 0) / 100 - 0.060, -0.06, 0.15),
     volRatio:  clampNumber(
                  ((Number(p.godsEyeMemory?.aVol || 0) + Number(p.godsEyeMemory?.bVol || 0)) / 2)
                  / (LEAGUE_VOL_LIMITS[String(p.league || "")] || 12) - 1.0, -1, 2.5),
@@ -19052,12 +18955,17 @@ function getTrackedInputSource(marketKey = "ft") {
   return unique[0] || "unknown";
 }
 
-function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixtureMeta, league, diagnostics }) {
+function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixtureMeta, league, diagnostics, engineABSnapshot }) {
   // ITEM #5 FIX — FULL-MARKET RETROSPECTIVE COVERAGE (2026-07-09): NO PLAY picks are
   // no longer dropped here. Every market the engine evaluated each run — including
   // ones that didn't clear the edge threshold — is now captured so the retrospective
   // tuner can test "would a different threshold have turned this into a correct call"
   // against the real settled outcome. Only a genuinely empty row is rejected.
+  // ISSUE 4 FIX: engineABSnapshot is now an explicit parameter, threaded down from
+  // runEngine -> buildResultRows -> here, instead of being read via a bare
+  // `typeof engineABSnapshot` check against runEngine's local scope below — this
+  // function has no lexical access to runEngine's locals, so that check always
+  // evaluated to "undefined" and every saved pick silently got engineABSnapshot: null.
   if (!pickRow) return null;
 
   const fixtureMeta = { ...originalFixtureMeta };
@@ -19384,13 +19292,13 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     isABQualified,
     trackerBucket: "raw",
     // ENGINE A/B FIX — STAGE 2: attaches the per-run Engine A vs Engine B FT
-    // snapshot (see engineABSnapshot built in runEngine) onto every saved pick,
-    // regardless of market, so settlement can later grade both engines against
-    // the same real outcome for a true matched-pick comparison. Read defensively
-    // since engineABSnapshot is only ever built inside runEngine's FT branch;
-    // falls back to null rather than throwing if this payload is ever built from
-    // a context where it wasn't computed.
-    engineABSnapshot: (typeof engineABSnapshot !== "undefined" && engineABSnapshot) ? engineABSnapshot : null,
+    // snapshot onto every saved pick, regardless of market, so settlement can later
+    // grade both engines against the same real outcome for a true matched-pick
+    // comparison. ISSUE 4 FIX: sourced from this function's own engineABSnapshot
+    // parameter (passed down from runEngine -> buildResultRows -> here) instead of a
+    // `typeof engineABSnapshot` check against runEngine's local scope, which this
+    // function has no lexical access to and which always evaluated to "undefined".
+    engineABSnapshot: engineABSnapshot || null,
     sampleTier,
     projectionOnly,
     hasH2H,
@@ -19435,7 +19343,14 @@ const g_lineMemorySnapshots = {};
 function recordLiveCalculationSnapshot(gameId, pick, state) {
   if (!gameId) return null;
   try {
-    const key = "snapshot_" + String(gameId).replace(/[^a-z0-9_]/gi, "");
+    // ISSUE 8 FIX: the real caller (buildResultRows, below) passes a structured object
+    // like { eventId, league, marketKey, side, ... } as gameId, not a primitive.
+    // String(gameId) on an object collapses to the literal "[object Object]", so every
+    // game shared one key ("snapshot_objectObject") and constantly overwrote each
+    // other's snapshots. Extract the real eventId when gameId is an object; fall back to
+    // a plain string representation only when a primitive is actually passed.
+    const rawId = (gameId && typeof gameId === "object") ? (gameId.eventId ?? gameId.id ?? gameId) : gameId;
+    const key = "snapshot_" + String(rawId).replace(/[^a-z0-9_]/gi, "");
     const payload = { gameId, pick, state, capturedAt: new Date().toISOString() };
     localStorage.setItem(key, JSON.stringify(payload));
     return payload;
@@ -19445,7 +19360,14 @@ function recordLiveCalculationSnapshot(gameId, pick, state) {
 async function executeRetrospectiveBacktest(gameId) {
   if (!gameId) return null;
   try {
-    const key = "snapshot_" + String(gameId).replace(/[^a-z0-9_]/gi, "");
+    // ISSUE 9 FIX: the real caller (applyManualSettlementToTrackedPick's post-settle
+    // retrospective block) passes a structured configuration object
+    // { league, parsed, lines, fixtureMeta } instead of a primitive id, so String(gameId)
+    // also collapsed to "snapshot_objectObject" here. Extract the eventId from
+    // fixtureMeta.eventId (the exact caller path) or a top-level eventId (generic
+    // fallback) before falling back to a plain string.
+    const rawId = (gameId && typeof gameId === "object") ? (gameId.fixtureMeta?.eventId ?? gameId.eventId ?? gameId) : gameId;
+    const key = "snapshot_" + String(rawId).replace(/[^a-z0-9_]/gi, "");
     const raw = localStorage.getItem(key);
     if (!raw) return null;
     const snapshot = JSON.parse(raw);
@@ -19454,7 +19376,7 @@ async function executeRetrospectiveBacktest(gameId) {
   } catch(e) { return null; }
 }
 
-    function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diagnostics }) {
+    function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diagnostics, engineABSnapshot }) {
   const tracked = [];
   table.style.display = "table";
   table.innerHTML = "<tr><th>Pick</th><th>Projection</th><th>Edge</th><th>Model Grade</th><th>Prediction</th></tr>";
@@ -19473,7 +19395,7 @@ async function executeRetrospectiveBacktest(gameId) {
       console.warn("MARKET HIJACK ATTEMPT:", { name: p.name, original: p.marketKey, new: marketKeyFromLogic });
     }
     const pickWithCorrectKey = { ...p, marketKey: marketKeyFromLogic };
-    const payload = buildTrackedPickPayload({ pickRow: pickWithCorrectKey, isLock: isLock && !isNoPlay, fixtureMeta, league, diagnostics });
+    const payload = buildTrackedPickPayload({ pickRow: pickWithCorrectKey, isLock: isLock && !isNoPlay, fixtureMeta, league, diagnostics, engineABSnapshot });
     if (payload) tracked.push(payload);
 
     // Snapshot for actionable picks
@@ -19653,7 +19575,13 @@ function withErrorBoundary(fn, context) {
       if (typeof triggerGlobalEngineAlert === "function")
         triggerGlobalEngineAlert(context + " crashed: " + msg);
       const t = document.getElementById("results");
-      if (t) {
+      // ISSUE 7 FIX: runEngine's own catch block now re-throws (see the paired fix in
+      // runEngine's catch/finally block) so this outer boundary actually sees the error
+      // and fires the alert above. Without this guard, runEngine's own error row (already
+      // inserted into this same table before the re-throw) would get a second, duplicate
+      // error row stacked underneath it. Only insert a row here if the table is still in
+      // its untouched, header-only state.
+      if (t && t.rows.length <= 1) {
         t.style.display = "table";
         const row = t.insertRow();
         row.innerHTML = `<td colspan="5" style="color:#ff6b6b;text-align:left;padding:8px;">⚠ <b>${escapeHtml(context)}</b> hit an error: ${escapeHtml(msg)}</td>`;
@@ -20368,17 +20296,9 @@ const h1Calc = compute1HProjection({
       // / ftCalc.ftProjectionOnly — the same values already passed downstream into the Q1-Q4
       // display payloads (see the Q1/Q2/Q3/Q4 payload builders below), so this now matches
       // what was already being displayed as if it were quarter-specific.]
-      // BUGFIX — Q-INITIAL-PASS NaN GRADE DESPITE QUALIFYING EDGE (audit item #1): this
-      // initial computeQ pass never guarded stdDev(aS.concat(bS)) against NaN/empty input
-      // the way the later rescale block in runEngine does (see its own _q1VolSafe/
-      // _q2VolSafe/_q3VolSafe/_q4VolSafe guards). A NaN volatility here silently produces
-      // a NaN win probability inside getConfidenceGrade, which falls through to grade
-      // "NaN" (NO PLAY) even when pick/edge are fully valid. Falls back to 0 (neutral)
-      // whenever the computed volatility is not finite.
-      const _qVolSafe = isFinite(stdDev(aS.concat(bS))) ? stdDev(aS.concat(bS)) : 0;
       const qConf = getConfidenceGrade({
         pick: qPick, line: lineVal, edge: qEdge, sampleTier: tier,
-        volatility: _qVolSafe, volLimit,
+        volatility: stdDev(aS.concat(bS)), volLimit,
         fullModel: ftCalc.ftFullModel, projectionOnly: ftCalc.ftProjectionOnly,
         // FIX #27: marketKey was hardcoded "h1" for every quarter (q1-q4), which is wrong —
         // it happened to be numerically harmless here only because q2Edge/q4Edge are never
@@ -21147,19 +21067,6 @@ await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtur
           const hasH2H = p.hasH2H ?? false;
           
           p.winProbability = getConfidenceWinProbability(grade, edgePct, volRatio, sampleTier, hasH2H, false, league);
-
-          // BUGFIX — PICK/PROBABILITY DECOUPLING (audit item #2): getPick() decides
-          // OVER/UNDER purely from raw point-edge vs. a threshold, entirely independent
-          // of this winProbability estimate. That let a live pick be issued on the side
-          // this same model considers <50% likely to win, with no signal anywhere in the
-          // UI that the two systems disagreed. Flags that contradiction explicitly on the
-          // pick object instead of silently displaying a normal-looking pick.
-          const _pickSideForProbCheck = getPickSideFromText(p.pick);
-          if (_pickSideForProbCheck && isFinite(p.winProbability) && p.winProbability < 0.5) {
-            p.probabilityMismatchFlag = true;
-            p.probabilityMismatchReason = "Model-estimated win probability (" + (p.winProbability * 100).toFixed(1) + "%) is below 50% for the picked side — pick/edge threshold and win-probability model disagree.";
-            engineDebug("WARN: pick/probability mismatch", { market: p.marketKey, pick: p.pick, winProbability: p.winProbability });
-          }
         }
       });
     }
@@ -21243,13 +21150,14 @@ const markets = finalPicksForDisplay.map(p => ({
 
     // All picks are already in finalPicksForDisplay; lock is determined by selectLock
     const displayablePicks = finalPicksForDisplay;
-        // Keep all rows, but non A/B picks already show "NO PLAY" from getPick logic
+    // Keep all rows, but non A/B picks already show "NO PLAY" from getPick logic
     const trackedToSave = buildResultRows({
   table,
   finalPicks: finalPicksForDisplay,
   lockIdx,
   fixtureMeta,
   league,
+      engineABSnapshot,
       diagnostics: {
       phase2Activation,
       ftSampleTier: ftCalc.ftSampleTier,
@@ -21397,22 +21305,6 @@ window.__LAST_AUDIT_STATE = {
     buildVersion: APP_BUILD_VERSION,
     modelVersion: ENGINE_MODEL_VERSION,
     league,
-    // ENGINE A/B FIX — AUDIT DISCLOSURE (2026-07-14): explicitly states which
-    // engine produced every number in this dump, so a copied audit is never
-    // ambiguous about whether the averaging used recency weighting + trimming
-    // (Engine A) or a flat last-5 mean with neither (Engine B). Read directly
-    // from the live ENGINE_MODE, which reflects whatever was active at the
-    // moment this Run executed.
-    engineMode: ENGINE_MODE,
-    engineModeDescription: ENGINE_MODE === "B"
-      ? "Engine B: last 5 games only, flat arithmetic mean, NO recency weighting, NO outlier trimming."
-      : "Engine A: last 10 games, recency-weighted average with outlier trimming (weightedRecentAverage/trimmedAvg).",
-    // ENGINE A/B FIX — STAGE 3: this note confirms that under Engine B, the series-fetch
-    // functions (getOverallSeries/getManualSeries/getManualAllowedSeries/getFetchedSeries)
-    // now genuinely cap every scored/allowed series at 5 games via applyEngineModeSeriesCap
-    // before it reaches averaging, volatility, or sample-tier logic — so STEP1 sample sizes
-    // elsewhere in this dump should read 5, not 10, whenever engineMode is "B".
-    engineABLocked: (function () { try { return localStorage.getItem("BB_ENGINE_AB_LOCKED") === "1"; } catch (e) { return false; } })(),
     leagueTrustLevel: _aud_trust.level,
     leagueTrustMode: _aud_trust.mode,
     leagueTrustGuidance: _aud_trust.guidance,
@@ -21603,14 +21495,7 @@ window.__LAST_AUDIT_STATE = {
         teamA_allowedAvg: avgOrNaN(_aud_aFTAll),
         teamB_allowedAvg: avgOrNaN(_aud_bFTAll),
         teamA_stdDev:     stdDev(_aud_aFTRaw),
-        teamB_stdDev:     stdDev(_aud_bFTRaw),
-        // ENGINE A/B FIX — AUDIT DISCLOSURE: the averages above route through
-        // avgOrNaN -> trimmedAvg, which branches on ENGINE_MODE (see Stage 1).
-        // Stating that explicitly here so the copied audit is self-describing
-        // instead of silently implying Engine A's method regardless of mode.
-        averagingMethodNote: ENGINE_MODE === "B"
-          ? "Computed via simpleAverage: last 5 games, flat mean, no recency weighting, no trimming."
-          : "Computed via weightedRecentAverage: last 10 games, recency-weighted, trimmed."
+        teamB_stdDev:     stdDev(_aud_bFTRaw)
       },
       STEP3_anchorInputs: {
         sampleSizeForAnchor: Math.min(_aud_aFTRaw.length, _aud_bFTRaw.length),
@@ -21685,14 +21570,7 @@ window.__LAST_AUDIT_STATE = {
           STEP1_rawSeries:    { teamA: safeArr(parsed.a1HScored) || [], teamB: safeArr(parsed.b1HScored) || [] },
           STEP1_allowedSeries:{ teamA: safeArr(parsed.a1HAllowed) || [], teamB: safeArr(parsed.b1HAllowed) || [] },
           STEP1_sampleSizes:  { teamA: safeArr(parsed.a1HScored)?.length || 0, teamB: safeArr(parsed.b1HScored)?.length || 0 },
-          STEP2_averages:     {
-            teamA_scoredAvg: h1Calc.aS1,
-            teamB_scoredAvg: h1Calc.bS1,
-            // ENGINE A/B FIX — AUDIT DISCLOSURE: mirrors the FT_TOTAL note above.
-            averagingMethodNote: ENGINE_MODE === "B"
-              ? "Computed via simpleAverage: last 5 games, flat mean, no recency weighting, no trimming."
-              : "Computed via weightedRecentAverage: last 10 games, recency-weighted, trimmed."
-          },
+          STEP2_averages:     { teamA_scoredAvg: h1Calc.aS1, teamB_scoredAvg: h1Calc.bS1 },
           STEP3_leagueBase1H: _aud_lBase / 4,
           STEP4_advancedBlend:{ used: ftCalc.usedAdvanced, pace: ftCalc.pace },
           STEP5_h2hBlend: {
@@ -21867,6 +21745,12 @@ if (trackedToSave.length) {
       // panel. Revert to the generic message once the root cause is confirmed fixed.
       showRunError(table, "⚠ Engine error: " + escapeHtml(String(err?.message || err)) + " — check 🔬 debug panel for stack trace.");
     }
+    // ISSUE 7 FIX: re-throw so the global withErrorBoundary wrapper around every call to
+    // runEngine (see runBtn's click handler) actually sees this failure and fires its own
+    // alert/debug-log path. Previously this catch fully swallowed the error here, so the
+    // outer boundary's catch block never ran for a runEngine crash. A matching guard was
+    // added to withErrorBoundary so this doesn't produce a duplicate error row.
+    throw err;
   } finally {
     window.__engineRunInProgress = false;
     MODEL_TUNING.recencyWeights = _savedRecencyWeights;
@@ -22367,12 +22251,10 @@ if (fetchBtn) fetchBtn.addEventListener("click", withErrorBoundary(fetchESPN, "f
       const clearBtn = document.getElementById("clearBtn");
       if (clearBtn) clearBtn.addEventListener("click", clearAll);
 
-      // ENGINE A/B FIX — STAGE 2/relocation: wire the toggle button (now living
-      // in the actions row, before the copy buttons) and paint its initial
-      // state (mode + locked/unlocked) as soon as the DOM is ready. Selecting
-      // by ID means this binding is unaffected by moving the button's markup.
+      // ENGINE A/B FIX — STAGE 2: wire the header toggle button and paint its
+      // initial state (mode + locked/unlocked) as soon as the DOM is ready.
       const engineModeBtn = document.getElementById("engineModeBtn");
-      if (engineModeBtn) engineModeBtn.addEventListener("click", withErrorBoundary(toggleEngineMode, "toggleEngineMode"));
+      if (engineModeBtn) engineModeBtn.addEventListener("click", toggleEngineMode);
       renderEngineModeButton();
 
       document.querySelectorAll(".section").forEach(s => {
@@ -22641,17 +22523,6 @@ try {
     auditCopyBtn.addEventListener("click", () => {
           if (!window.__LAST_AUDIT_STATE) {
             alert("⚠️ You must hit 'Run' first to generate audit data.");
-            return;
-          }
-
-          // ENGINE A/B FIX — STALE-AUDIT GUARD (2026-07-14): the audit dump is
-          // only rebuilt when runEngine executes. If ENGINE_MODE has changed
-          // since that last run completed (e.g. the toggle's auto-re-run is
-          // still in flight, or was somehow bypassed), the stored audit would
-          // silently describe the WRONG engine. Block the copy rather than
-          // hand out numbers that don't match the currently active mode.
-          if (window.__LAST_AUDIT_STATE?.meta?.engineMode !== ENGINE_MODE) {
-            alert("⚠️ Audit data is stale for the current engine mode (" + ENGINE_MODE + "). Hit 'Run' again, then Copy Audit.");
             return;
           }
 
