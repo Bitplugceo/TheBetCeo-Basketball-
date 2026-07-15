@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5039,7 +5040,12 @@ function calibrateEngineConstants() {
     // bar rises with the number of candidates actually swept for this constant.
     const _gridSizeForConstant = (TUNABLE_CONSTANTS_GRID[constantName] || []).length || 1;
     const _correctedConstantMultiplier = 2 * Math.sqrt(1 + Math.log(Math.max(2, _gridSizeForConstant)));
+    // Issue 14 fix: added a strict best.netDelta > 0 guard. Without it, if every
+    // candidate performed worse than the current default, the "least bad" (still
+    // negative) option could clear the absolute-value significance threshold and get
+    // promoted as if it were an improvement.
     const isSignificant = best && isFinite(best.netDelta) && isFinite(best.count) && best.count > 0
+      && best.netDelta > 0
       && Math.abs(best.netDelta) > _correctedConstantMultiplier * Math.sqrt(best.count);
     if (best && isSignificant) {
       setTunableConstant(constantName, best.value, best.netDelta, best.count);
@@ -6302,6 +6308,19 @@ const LEAGUE_RATING_BASES = {
   aba: 108.5,
   default: 110.0
 };
+
+// Issue 11 fix: pace10 samples (see calculateAdvancedMetrics) are always normalized to
+// a 48-minute equivalent regardless of the league's actual regulation time, so any
+// divisor derived from that pace must be rescaled by the league's real regulation
+// minutes or it silently overprojects every league shorter than 48 minutes.
+const LEAGUE_REGULATION_MINUTES = {
+  nba: 48, nba_gl: 48, nba_summer: 48,
+  wnba: 40, wnba_pre: 40, ncaa: 40, ncaaw: 40,
+  default: 40
+};
+function getLeagueRegulationMinutes(league) {
+  return LEAGUE_REGULATION_MINUTES[String(league || "").toLowerCase()] || LEAGUE_REGULATION_MINUTES.default;
+}
 
 function getLeagueRecencyDefaults(league) {
   // FIX #21: LEAGUE_CONFIG_MAP recency weights are all [1,1,1,1,1] placeholders
@@ -14293,7 +14312,13 @@ function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", diverg
 // independently re-derived from data — revisit once enough settled picks exist at the
 // high end of this range to check it against outcomes.
 function getVolatilityRatioForSeries(series, leagueVolLimit) {
-  const sd = stdDev(Array.isArray(series) ? series : []);
+  const cleanSeries = Array.isArray(series) ? series.map(Number).filter(v => isFinite(v)) : [];
+  // Issue 15 fix: with fewer than 3 games, stdDev() collapses to (or near) 0, which
+  // reads as "perfect stability" and inflates confidence for thin quarter samples that
+  // bypass the FT/H1/Team sample-tier gate. Return a neutral baseline volatility of 1.0
+  // instead of trusting a near-zero-sample variance figure.
+  if (cleanSeries.length < 3) return 1.0;
+  const sd = stdDev(cleanSeries);
   const limit = Number(leagueVolLimit) || 12;
   return Math.min(2.5, sd / limit);
 }
@@ -15640,7 +15665,11 @@ btn.addEventListener("click", () => { section.classList.toggle("collapsed"); });
           const uid = r?.uid || r?.team?.uid || "";
           const mUid = uid.match(/t:(\d+)/);
           const id = mUid ? mUid[1] : (r?.id || r?.team?.id ? String(r?.id || r?.team?.id) : null);
-          if (!id || !catalogMap.has(String(id))) continue;
+          // Issue 17 fix: only enforce the catalog-membership constraint when the
+          // catalog actually loaded something. If fetchLeagueTeamCatalog failed and
+          // returned an empty catalog, catalogMap.size is 0 and every real match was
+          // previously discarded unconditionally, causing "Can't find team" failures.
+          if (!id || (catalogMap.size > 0 && !catalogMap.has(String(id)))) continue;
 
           const resultName = normalizeTeamName(r?.displayName || r?.team?.displayName || r?.name || "");
           const catalogName = catalogMap.get(String(id)) || "";
@@ -15801,21 +15830,30 @@ async function fetchNbaSummerGameRefsViaScoreboard(base, teamId) {
     dateKeys.push(getDateKeyLocal(d));
   }
 
-  const jobs = dateKeys.map(dateKey => {
-    const key = `${base}:sbscan:${dateKey}`;
-    return _schedCache.has(key)
-      ? _schedCache.get(key)
-      : (() => {
-          const p = proxyFetch(`${base}/scoreboard?dates=${dateKey}&limit=200`).catch(err => {
-            _schedCache.delete(key);
-            return null;
-          });
-          cacheSet(_schedCache, key, p);
-          return p;
-        })();
-  });
-
-  const payloads = await Promise.allSettled(jobs);
+  // Issue 20 fix: firing all ~31 days of July concurrently triggered public CORS
+  // proxy rate-limiting and browser-level abort timeouts. Fetch in sequential
+  // batches of 5, awaiting each batch before starting the next, to preserve proxy
+  // stability instead of blasting every request at once.
+  const _summerBatchSize = 5;
+  const payloads = [];
+  for (let _sbi = 0; _sbi < dateKeys.length; _sbi += _summerBatchSize) {
+    const _summerBatchKeys = dateKeys.slice(_sbi, _sbi + _summerBatchSize);
+    const _summerBatchJobs = _summerBatchKeys.map(dateKey => {
+      const key = `${base}:sbscan:${dateKey}`;
+      return _schedCache.has(key)
+        ? _schedCache.get(key)
+        : (() => {
+            const p = proxyFetch(`${base}/scoreboard?dates=${dateKey}&limit=200`).catch(err => {
+              _schedCache.delete(key);
+              return null;
+            });
+            cacheSet(_schedCache, key, p);
+            return p;
+          })();
+    });
+    const _summerBatchPayloads = await Promise.allSettled(_summerBatchJobs);
+    payloads.push(..._summerBatchPayloads);
+  }
   const refs = [];
   payloads.forEach(result => {
     if (result.status !== "fulfilled" || !result.value) return;
@@ -16191,7 +16229,11 @@ async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
 
   for (let season = currentSeason; season >= minSeason; season--) {
     for (const stype of rules.h2hScheduleTypes) {
-      const key = `${base}:h2h-sched:${tA}:${season}:${stype}`;
+      // Issue 16 fix: unified cache key prefix with fetchScheduleCore's ":sched:" —
+      // both functions query the exact same ESPN schedule endpoint for this team,
+      // and the previous ":h2h-sched:" prefix partitioned the cache, forcing a
+      // duplicate fetch of the same schedule JSON within a single run.
+      const key = `${base}:sched:${tA}:${season}:${stype}`;
       const req = _schedCache.has(key)
         ? _schedCache.get(key)
         : (() => {
@@ -17710,8 +17752,15 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   if (isEspnLeague && hasRealRatings && hasRealPace) {
     const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
     const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
-    aS = (synPace * projectedRatingA) / 100;
-    bS = (synPace * projectedRatingB) / 100;
+    // Issue 11 fix: pace10 samples are normalized to a 48-minute equivalent (see
+    // calculateAdvancedMetrics' pace formula), so dividing by a flat 100 overprojects
+    // any league whose actual regulation time is shorter than 48 minutes (NCAA/WNBA =
+    // 40 min) by the ratio 48/regMinutes (~20% inflation). Scale the divisor by the
+    // league's real regulation minutes to correct for this.
+    const _ftRegMinutes = getLeagueRegulationMinutes(league);
+    const _ftDivisor = 100 * (48 / _ftRegMinutes);
+    aS = (synPace * projectedRatingA) / _ftDivisor;
+    bS = (synPace * projectedRatingB) / _ftDivisor;
     synNetA = avgOrNaN(ctxA.ortg10) - avgOrNaN(ctxA.drtg10);
     synNetB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
     usedAdvanced = true;
@@ -18014,7 +18063,11 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     // scaled value. DO NOT reintroduce a leaguePaceBase-based divisor here.
     const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
     const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
-    const halfDivisor = 200;
+    // Issue 11 fix: scale the half-game divisor by the league's real regulation minutes
+    // (48 NBA, 40 NCAA/WNBA) instead of a flat 200, since pace10 is normalized to a
+    // 48-minute equivalent and a flat divisor overprojects 40-minute leagues by ~20%.
+    const _h1RegMinutes = getLeagueRegulationMinutes(league);
+    const halfDivisor = 200 * (48 / _h1RegMinutes);
     projA1H = (synPace * projectedRatingA) / halfDivisor;
     projB1H = (synPace * projectedRatingB) / halfDivisor;
   } else {
@@ -18188,7 +18241,24 @@ function getMassacreModelRangeLimit() { return 120; }
 // needed here — this comment documents that the maintenance-risk concern in the
 // issue list has already been mitigated by the snapshot architecture.
 
-function getH2HSeasonDecayWeight(dateStr) {
+function getSeasonYearForDateAndLeague(dateObj, league) {
+  // Issue 19 helper: mirrors getCurrentSeasonYear's per-league season-year boundary
+  // rules, but accepts an explicit date instead of always using "now" — needed so
+  // getH2HSeasonDecayWeight can correctly bucket a specific H2H game's season.
+  const year = dateObj.getUTCFullYear();
+  const month = dateObj.getUTCMonth();
+  const l = String(league || "").toLowerCase();
+
+  if (["nba", "ncaa", "ncaaw", "nba_gl"].includes(l) && month >= 9) return year + 1;
+  if (["wnba", "wnba_pre"].includes(l)) return year;
+
+  const singleYearLeagues = ["cebl", "pba", "phil_mpbl", "indonesia_ibl", "bal", "rwanda", "fiba_wc", "fiba_eb", "fiba_ac", "puerto_rico_bsn", "chile_lnb", "chile_lnb2", "el_salvador_lmb", "uruguay_lub", "uruguay_lfb_w", "venezuela_sl", "nznbl", "aus_nbl1_east", "aus_nbl1_north", "aus_nbl1_south", "aus_nbl1_west", "aus_nbl1_east_w", "aus_nbl1_north_w", "aus_nbl1_south_w", "aus_nbl1_west_w", "aus_big_v", "aus_big_v_w", "nba_summer"];
+  if (singleYearLeagues.includes(l)) return year;
+
+  return month < 8 ? year - 1 : year;
+}
+
+function getH2HSeasonDecayWeight(dateStr, league) {
   // [FIX 6/15: SEASON DECAY WEIGHT] Maps each H2H game's season to its decay multiplier.
   // Current season = 1.00 | -1 = 0.75 | -2 = 0.50 | -3 or older = 0.30.
   // Season boundary: October = start of new season year (Oct 2024 → 2025 season).
@@ -18205,12 +18275,14 @@ function getH2HSeasonDecayWeight(dateStr) {
   try {
     const d = new Date(dateStr);
     if (isNaN(d.getTime())) return _decayMinus1;
-    const gameYear = d.getUTCFullYear();
-    const gameMonth = d.getUTCMonth(); // 0-based; Oct = 9
-    const gameSeasonYear = gameMonth >= 9 ? gameYear + 1 : gameYear;
-    const nowMonth = new Date().getUTCMonth();
-    const nowYear = new Date().getUTCFullYear();
-    const currentSeasonYear = nowMonth >= 9 ? nowYear + 1 : nowYear;
+    // Issue 19 fix: previously always applied the NBA October-start season boundary
+    // regardless of league, so a WNBA game in August and a WNBA game in October of the
+    // same actual season got mapped to different "season years" and split decay
+    // weights. Now uses the same per-league season-year rules getCurrentSeasonYear
+    // already relies on (calendar-year for WNBA/single-year leagues, Oct-boundary for
+    // NBA-family, Aug cross-boundary cutoff for everything else).
+    const gameSeasonYear = getSeasonYearForDateAndLeague(d, league);
+    const currentSeasonYear = getSeasonYearForDateAndLeague(new Date(), league);
     const diff = currentSeasonYear - gameSeasonYear;
     if (diff <= 0) return _decayCurrent;
     if (diff === 1) return _decayMinus1;
@@ -18314,7 +18386,10 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
     if (isFinite(vA) && vA > 0 && isFinite(vB) && vB > 0) {
       rawA.push(vA);
       rawB.push(vB);
-      decayWeights.push(getH2HSeasonDecayWeight(g.date));
+      // Issue 19 fix: pass the active league through so getH2HSeasonDecayWeight can
+      // apply the correct season-boundary rule for this league instead of always
+      // assuming the NBA October-start boundary.
+      decayWeights.push(getH2HSeasonDecayWeight(g.date, AppState.context.data?.league));
     }
   });
 
@@ -18382,7 +18457,10 @@ function _getMassacreBlendWeight(severity) {
 
 
 function meanFromList(values) {
-  const clean = (values || []).map(Number).filter(v => isFinite(v));
+  // Issue 13 fix: filter out null/undefined BEFORE Number() conversion — Number(null)
+  // coerces to 0 and previously survived the isFinite filter, silently treating a
+  // missing SOS rating as an unbelievably weak "0" instead of excluding it from the mean.
+  const clean = (values || []).filter(v => v !== null && v !== undefined).map(Number).filter(v => isFinite(v));
   return clean.length ? clean.reduce((s, v) => s + v, 0) / clean.length : NaN;
 }
 
@@ -20163,8 +20241,13 @@ const h1Calc = compute1HProjection({
         const projRatingAQ = avgOrNaN(ctxAQ.ortg10) + avgOrNaN(ctxBQ.drtg10) - leagueRatingBaseQ;
         const projRatingBQ = avgOrNaN(ctxBQ.ortg10) + avgOrNaN(ctxAQ.drtg10) - leagueRatingBaseQ;
         // Divide by 400 = 4 quarters * 100, giving per-quarter projection from full-game ratings
-        projA = anchorProjection((synPaceQ * projRatingAQ) / 400, sampleSize, leagueBaseQ);
-        projB = anchorProjection((synPaceQ * projRatingBQ) / 400, sampleSize, leagueBaseQ);
+        // Issue 11 fix: scale by the league's real regulation minutes (48 NBA, 40
+        // NCAA/WNBA) since pace10 is normalized to a 48-minute equivalent and a flat
+        // 400 divisor overprojects 40-minute leagues by ~20%.
+        const _qRegMinutes = getLeagueRegulationMinutes(league);
+        const qDivisor = 400 * (48 / _qRegMinutes);
+        projA = anchorProjection((synPaceQ * projRatingAQ) / qDivisor, sampleSize, leagueBaseQ);
+        projB = anchorProjection((synPaceQ * projRatingBQ) / qDivisor, sampleSize, leagueBaseQ);
       } else {
         // FIX #15→#38: 50/50 blend replaced with the same dynamic teamWeight/oppWeight
         // used by computeFTProjection (Issue 3 / FIX #8). The 50/50 split was correct
@@ -22782,7 +22865,13 @@ ${fullHTML}
       let wins = 0, saves = 0, total = 0;
 
       settledInLeague.forEach(pick => {
-        const edgePct    = Math.abs(Number(pick.edgePct || 0));
+        // Issue 18 fix: the simulator previously tested candidates against a flat
+        // edge-percentage bar (e.g. >= 5.0%), while the live engine gates picks on
+        // raw point-scale thresholds via getLeagueEdgePointThreshold (e.g. 7.0 points,
+        // which is only a ~3.2% edge on a 220 line). That mismatch let the backtest
+        // optimize and lock in weights against a model behavior production never
+        // actually runs. Now compares the same raw point edge the live engine uses.
+        const rawEdgePoints = Math.abs(Number(pick.rawEdge ?? pick.edge ?? 0));
         const side       = String(pick.side || getPickSideFromText(pick.predictionText || "")).toLowerCase();
         const result     = String(pick.resultStatus || "").toLowerCase();
         const aVol       = Number(pick.diagnostics?.aVol ?? pick.godsEyeMemory?.aVol ?? 0);
@@ -22793,18 +22882,18 @@ ${fullHTML}
 
         if (!side || !["win", "loss", "push"].includes(result)) return;
 
-        const recencyBoost    = (candidate.weights[0] - 1.35) * 0.40;
-        const adjustedEdgePct = (edgePct * (1 + recencyBoost)) / candidate.edgeMult;
+        const recencyBoost       = (candidate.weights[0] - 1.35) * 0.40;
+        const adjustedEdgePoints = (rawEdgePoints * (1 + recencyBoost)) / candidate.edgeMult;
 
-        const overThresh  = (marketKey === "h1" || marketKey === "h2") ? 5.0 : 5.0;
-        const underThresh = (marketKey === "h1" || marketKey === "h2") ? 5.5 : 5.5;
+        const overThresh  = getLeagueEdgePointThreshold(leagueKey, marketKey);
+        const underThresh = overThresh * (getParam("underEdgeFactor", leagueKey) ?? UNDER_EDGE_FACTOR);
 
         const aggressivePaceDanger = candidate.paceAdj === "aggressive" && isHighVol &&
                                      result === "loss" && side === "over";
 
         const wouldTake = !aggressivePaceDanger &&
-                          ((side === "over"  && adjustedEdgePct >= overThresh) ||
-                           (side === "under" && adjustedEdgePct >= underThresh));
+                          ((side === "over"  && adjustedEdgePoints >= overThresh) ||
+                           (side === "under" && adjustedEdgePoints >= underThresh));
 
         total++;
 
