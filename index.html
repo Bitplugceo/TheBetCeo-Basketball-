@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -8386,12 +8387,22 @@ function rebuildTrackerStats() {
   const archived = Array.isArray(AppState.tracker.state.archivedPicks) ? AppState.tracker.state.archivedPicks : [];
   const all = [...active, ...archived];
 
+  // #23: resultStatus (actualGrade) remains the only source of truth for wins/
+  // losses/pushes below — that decision is unchanged. This just makes the
+  // engine-vs-settled divergence rate visible instead of silent, since a
+  // rising rate is a signal the live engineResultStatus grading is drifting
+  // from what actually settles.
+  const _settledForDivergence = all.filter(p => ["win", "loss", "push"].includes(String(p.resultStatus || "").toLowerCase()));
+  const _divergent = _settledForDivergence.filter(p => p.engineResultStatus && String(p.engineResultStatus).toLowerCase() !== String(p.resultStatus).toLowerCase());
+
   AppState.tracker.state.stats = {
     total: all.length,
     settled: all.filter(p => p.resultStatus && p.resultStatus !== "pending").length,
     wins: all.filter(p => p.resultStatus === "win").length,
     losses: all.filter(p => p.resultStatus === "loss").length,
-    pushes: all.filter(p => p.resultStatus === "push").length
+    pushes: all.filter(p => p.resultStatus === "push").length,
+    engineDivergenceCount: _divergent.length,
+    engineDivergenceRate: _settledForDivergence.length ? parseFloat((_divergent.length / _settledForDivergence.length * 100).toFixed(1)) : null
   };
 
   rebuildTrackerDerivedState();
@@ -12865,8 +12876,13 @@ function getPick(edge, line, league, marketKey, context = {}) {
 }
 
     function detectTrap(edge, line, pick, league, marketType, vol) {
-
-  return false;
+  if (!pick || pick === "NO PLAY" || !isFinite(edge) || !isFinite(line) || line <= 0) return false;
+  const edgePct = Math.abs(edge / line);
+  const volLimit = getMarketVolLimit(league, marketType) || 12;
+  const volRatio = (isFinite(vol) && volLimit > 0) ? vol / volLimit : 0;
+  // Trap zone: edge looks real but modest, while volatility is running hot —
+  // the classic "looks like value, plays like noise" line.
+  return volRatio >= 1.15 && edgePct > 0.02 && edgePct < 0.06;
 }
 
     function selectLock(markets) {
@@ -12943,7 +12959,21 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
   return parseFloat(clampNumber(1 / (1 + Math.exp(-Math.min(10, Math.max(-10, logOdds)))), 0.10, 0.90).toFixed(3));
 }
 
-    
+// #21: surfaces whether a league has a real fitted coefficient set in
+// BB_CONFIDENCE_MODEL_COEFF, or is silently falling back to the hardcoded
+// defaults baked into getConfidenceWinProbability's `?? ...` chain.
+function isConfidenceCoeffFitted(league) {
+  try {
+    const stored = localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF");
+    if (!stored) return false;
+    const models = JSON.parse(stored);
+    const leagueGroup = league === "nba" ? "nba"
+      : (league === "ncaa" || league === "ncaaw") ? "ncaa" : "other";
+    const tierKey = "tier_" + getLeagueTrustMeta(league).level;
+    const coeff = models[league] || models[leagueGroup] || models[tierKey] || models["global"];
+    return !!(coeff && Object.keys(coeff).length > 0);
+  } catch(e) { return false; }
+}
 
 function getConfidenceGrade(params) {
 
@@ -12952,6 +12982,7 @@ function getConfidenceGrade(params) {
   
   const {
     pick, note, line, edge, sampleTier, hasH2H, volatility, volLimit,
+    paceGapRisk, blowoutGap, trap,
     league = ""
   } = params || {};
 
@@ -12961,7 +12992,12 @@ function getConfidenceGrade(params) {
 
   const edgePct = Math.abs(edge / line);
   const volRatio = (isFinite(volatility) && isFinite(volLimit) && volLimit > 0) ? volatility / volLimit : 0.5;
-  const winProb = getConfidenceWinProbability(null, edgePct, volRatio, sampleTier, hasH2H, false, league);
+  let winProb = getConfidenceWinProbability(null, edgePct, volRatio, sampleTier, hasH2H, !!trap, league);
+
+  if (isFinite(winProb)) {
+    if (isFinite(blowoutGap) && blowoutGap > 15) winProb *= 0.97;
+    if (!!paceGapRisk) winProb *= 0.98;
+  }
 
   if (!isFinite(winProb)) {
     engineDebug("getConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
@@ -13209,7 +13245,13 @@ function computeIntelligencePack(league, lines = {}, parsedInput = null) {
 }
 
 function updateIntelligencePack(leagueOverride = "", linesOverride = null, parsedOverride = null) {
-  return null;
+  // #26: was a hardcoded no-op. Now delegates to the real computeIntelligencePack()
+  // and caches the result so callers (input/change listeners) actually refresh
+  // something instead of doing nothing.
+  const league = leagueOverride || document.getElementById("leagueSelect")?.value || "";
+  const pack = computeIntelligencePack(league, linesOverride || {}, parsedOverride || null);
+  window.g_lastIntelligencePack = pack;
+  return pack;
 }
 
 function getCrossSignalAgreement(side, marketKey, parsed) {
@@ -13252,6 +13294,7 @@ function getCrossSignalAgreement(side, marketKey, parsed) {
 function applyIntelligenceLayerToPicks(picks, intelligencePack, league) {
 
     if (!Array.isArray(picks) || !picks.length || !intelligencePack) return;
+  const QUARTER_KEYS = new Set(["q1", "q2", "q3", "q4"]);
   picks.forEach(p => {
     if (!p || p.pick === "NO PLAY") return;
     let confAdj = 0;
@@ -13260,6 +13303,11 @@ function applyIntelligenceLayerToPicks(picks, intelligencePack, league) {
 
     if (restA < 1 || restB < 1) { confAdj -= 2; }
     if (Number(intelligencePack.travelMiles || 0) > 1000) { confAdj -= 1; }
+
+    if (QUARTER_KEYS.has(p.marketKey) && (restA < 1 || restB < 1 || Number(intelligencePack.travelMiles || 0) > 1000)) {
+      const qVolRatio = (isFinite(p.volatility) && isFinite(p.volLimit) && p.volLimit > 0) ? (p.volatility / p.volLimit) : 0.5;
+      confAdj -= (qVolRatio * 2) / 8;
+    }
 
     if (p.confidence && confAdj !== 0) applyGuardedConfidenceShift(p, confAdj > 0 ? 1 : -1, "intelligenceLayer", confAdj);
     if (confAdj !== 0) p.intelligenceAdjusted = true;
@@ -15415,8 +15463,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
   const sampleSize = Math.min(aFTS.length, bFTS.length);
-  const aOverallAvg = avgOrNaN(aFTS);
-  const bOverallAvg = avgOrNaN(bFTS);
+  const aOverallAvg = getDateAwareOrFallbackAverage(aFTS, "A", "ft");
+  const bOverallAvg = getDateAwareOrFallbackAverage(bFTS, "B", "ft");
   const aVenueAvg = avgOrNaN(aVenueFTS);
   const bVenueAvg = avgOrNaN(bVenueFTS);
   const aScoredBlendFT = computeVenueBlend(aOverallAvg, aVenueAvg, aVenueFTS.length);
@@ -15618,18 +15666,6 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const _dateAwareAvgA1 = getDateAwareOrFallbackAverage(aS1, "A", "h1");
   const _dateAwareAvgB1 = getDateAwareOrFallbackAverage(bS1, "B", "h1");
-  try {
-    const _oldA1 = weightedRecentAverage(aS1);
-    const _oldB1 = weightedRecentAverage(bS1);
-    if (isFinite(_oldA1) && isFinite(_dateAwareAvgA1) && _oldA1 !== 0 && Math.abs(_dateAwareAvgA1 - _oldA1) / Math.abs(_oldA1) > 0.03) {
-      engineDebug("Date-aware avg diff — H1 Team A recency average", { old: _oldA1, dateAware: _dateAwareAvgA1, pctDiff: (((_dateAwareAvgA1 - _oldA1) / _oldA1) * 100).toFixed(1) + "%" });
-    }
-    if (isFinite(_oldB1) && isFinite(_dateAwareAvgB1) && _oldB1 !== 0 && Math.abs(_dateAwareAvgB1 - _oldB1) / Math.abs(_oldB1) > 0.03) {
-      engineDebug("Date-aware avg diff — H1 Team B recency average", { old: _oldB1, dateAware: _dateAwareAvgB1, pctDiff: (((_dateAwareAvgB1 - _oldB1) / _oldB1) * 100).toFixed(1) + "%" });
-    }
-  } catch (_shadowErr) {
-    
-  }
 
   const h1SampleTier = getSampleTier(aS1, bS1);
   if (h1SampleTier === "insufficient") {
@@ -17384,18 +17420,6 @@ const h1Calc = compute1HProjection({
 
       const _dateAwareAvgAQ = getDateAwareOrFallbackAverage(aS, "A", qKey);
       const _dateAwareAvgBQ = getDateAwareOrFallbackAverage(bS, "B", qKey);
-      try {
-        const _oldAQ = weightedRecentAverage(aS);
-        const _oldBQ = weightedRecentAverage(bS);
-        if (isFinite(_oldAQ) && isFinite(_dateAwareAvgAQ) && _oldAQ !== 0 && Math.abs(_dateAwareAvgAQ - _oldAQ) / Math.abs(_oldAQ) > 0.03) {
-          engineDebug("Date-aware avg diff — " + qKey.toUpperCase() + " Team A recency average", { old: _oldAQ, dateAware: _dateAwareAvgAQ, pctDiff: (((_dateAwareAvgAQ - _oldAQ) / _oldAQ) * 100).toFixed(1) + "%" });
-        }
-        if (isFinite(_oldBQ) && isFinite(_dateAwareAvgBQ) && _oldBQ !== 0 && Math.abs(_dateAwareAvgBQ - _oldBQ) / Math.abs(_oldBQ) > 0.03) {
-          engineDebug("Date-aware avg diff — " + qKey.toUpperCase() + " Team B recency average", { old: _oldBQ, dateAware: _dateAwareAvgBQ, pctDiff: (((_dateAwareAvgBQ - _oldBQ) / _oldBQ) * 100).toFixed(1) + "%" });
-        }
-      } catch (_shadowErrQ) {
-        
-      }
 
       const pKeyA = "a" + qKey.toUpperCase() + "Allowed";
       const pKeyB = "b" + qKey.toUpperCase() + "Allowed";
@@ -17675,6 +17699,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const lqB = computeLineupQuality(AppState.context.data?.B?.roster, g_injB);
     const _lqiShared = (lqA + lqB) / 2;
 
+    const ftVolatilityForConf = ftCalc.ftVolRatio != null ? ftCalc.ftVolRatio * (getMarketVolLimit(league, "ft")) : 0;
+    const ftTrap = detectTrap(ftCalc.ftEdge, ftLine, ftPick, league, "ft", ftVolatilityForConf);
     const ftConfidence = getConfidenceGrade({
       pick: ftPick,
       note: ftNote,
@@ -17683,14 +17709,14 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       sampleTier: ftCalc.ftSampleTier,
       projectionOnly: ftCalc.ftProjectionOnly,
       fullModel: ftCalc.ftFullModel,
-      trap: false,
+      trap: ftTrap,
       hasH2H: ftCalc.ftHasH2H,
-      volatility: ftCalc.ftVolRatio != null ? ftCalc.ftVolRatio * (getMarketVolLimit(league, "ft")) : 0,
+      volatility: ftVolatilityForConf,
       volLimit: getMarketVolLimit(league, "ft"),
       injuryNotes: [],
-      paceGapRisk: false,
+      paceGapRisk: ftCalc.paceGapRisk,
       defensiveFloorFlag: ftCalc.defensiveFloorFlag,
-      blowoutGap: 0,
+      blowoutGap: ftCalc.blowoutGap,
       marketKey: "ft",
 
       q4Edge: q4?.edge,
@@ -17700,13 +17726,15 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       league
     });
 
+        const h1VolatilityForConf = Math.max(h1Calc.aVol1, h1Calc.bVol1) * getMarketVolLimit(league, "h1");
+        const h1Trap = detectTrap(h1Calc.h1Edge, h1Line, h1Pick, league, "h1", h1VolatilityForConf);
         const h1Confidence = getConfidenceGrade({
       pick: h1Pick, note: h1Note, line: h1Line, edge: h1Calc.h1Edge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
-      fullModel: h1Calc.h1FullModel, trap: false, hasH2H: h1Calc.h1HasH2H,
+      fullModel: h1Calc.h1FullModel, trap: h1Trap, hasH2H: h1Calc.h1HasH2H,
 
       
-      volatility: Math.max(h1Calc.aVol1, h1Calc.bVol1) * getMarketVolLimit(league, "h1"),
+      volatility: h1VolatilityForConf,
       volLimit: getMarketVolLimit(league, "h1"),
       marketKey: "h1",
 
@@ -17719,6 +17747,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
 
     const h1ConfidenceFinal = h1Confidence;
 
+    const aTrap = detectTrap(ftCalc.aEdge, aLine, aPick, league, "ft", ftCalc.aVol);
     const aConfidence = getConfidenceGrade({
       pick: aPick,
       note: ftNote,
@@ -17727,7 +17756,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       sampleTier: ftCalc.ftSampleTier,
       projectionOnly: ftCalc.ftProjectionOnly,
       fullModel: ftCalc.teamFullModel,
-      trap: false,
+      trap: aTrap,
       hasH2H: ftCalc.ftHasH2H,
 
       
@@ -17739,6 +17768,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       lineupQuality: lqA
     });
 
+    const bTrap = detectTrap(ftCalc.bEdge, bLine, bPick, league, "ft", ftCalc.bVol);
     const bConfidence = getConfidenceGrade({
       pick: bPick,
       note: ftNote,
@@ -17747,7 +17777,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       sampleTier: ftCalc.ftSampleTier,
       projectionOnly: ftCalc.ftProjectionOnly,
       fullModel: ftCalc.teamFullModel,
-      trap: false,
+      trap: bTrap,
       hasH2H: ftCalc.ftHasH2H,
 
       volatility: ftCalc.bVol,
@@ -17758,18 +17788,20 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       lineupQuality: lqB
     });
     
+    const h1aTrap = detectTrap(h1aEdge, finalLines.h1aLine, h1aPick, league, "h1", h1Calc.aVol1);
     const h1aConfidence = getConfidenceGrade({
       pick: h1aPick, note: h1Note, line: finalLines.h1aLine, edge: h1aEdge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
-      fullModel: h1Calc.h1FullModel, trap: false, hasH2H: h1Calc.h1HasH2H,
+      fullModel: h1Calc.h1FullModel, trap: h1aTrap, hasH2H: h1Calc.h1HasH2H,
       marketKey: "h1",
 
       league
     });
+    const h1bTrap = detectTrap(h1bEdge, finalLines.h1bLine, h1bPick, league, "h1", h1Calc.bVol1);
     const h1bConfidence = getConfidenceGrade({
       pick: h1bPick, note: h1Note, line: finalLines.h1bLine, edge: h1bEdge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
-      fullModel: h1Calc.h1FullModel, trap: false, hasH2H: h1Calc.h1HasH2H,
+      fullModel: h1Calc.h1FullModel, trap: h1bTrap, hasH2H: h1Calc.h1HasH2H,
       marketKey: "h1",
 
       league
@@ -17858,6 +17890,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     fullModel: ftCalc.ftFullModel,
     sampleTier: ftCalc.ftSampleTier,
     hasH2H: ftCalc.ftHasH2H,
+    trap: ftTrap,
+    coeffFitted: isConfidenceCoeffFitted(league),
 
     aVenueEnabled: ftCalc.aVenueEnabled,
     bVenueEnabled: ftCalc.bVenueEnabled,
@@ -17881,16 +17915,17 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     fullModel: h1Calc.h1FullModel,
     sampleTier: h1Calc.h1SampleTier,
     hasH2H: h1Calc.h1HasH2H,
+    trap: h1Trap,
     aVenueEnabled: h1Calc.aVenueEnabled,
     bVenueEnabled: h1Calc.bVenueEnabled,
     aVenueAdjustment: h1Calc.aVenueAdjustment,
     bVenueAdjustment: h1Calc.bVenueAdjustment
   },
 
-      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: q1?.fullModel ?? false, sampleTier: q1?.tier, hasH2H: q1?.hasH2H },
-      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: q2?.fullModel ?? false, sampleTier: q2?.tier, hasH2H: q2?.hasH2H },
-      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: q3?.fullModel ?? false, sampleTier: q3?.tier, hasH2H: q3?.hasH2H },
-      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: q4?.fullModel ?? false, sampleTier: q4?.tier, hasH2H: q4?.hasH2H },
+      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: q1?.fullModel ?? false, sampleTier: q1?.tier, hasH2H: q1?.hasH2H, volatility: q1?.volatility, volLimit: getMarketVolLimit(league, "q1") },
+      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: q2?.fullModel ?? false, sampleTier: q2?.tier, hasH2H: q2?.hasH2H, volatility: q2?.volatility, volLimit: getMarketVolLimit(league, "q2") },
+      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: q3?.fullModel ?? false, sampleTier: q3?.tier, hasH2H: q3?.hasH2H, volatility: q3?.volatility, volLimit: getMarketVolLimit(league, "q3") },
+      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: q4?.fullModel ?? false, sampleTier: q4?.tier, hasH2H: q4?.hasH2H, volatility: q4?.volatility, volLimit: getMarketVolLimit(league, "q4") },
   {
     _idx: 3,
     name: "Team A Total" + aBadge,
@@ -18178,6 +18213,9 @@ defensiveFloorFlag: ftCalc.defensiveFloorFlag,
 h1DefensiveFloorFlag: h1Calc.defensiveFloorFlag,
     blowoutGap: ftCalc.blowoutGap,
     volatilityBlock: ftCalc.volatilityBlock,
+    trap: ftTrap,
+    h1Trap: h1Trap,
+    coeffFitted: isConfidenceCoeffFitted(league),
 
         aVol: ftCalc.aVol,
     bVol: ftCalc.bVol,
@@ -20334,8 +20372,11 @@ window.ENGINE_TEST_SUITE = (() => {
   });
 
   suite("detectTrap", () => {
-    expect("always false (removed per spec)", detectTrap(1,  220, "OVER 220.5", "nba", "ft", 0), false);
-    expect("always false (removed per spec)", detectTrap(12, 220, "OVER 220.5", "nba", "ft", 5), false);
+    expect("no pick = false",           detectTrap(1,  220, "NO PLAY", "nba", "ft", 0), false);
+    expect("low edge, no vol = false",  detectTrap(1,  220, "OVER 220.5", "nba", "ft", 0), false);
+    expect("moderate edge, low vol = false", detectTrap(12, 220, "OVER 220.5", "nba", "ft", 5), false);
+    expect("moderate edge, hot vol = true (trap zone)", detectTrap(12, 220, "OVER 220.5", "nba", "ft", 15), true);
+    expect("big edge, hot vol = false (real signal, not a trap)", detectTrap(25, 220, "OVER 220.5", "nba", "ft", 15), false);
   });
 
   suite("anchorProjection", () => {
