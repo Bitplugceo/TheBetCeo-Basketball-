@@ -1,3 +1,4 @@
+M
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -15642,6 +15643,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projAFT = isFinite(projAFT) ? (isFinite(avgH2HA) ? (projAFT * (1 - hw) + avgH2HA * hw) : projAFT) : avgH2HA;
     projBFT = isFinite(projBFT) ? (isFinite(avgH2HB) ? (projBFT * (1 - hw) + avgH2HB * hw) : projBFT) : avgH2HB;
 
+    // FIX #3: the volatility clamp applied to aS/bS earlier is otherwise bypassed
+    // by this raw H2H blend — re-clamp the post-H2H projection so the damping
+    // still bounds the number that actually leaves this function.
+    projAFT = applyVolatility(projAFT, aFTS, volLimit, league);
+    projBFT = applyVolatility(projBFT, bFTS, volLimit, league);
+
     var _ftRealH2HWeight = hw;
   }
   let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
@@ -15806,6 +15813,11 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const avgH2HB = avgOrNaN(decayH2HB);
     projA1H = isFinite(projA1H) ? (isFinite(avgH2HA) ? (projA1H * (1 - hw) + avgH2HA * hw) : projA1H) : avgH2HA;
     projB1H = isFinite(projB1H) ? (isFinite(avgH2HB) ? (projB1H * (1 - hw) + avgH2HB * hw) : projB1H) : avgH2HB;
+
+    // FIX #3: re-clamp after the H2H blend so the volatility damping applied
+    // to projA1H/projB1H earlier isn't bypassed by the raw H2H average.
+    projA1H = applyVolatility(projA1H, aS1, volLimit, league);
+    projB1H = applyVolatility(projB1H, bS1, volLimit, league);
   }
   let h1Proj = (isFinite(projA1H) ? projA1H : 0) + (isFinite(projB1H) ? projB1H : 0);
 
@@ -17571,6 +17583,12 @@ const h1Calc = compute1HProjection({
         const avgH2HB = avgOrNaN(decayH2HB);
         projA = isFinite(avgH2HA) ? ((projA * (1 - hw)) + (avgH2HA * hw)) : projA;
         projB = isFinite(avgH2HB) ? ((projB * (1 - hw)) + (avgH2HB * hw)) : projB;
+
+        // FIX #3 (quarters): same clamp-bypass pattern as FT/H1 — re-clamp
+        // after the raw H2H blend so the earlier volatility damping on
+        // projA/projB still bounds the number that leaves this block.
+        projA = applyVolatility(projA, aS, volLimit, league);
+        projB = applyVolatility(projB, bS, volLimit, league);
       }
 
       const teamANameForShape = document.getElementById("teamAName")?.value?.trim() || "";
@@ -17588,11 +17606,18 @@ const h1Calc = compute1HProjection({
       const qEdge = lineVal ? qProj - lineVal : NaN;
       const qPick = getPick(qEdge, lineVal, league, qKey, { aSc: avgOrNaN(aS), bSc: avgOrNaN(bS) });
 
-      
+      // FIX #18 (quarters residual): detectTrap() is wired into FT/H1/Team
+      // confidence grades but was never called for quarters, so qConf always
+      // graded as non-trap by default. Compute it the same way here.
+      const qTrap = detectTrap(qEdge, lineVal, qPick, league, qKey, stdDev(aS.concat(bS)));
       const qConf = getConfidenceGrade({
         pick: qPick, line: lineVal, edge: qEdge, sampleTier: tier,
         volatility: stdDev(aS.concat(bS)), volLimit,
-        fullModel: qFullModel, projectionOnly: qProjectionOnly,
+        fullModel: qFullModel, projectionOnly: qProjectionOnly, trap: qTrap,
+        // FIX #19: quarters previously never discounted their own confidence
+        // grade for pace-gap risk or a wide projection blowout either.
+        paceGapRisk: Math.abs((avgOrNaN(ctxAQ.pace10) || 74) - (avgOrNaN(ctxBQ.pace10) || 74)) > 6,
+        blowoutGap: Math.abs(projA - projB),
 
         marketKey: qKey, hasH2H: hasH2H,
 
@@ -17785,7 +17810,11 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: h1Trap, hasH2H: h1Calc.h1HasH2H,
 
-      
+      // FIX #19: H1 previously never discounted its own confidence grade for
+      // pace-gap risk or a wide projection blowout, even though both were
+      // already computed on h1Calc — wire them in the same way FT does.
+      paceGapRisk: h1Calc.paceGapRisk,
+      blowoutGap: Math.abs((h1Calc.projA1H || 0) - (h1Calc.projB1H || 0)),
       volatility: h1VolatilityForConf,
       volLimit: getMarketVolLimit(league, "h1"),
       marketKey: "h1",
@@ -17811,7 +17840,11 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       trap: aTrap,
       hasH2H: ftCalc.ftHasH2H,
 
-      
+      // FIX #19: Team A previously never discounted its own confidence grade
+      // for pace-gap risk or a wide projection blowout, even though both are
+      // already computed on ftCalc — wire them in the same way FT itself does.
+      paceGapRisk: ftCalc.paceGapRisk,
+      blowoutGap: ftCalc.blowoutGap,
       volatility: ftCalc.aVol,
       volLimit: getMarketVolLimit(league, "ft"),
       injuryNotes: [],
@@ -17832,6 +17865,11 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       trap: bTrap,
       hasH2H: ftCalc.ftHasH2H,
 
+      // FIX #19: Team B previously never discounted its own confidence grade
+      // for pace-gap risk or a wide projection blowout, even though both are
+      // already computed on ftCalc — wire them in the same way FT itself does.
+      paceGapRisk: ftCalc.paceGapRisk,
+      blowoutGap: ftCalc.blowoutGap,
       volatility: ftCalc.bVol,
       volLimit: getMarketVolLimit(league, "ft"),
       injuryNotes: [],
@@ -17845,6 +17883,12 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       pick: h1aPick, note: h1Note, line: finalLines.h1aLine, edge: h1aEdge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: h1aTrap, hasH2H: h1Calc.h1HasH2H,
+      // FIX #19: H1 Team A previously graded with no volatility signal at all
+      // (volRatio silently defaulted to 0.5) and no pace-gap/blowout discount.
+      volatility: h1Calc.aVol1,
+      volLimit: getMarketVolLimit(league, "h1"),
+      paceGapRisk: h1Calc.paceGapRisk,
+      blowoutGap: Math.abs((h1Calc.projA1H || 0) - (h1Calc.projB1H || 0)),
       marketKey: "h1",
 
       league
@@ -17854,6 +17898,12 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       pick: h1bPick, note: h1Note, line: finalLines.h1bLine, edge: h1bEdge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: h1bTrap, hasH2H: h1Calc.h1HasH2H,
+      // FIX #19: H1 Team B previously graded with no volatility signal at all
+      // (volRatio silently defaulted to 0.5) and no pace-gap/blowout discount.
+      volatility: h1Calc.bVol1,
+      volLimit: getMarketVolLimit(league, "h1"),
+      paceGapRisk: h1Calc.paceGapRisk,
+      blowoutGap: Math.abs((h1Calc.projA1H || 0) - (h1Calc.projB1H || 0)),
       marketKey: "h1",
 
       league
