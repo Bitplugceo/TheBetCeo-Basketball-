@@ -1,4 +1,3 @@
-B
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -719,6 +718,22 @@ td {
   line-height: 1.4;
   color: var(--muted);
   border: 1px dashed var(--muted);
+  border-radius: 0;
+  vertical-align: middle;
+  cursor: help;
+}
+
+/* FIX #21: shown on the confidence badge when the grade is running on
+   hand-guessed default coefficients rather than a real fitted model. */
+.conf-default-coeff-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 4px;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1.4;
+  color: #ffa500;
+  border: 1px dashed #ffa500;
   border-radius: 0;
   vertical-align: middle;
   cursor: help;
@@ -6208,7 +6223,7 @@ const TRACKER_SAVE_DEBOUNCE_MS = 10000;
 const TRACKER_SAVE_RETRY_BASE_MS = 1500;
 const TRACKER_SAVE_RETRY_MAX_MS = 15000;
 const TRACKER_NETWORK_TIMEOUT_MS = BB_CONFIG.timeouts.fetch;
-const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_G";
+const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_F";
 const ENGINE_MODEL_VERSION = "engine_v2_final";
 const TRACKER_LEARNING_ENABLED = true;
 
@@ -9644,7 +9659,16 @@ function renderTrackedPicks() {
   const stats = g_trackerState.stats || { total: 0, settled: 0, wins: 0, losses: 0, pushes: 0 };
   const pendingCount = active.filter(p => String(p?.resultStatus || "pending").toLowerCase() === "pending").length;
 
-  summaryEl.textContent = `${displayPicks.length} live/recent • ${pendingCount} pending • ${stats.wins} wins • ${stats.losses} losses`;
+  // FIX #23: engineDivergenceRate was being computed in rebuildTrackerStats()
+  // but nothing ever displayed it, leaving the only visible signal a tiny 8px
+  // "MID:" footnote on individual rows. Surface the aggregate rate here once
+  // there's a meaningful sample, so a rising divergence rate is actually
+  // noticeable instead of silent.
+  const _divergenceSuffix = (isFinite(stats.engineDivergenceRate) && stats.settled >= 10)
+    ? ` • ${stats.engineDivergenceRate}% engine/settled divergence (${stats.engineDivergenceCount})`
+    : "";
+
+  summaryEl.textContent = `${displayPicks.length} live/recent • ${pendingCount} pending • ${stats.wins} wins • ${stats.losses} losses${_divergenceSuffix}`;
 
   const marketLabels = { ft: "FT", h1: "1H", q1: "Q1", q2: "Q2", q3: "Q3", q4: "Q4", team_a: "Team A", team_b: "Team B" };
   const chips = ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"].map(key => {
@@ -16833,6 +16857,17 @@ async function executeRetrospectiveBacktest(gameId) {
         _provBadge.textContent = "?";
         tdConf.appendChild(_provBadge);
       }
+      // FIX #21: coeffFitted was already being computed and attached to every
+      // pick object, but nothing ever displayed it — the grade looked identical
+      // whether it came from a real fitted model or the hardcoded `?? ...`
+      // defaults in getConfidenceWinProbability. Surface it here.
+      if (p.coeffFitted === false) {
+        const _defaultCoeffBadge = document.createElement("span");
+        _defaultCoeffBadge.className = "conf-default-coeff-badge";
+        _defaultCoeffBadge.title = "This grade is using hardcoded default coefficients — no fitted model exists yet for this league";
+        _defaultCoeffBadge.textContent = "~";
+        tdConf.appendChild(_defaultCoeffBadge);
+      }
     }
     row.appendChild(tdConf);
 
@@ -17487,6 +17522,23 @@ const h1Calc = compute1HProjection({
       if (injA < 1) projB *= (1 + (1 - injA) * _qInjOppBoostFactor);
       if (injB < 1) projA *= (1 + (1 - injB) * _qInjOppBoostFactor);
 
+      // FIX #17: quarters previously never received the rest-days/back-to-back/
+      // travel intelligence signal that FT and H1 both apply via STEP6. Wire it
+      // in here the same way FT does (per-team signal, damped by the opponent's
+      // volatility), scaled down proportionally for a quarter: H1 already scales
+      // the signal by /4 for a half, so a quarter (half of a half) uses /8.
+      const aVolQ = getVolatilityRatioForSeries(aS, volLimit);
+      const bVolQ = getVolatilityRatioForSeries(bS, volLimit);
+      const intelQ = computeIntelligencePack(league);
+      const intelSignalAQ = buildTeamMarketIntelSignal(intelQ, "A");
+      const intelSignalBQ = buildTeamMarketIntelSignal(intelQ, "B");
+      if (isFinite(intelSignalAQ.signal) && intelSignalAQ.signal !== 0) {
+        projA = applyDampedIntelSignal(projA, intelSignalAQ.signal / 8, bVolQ);
+      }
+      if (isFinite(intelSignalBQ.signal) && intelSignalBQ.signal !== 0) {
+        projB = applyDampedIntelSignal(projB, intelSignalBQ.signal / 8, aVolQ);
+      }
+
       const aH2H = getH2HSeries("A", qKey, parsed);
       const bH2H = getH2HSeries("B", qKey, parsed);
       const hasH2H = maybeReadH2HEnabled(qKey) && aH2H.length >= 2 && bH2H.length >= 2;
@@ -17873,6 +17925,10 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     
     const projDiff = ftCalc.projAFT - ftCalc.projBFT;
 
+    // FIX #21: computed once so every market's pick object can carry it (previously
+    // only the FT object attached this field, and nothing ever displayed it).
+    const _coeffFitted = isConfidenceCoeffFitted(league);
+
     const picks = [
   {
     _idx: 0,
@@ -17891,7 +17947,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     sampleTier: ftCalc.ftSampleTier,
     hasH2H: ftCalc.ftHasH2H,
     trap: ftTrap,
-    coeffFitted: isConfidenceCoeffFitted(league),
+    coeffFitted: _coeffFitted,
 
     aVenueEnabled: ftCalc.aVenueEnabled,
     bVenueEnabled: ftCalc.bVenueEnabled,
@@ -17916,16 +17972,17 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     sampleTier: h1Calc.h1SampleTier,
     hasH2H: h1Calc.h1HasH2H,
     trap: h1Trap,
+    coeffFitted: _coeffFitted,
     aVenueEnabled: h1Calc.aVenueEnabled,
     bVenueEnabled: h1Calc.bVenueEnabled,
     aVenueAdjustment: h1Calc.aVenueAdjustment,
     bVenueAdjustment: h1Calc.bVenueAdjustment
   },
 
-      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: q1?.fullModel ?? false, sampleTier: q1?.tier, hasH2H: q1?.hasH2H, volatility: q1?.volatility, volLimit: getMarketVolLimit(league, "q1") },
-      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: q2?.fullModel ?? false, sampleTier: q2?.tier, hasH2H: q2?.hasH2H, volatility: q2?.volatility, volLimit: getMarketVolLimit(league, "q2") },
-      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: q3?.fullModel ?? false, sampleTier: q3?.tier, hasH2H: q3?.hasH2H, volatility: q3?.volatility, volLimit: getMarketVolLimit(league, "q3") },
-      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: q4?.fullModel ?? false, sampleTier: q4?.tier, hasH2H: q4?.hasH2H, volatility: q4?.volatility, volLimit: getMarketVolLimit(league, "q4") },
+      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: q1?.fullModel ?? false, sampleTier: q1?.tier, hasH2H: q1?.hasH2H, volatility: q1?.volatility, volLimit: getMarketVolLimit(league, "q1"), coeffFitted: _coeffFitted },
+      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: q2?.fullModel ?? false, sampleTier: q2?.tier, hasH2H: q2?.hasH2H, volatility: q2?.volatility, volLimit: getMarketVolLimit(league, "q2"), coeffFitted: _coeffFitted },
+      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: q3?.fullModel ?? false, sampleTier: q3?.tier, hasH2H: q3?.hasH2H, volatility: q3?.volatility, volLimit: getMarketVolLimit(league, "q3"), coeffFitted: _coeffFitted },
+      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: q4?.fullModel ?? false, sampleTier: q4?.tier, hasH2H: q4?.hasH2H, volatility: q4?.volatility, volLimit: getMarketVolLimit(league, "q4"), coeffFitted: _coeffFitted },
   {
     _idx: 3,
     name: "Team A Total" + aBadge,
@@ -17942,6 +17999,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     fullModel: ftCalc.teamFullModel,
     sampleTier: ftCalc.ftSampleTier,
     hasH2H: ftCalc.ftHasH2H,
+    coeffFitted: _coeffFitted,
     aVenueEnabled: ftCalc.aVenueEnabled,
     aVenueAdjustment: ftCalc.aVenueAdjustment
   },
@@ -17961,6 +18019,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     fullModel: ftCalc.teamFullModel,
     sampleTier: ftCalc.ftSampleTier,
     hasH2H: ftCalc.ftHasH2H,
+    coeffFitted: _coeffFitted,
     bVenueEnabled: ftCalc.bVenueEnabled,
     bVenueAdjustment: ftCalc.bVenueAdjustment
   },
@@ -17979,7 +18038,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     note: h1Note,
     fullModel: h1Calc.h1FullModel,
     sampleTier: h1Calc.h1SampleTier,
-    hasH2H: h1Calc.h1HasH2H
+    hasH2H: h1Calc.h1HasH2H,
+    coeffFitted: _coeffFitted
   },
   {
     _idx: 15,
@@ -17996,7 +18056,8 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     note: h1Note,
     fullModel: h1Calc.h1FullModel,
     sampleTier: h1Calc.h1SampleTier,
-    hasH2H: h1Calc.h1HasH2H
+    hasH2H: h1Calc.h1HasH2H,
+    coeffFitted: _coeffFitted
   }
     ];
 
