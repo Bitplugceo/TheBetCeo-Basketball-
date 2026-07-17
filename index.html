@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -8252,7 +8253,12 @@ next.closingLine = (next.closingLine !== undefined && next.closingLine !== null 
     return null;
   })();
   next.edge = isFinite(Number(next.edge)) ? Number(next.edge) : null;
-  next.edgePct = (next.edgePct !== null && next.edgePct !== undefined && isFinite(Number(next.edgePct))) ? Number(next.edgePct) : (isFinite(Number(next.edge)) && isFinite(Number(next.lineAtPick)) && Number(next.lineAtPick) ? (Number(next.edge) / Number(next.lineAtPick)) * 100 : null);
+  // FIX #26: edgePct must be an unsigned magnitude, matching every live-grading
+  // use (getConfidenceGrade, detectTrap, selectLock all Math.abs() it). Storing
+  // it signed here made UNDER picks look like near-zero/negative edge to
+  // calibrateConfidenceModel's buildF(), which reads this exact field back in
+  // to retrain — direction is already preserved separately via next.side/next.edge.
+  next.edgePct = (next.edgePct !== null && next.edgePct !== undefined && isFinite(Number(next.edgePct))) ? Math.abs(Number(next.edgePct)) : (isFinite(Number(next.edge)) && isFinite(Number(next.lineAtPick)) && Number(next.lineAtPick) ? Math.abs((Number(next.edge) / Number(next.lineAtPick)) * 100) : null);
   next.trackerSoftInfluence = next.trackerSoftInfluence || next?.diagnostics?.trackerSoftInfluence || null;
   next.trackerFeedback = next.trackerFeedback || next?.diagnostics?.trackerFeedback || null;
   next.shadowTrackerFeedback = next.shadowTrackerFeedback || next?.diagnostics?.shadowTrackerFeedback || null;
@@ -15805,6 +15811,11 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const clamp = getEffectivePaceClamp(league);
 
   let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
+  // FIX #27: computeFTProjection gates hasRealPace on >=5 pace10 points per
+  // side before trusting the advanced-stats branch; this function was missing
+  // that same gate, letting H1 flip into the ratings-based projection off a
+  // single fetched data point while FT requires 5. Match FT's standard.
+  hasRealPace = hasRealPace && (ctxA.pace10 || []).length >= 5 && (ctxB.pace10 || []).length >= 5;
 
   let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10))
     && (ctxA.ortg10 || []).length >= 5 && (ctxB.ortg10 || []).length >= 5;
@@ -16262,6 +16273,13 @@ function calibrateConfidenceModel() {
 
   const _gd = (data, lr, lambda) => {
     let c = { intercept: -0.2, edgePct: 8.0, volRatio: -0.8, sampleFull: 0.4, h2h: 0.2, trap: -1.2 };
+    // FIX #28: gradient was accumulated as a raw sum over `data`, never divided
+    // by sample count, so the effective step size scaled with dataset size.
+    // runGD() selects lr/lambda via 3-fold CV on ~2/3 of the data, then reuses
+    // that same lr to fit the FULL dataset — a mismatch that grows as the
+    // tracker accumulates more picks over time. Normalize to the mean gradient
+    // so lr behaves the same regardless of how many rows are in `data`.
+    const _n = data.length || 1;
     for (let iter = 0; iter < 400; iter++) {
       const g = { intercept: 0, edgePct: 0, volRatio: 0, sampleFull: 0, h2h: 0, trap: 0 };
       for (const { f, y } of data) {
@@ -16275,12 +16293,12 @@ function calibrateConfidenceModel() {
         g.h2h        += e * f.h2h;
         g.trap       += e * f.trap;
       }
-      c.intercept  += lr * g.intercept;
-      c.edgePct    += lr * g.edgePct    - lr * lambda * c.edgePct;
-      c.volRatio   += lr * g.volRatio   - lr * lambda * c.volRatio;
-      c.sampleFull += lr * g.sampleFull - lr * lambda * c.sampleFull;
-      c.h2h        += lr * g.h2h        - lr * lambda * c.h2h;
-      c.trap       += lr * g.trap       - lr * lambda * c.trap;
+      c.intercept  += lr * (g.intercept  / _n);
+      c.edgePct    += lr * (g.edgePct    / _n) - lr * lambda * c.edgePct;
+      c.volRatio   += lr * (g.volRatio   / _n) - lr * lambda * c.volRatio;
+      c.sampleFull += lr * (g.sampleFull / _n) - lr * lambda * c.sampleFull;
+      c.h2h        += lr * (g.h2h        / _n) - lr * lambda * c.h2h;
+      c.trap       += lr * (g.trap       / _n) - lr * lambda * c.trap;
     }
     return c;
   };
@@ -16785,7 +16803,10 @@ function getSampleTierForMarket(market, dx = {}) {
     inputSource: getTrackedInputSource(marketKey),
     edge: trackedEdge,
     rawEdge: isFinite(pickRow.edge) ? Number(pickRow.edge) : trackedEdge,
-    edgePct: isFinite(trackedEdge) && trackedLine ? (trackedEdge / trackedLine) * 100 : null,
+    // FIX #26: unsigned magnitude — see matching fix in ensureTrackedPickKeys.
+    // trackedEdge is signed (positive=OVER, negative=UNDER); direction is
+    // already captured by `side` above, so edgePct should be magnitude only.
+    edgePct: isFinite(trackedEdge) && trackedLine ? Math.abs((trackedEdge / trackedLine) * 100) : null,
 
     winProbability: isFinite(pickRow.winProbability) ? Number(pickRow.winProbability) : (pickRow.winProbability || null),
     latestSeenLine: null,
@@ -18692,8 +18713,12 @@ window.__LAST_AUDIT_STATE = {
     trackerSoftEffects: TRACKER_SOFT_EFFECTS,
     engineMode: ENGINE_MODE,
     leagueTrustMeta: _aud_trust,
-    h2hFixedWeight: 0.35,
-    h2hTeamWeight:  0.65,
+    // FIX #29: these were hardcoded to 0.35/0.65 and never matched the real
+    // logic — getH2HWeight() actually caps at getParam("h2hMaxWeight", league)
+    // ?? 0.30 (tunable 0.15-0.40 per league) and computes a dynamic weight, not
+    // a fixed 35/65 split. Not read anywhere else in the code, so this was
+    // audit-trail-only, but it was actively misleading anyone debugging off it.
+    h2hMaxWeightCap: getParam("h2hMaxWeight", league) ?? 0.30,
     recencyWeightsUsed: { ft: _runFTWeights, h1: _runH1Weights },
     verifiedFtConfig: verifiedFtConfig ? { configKey: verifiedFtConfig.configKey, netDelta: verifiedFtConfig.netDelta, sampleCount: verifiedFtConfig.sampleCount } : null,
     verifiedH1Config: verifiedH1Config ? { configKey: verifiedH1Config.configKey, netDelta: verifiedH1Config.netDelta, sampleCount: verifiedH1Config.sampleCount } : null,
