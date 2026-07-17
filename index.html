@@ -13053,7 +13053,7 @@ function getConfidenceGrade(params) {
   
   const {
     pick, note, line, edge, sampleTier, hasH2H, volatility, volLimit,
-    paceGapRisk, blowoutGap, trap,
+    paceGapRisk, blowoutGap, trap, lineupQuality, siblingEdge,
     league = ""
   } = params || {};
 
@@ -13068,6 +13068,24 @@ function getConfidenceGrade(params) {
   if (isFinite(winProb)) {
     if (isFinite(blowoutGap) && blowoutGap > 15) winProb *= 0.97;
     if (!!paceGapRisk) winProb *= 0.98;
+
+    // FIX #24: lineupQuality (roster plus-minus + injury severity, computed
+    // per-market via computeLineupQuality on a 0.3-1.0 scale) and siblingEdge
+    // (a quarter's parent H1/FT edge, meant to flag cross-market model
+    // disagreement) were both computed and passed at every call site but
+    // never read here, so they never actually tempered the grade. Wire them
+    // in as bounded discounts, same style/magnitude as paceGapRisk/blowoutGap
+    // above. lineupQuality=1.0 (full strength) is a no-op; the discount grows
+    // toward a 5% max as it approaches its floor of 0.3.
+    if (isFinite(lineupQuality) && lineupQuality < 1.0) {
+      winProb *= (0.95 + 0.05 * clampNumber(lineupQuality, 0.3, 1.0));
+    }
+    // siblingEdge disagreement: only penalize when both edges are finite,
+    // non-zero, and point in opposite directions (e.g. a quarter favors Team
+    // A while its parent H1/FT edge favors Team B).
+    if (isFinite(edge) && isFinite(siblingEdge) && edge !== 0 && siblingEdge !== 0 && Math.sign(edge) !== Math.sign(siblingEdge)) {
+      winProb *= 0.97;
+    }
   }
 
   if (!isFinite(winProb)) {
@@ -15562,6 +15580,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
   const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
   const leagueRatingBase = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
+  // FIX #23: defensiveFloorFlag below compares raw points-allowed (aAllowed/
+  // bAllowed) against a per-100-possession rating base, which is only
+  // roughly the same magnitude for NBA-paced leagues. compute1HProjection
+  // already does this correctly with a points-basis constant (leagueBase1H)
+  // — add the FT equivalent (per-team full-game points) here.
+  const leagueBaseFT = eb / 2;
   let synPace = leaguePaceBase;
 
   const ctxA = AppState.context.data?.A || {};
@@ -15718,7 +15742,11 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     ftProjectionOnly: !ftHasH2H && ftSampleTier === "thin",
     blowoutGap: Math.abs((projAFT||0) - (projBFT||0)),
     aS, bS, aScores: aFTS, bScores: bFTS,
-    defensiveFloorFlag: (isFinite(aAllowed) && aAllowed <= leagueRatingBase * 0.92) || (isFinite(bAllowed) && bAllowed <= leagueRatingBase * 0.92),
+    // FIX #23: compare points-allowed against a points-basis threshold
+    // (leagueBaseFT) instead of the per-100-possession rating base, so the
+    // flag doesn't fire almost-always-true for slower-pace leagues (NCAA,
+    // Euroleague, etc.) — same fix pattern as compute1HProjection.
+    defensiveFloorFlag: (isFinite(aAllowed) && aAllowed <= leagueBaseFT * 0.92) || (isFinite(bAllowed) && bAllowed <= leagueBaseFT * 0.92),
 
     aVenueEnabled: aVenueDiag.enabled, bVenueEnabled: bVenueDiag.enabled,
     aVenueAdjustment: aVenueDiag, bVenueAdjustment: bVenueDiag,
@@ -15832,10 +15860,19 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const combinedVol = Math.max(aVol1, bVol1);
 
   const intel = computeIntelligencePack(league);
-  const intelSignal = buildTotalMarketIntelSignal(intel);
-  if (isFinite(intelSignal.signal) && intelSignal.signal !== 0) {
-    projA1H = applyDampedIntelSignal(projA1H, intelSignal.signal / 4, bVol1);
-    projB1H = applyDampedIntelSignal(projB1H, intelSignal.signal / 4, aVol1);
+  // FIX #25: H1 previously used buildTotalMarketIntelSignal, which combines
+  // both teams' rest-days into ONE signal and applies it to BOTH projA1H and
+  // projB1H equally — so a rested Team A got dinged just because Team B was
+  // on a back-to-back. FT already does this correctly (buildTeamMarketIntelSignal,
+  // one call per team, each applied only to that team's own projection,
+  // damped by the OTHER team's volatility). Match that pattern here.
+  const intelSignalA1H = buildTeamMarketIntelSignal(intel, "A");
+  const intelSignalB1H = buildTeamMarketIntelSignal(intel, "B");
+  if (isFinite(intelSignalA1H.signal) && intelSignalA1H.signal !== 0) {
+    projA1H = applyDampedIntelSignal(projA1H, intelSignalA1H.signal / 4, bVol1);
+  }
+  if (isFinite(intelSignalB1H.signal) && intelSignalB1H.signal !== 0) {
+    projB1H = applyDampedIntelSignal(projB1H, intelSignalB1H.signal / 4, aVol1);
   }
 
   const aH2H = getH2HSeries("A", "h1", parsed);
@@ -16595,9 +16632,15 @@ function getSampleTierForMarket(market, dx = {}) {
   }
 
   function getVolatilityValueForMarket(market, dx = {}) {
-    if (market === "ft") return Math.max(Number(dx.aVol || 0), Number(dx.bVol || 0));
-    if (market === "team_a") return Number(dx.aVol || 0);
-    if (market === "team_b") return Number(dx.bVol || 0);
+    // FIX #22: dx.aVol/dx.bVol are the volLimit-premultiplied FT team
+    // volatilities (typically 8-30+), but getVolatilityBucket's edges
+    // (0.7/1.3/1.9) are calibrated for the raw 0-2.5 ratio scale — the same
+    // ft/h1 convention mismatch as the H1 confidence bug. Divide back down to
+    // the raw ratio so ft/team_a/team_b bucket on the same scale as h1.
+    const _ftVolLimitForBucket = getMarketVolLimit(league, "ft") || 1;
+    if (market === "ft") return Math.max(Number(dx.aVol || 0), Number(dx.bVol || 0)) / _ftVolLimitForBucket;
+    if (market === "team_a") return Number(dx.aVol || 0) / _ftVolLimitForBucket;
+    if (market === "team_b") return Number(dx.bVol || 0) / _ftVolLimitForBucket;
     if (market === "h1") return Math.max(Number(dx.aVol1 || 0), Number(dx.bVol1 || 0));
     if (market === "h1_team_a") return Number(dx.aVol1 || 0);
     if (market === "h1_team_b") return Number(dx.bVol1 || 0);
@@ -17679,7 +17722,12 @@ const h1Calc = compute1HProjection({
         league
       });
 
-      return { proj: qProj, edge: qEdge, line: lineVal, pick: qPick, confidence: qConf, tier, projA, projB, hasH2H, volatility: stdDev(aS.concat(bS)), fullModel: qFullModel, projectionOnly: qProjectionOnly };
+      // FIX #20: expose paceGapRisk on the returned object so the post-anchor
+      // confidence recompute below (which currently drops trap/paceGapRisk/
+      // blowoutGap entirely) can restore these discounts instead of grading
+      // blind on the common path where H1/FT anchoring fires.
+      const qPaceGapRisk = Math.abs((avgOrNaN(ctxAQ.pace10) || 74) - (avgOrNaN(ctxBQ.pace10) || 74)) > 6;
+      return { proj: qProj, edge: qEdge, line: lineVal, pick: qPick, confidence: qConf, tier, projA, projB, hasH2H, volatility: stdDev(aS.concat(bS)), fullModel: qFullModel, projectionOnly: qProjectionOnly, paceGapRisk: qPaceGapRisk };
     };
 
     const q1 = computeQ("q1", parseMarketLine(document.getElementById("q1Market")?.value), g_injA.scoringMult, g_injB.scoringMult, { h2hFactor: ftConfigOverride?.h2hFactor });
@@ -17717,14 +17765,19 @@ const h1Calc = compute1HProjection({
 
             q1.pick = getPick(q1.edge, q1.line, league, "q1", {});
 
-            
-
-            
+            // FIX #20: this recompute previously dropped trap/paceGapRisk/
+            // blowoutGap entirely, so the grade that survives to the pick on
+            // the common (anchored) path was never discounted for any of
+            // them, even though computeQ's own pre-anchor grade included all
+            // three. Recompute trap against the post-anchor edge/pick and
+            // restore the other two from the quarter's own data.
             const _q1VolSafe = isFinite(q1.volatility) ? q1.volatility : 0;
+            const _q1TrapPostAnchor = detectTrap(q1.edge, q1.line, q1.pick, league, "q1", _q1VolSafe);
             q1.confidence = getConfidenceGrade({
               pick: q1.pick, line: q1.line, edge: q1.edge, sampleTier: q1.tier,
               volatility: _q1VolSafe, volLimit: getMarketVolLimit(league, "q1"), marketKey: "q1", hasH2H: q1.hasH2H,
               fullModel: q1.fullModel, projectionOnly: q1.projectionOnly,
+              trap: _q1TrapPostAnchor, paceGapRisk: q1.paceGapRisk, blowoutGap: Math.abs((q1.projA || 0) - (q1.projB || 0)),
               siblingEdge: h1Calc.h1Edge, league
             });
           }
@@ -17735,11 +17788,14 @@ const h1Calc = compute1HProjection({
 
             q2.pick = getPick(q2.edge, q2.line, league, "q2", {});
 
+            // FIX #20: same restoration as Q1 above.
             const _q2VolSafe = isFinite(q2.volatility) ? q2.volatility : 0;
+            const _q2TrapPostAnchor = detectTrap(q2.edge, q2.line, q2.pick, league, "q2", _q2VolSafe);
             q2.confidence = getConfidenceGrade({
               pick: q2.pick, line: q2.line, edge: q2.edge, sampleTier: q2.tier,
               volatility: _q2VolSafe, volLimit: getMarketVolLimit(league, "q2"), marketKey: "q2", hasH2H: q2.hasH2H,
               fullModel: q2.fullModel, projectionOnly: q2.projectionOnly,
+              trap: _q2TrapPostAnchor, paceGapRisk: q2.paceGapRisk, blowoutGap: Math.abs((q2.projA || 0) - (q2.projB || 0)),
               siblingEdge: h1Calc.h1Edge, league
             });
           }
@@ -17760,11 +17816,14 @@ const h1Calc = compute1HProjection({
 
             q3.pick = getPick(q3.edge, q3.line, league, "q3", {});
 
+            // FIX #20: same restoration as Q1/Q2 above.
             const _q3VolSafe = isFinite(q3.volatility) ? q3.volatility : 0;
+            const _q3TrapPostAnchor = detectTrap(q3.edge, q3.line, q3.pick, league, "q3", _q3VolSafe);
             q3.confidence = getConfidenceGrade({
               pick: q3.pick, line: q3.line, edge: q3.edge, sampleTier: q3.tier,
               volatility: _q3VolSafe, volLimit: getMarketVolLimit(league, "q3"), marketKey: "q3", hasH2H: q3.hasH2H,
               fullModel: q3.fullModel, projectionOnly: q3.projectionOnly,
+              trap: _q3TrapPostAnchor, paceGapRisk: q3.paceGapRisk, blowoutGap: Math.abs((q3.projA || 0) - (q3.projB || 0)),
               siblingEdge: ftCalc.ftEdge, league
             });
           }
@@ -17775,13 +17834,14 @@ const h1Calc = compute1HProjection({
 
             q4.pick = getPick(q4.edge, q4.line, league, "q4", {});
 
-            
-
+            // FIX #20: same restoration as Q1/Q2/Q3 above.
             const _q4VolSafe = isFinite(q4.volatility) ? q4.volatility : 0;
+            const _q4TrapPostAnchor = detectTrap(q4.edge, q4.line, q4.pick, league, "q4", _q4VolSafe);
             q4.confidence = getConfidenceGrade({
               pick: q4.pick, line: q4.line, edge: q4.edge, sampleTier: q4.tier,
               volatility: _q4VolSafe, volLimit: getMarketVolLimit(league, "q4"), marketKey: "q4", hasH2H: q4.hasH2H,
               fullModel: q4.fullModel, projectionOnly: q4.projectionOnly,
+              trap: _q4TrapPostAnchor, paceGapRisk: q4.paceGapRisk, blowoutGap: Math.abs((q4.projA || 0) - (q4.projB || 0)),
               siblingEdge: ftCalc.ftEdge, league
             });
           }
@@ -17932,14 +17992,21 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       lineupQuality: lqB
     });
     
-    const h1aTrap = detectTrap(h1aEdge, finalLines.h1aLine, h1aPick, league, "h1", h1Calc.aVol1);
+    // FIX #21: h1Calc.aVol1 is the raw volatility ratio (0-2.5), never
+    // multiplied by volLimit — but getConfidenceGrade divides volatility by
+    // volLimit again internally, so passing the raw ratio here silently
+    // deflated it a second time and inflated H1 Team A confidence while
+    // suppressing its trap detection. Pre-multiply it the same way
+    // h1VolatilityForConf (combined H1) and ftCalc.aVol (FT) already do.
+    const h1aVolatilityForConf = h1Calc.aVol1 * getMarketVolLimit(league, "h1");
+    const h1aTrap = detectTrap(h1aEdge, finalLines.h1aLine, h1aPick, league, "h1", h1aVolatilityForConf);
     const h1aConfidence = getConfidenceGrade({
       pick: h1aPick, note: h1Note, line: finalLines.h1aLine, edge: h1aEdge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: h1aTrap, hasH2H: h1Calc.h1HasH2H,
       // FIX #19: H1 Team A previously graded with no volatility signal at all
       // (volRatio silently defaulted to 0.5) and no pace-gap/blowout discount.
-      volatility: h1Calc.aVol1,
+      volatility: h1aVolatilityForConf,
       volLimit: getMarketVolLimit(league, "h1"),
       paceGapRisk: h1Calc.paceGapRisk,
       blowoutGap: Math.abs((h1Calc.projA1H || 0) - (h1Calc.projB1H || 0)),
@@ -17947,14 +18014,18 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
 
       league
     });
-    const h1bTrap = detectTrap(h1bEdge, finalLines.h1bLine, h1bPick, league, "h1", h1Calc.bVol1);
+    // FIX #21: same raw-ratio-vs-premultiplied mismatch as H1 Team A above —
+    // h1Calc.bVol1 is the raw ratio and must be pre-multiplied by volLimit
+    // before reaching detectTrap/getConfidenceGrade.
+    const h1bVolatilityForConf = h1Calc.bVol1 * getMarketVolLimit(league, "h1");
+    const h1bTrap = detectTrap(h1bEdge, finalLines.h1bLine, h1bPick, league, "h1", h1bVolatilityForConf);
     const h1bConfidence = getConfidenceGrade({
       pick: h1bPick, note: h1Note, line: finalLines.h1bLine, edge: h1bEdge,
       sampleTier: h1Calc.h1SampleTier, projectionOnly: h1Calc.h1ProjectionOnly,
       fullModel: h1Calc.h1FullModel, trap: h1bTrap, hasH2H: h1Calc.h1HasH2H,
       // FIX #19: H1 Team B previously graded with no volatility signal at all
       // (volRatio silently defaulted to 0.5) and no pace-gap/blowout discount.
-      volatility: h1Calc.bVol1,
+      volatility: h1bVolatilityForConf,
       volLimit: getMarketVolLimit(league, "h1"),
       paceGapRisk: h1Calc.paceGapRisk,
       blowoutGap: Math.abs((h1Calc.projA1H || 0) - (h1Calc.projB1H || 0)),
