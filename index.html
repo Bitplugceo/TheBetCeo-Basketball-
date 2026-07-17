@@ -3798,6 +3798,9 @@ function extractH2HFromPastedEvents() {
     
     if (window.__h2hEntryCache && window.__h2hEntryCache.length) {
       window.__h2hEntryCache = [];
+      // FIX: clear the decay-weighted game records too, or a stale matchup's
+      // dated H2H games linger in AppState after the team IDs are reset.
+      AppState.context.data.h2hGames = [];
       const h2hTag = document.getElementById("h2hAutoTag");
       if (h2hTag) h2hTag.style.display = "none";
       ["aFTH2H","bFTH2H","a1HH2H","b1HH2H","aQ1H2H","bQ1H2H","aQ2H2H","bQ2H2H","aQ3H2H","bQ3H2H","aQ4H2H","bQ4H2H"].forEach(id => {
@@ -3839,6 +3842,14 @@ function extractH2HFromPastedEvents() {
   });
 
   
+  // FIX: enforce an actual recency cutoff. Previously this filter only sorted
+  // by startTimestamp and sliced the top N with no floor at all, so if the
+  // two teams hadn't played recently it would happily reach back years —
+  // contradicting the "(2022+)" auto-fill label, which describes the ESPN
+  // fetch path's h2hLookbackSeasons behavior that was never implemented here.
+  const _h2hCutoffLeague = document.getElementById("leagueSelect")?.value || "";
+  const _h2hLookbackYears = getParam("h2hLookbackSeasons", _h2hCutoffLeague) ?? 4;
+  const _h2hMinSeasonYear = getCurrentSeasonYear(_h2hCutoffLeague) - _h2hLookbackYears;
 
     let h2hMatches = uniqueEvents.filter(ev => {
     const sType = ev.status?.type ?? "";
@@ -3850,6 +3861,11 @@ function extractH2HFromPastedEvents() {
     
     if (hId && hId === aId) return false;
     if (!((hId === idA && aId === idB) || (hId === idB && aId === idA))) return false;
+
+    if (!ev.startTimestamp) return false;
+    const evDate = new Date(ev.startTimestamp * 1000);
+    if (isNaN(evDate.getTime())) return false;
+    if (getSeasonYearForDateAndLeague(evDate, _h2hCutoffLeague) < _h2hMinSeasonYear) return false;
 
     const fixtureTid = getFixtureTournamentId();
     if (fixtureTid != null) {
@@ -3900,6 +3916,26 @@ function extractH2HFromPastedEvents() {
 
     window.__h2hEntryCache.sort((a, b) => b.ts - a.ts);
     window.__h2hEntryCache = window.__h2hEntryCache.slice(0, 5);
+
+    // FIX: getMassacreH2HSeries() only ever reads AppState.context.data.h2hGames,
+    // which was previously populated exclusively by the ESPN fetch path
+    // (fetchESPNCore) — so SofaScore-pasted H2H never got date-based decay
+    // weighting and always fell back to a flat average instead. Mirror
+    // fetchH2HCore's record shape: teamAId there is already the current
+    // fixture's Team A id (not home/away), and scoreA/scoreB are already
+    // normalized to that same A/B split — exactly what this cache already is
+    // via the isAHome check above — so no home/away flip is needed here.
+    AppState.context.data.h2hGames = window.__h2hEntryCache.map(e => ({
+      date: new Date((e.ts || 0) * 1000).toISOString(),
+      teamAId: idA,
+      teamBId: idB,
+      scoreA: e.aFT, scoreB: e.bFT,
+      h1A: e.aH1, h1B: e.bH1,
+      q1A: e.aQ1, q1B: e.bQ1,
+      q2A: e.aQ2, q2B: e.bQ2,
+      q3A: e.aQ3, q3B: e.bQ3,
+      q4A: e.aQ4, q4B: e.bQ4
+    }));
 
     const merged = window.__h2hEntryCache;
     const h2hA = merged.map(e => e.aFT);
@@ -8179,6 +8215,12 @@ function weightedRecentAverageByDate(items, weights = MODEL_TUNING.recencyWeight
 function getDateAwareOrFallbackAverage(series, side, marketKey) {
   const clean = Array.isArray(series) ? series.map(Number).filter(v => isFinite(v)) : [];
   if (!clean.length) return NaN;
+  // FIX: Engine B is supposed to use a flat 5-game average (trimmedAvg()
+  // already branches to last5Average for Engine B), but this function was
+  // never gated on ENGINE_MODE — so the primary scored-points average was
+  // identical for both engines and the A/B shadow comparison never actually
+  // tested anything on the main input. Mirror trimmedAvg()'s branch here.
+  if (ENGINE_MODE === "B") return last5Average(clean);
   const dates = getStashedSeriesDates(side, marketKey);
   if (dates && dates.length === clean.length) {
     const dateAware = weightedRecentAverageByDate(clean.map((v, i) => ({ value: v, date: dates[i] })));
