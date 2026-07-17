@@ -1,4 +1,3 @@
-M
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4400,6 +4399,7 @@ function initLeagueOverridesFromDefaults() {
 }
 
 let INJURY_OPPONENT_BOOST_FACTOR = getParam("injuryOppBoostFactor") ?? getTunableConstant("INJURY_OPPONENT_BOOST_FACTOR", 0.2);
+let UNDER_EDGE_FACTOR = getParam("underEdgeFactor") ?? getTunableConstant("UNDER_EDGE_FACTOR", 1.2);
 
 const TUNING_GRID = {
   h2hFactors: [0.75, 1.0],
@@ -4877,7 +4877,7 @@ function evaluatePickWithParams(pick, paramOverrides) {
 
     const edgePct = Math.abs(edge / lineVal);
     const volLimit = getMarketVolLimit(league, marketKey);
-    const volRatio = 0.5;
+    const volRatio = (isFinite(pick.volatility) && isFinite(volLimit) && volLimit > 0) ? Number(pick.volatility) / volLimit : 0.5;
     const sampleTier = pick.sampleTier || "thin";
     const hasH2H = pick.hasH2H || false;
     const winProbability = getConfidenceWinProbability(null, edgePct, volRatio, sampleTier, hasH2H, false, league);
@@ -5151,7 +5151,7 @@ if (aS.length < 2 || bS.length < 2) continue;
 
               
               const _edgePct = isFinite(edge) && isFinite(line) && line ? Math.abs(edge / line) : 0;
-              const _volRatio = 0.5;
+              const _volRatio = (isFinite(pick.volatility) && isFinite(pick.volLimit) && pick.volLimit > 0) ? Number(pick.volatility) / Number(pick.volLimit) : 0.5;
               const _sampleTier = pick.sampleTier || "thin";
               const _hasH2H = pick.hasH2H || false;
               const _winProbability = getConfidenceWinProbability(null, _edgePct, _volRatio, _sampleTier, _hasH2H, false, league);
@@ -5219,6 +5219,62 @@ function getLearnedBrutalityThresholds(league) {
     heavy: getParam("massacreHeavyThreshold", league) ?? MASSACRE_TUNING.heavyThreshold ?? 20,
     nuclear: getParam("massacreNuclearThreshold", league) ?? MASSACRE_TUNING.nuclearThreshold ?? 30
   };
+}
+
+function calibrateMassacreCoefficients() {
+  const settled = getLearningTrackedPicks().filter(p =>
+    p && p.massacreDecision === "applied" && p.massacre &&
+    p.actualScore != null &&
+    (p.resultStatus === "win" || p.resultStatus === "loss")
+  );
+  if (settled.length < 15) return;
+
+  const CANDIDATE_THRESHOLD_SETS = [
+    { light: 8,  heavy: 18, nuclear: 28 },
+    { light: 10, heavy: 20, nuclear: 30 },
+    { light: 12, heavy: 22, nuclear: 32 }
+  ];
+
+  const byLeague = {};
+  settled.forEach(p => {
+    const lg = String(p.league || "default").toLowerCase();
+    if (!byLeague[lg]) byLeague[lg] = [];
+    byLeague[lg].push(p);
+  });
+
+  Object.keys(byLeague).forEach(league => {
+    const picks = byLeague[league];
+    if (picks.length < 15) return;
+
+    let defaultNetDelta = 0;
+    picks.forEach(p => { defaultNetDelta += p.resultStatus === "win" ? 1 : -1; });
+
+    let bestSet = null;
+    let bestNetDelta = -Infinity;
+
+    CANDIDATE_THRESHOLD_SETS.forEach(candidate => {
+      let netDelta = 0;
+      picks.forEach(p => {
+        const margin = Math.abs(p.massacre?.profileA?.avgMargin ?? p.massacre?.profileB?.avgMargin ?? 0);
+        const wouldApply = margin >= candidate.light;
+        if (!wouldApply) return;
+        netDelta += p.resultStatus === "win" ? 1 : -1;
+      });
+      if (netDelta > bestNetDelta) { bestNetDelta = netDelta; bestSet = candidate; }
+    });
+
+    const isSignificant = bestSet && bestNetDelta > defaultNetDelta &&
+      Math.abs(bestNetDelta - defaultNetDelta) > 2 * Math.sqrt(picks.length);
+
+    if (isSignificant) {
+      try {
+        localStorage.setItem("BB_BRUTALITY_THRESHOLDS_" + league.toUpperCase(), JSON.stringify(bestSet));
+        engineDebug("Massacre coefficients recalibrated", { league, bestSet, netDelta: bestNetDelta, sampleCount: picks.length });
+      } catch (e) {
+        engineDebug("calibrateMassacreCoefficients failed to persist: " + (e?.message || String(e)), { league, error: e });
+      }
+    }
+  });
 }
 
 const TRACKER_POLICY = {
@@ -7017,14 +7073,6 @@ window.getRollingMeanError = window.getRollingMeanError || function(n) {
   if (!sample.length) return NaN;
   return sample.reduce((s, e) => s + e.error, 0) / sample.length;
 };
-
-window.recordPickVariance = window.recordPickVariance || function(pick) {};
-window.getRollingMeanError = window.getRollingMeanError || function(n) { return NaN; };
-window.g_pickVarianceLog = window.g_pickVarianceLog || [];
-
-window.recordPickVariance = window.recordPickVariance || function(pick) {};
-window.getRollingMeanError = window.getRollingMeanError || function(n) { return NaN; };
-window.g_pickVarianceLog = window.g_pickVarianceLog || [];
 
 let g_engineAlertNeedsReview = false;
 let g_engineAlertLastLine = "";
@@ -12871,8 +12919,6 @@ function getOverallSeries(side, limit) {
   return fetched.slice(0, n);
 }
 
-let UNDER_EDGE_FACTOR = getParam("underEdgeFactor") ?? getTunableConstant("UNDER_EDGE_FACTOR", 1.2);
-
 function getPick(edge, line, league, marketKey, context = {}) {
 
   
@@ -13176,7 +13222,7 @@ const CITY_COORDS = {
   "portland,or": [45.512, -122.677], "sacramento,ca": [38.582, -121.494], "san antonio,tx": [29.424, -98.494],
   "toronto,on": [43.653, -79.383], "salt lake city,ut": [40.761, -111.891], "washington,dc": [38.907, -77.037],
   "paradise,nv": [36.115, -115.174], "las vegas,nv": [36.115, -115.174], "uncasville,ct": [41.462, -72.093],
-  "chicago,il": [41.878, -87.630], "college park,ga": [33.653, -84.449], "seattle,wa": [47.606, -122.332],
+  "college park,ga": [33.653, -84.449], "seattle,wa": [47.606, -122.332],
   "manchester,nh": [42.996, -71.455], "grand rapids,mi": [42.963, -85.668], "santa cruz,ca": [36.974, -122.030],
   "birmingham,al": [33.520, -86.802], "westchester,il": [41.850, -87.887], "iowa city,ia": [41.660, -91.535],
   "greensboro,nc": [36.073, -79.792], "erie,pa": [42.129, -80.085], "long island,ny": [40.789, -73.135],
@@ -13184,7 +13230,7 @@ const CITY_COORDS = {
   "durham,nc": [35.994, -78.899], "chapel hill,nc": [35.913, -79.056], "lawrence,ks": [38.972, -95.235],
   "ann arbor,mi": [42.281, -83.743], "east lansing,mi": [42.737, -84.484], "columbus,oh": [39.983, -83.005],
   "bloomington,in": [39.165, -86.526], "champaign,il": [40.114, -88.207], "madison,wi": [43.073, -89.401],
-  "iowa city,ia": [41.660, -91.535], "college station,tx": [30.601, -96.315], "gainesville,fl": [29.652, -82.325],
+  "college station,tx": [30.601, -96.315], "gainesville,fl": [29.652, -82.325],
   "knoxville,tn": [35.960, -83.921], "lexington,ky": [38.041, -84.501], "tuscaloosa,al": [33.209, -87.569],
   "athens,ga": [33.960, -83.379], "baton rouge,la": [30.451, -91.187], "fayetteville,ar": [36.062, -94.157],
   "columbia,mo": [38.951, -92.334], "starkville,ms": [33.451, -88.819], "oxford,ms": [34.366, -89.519],
@@ -13200,7 +13246,7 @@ const CITY_COORDS = {
   "provo,ut": [40.233, -111.658], "san diego,ca": [32.716, -117.161], "spokane,wa": [47.658, -117.426],
   "morgantown,wv": [39.629, -79.955], "blacksburg,va": [37.229, -80.413], "charlottesville,va": [38.029, -78.477],
   "college park,md": [38.981, -76.937], "piscataway,nj": [40.500, -74.462], "new brunswick,nj": [40.499, -74.447],
-  "villanova,pa": [40.037, -75.343], "storrs,ct": [41.809, -72.253], "omaha,ne": [41.257, -95.995],
+  "villanova,pa": [40.037, -75.343], "omaha,ne": [41.257, -95.995],
   "wichita,ks": [37.687, -97.330], "dayton,oh": [39.759, -84.192], "richmond,va": [37.541, -77.436],
   "hamilton,ny": [42.816, -75.539], "worcester,ma": [42.263, -71.802], "providence,ri": [41.824, -71.413],
   "flagstaff,az": [35.198, -111.651], "moscow,id": [46.732, -117.000], "reno,nv": [39.529, -119.813]
@@ -15288,6 +15334,10 @@ function getManualAllowedSeries(side, marketKey, parsed) {
   if (side === "B" && marketKey === "ft") return safeArr(parsed.bFTAllowed) || [];
   if (side === "A" && marketKey === "h1") return safeArr(parsed.a1HAllowed) || [];
   if (side === "B" && marketKey === "h1") return safeArr(parsed.b1HAllowed) || [];
+  if (marketKey.startsWith("q")) {
+    const pKey = side.toLowerCase() + marketKey.toUpperCase() + "Allowed";
+    if (parsed[pKey] && parsed[pKey].length) return safeArr(parsed[pKey]);
+  }
   return [];
 }
 
@@ -16326,10 +16376,10 @@ async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta)
   if (!Array.isArray(picks) || !picks.length) return;
   const ctxA = getMassacreTeamContext("A", parsed);
   const ctxB = getMassacreTeamContext("B", parsed);
-  const scoredA = getOverallSeries("A", 10);
-  const scoredB = getOverallSeries("B", 10);
-  const allowedA = getManualAllowedSeries("A", "ft", parsed);
-  const allowedB = getManualAllowedSeries("B", "ft", parsed);
+  const scoredA = (Array.isArray(ctxA.ftScored10) && ctxA.ftScored10.length >= 2) ? ctxA.ftScored10 : getOverallSeries("A", 10);
+  const scoredB = (Array.isArray(ctxB.ftScored10) && ctxB.ftScored10.length >= 2) ? ctxB.ftScored10 : getOverallSeries("B", 10);
+  const allowedA = (Array.isArray(ctxA.ftAllowed10) && ctxA.ftAllowed10.length >= 2) ? ctxA.ftAllowed10 : getManualAllowedSeries("A", "ft", parsed);
+  const allowedB = (Array.isArray(ctxB.ftAllowed10) && ctxB.ftAllowed10.length >= 2) ? ctxB.ftAllowed10 : getManualAllowedSeries("B", "ft", parsed);
   const marginA = marginSeries(scoredA, allowedA);
   const marginB = marginSeries(scoredB, allowedB);
   const profileA = getMassacreProfile(marginA.length >= 2 ? marginA : [], "Team A");
@@ -16519,7 +16569,7 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
       const grade = String(pickRow.confidence || "—").toUpperCase();
   const isABQualified = grade === "A" || grade === "B";
 
-  function getSampleTierForMarket(market, dx = {}) {
+function getSampleTierForMarket(market, dx = {}) {
     if (pickRow?.sampleTier) return pickRow.sampleTier;
     if (market === "ft" || market === "team_a" || market === "team_b") return dx.ftSampleTier || "unknown";
     if (market === "h1" || market === "h1_team_a" || market === "h1_team_b" || market.startsWith("q")) return dx.h1SampleTier || "unknown";
@@ -16528,6 +16578,7 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
   }
 
   function getProjectionOnlyForMarket(market, dx = {}) {
+    if (pickRow?.projectionOnly !== undefined) return !!pickRow.projectionOnly;
     if (market === "ft" || market === "team_a" || market === "team_b") return !!dx.ftProjectionOnly;
     if (market === "h1" || market === "h1_team_a" || market === "h1_team_b") return !!dx.h1ProjectionOnly;
     return false;
@@ -16548,6 +16599,9 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     if (market === "team_a") return Number(dx.aVol || 0);
     if (market === "team_b") return Number(dx.bVol || 0);
     if (market === "h1") return Math.max(Number(dx.aVol1 || 0), Number(dx.bVol1 || 0));
+    if (market === "h1_team_a") return Number(dx.aVol1 || 0);
+    if (market === "h1_team_b") return Number(dx.bVol1 || 0);
+    if (market.startsWith("q") && pickRow && isFinite(Number(pickRow.volatility))) return Number(pickRow.volatility);
     return 0;
   }
 
@@ -18029,10 +18083,10 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     bVenueAdjustment: h1Calc.bVenueAdjustment
   },
 
-      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: q1?.fullModel ?? false, sampleTier: q1?.tier, hasH2H: q1?.hasH2H, volatility: q1?.volatility, volLimit: getMarketVolLimit(league, "q1"), coeffFitted: _coeffFitted },
-      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: q2?.fullModel ?? false, sampleTier: q2?.tier, hasH2H: q2?.hasH2H, volatility: q2?.volatility, volLimit: getMarketVolLimit(league, "q2"), coeffFitted: _coeffFitted },
-      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: q3?.fullModel ?? false, sampleTier: q3?.tier, hasH2H: q3?.hasH2H, volatility: q3?.volatility, volLimit: getMarketVolLimit(league, "q3"), coeffFitted: _coeffFitted },
-      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: q4?.fullModel ?? false, sampleTier: q4?.tier, hasH2H: q4?.hasH2H, volatility: q4?.volatility, volLimit: getMarketVolLimit(league, "q4"), coeffFitted: _coeffFitted },
+      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: q1?.fullModel ?? false, sampleTier: q1?.tier, hasH2H: q1?.hasH2H, volatility: q1?.volatility, volLimit: getMarketVolLimit(league, "q1"), coeffFitted: _coeffFitted, projectionOnly: q1?.projectionOnly ?? false },
+      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: q2?.fullModel ?? false, sampleTier: q2?.tier, hasH2H: q2?.hasH2H, volatility: q2?.volatility, volLimit: getMarketVolLimit(league, "q2"), coeffFitted: _coeffFitted, projectionOnly: q2?.projectionOnly ?? false },
+      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: q3?.fullModel ?? false, sampleTier: q3?.tier, hasH2H: q3?.hasH2H, volatility: q3?.volatility, volLimit: getMarketVolLimit(league, "q3"), coeffFitted: _coeffFitted, projectionOnly: q3?.projectionOnly ?? false },
+      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: q4?.fullModel ?? false, sampleTier: q4?.tier, hasH2H: q4?.hasH2H, volatility: q4?.volatility, volLimit: getMarketVolLimit(league, "q4"), coeffFitted: _coeffFitted, projectionOnly: q4?.projectionOnly ?? false },
   {
     _idx: 3,
     name: "Team A Total" + aBadge,
