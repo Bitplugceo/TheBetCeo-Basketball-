@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3799,9 +3798,6 @@ function extractH2HFromPastedEvents() {
     
     if (window.__h2hEntryCache && window.__h2hEntryCache.length) {
       window.__h2hEntryCache = [];
-      // FIX: clear the decay-weighted game records too, or a stale matchup's
-      // dated H2H games linger in AppState after the team IDs are reset.
-      AppState.context.data.h2hGames = [];
       const h2hTag = document.getElementById("h2hAutoTag");
       if (h2hTag) h2hTag.style.display = "none";
       ["aFTH2H","bFTH2H","a1HH2H","b1HH2H","aQ1H2H","bQ1H2H","aQ2H2H","bQ2H2H","aQ3H2H","bQ3H2H","aQ4H2H","bQ4H2H"].forEach(id => {
@@ -3843,14 +3839,6 @@ function extractH2HFromPastedEvents() {
   });
 
   
-  // FIX: enforce an actual recency cutoff. Previously this filter only sorted
-  // by startTimestamp and sliced the top N with no floor at all, so if the
-  // two teams hadn't played recently it would happily reach back years —
-  // contradicting the "(2022+)" auto-fill label, which describes the ESPN
-  // fetch path's h2hLookbackSeasons behavior that was never implemented here.
-  const _h2hCutoffLeague = document.getElementById("leagueSelect")?.value || "";
-  const _h2hLookbackYears = getParam("h2hLookbackSeasons", _h2hCutoffLeague) ?? 4;
-  const _h2hMinSeasonYear = getCurrentSeasonYear(_h2hCutoffLeague) - _h2hLookbackYears;
 
     let h2hMatches = uniqueEvents.filter(ev => {
     const sType = ev.status?.type ?? "";
@@ -3862,11 +3850,6 @@ function extractH2HFromPastedEvents() {
     
     if (hId && hId === aId) return false;
     if (!((hId === idA && aId === idB) || (hId === idB && aId === idA))) return false;
-
-    if (!ev.startTimestamp) return false;
-    const evDate = new Date(ev.startTimestamp * 1000);
-    if (isNaN(evDate.getTime())) return false;
-    if (getSeasonYearForDateAndLeague(evDate, _h2hCutoffLeague) < _h2hMinSeasonYear) return false;
 
     const fixtureTid = getFixtureTournamentId();
     if (fixtureTid != null) {
@@ -3917,26 +3900,6 @@ function extractH2HFromPastedEvents() {
 
     window.__h2hEntryCache.sort((a, b) => b.ts - a.ts);
     window.__h2hEntryCache = window.__h2hEntryCache.slice(0, 5);
-
-    // FIX: getMassacreH2HSeries() only ever reads AppState.context.data.h2hGames,
-    // which was previously populated exclusively by the ESPN fetch path
-    // (fetchESPNCore) — so SofaScore-pasted H2H never got date-based decay
-    // weighting and always fell back to a flat average instead. Mirror
-    // fetchH2HCore's record shape: teamAId there is already the current
-    // fixture's Team A id (not home/away), and scoreA/scoreB are already
-    // normalized to that same A/B split — exactly what this cache already is
-    // via the isAHome check above — so no home/away flip is needed here.
-    AppState.context.data.h2hGames = window.__h2hEntryCache.map(e => ({
-      date: new Date((e.ts || 0) * 1000).toISOString(),
-      teamAId: idA,
-      teamBId: idB,
-      scoreA: e.aFT, scoreB: e.bFT,
-      h1A: e.aH1, h1B: e.bH1,
-      q1A: e.aQ1, q1B: e.bQ1,
-      q2A: e.aQ2, q2B: e.bQ2,
-      q3A: e.aQ3, q3B: e.bQ3,
-      q4A: e.aQ4, q4B: e.bQ4
-    }));
 
     const merged = window.__h2hEntryCache;
     const h2hA = merged.map(e => e.aFT);
@@ -4501,7 +4464,7 @@ function updateConstantCandidateScore(constantName, value, delta) {
   }
 }
 
-function selectBestConstantValue(constantName, minSamples = 15) {
+function selectBestConstantValue(constantName, minSamples = 60) { // audit fix: was 15
   const key = `BB_CONST_CANDIDATE_${constantName}`;
   let scores = {};
   try {
@@ -4524,7 +4487,7 @@ function calibrateEngineConstants() {
     p.snapshot && p.actualScore != null &&
     (p.resultStatus === "win" || p.resultStatus === "loss")
   );
-  if (settled.length < 15) return;
+  if (settled.length < 75) return; // audit fix: was 15 — require far more of your own settled picks before re-tuning constants
 
   settled.forEach(pick => {
     if (!["ft", "team_a", "team_b"].includes(pick.marketKey)) return;
@@ -4572,7 +4535,7 @@ function calibrateEngineConstants() {
   });
 
   ["INJURY_OPPONENT_BOOST_FACTOR", "UNDER_EDGE_FACTOR"].forEach(constantName => {
-    const best = selectBestConstantValue(constantName, 15);
+    const best = selectBestConstantValue(constantName, 60); // audit fix: was 15
 
     
 
@@ -4661,7 +4624,7 @@ function selectBestConfig(league, marketKey) {
     : null;
   
   const qualified = Object.entries(scores)
-    .filter(([, d]) => (d.count || 0) >= 8 && (d.netDelta || 0) > 0)
+    .filter(([, d]) => (d.count || 0) >= 25 && (d.netDelta || 0) > 0) // audit fix: was >= 8
     .map(([key, d]) => ({
       key, netDelta: d.netDelta || 0, count: d.count || 0,
       efficiency: (d.netDelta || 0) / Math.max(1, d.count || 1),
@@ -4939,12 +4902,12 @@ function buildRecordFromEval(evalResults = []) {
 
 function runCoordinateAscentTuner(allPicks, targetLeague) {
   const settled = allPicks.filter(p =>
-    p && p.snapshot && p.actualScore != null &&
+    p && p.snapshot && p.actualScore != null && !p.isShadow && // audit fix: exclude shadow/hypothetical picks
     (!targetLeague || String(p.league).toLowerCase() === String(targetLeague).toLowerCase()) &&
     (p.resultStatus === "win" || p.resultStatus === "loss")
   );
 
-  const minRequired = targetLeague ? 100 : 50;
+  const minRequired = targetLeague ? 250 : 125; // audit fix: was 100/50
   if (settled.length < minRequired) {
     engineDebug(`Coordinate ascent tuner skipped for ${targetLeague || "global"}: needs ${minRequired} picks, has ${settled.length}`);
     return null;
@@ -5200,7 +5163,7 @@ if (aS.length < 2 || bS.length < 2) continue;
 
   const _mktPicks = getTotalSettledCountForLeagueMarket(league, marketKey);
   const _lgPicks  = getTotalSettledCountForLeague(league);
-  const _lockReady = _mktPicks >= 100 || (_lgPicks >= 50 && _mktPicks >= 20);
+  const _lockReady = _mktPicks >= 250 || (_lgPicks >= 125 && _mktPicks >= 60); // audit fix: was 100 / 50+20
   if (_lockReady) {
     const best = selectBestConfig(league, marketKey);
     const _bestIsSignificant = best && isFinite(best.netDelta) && isFinite(best.sampleCount) && best.sampleCount > 0
@@ -5323,8 +5286,8 @@ const TRACKER_POLICY = {
 const TRACKER_SOFT_EFFECTS = {
   enabled: true,
 
-  minSettled: 30,
-  minSettledFull: 75,
+  minSettled: 100, // audit fix: was 30
+  minSettledFull: 200, // audit fix: was 75
 
   weakEdgeNoPlayPct: 0.055,
   weakTeamNoPlayPct: 0.060,
@@ -5339,12 +5302,12 @@ const PHASE2_CONTROL = {
 
 const PHASE2_ACTIVATION_RULES = {
   trackerFeedback: {
-    minSettled: 50,
+    minSettled: 150, // audit fix: was 50
     minMarketSideSignals: 2,
     minProfileSignals: 1
   },
   teamMemory: {
-    minSettled: 50,
+    minSettled: 150, // audit fix: was 50
     minTeamSignals: 2,
     minMatchupSignals: 1
   }
@@ -6316,7 +6279,7 @@ const TRACKER_SAVE_DEBOUNCE_MS = 10000;
 const TRACKER_SAVE_RETRY_BASE_MS = 1500;
 const TRACKER_SAVE_RETRY_MAX_MS = 15000;
 const TRACKER_NETWORK_TIMEOUT_MS = BB_CONFIG.timeouts.fetch;
-const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_G";
+const TRACKER_FIXED_USER_KEY = "THE_BET_CEO_KEY_F";
 const ENGINE_MODEL_VERSION = "engine_v2_final";
 const TRACKER_LEARNING_ENABLED = true;
 
@@ -6686,7 +6649,6 @@ function finalizeDerivedBucket(bucket) {
   const settled = Number(bucket.settled || 0);
   const wins = Number(bucket.wins || 0);
   const losses = Number(bucket.losses || 0);
-  const pushes = Number(bucket.pushes || 0);
   const decisive = wins + losses;
 
   const rawWinRate = decisive ? Number(((wins / decisive) * 100).toFixed(2)) : null;
@@ -6717,7 +6679,7 @@ function finalizeDerivedBucket(bucket) {
   bucket.signalDirection = signalDirection;
   bucket.isActionable = isActionable;
 
-  bucket.winRate = settled ? Number((((wins + pushes * 0.5) / settled) * 100).toFixed(2)) : null;
+  bucket.winRate = settled ? Number(((wins / settled) * 100).toFixed(2)) : null;
 
   return bucket;
 }
@@ -8174,18 +8136,9 @@ function trimmedAvg(arr) {
   const work = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
   if (!work.length) return NaN;
 
-  let trimmed = work;
-  if (work.length >= 5) {
-    const sorted = [...work].sort((a, b) => a - b);
-    const minVal = sorted[0];
-    const maxVal = sorted[sorted.length - 1];
-    let minRemoved = false, maxRemoved = false;
-    trimmed = work.filter(v => {
-      if (!minRemoved && v === minVal) { minRemoved = true; return false; }
-      if (!maxRemoved && v === maxVal) { maxRemoved = true; return false; }
-      return true;
-    });
-  }
+  const sorted = [...work].sort((a, b) => a - b);
+  const trimCount = sorted.length >= 5 ? 1 : 0;
+  const trimmed = trimCount ? sorted.slice(trimCount, sorted.length - trimCount) : sorted;
 
   if (ENGINE_MODE === "B") return last5Average(trimmed);
   return weightedRecentAverage(trimmed);
@@ -8216,12 +8169,6 @@ function weightedRecentAverageByDate(items, weights = MODEL_TUNING.recencyWeight
 function getDateAwareOrFallbackAverage(series, side, marketKey) {
   const clean = Array.isArray(series) ? series.map(Number).filter(v => isFinite(v)) : [];
   if (!clean.length) return NaN;
-  // FIX: Engine B is supposed to use a flat 5-game average (trimmedAvg()
-  // already branches to last5Average for Engine B), but this function was
-  // never gated on ENGINE_MODE — so the primary scored-points average was
-  // identical for both engines and the A/B shadow comparison never actually
-  // tested anything on the main input. Mirror trimmedAvg()'s branch here.
-  if (ENGINE_MODE === "B") return last5Average(clean);
   const dates = getStashedSeriesDates(side, marketKey);
   if (dates && dates.length === clean.length) {
     const dateAware = weightedRecentAverageByDate(clean.map((v, i) => ({ value: v, date: dates[i] })));
@@ -16258,10 +16205,11 @@ function calibrateConfidenceModel() {
   const currentVersion = getCurrentModelVersion();
   const allPicks = getAllTrackedPicksForReport().filter(p =>
     p.modelVersion === currentVersion &&
+    !p.isShadow && // audit fix: exclude hypothetical/NO PLAY shadow picks — only train on games you actually predicted and settled
     isFinite(Number(p.edgePct)) &&
     (p.resultStatus === "win" || p.resultStatus === "loss")
   );
-  if (allPicks.length < 50) return; 
+  if (allPicks.length < 150) return; // audit fix: was 50
 
   const gradeWinRates = { A: [], B: [], C: [], D: [] };
   allPicks.forEach(p => {
@@ -16418,7 +16366,7 @@ function optimizePickThresholds(league) {
     (p.resultStatus === "win" || p.resultStatus === "loss") &&
     isFinite(Number(p.edgePct))
   );
-  if (allPicks.length < 20) return null;
+  if (allPicks.length < 60) return null; // audit fix: was 20
   const thresholds = [4, 5, 6, 7, 8, 9, 10];
   let best = null, bestWinRate = 0;
   thresholds.forEach(t => {
@@ -16438,7 +16386,7 @@ function runOutOfSampleValidation(league) {
     (p.resultStatus === "win" || p.resultStatus === "loss") &&
     p.createdAt
   ).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
-  if (allPicks.length < 30) return null;
+  if (allPicks.length < 75) return null; // audit fix: was 30
   const splitIdx = Math.floor(allPicks.length * 0.7);
   const testSet = allPicks.slice(splitIdx);
   const wins = testSet.filter(p => p.resultStatus === "win").length;
@@ -16458,8 +16406,8 @@ function checkModelHealth(league) {
   const allPicks = getLearningTrackedPicks().filter(p =>
     p.league === league && (p.resultStatus === "win" || p.resultStatus === "loss")
   );
-  if (allPicks.length < 10) return null;
-  const recentPicks = allPicks.slice(-10);
+  if (allPicks.length < 30) return null; // audit fix: was 10
+  const recentPicks = allPicks.slice(-20); // audit fix: was -10, wider window for a less noisy drift read
   const allWR = allPicks.filter(p => p.resultStatus === "win").length / allPicks.length;
   const recentWR = recentPicks.filter(p => p.resultStatus === "win").length / recentPicks.length;
   const drift = recentWR - allWR;
@@ -16469,6 +16417,10 @@ function checkModelHealth(league) {
 
 async function applyMassacreFrameworkToPicks(picks, league, parsed, fixtureMeta) {
   if (!Array.isArray(picks) || !picks.length) return;
+  // DISABLED (audit fix): streak-chasing on scoring margin is unvalidated
+  // momentum betting and was never back-tested to confirm it beats breakeven.
+  // Neutralized here (not deleted) so downstream code paths stay intact.
+  return;
   const ctxA = getMassacreTeamContext("A", parsed);
   const ctxB = getMassacreTeamContext("B", parsed);
   const scoredA = (Array.isArray(ctxA.ftScored10) && ctxA.ftScored10.length >= 2) ? ctxA.ftScored10 : getOverallSeries("A", 10);
