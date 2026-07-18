@@ -1,3 +1,4 @@
+s
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4192,6 +4193,30 @@ const TUNABLE_PARAM_REGISTRY = {
     description: "Volatility limits used to scale volatility ratio",
     lastVerifiedAt: null
   },
+  // AUDIT ADD: these three were previously hardcoded directly inside
+  // getMarketVolLimit (0.7071 / 0.5 / 0.5) with no documented derivation.
+  // Registering them here doesn't change current behavior (defaults match
+  // the old hardcoded values exactly) but lets them be corrected from real
+  // settled-pick data the same way every other constant in this file is,
+  // instead of being permanently fixed at a guess.
+  h1VolScale: {
+    value: 0.7071, min: 0.4, max: 1.0, type: "scalar",
+    scope: "global", appliesTo: ["h1"],
+    description: "Half-game volatility limit as a fraction of the full-game volatilityLimit (getMarketVolLimit). Default 0.7071 ≈ 1/sqrt(2), a time-fraction variance scaling.",
+    lastVerifiedAt: null
+  },
+  teamVolScale: {
+    value: 0.5, min: 0.3, max: 1.0, type: "scalar",
+    scope: "global", appliesTo: ["team_a", "team_b"],
+    description: "Single-team full-game volatility limit as a fraction of the full-game volatilityLimit (getMarketVolLimit). Was a flat hardcoded 0.5 with no documented derivation.",
+    lastVerifiedAt: null
+  },
+  quarterVolScale: {
+    value: 0.5, min: 0.25, max: 1.0, type: "scalar",
+    scope: "global", appliesTo: ["q1", "q2", "q3", "q4"],
+    description: "Quarter volatility limit as a fraction of the full-game volatilityLimit (getMarketVolLimit). Was a flat hardcoded 0.5 with no documented derivation.",
+    lastVerifiedAt: null
+  },
   edgeFTPointThreshold: {
     value: 5.0, min: 2.0, max: 15.0, type: "scalar",
     scope: "global", appliesTo: ["ft"],
@@ -7643,6 +7668,16 @@ function calculateAdvancedMetrics(stats, pointsScored, pointsAllowed, minutes = 
   const orb = getStat("offensiveRebounds");
   const tov = getStat("turnovers");
 
+  // AUDIT NOTE: this is a simplified possessions estimate, not the standard
+  // (Dean Oliver / basketball-reference) formula. The standard formula weights
+  // the offensive-rebound term by the team's rebounding rate against the
+  // opponent's available defensive rebounds — 1.07 * (ORB / (ORB + Opp DRB)) *
+  // (FGA - FGM) — which requires opponent DRB data this function doesn't
+  // receive. This uses a flat 0.4 * ORB term instead, which is a reasonable
+  // approximation but will diverge from standard advanced-stats sources,
+  // particularly for teams with unusual offensive-rebounding rates. Treat
+  // ortg/drtg/pace below as internally-consistent for this app's own
+  // relative comparisons, not as directly comparable to external ORTG/DRTG.
   let possessions = 0.96 * (fga + (0.44 * fta) - (0.4 * orb) + tov);
 
   if (possessions <= 0 || possessions < 50) {
@@ -9574,7 +9609,21 @@ function getCurrentFixtureMeta() {
   })();
 
   return {
-    eventId: matchedOpt ? (matchedOpt.value || "") : "",
+    // AUDIT FIX (manual-settle-reverts-to-pending bug): when there's no
+    // dropdown-matched fixture (i.e. a manually-typed game, which is every
+    // manual-league pick), eventId used to fall through to "". The tracker's
+    // merge/dedup key (makeTrackerActiveMergeKey) is eventId|marketKey|side
+    // ONLY — so with eventId always "", every manual pick sharing the same
+    // market+side (e.g. two different manual "ft over" picks) collapsed
+    // into the SAME tracker slot. Settling one could then be shadowed by a
+    // still-pending pick for a completely different game occupying that
+    // same collapsed slot, which is what showed up as "settled pick came
+    // back as pending." Fix: derive a stable per-matchup fallback id from
+    // the normalized team names + today's date so different manual games
+    // no longer collide. (Note: this doesn't disambiguate a true same-day
+    // rematch between the identical two teams — a much rarer edge case
+    // than the universal collision this replaces.)
+    eventId: matchedOpt ? (matchedOpt.value || "") : ((normA || normB) ? `manual-${normA}-vs-${normB}-${new Date().toISOString().slice(0, 10)}` : ""),
     eventDate: matchedOpt ? (matchedOpt.dataset.eventDate || "") : "",
     homeTeam: matchedOpt ? (matchedOpt.dataset.home || teamAName) : teamAName,
     awayTeam: matchedOpt ? (matchedOpt.dataset.away || teamBName) : teamBName,
@@ -12539,10 +12588,6 @@ function isPickPeriodComplete(marketKey, currentPeriod, isHalfTime, isGameFinal,
             setTimeout(() => {
               try { if (typeof window.calibrateMassacreCoefficients === 'function') window.calibrateMassacreCoefficients(); } catch(e) {}
               try { calibrateConfidenceModel(); } catch(e) {}
-              try {
-                const _thresholdLg = document.getElementById("leagueSelect")?.value || "";
-                if (_thresholdLg) optimizePickThresholds(_thresholdLg);
-              } catch(e) {}
 
               try { calibrateEngineConstants(); } catch(e) {}
               try {
@@ -12713,12 +12758,20 @@ function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", diverg
   return Math.min(_h2hCap, weight * factor);
 }
 
-  function applyVolatility(proj, series, leagueVolLimit, league) {
+  function applyVolatility(proj, series, leagueVolLimit, league, baselineOverride) {
 
   if (!isFinite(proj)) return proj;
   const volRatio = getVolatilityRatioForSeries(series, leagueVolLimit);
   if (!isFinite(volRatio) || volRatio <= 1) return proj;
-  const baseline = avgOrNaN(series);
+  // AUDIT FIX: baseline used to always be the raw historical average of
+  // `series`, even when this is called AFTER an injury multiplier has
+  // already been applied to `proj` (see the FIX #3 re-clamp in
+  // computeFTProjection/compute1HProjection). In that case, damping toward
+  // the raw (healthy-roster) baseline could partially undo the injury
+  // adjustment whenever volatility was elevated. Callers that already know
+  // the correct current-context baseline can now pass it explicitly;
+  // callers that don't (the majority) keep the exact previous behavior.
+  const baseline = isFinite(baselineOverride) ? baselineOverride : avgOrNaN(series);
   if (!isFinite(baseline)) return proj;
   const dampening = Math.max(0.5, 1.0 - (volRatio - 1) * 0.3);
   return baseline + (proj - baseline) * dampening;
@@ -15582,6 +15635,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const ftHasH2H = maybeReadH2HEnabled("ft") && aH2H.length >= 2 && bH2H.length >= 2;
   let projAFT = aS;
   let projBFT = bS;
+  // AUDIT FIX: was previously `var _ftRealH2HWeight = hw;` declared inside
+  // the `if (ftHasH2H)` block below and read via `typeof x !== "undefined"`
+  // at the end of this function. That worked correctly only because `var`
+  // hoists to function scope — but it's a confusing pattern to read and easy
+  // to break with a future edit. Declare it once, up front, instead.
+  let _ftRealH2HWeight = 0;
   if (ftHasH2H) {
 
     const massacreH2H = getMassacreH2HSeries("ft", getCurrentFixtureMeta(), parsed);
@@ -15609,10 +15668,18 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     // FIX #3: the volatility clamp applied to aS/bS earlier is otherwise bypassed
     // by this raw H2H blend — re-clamp the post-H2H projection so the damping
     // still bounds the number that actually leaves this function.
-    projAFT = applyVolatility(projAFT, aFTS, volLimit, league);
-    projBFT = applyVolatility(projBFT, bFTS, volLimit, league);
+    // AUDIT FIX: this re-clamp used to anchor to the raw historical average of
+    // aFTS/bFTS, which doesn't reflect the injury/opponent-boost multipliers
+    // already applied to aS/bS above — in high-volatility spots that could pull
+    // an injury-suppressed projection back toward the healthy-roster baseline,
+    // partially undoing the injury adjustment. Anchor to the same
+    // injury-and-opponent-boost-adjusted baseline aS/bS were built from instead.
+    const _aInjAdjBaseline = avgOrNaN(aFTS) * injMultA * (injMultB < 1 ? (1 + (1 - injMultB) * _injOppBoostFactor) : 1);
+    const _bInjAdjBaseline = avgOrNaN(bFTS) * injMultB * (injMultA < 1 ? (1 + (1 - injMultA) * _injOppBoostFactor) : 1);
+    projAFT = applyVolatility(projAFT, aFTS, volLimit, league, _aInjAdjBaseline);
+    projBFT = applyVolatility(projBFT, bFTS, volLimit, league, _bInjAdjBaseline);
 
-    var _ftRealH2HWeight = hw;
+    _ftRealH2HWeight = hw;
   }
   let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
 
@@ -15649,7 +15716,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     bVol: _bVolRatio * volLimit,
     ftVolRatio: _ftVolRatio,
 
-    ftH2HWeight: (typeof _ftRealH2HWeight !== "undefined" && isFinite(_ftRealH2HWeight)) ? _ftRealH2HWeight : 0
+    ftH2HWeight: isFinite(_ftRealH2HWeight) ? _ftRealH2HWeight : 0
   };
 }
 
@@ -15797,8 +15864,14 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
     // FIX #3: re-clamp after the H2H blend so the volatility damping applied
     // to projA1H/projB1H earlier isn't bypassed by the raw H2H average.
-    projA1H = applyVolatility(projA1H, aS1, volLimit, league);
-    projB1H = applyVolatility(projB1H, bS1, volLimit, league);
+    // AUDIT FIX: anchor to the injury/opponent-boost-adjusted baseline (same
+    // reasoning as the FT version of this fix) instead of the raw historical
+    // average, so high-volatility damping doesn't partially undo an injury
+    // adjustment that was already applied to projA1H/projB1H above.
+    const _aInjAdjBaseline1H = avgOrNaN(aS1) * injMultA * (injMultB < 1 ? (1 + (1 - injMultB) * _injOppBoostFactorH1) : 1);
+    const _bInjAdjBaseline1H = avgOrNaN(bS1) * injMultB * (injMultA < 1 ? (1 + (1 - injMultA) * _injOppBoostFactorH1) : 1);
+    projA1H = applyVolatility(projA1H, aS1, volLimit, league, _aInjAdjBaseline1H);
+    projB1H = applyVolatility(projB1H, bS1, volLimit, league, _bInjAdjBaseline1H);
   }
   let h1Proj = (isFinite(projA1H) ? projA1H : 0) + (isFinite(projB1H) ? projB1H : 0);
 
@@ -15821,11 +15894,14 @@ function getMarketVolLimit(league, marketKey) {
 
   const key = String(marketKey || "").toLowerCase();
 
-  
-  if (key === "h1" || key === "h1_team_a" || key === "h1_team_b") return base * 0.7071;
+  // AUDIT FIX: these were previously hardcoded (0.7071 / 0.5 / 0.5) with no
+  // documented derivation and no way to correct them from real data. Now
+  // sourced from TUNABLE_PARAM_REGISTRY via getParam, with identical
+  // defaults, so this is a no-op until someone actually tunes them.
+  if (key === "h1" || key === "h1_team_a" || key === "h1_team_b") return base * (getParam("h1VolScale", league) ?? 0.7071);
 
-  if (key === "team_a" || key === "team_b") return base * 0.5;
-  if (key.startsWith("q")) return base * 0.5;
+  if (key === "team_a" || key === "team_b") return base * (getParam("teamVolScale", league) ?? 0.5);
+  if (key.startsWith("q")) return base * (getParam("quarterVolScale", league) ?? 0.5);
   return base;
 }
 
@@ -16256,25 +16332,13 @@ function calibrateConfidenceModel() {
   }
 }
 
-function optimizePickThresholds(league) {
-  const allPicks = getLearningTrackedPicks().filter(p =>
-    p.league === league &&
-    (p.resultStatus === "win" || p.resultStatus === "loss") &&
-    isFinite(Number(p.edgePct))
-  );
-  if (allPicks.length < 60) return null; // audit fix: was 20
-  const thresholds = [4, 5, 6, 7, 8, 9, 10];
-  let best = null, bestWinRate = 0;
-  thresholds.forEach(t => {
-    const above = allPicks.filter(p => Math.abs(Number(p.edgePct)) >= t);
-    if (!above.length) return;
-    const wins = above.filter(p => p.resultStatus === "win").length;
-    const wr = wins / above.length;
-    if (wr > bestWinRate) { bestWinRate = wr; best = { threshold: t, winRate: wr, n: above.length }; }
-  });
-  if (best) engineDebug("optimizePickThresholds result", { league, ...best });
-  return best;
-}
+// AUDIT REMOVE: optimizePickThresholds used to live here. Its only call site
+// discarded the return value (it existed purely for a debug log line), and
+// its methodology was weaker than the coordinate-ascent tuner elsewhere in
+// this file — an in-sample-only max-win-rate search over edge thresholds
+// with no train/validation split, no significance test, and no minimum
+// sample-size floor per bucket. Removed rather than left as an unused
+// landmine that could get wired into a live parameter later.
 
 function runOutOfSampleValidation(league) {
   const allPicks = getLearningTrackedPicks().filter(p =>
@@ -17182,6 +17246,17 @@ async function runEngine() {
   acknowledgeGlobalEngineAlert();
   renderEngineDebugPanel();
   if (runBtn) runBtn.disabled = true;
+  // AUDIT NOTE: MODEL_TUNING.recencyWeights is used as a side-channel to pass
+  // per-run weight vectors into computeFTProjection/compute1HProjection
+  // (which fall back to it inside weightedRecentAverage) rather than
+  // threading an explicit parameter through. That's a real architectural
+  // smell — but the restoration on any exit path (including thrown errors)
+  // is already guaranteed by the `finally` block at the end of this
+  // function, so there is no live corruption risk today. Fully eliminating
+  // the global would mean threading a weights param through avgOrNaN /
+  // trimmedAvg / getDateAwareOrFallbackAverage and every call site inside
+  // both projection functions — a much larger change that needs real
+  // browser testing to verify safely, not a blind text patch.
   const _savedRecencyWeights = [...MODEL_TUNING.recencyWeights];
   engineDebug("run start", {
     trackerKey: getTrackerUserKey(),
@@ -17561,8 +17636,12 @@ const h1Calc = compute1HProjection({
         // FIX #3 (quarters): same clamp-bypass pattern as FT/H1 — re-clamp
         // after the raw H2H blend so the earlier volatility damping on
         // projA/projB still bounds the number that leaves this block.
-        projA = applyVolatility(projA, aS, volLimit, league);
-        projB = applyVolatility(projB, bS, volLimit, league);
+        // AUDIT FIX: anchor to the injury/opponent-boost-adjusted baseline,
+        // same reasoning as the FT and H1 versions of this fix.
+        const _aInjAdjBaselineQ = avgOrNaN(aS) * injA * (injB < 1 ? (1 + (1 - injB) * _qInjOppBoostFactor) : 1);
+        const _bInjAdjBaselineQ = avgOrNaN(bS) * injB * (injA < 1 ? (1 + (1 - injA) * _qInjOppBoostFactor) : 1);
+        projA = applyVolatility(projA, aS, volLimit, league, _aInjAdjBaselineQ);
+        projB = applyVolatility(projB, bS, volLimit, league, _bInjAdjBaselineQ);
       }
 
       const teamANameForShape = document.getElementById("teamAName")?.value?.trim() || "";
