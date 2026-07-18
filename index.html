@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5041,7 +5040,21 @@ async function runRetrospectiveAnalysis(pick) {
         const injuryMult = 1.0;
         for (const _unused of [0]) {
             const config = { h2hFactor, recencyProfile, paceDampening, edgeMult, injuryMult };
-            
+
+            // AUDIT FIX: computeFTProjection/compute1HProjection never read
+            // config.recencyProfile — every candidate profile below was
+            // silently producing the SAME projection, so this sweep recorded
+            // identical outcomes under different candidate keys and couldn't
+            // actually tell recency profiles apart. Apply the candidate the
+            // same way runEngine applies a verified one (temporary swap of
+            // the global weight vector weightedRecentAverage falls back to),
+            // scoped to this candidate's evaluation only, and always restored
+            // via finally below — even if evaluation throws or `continue`s.
+            const _savedRecencyWeightsForSweep = MODEL_TUNING.recencyWeights;
+            if (Array.isArray(recencyProfile)) MODEL_TUNING.recencyWeights = recencyProfile;
+
+            try {
+
             let proj, line, edge, pickDecision;
             try {
               if (marketKey === "ft") {
@@ -5109,10 +5122,13 @@ if (aS.length < 2 || bS.length < 2) continue;
               const _winProbability = getConfidenceWinProbability(null, _edgePct, _volRatio, _sampleTier, _hasH2H, false, league);
               updateCandidateScore(league, marketKey, config, delta, _winProbability, wouldWin ? 1 : 0);
             }
+          } finally {
+            MODEL_TUNING.recencyWeights = _savedRecencyWeightsForSweep;
           }
         }
       }
     }
+  }
 
   const _mktPicks = getTotalSettledCountForLeagueMarket(league, marketKey);
   const _lgPicks  = getTotalSettledCountForLeague(league);
@@ -8088,10 +8104,29 @@ function weightedRecentAverage(arr, weights) {
 function trimmedAvg(arr) {
   const work = Array.isArray(arr) ? arr.map(Number).filter(v => isFinite(v)) : [];
   if (!work.length) return NaN;
+  if (work.length < 5) return weightedRecentAverage(work);
 
+  // AUDIT FIX (trimmedAvg ordering bug): the previous implementation sorted
+  // by VALUE to find the min/max to trim, then fed that value-sorted array
+  // straight into weightedRecentAverage(), which assumes index 0 is the
+  // MOST RECENT game and weights it highest. That silently applied recency
+  // weights to magnitude-order instead of date-order — e.g. a team on a
+  // clear scoring uptrend got its average pulled toward its lowest games,
+  // not its most recent ones. Fix: find the outlier values via a sorted
+  // copy, but remove them from `work` while preserving work's original
+  // (chronological, most-recent-first) order, so the array handed to
+  // weightedRecentAverage still has index 0 = most recent game.
   const sorted = [...work].sort((a, b) => a - b);
-  const trimCount = sorted.length >= 5 ? 1 : 0;
-  const trimmed = trimCount ? sorted.slice(trimCount, sorted.length - trimCount) : sorted;
+  const minVal = sorted[0];
+  const maxVal = sorted[sorted.length - 1];
+
+  let removedMin = false, removedMax = false;
+  const trimmed = [];
+  for (const v of work) {
+    if (!removedMin && v === minVal) { removedMin = true; continue; }
+    if (!removedMax && v === maxVal) { removedMax = true; continue; }
+    trimmed.push(v);
+  }
 
   return weightedRecentAverage(trimmed);
 }
@@ -20463,6 +20498,22 @@ window.ENGINE_TEST_SUITE = (() => {
     expectApprox("stdDev of varied arr ≈ 14.14", stdDev([80,90,100,110,120]), 14.14, 0.1);
     const w = weightedRecentAverage([100,90,80,70,60]);
     expectApprox("weightedRecentAverage is recency-weighted (>80)", w, 83.2, 2.0);
+
+    // REGRESSION TEST for the trimmedAvg ordering bug: recency weights must
+    // be applied to chronological order (index 0 = most recent), not to the
+    // value-sorted order used internally to find the outliers to trim.
+    // Before the fix, an upward-trending series (recent games HIGHER) scored
+    // BELOW its own flat mean here — the exact opposite of intended behavior.
+    const uptrend = [130,128,125,120,115,110,108,105,102,100]; // most recent first
+    const downtrend = [...uptrend].reverse();                   // most recent first, declining
+    const flatMean = avg(uptrend); // same set of numbers either way
+    const uptrendResult = trimmedAvg(uptrend);
+    const downtrendResult = trimmedAvg(downtrend);
+    expectTrue("trimmedAvg(uptrend) is ABOVE the flat mean", uptrendResult > flatMean);
+    expectTrue("trimmedAvg(downtrend) is BELOW the flat mean", downtrendResult < flatMean);
+    expectTrue("trimmedAvg(uptrend) > trimmedAvg(downtrend) for the same value set",
+      uptrendResult > downtrendResult);
+    expectApprox("trimmedAvg(uptrend) exact expected value", uptrendResult, 117.87, 0.5);
   });
 
   suite("getPick — simplified direction", () => {
