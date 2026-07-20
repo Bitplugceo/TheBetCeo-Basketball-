@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1145,29 +1146,19 @@ body.dark-mode.engine-alert .section {
   border-bottom: 1px solid var(--panel-border);
 }
 
-.tracker-market-chip {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 12px 14px;
-  background: var(--tracker-chip-bg);
-  border: 1px solid var(--tracker-chip-border);
-  color: var(--tracker-strong);
-  font-size: 12px;
-  font-weight: 800;
-}
+/* FIX #49: removed a dead, fully-shadowed .tracker-market-chip block that
+   used to sit here (padding 12px 14px, plain chip background) — the later
+   definition below (padding 9px 11px, gradient background) always won per
+   CSS cascade, so this deleted block had zero visual effect; light-mode
+   rendering is unchanged. */
 
-.tracker-analytics-panel {
-  padding: 14px;
-  border-bottom: 1px solid var(--panel-border);
-  background:
-    linear-gradient(180deg, rgba(217,31,38,0.04) 0%, rgba(23,144,63,0.05) 38%, rgba(255,255,255,0) 100%);
-}
-
-body.dark-mode .tracker-analytics-panel {
-  background:
-    linear-gradient(180deg, rgba(217,31,38,0.10) 0%, rgba(23,144,63,0.08) 38%, rgba(0,0,0,0) 100%);
-}
+/* FIX #49: removed a dead .tracker-analytics-panel block (padding 14px,
+   gradient background) and its paired dark-mode override — both fully
+   shadowed by later definitions further down (the plain rule loses to the
+   one at what's now the last .tracker-analytics-panel definition; the
+   dark-mode override loses to the later `body.dark-mode .tracker-analytics-panel`
+   rule below, which sets background: var(--tracker-summary-bg)). Zero visual
+   change either mode, since these never won the cascade. */
 
 .tracker-analytics-title {
   margin-bottom: 4px;
@@ -1177,13 +1168,8 @@ body.dark-mode .tracker-analytics-panel {
   letter-spacing: 0.2px;
 }
 
-.tracker-report-subtitle {
-  margin: 0 0 12px 0;
-  color: var(--tracker-subtext);
-  font-size: 10px;
-  line-height: 1.25;
-  font-weight: 700;
-}
+/* FIX #49: removed a dead .tracker-report-subtitle block (margin-bottom 12px)
+   — shadowed by the later definition (margin-bottom 10px) which always won. */
 
 .tracker-chip-row {
   display: flex;
@@ -1394,11 +1380,10 @@ body.dark-mode .tracker-recommendation {
   font-weight: 700;
 }
 
-.tracker-analytics-panel {
-  padding: 12px;
-  border-bottom: 1px solid var(--panel-border);
-  background: var(--tracker-summary-bg);
-}
+/* FIX #49: removed another dead .tracker-analytics-panel plain rule
+   (padding 12px) — shadowed by the final definition further down (padding
+   10px). Keeping the dark-mode override below, which is the one that
+   actually wins the cascade for dark mode. */
 
 body.dark-mode .tracker-analytics-panel {
   background: var(--tracker-summary-bg);
@@ -1561,11 +1546,9 @@ body.dark-mode .league-trust-pill.trust-blocked {
   font-weight: 700;
 }
 
-.tracker-analytics-panel {
-  padding: 12px;
-  border-bottom: 1px solid var(--panel-border);
-  background: var(--tracker-summary-bg);
-}
+/* FIX #49: removed a third dead .tracker-analytics-panel plain rule
+   (identical to the one removed above) — shadowed by the final definition
+   just below in .tracker-analytics-shell's neighborhood. */
 .tracker-analytics-shell {
   display: grid;
   gap: 8px;
@@ -4273,9 +4256,19 @@ function loadTunableParamRegistryOverrides() {
     const stored = JSON.parse(raw);
     if (!stored || typeof stored !== "object") return;
     Object.keys(stored).forEach(key => {
-      if (TUNABLE_PARAM_REGISTRY[key] && stored[key] && "value" in stored[key]) {
-        TUNABLE_PARAM_REGISTRY[key].value = stored[key].value;
-        TUNABLE_PARAM_REGISTRY[key].lastVerifiedAt = stored[key].lastVerifiedAt || null;
+      const entry = TUNABLE_PARAM_REGISTRY[key];
+      if (entry && stored[key] && "value" in stored[key]) {
+        // FIX #40: setTunableParam clamps to entry.min/max before writing, but this
+        // load path (populated straight from localStorage on every page load) didn't,
+        // so a stale/tampered/out-of-range stored value flowed into live use unclamped
+        // (e.g. teamWeightBase=5.0 instead of its declared 0.40-0.85 range, producing
+        // negative team projections downstream). Apply the same clamp setTunableParam uses.
+        let storedValue = stored[key].value;
+        if (entry.type === "scalar" && isFinite(entry.min) && isFinite(entry.max) && isFinite(storedValue)) {
+          storedValue = clampNumber(storedValue, entry.min, entry.max);
+        }
+        entry.value = storedValue;
+        entry.lastVerifiedAt = stored[key].lastVerifiedAt || null;
       }
     });
   } catch (e) {
@@ -4301,7 +4294,25 @@ let g_tunableParamLeagueOverrides = {};
 function loadTunableParamLeagueOverrides() {
   try {
     const raw = localStorage.getItem(TUNABLE_PARAM_LEAGUE_OVERRIDES_KEY);
-    g_tunableParamLeagueOverrides = raw ? (JSON.parse(raw) || {}) : {};
+    const parsed = raw ? (JSON.parse(raw) || {}) : {};
+    // FIX #40: same unclamped-load gap as loadTunableParamRegistryOverrides, at the
+    // league-override layer — clamp each stored value to its registry entry's min/max
+    // before it becomes readable via getTunableParam's leagueEntry.value path. Keys with
+    // no matching registry entry (e.g. volatilityLimit, which isn't scalar-registered)
+    // are left untouched, same as before.
+    Object.keys(parsed).forEach(leagueKey => {
+      const leagueOverrides = parsed[leagueKey];
+      if (!leagueOverrides || typeof leagueOverrides !== "object") return;
+      Object.keys(leagueOverrides).forEach(paramKey => {
+        const entry = TUNABLE_PARAM_REGISTRY[paramKey];
+        const override = leagueOverrides[paramKey];
+        if (entry && override && "value" in override && entry.type === "scalar" &&
+            isFinite(entry.min) && isFinite(entry.max) && isFinite(override.value)) {
+          override.value = clampNumber(override.value, entry.min, entry.max);
+        }
+      });
+    });
+    g_tunableParamLeagueOverrides = parsed;
   } catch (e) {
     engineDebug("loadTunableParamLeagueOverrides failed: " + (e?.message || String(e)), { error: e });
     g_tunableParamLeagueOverrides = {};
@@ -7575,14 +7586,18 @@ function buildFetchAuditIssues({
   if (league === "nba" || league === "ncaa") {
     requirePairSample(
       aStats?.h1Scored?.length,
-      aStats?.h1Scored?.length,
+      // FIX #41: was aStats?.h1Scored?.length again (comparing the series
+      // against itself), so a missing/thin h1Allowed series was never
+      // flagged. Compare against the actual allowed series, matching the
+      // FT version of this same check above.
+      aStats?.h1Allowed?.length,
       5,
       `${teamAName || "Team A"} overall 1H sample`
     );
 
     requirePairSample(
       bStats?.h1Scored?.length,
-      bStats?.h1Scored?.length,
+      bStats?.h1Allowed?.length,
       5,
       `${teamBName || "Team B"} overall 1H sample`
     );
@@ -10088,6 +10103,10 @@ function renderHealthDashboardPanel() {
   updateTrackerInsightsButton();
 }
 
+// FIX #42: this function's copy said configs lock in at "20+" settled picks
+// in four places; selectBestConfig's actual gate is (d.count || 0) >= 25
+// (raised from 8 per its own prior audit-fix comment). Copy never updated to
+// match — all four occurrences corrected to 25+.
 function renderConfigsPanel() {
   const panel = document.getElementById("trackerAnalyticsPanel");
   if (!panel) return;
@@ -10165,7 +10184,7 @@ function renderConfigsPanel() {
           <div class="tracker-analytics-title">Pick-by-Pick Config Replay</div>
           <div class="tracker-analytics-subtitle">
             The engine silently tests ${totalCombos} parameter combos on every settled pick in
-            the background. The best config locks in after 20+ settled picks per market and
+            the background. The best config locks in after 25+ settled picks per market and
             immediately improves future predictions.
           </div>
         </div>
@@ -10249,16 +10268,16 @@ function renderConfigsPanel() {
           + `(Δ${deltaStr} across ${candidate.count} pick${candidate.count !== 1 ? "s" : ""})`;
         dotClass   = "";
       } else if (!isWin && candidate && candidate.netDelta <= 0) {
-        configNote = `⚠ LOSS — No alt-config found yet that improves on the default for ${pick.league || "?"} ${pick.marketKey || "?"}. Grid needs 20+ settled picks.`;
+        configNote = `⚠ LOSS — No alt-config found yet that improves on the default for ${pick.league || "?"} ${pick.marketKey || "?"}. Grid needs 25+ settled picks.`;
         dotClass   = "warn";
       } else if (candidate && candidate.netDelta <= 0) {
         configNote = `No winning alt-config found yet for ${pick.league || "?"} ${pick.marketKey || "?"}`;
         dotClass   = "warn";
       } else if (!isWin && pick.snapshot) {
-        configNote = `⚠ LOSS — Config grid still running for ${pick.league || "?"} ${pick.marketKey || "?"}. Best config will surface after 20 settled picks.`;
+        configNote = `⚠ LOSS — Config grid still running for ${pick.league || "?"} ${pick.marketKey || "?"}. Best config will surface after 25 settled picks.`;
         dotClass   = "warn";
       } else if (pick.snapshot) {
-        configNote = `Config grid queued — will surface after 20 settled picks for `
+        configNote = `Config grid queued — will surface after 25 settled picks for `
           + `${pick.league || "?"} ${pick.marketKey || "?"}`;
         dotClass   = "neutral";
       } else {
@@ -10663,6 +10682,11 @@ function renderTrackerAnalytics() {
   panel.classList.toggle("tracker-hidden", currentView === "picks");
   panel.style.display = currentView === "picks" ? "none" : "block";
 
+  // FIX #44: the God's Eye table further down (Data: ${p.sampleTier...}) used to
+  // call p.sampleTier.toUpperCase() with no guard. sampleTier can be null (line
+  // ~12696: "... || p.diagnostics.sampleTier || null") or undefined (quarter
+  // picks via q1?.tier), which threw and aborted the whole table's .map(). Now
+  // guarded to render "—" instead, matching every other field in that row.
   const reportBodyHtml = `
       <div class="tracker-kpi-grid">
         <div class="tracker-kpi-card featured">
@@ -11137,7 +11161,7 @@ function renderTrackerAnalytics() {
                                     <td style="font-size: 9px; color: var(--muted); line-height: 1.4;">
                         <strong>Edge:</strong> <span style="color:var(--text)">${edge}</span> | <strong>Grade:</strong> <span style="color:var(--text)">${p.confidenceGrade}</span><br>
                         <strong>Net:</strong> A:${nA} B:${nB}<br>
-                        <strong>Data:</strong> ${p.sampleTier.toUpperCase()}
+                        <strong>Data:</strong> ${p.sampleTier ? String(p.sampleTier).toUpperCase() : "—"}
                        </td>
                     </tr>
                   `;
@@ -18376,17 +18400,6 @@ await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtur
       });
     }
 
-const markets = finalPicksForDisplay.map(p => ({
-      _idx: p._idx,
-      edge: isFinite(p.displayEdge) ? p.displayEdge : p.edge,
-      line: isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line,
-      pick: p.pick,
-      fullModel: p.fullModel,
-      confidence: p.confidence,
-      note: p.note,
-      lockStrength: p.lockStrength,
-      lockRestricted: !!p.lockRestricted
-    }));
         const paceIcon = (ftCalc.pace > 100) ? "🔥" : "🧊";
 
         const paceDisplay = isFinite(ftCalc.pace) && ftCalc.pace > 0 ? ftCalc.pace.toFixed(1) : "—";
@@ -18415,24 +18428,13 @@ const markets = finalPicksForDisplay.map(p => ({
         }
         existingDash.innerHTML = dashHtml;
 
-    let lockIdx = selectLock(markets);
-    
-    if (lockIdx === -1 && markets.length) {
-      let bestIdx = -1;
-      let bestEdge = 0;
-      markets.forEach((m, i) => {
-        const grade = String(m.confidence || "").replace(/[^ABCD]/g, '').charAt(0);
-        const isAB = grade === "A" || grade === "B";
-        const absEdge = Math.abs(m.edge || 0);
-        if (isAB && absEdge > bestEdge && m.pick !== "NO PLAY" && !m.lockRestricted) {
-          bestEdge = absEdge;
-          bestIdx = i;
-        }
-      });
-      if (bestIdx !== -1) lockIdx = bestIdx;
-    }
-
-    lockIdx = selectLock(finalPicksForDisplay.map(p => ({
+    // FIX #45: this used to compute lockIdx twice — an earlier selectLock(markets)
+    // call plus a manual best-A/B-grade fallback scan, both unconditionally
+    // overwritten below before ever being read (selectLock is a pure function,
+    // confirmed no side effects, so nothing from the discarded computation was
+    // observable either). Removed the dead first pass and its now-unused
+    // `markets` array; this is the only lockIdx computation actually used.
+    let lockIdx = selectLock(finalPicksForDisplay.map(p => ({
       edge: isFinite(p.displayEdge) ? p.displayEdge : p.edge,
       line: isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line,
       pick: p.pick,
@@ -18771,7 +18773,7 @@ window.__LAST_AUDIT_STATE = {
         avgB:       avgOrNaN(_aud_h2hFTB),
         h2hWeight:  _aud_ftH2HW,
         teamWeight: 1 - _aud_ftH2HW,
-        formulaNote: "projA = projA*(1-hw) + avgH2HA*hw  (hw is dynamic via getH2HWeight: sample-size log-scaled, capped at 0.35, damped by injury/volatility/blowout/pace-gap — NOT a fixed constant)"
+        formulaNote: "projA = projA*(1-hw) + avgH2HA*hw  (hw is dynamic via getH2HWeight: sample-size log-scaled, capped at 0.30 by default (getParam(\"h2hMaxWeight\", league)), damped by injury/volatility/blowout/pace-gap — NOT a fixed constant)"
       },
       STEP8_injuryMultApplication: {
         multA: g_injA.scoringMult, multB: g_injB.scoringMult,
@@ -19111,7 +19113,13 @@ if (g_activeFetchController) {
 g_activeFetchController.abort(); 
 g_activeFetchController = null; 
 } 
-_fixtureLoadToken; 
+// FIX #46: was a no-op read (`_fixtureLoadToken;`); clearAll() does this
+// increment correctly. Without it, switching from a Big5 league to a manual
+// one mid-fetch left a stale ESPN fixture-load's myToken equal to the
+// current token, so its staleness guards never tripped and a late-arriving
+// response could overwrite the fixture dropdown after the user had already
+// moved to a different league.
+_fixtureLoadToken++; 
 closeDrop("dropA"); 
 closeDrop("dropB"); 
 unlockFetchBtn(); 
@@ -19741,9 +19749,14 @@ try {
                 q4A: g.q4A, q4B: g.q4B,
                 date: g.date
               })) || [],
+              // FIX #47: these were hardcoded (0.35/0.65) and contradicted the real,
+              // dynamically-computed values already sitting in this same object at
+              // projectionBuild.FT_TOTAL.STEP7_h2hBlend (see also FIX #29, which fixed
+              // the identical drift for engineConfig.h2hMaxWeightCap). Pull the real
+              // numbers from the last run instead of restating stale constants.
               blendWeights: {
-                ftH2HWeight: 0.35,
-                teamWeight: 0.65,
+                ftH2HWeight: window.__LAST_AUDIT_STATE?.projectionBuild?.FT_TOTAL?.STEP7_h2hBlend?.h2hWeight ?? null,
+                teamWeight: window.__LAST_AUDIT_STATE?.projectionBuild?.FT_TOTAL?.STEP7_h2hBlend?.teamWeight ?? null,
                 overallVsVenue: "Venue replaces overall when enabled"
               }
             };
@@ -20333,7 +20346,11 @@ function handleConfigDelete(event) {
   const row = event.target.closest('.config-row');
   if (!row) return;
   const rawKey = row.dataset.key;
-  if (confirm("Delete this verified config? The engine will auto‑generate a new one after 20 settled picks.")) {
+  // FIX #43: dialog said "20 settled picks" but storeVerifiedConfig is only
+  // ever reached via runRetrospectiveAnalysis's _lockReady gate, which
+  // requires 60+ settled picks in this market (and 125+ league-wide) at
+  // minimum — not 20. Corrected to state the real gate.
+  if (confirm("Delete this verified config? The engine will re-verify a new one once this market has 60+ new settled picks (125+ league-wide) and a statistically significant improvement is found.")) {
     localStorage.removeItem(rawKey);
     engineDebug("Config deleted", { key: rawKey });
     renderConfigsPanel();
@@ -20786,7 +20803,11 @@ window.ENGINE_TEST_SUITE = (() => {
     const zeroVar = getVolatilityRatioForSeries([100, 100, 100, 100], 12);
     expectApprox("zero variance = ratio 0", zeroVar, 0, 0.01);
     const capped = getVolatilityRatioForSeries([50, 200, 10, 300], 5);
-    expectTrue("ratio is capped at 1 even with extreme spread", capped <= 1);
+    // FIX #48: test asserted capped <= 1, but the function's actual (and
+    // correctly-used-elsewhere) cap is 2.5, not 1 — hand-verified sd([50,200,10,300])/5
+    // is ~23-27 either way, so Math.min(2.5, ...) legitimately returns 2.5. The old
+    // assertion would fail against correct code.
+    expectTrue("ratio is capped at 2.5 even with extreme spread", capped <= 2.5);
   });
 
   function run() {
