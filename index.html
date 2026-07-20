@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4326,6 +4327,55 @@ function saveTunableParamLeagueOverrides() {
   }
 }
 
+// AUDIT FIX: the only two legitimate writers of a league-scoped tunable
+// override are initLeagueOverridesFromDefaults() (seeds straight from the
+// static LEAGUE_VOL_LIMITS / LEAGUE_EDGE_POINT_THRESHOLDS tables, leaving
+// lastVerifiedAt null on purpose) and runCoordinateAscentTuner()'s
+// promotion step (always calls setTunableParam(key, val, league), which
+// ALWAYS stamps lastVerifiedAt with the current time). So an override with
+// lastVerifiedAt === null whose value does NOT match what
+// initLeagueOverridesFromDefaults() would have written has no possible
+// legitimate origin under this codebase — it's stale data carried forward
+// from an older build (e.g. before setTunableParam's stamping existed).
+// Strip only that exact signature; genuinely-seeded and tuner-verified
+// overrides are left completely alone.
+function pruneUnverifiedLeagueOverrideDrift() {
+  const PRUNABLE_STATIC_SOURCES = {
+    volatilityLimit: (lk) => LEAGUE_VOL_LIMITS[lk],
+    edgeFTPointThreshold: (lk) => LEAGUE_EDGE_POINT_THRESHOLDS[lk]?.ft,
+    edgeH1PointThreshold: (lk) => LEAGUE_EDGE_POINT_THRESHOLDS[lk]?.h1,
+    edgeTeamPointThreshold: (lk) => LEAGUE_EDGE_POINT_THRESHOLDS[lk]?.team,
+    edgeQPointThreshold: (lk) => LEAGUE_EDGE_POINT_THRESHOLDS[lk]?.q
+  };
+
+  let prunedCount = 0;
+  const prunedDetail = [];
+
+  Object.keys(g_tunableParamLeagueOverrides).forEach(leagueKey => {
+    const leagueOverrides = g_tunableParamLeagueOverrides[leagueKey];
+    if (!leagueOverrides || typeof leagueOverrides !== "object") return;
+
+    Object.keys(PRUNABLE_STATIC_SOURCES).forEach(paramKey => {
+      const entry = leagueOverrides[paramKey];
+      if (!entry || entry.lastVerifiedAt) return; // has a real stamp — never touch it
+
+      const expectedStaticValue = PRUNABLE_STATIC_SOURCES[paramKey](leagueKey);
+      if (!isFinite(expectedStaticValue)) return; // no static source to compare against — leave it alone
+
+      if (Number(entry.value) !== Number(expectedStaticValue)) {
+        prunedDetail.push({ league: leagueKey, param: paramKey, staleValue: entry.value, expectedStaticValue });
+        delete leagueOverrides[paramKey];
+        prunedCount++;
+      }
+    });
+  });
+
+  if (prunedCount > 0) {
+    saveTunableParamLeagueOverrides();
+    engineDebug("pruneUnverifiedLeagueOverrideDrift removed " + prunedCount + " unstamped, unexplained league override(s)", { pruned: prunedDetail });
+  }
+}
+
 function getTunableParam(key, league) {
   const entry = TUNABLE_PARAM_REGISTRY[key];
   if (!entry) {
@@ -5541,7 +5591,17 @@ const LEAGUE_EDGE_POINT_THRESHOLDS = {
 function getLeagueEdgePointThreshold(league, marketKey) {
   const lk = (league || "default").toLowerCase();
   let key = marketKey;
+  // AUDIT FIX: h1_team_a/h1_team_b and q1_team_a/q1_team_b were not
+  // explicitly bucketed here. h1_team_a/h1_team_b matched none of the prior
+  // branches (not team_a/team_b exactly, not startsWith("q"), not exactly
+  // "h1") and silently fell through to the "ft" bucket, pulling the wrong
+  // (and usually higher) FT threshold for a half-game team market. The
+  // q1_team_a/q1_team_b case happened to land in the "q" bucket already via
+  // the startsWith("q") branch below, but only by accident of naming — made
+  // explicit here so it no longer depends on that string-prefix coincidence.
   if (marketKey === "team_a" || marketKey === "team_b") key = "team";
+  else if (marketKey === "h1_team_a" || marketKey === "h1_team_b") key = "h1";
+  else if (marketKey === "q1_team_a" || marketKey === "q1_team_b") key = "q";
   else if (marketKey && marketKey.startsWith("q")) key = "q";
   else if (marketKey === "h1") key = "h1";
   else key = "ft";
@@ -5894,6 +5954,7 @@ const LEAGUE_CONFIG_MAP = {
 };
 
 initLeagueOverridesFromDefaults();
+pruneUnverifiedLeagueOverrideDrift();
 
 const LEAGUE_TRUST_PROFILES = {
   trusted: [
