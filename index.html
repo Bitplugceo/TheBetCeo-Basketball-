@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9687,6 +9688,16 @@ function getCurrentFixtureMeta() {
     ) || null;
   })();
 
+  // AUTO-FETCH REAL EVENT TIME FIX: when the user auto-fetched by typing team
+  // names (no dropdown-matched fixture), fall back to the real ESPN kickoff
+  // time resolved by resolveAutoFetchEventMeta() instead of leaving eventDate
+  // blank — blank eventDate is what caused buildTrackedPickPayload() to stamp
+  // the pick with "now" (the prediction time) instead of the actual game time.
+  const autoFetchMeta = (!matchedOpt && window.__autoFetchEventMeta &&
+    String(selectedTeamIds.A || "") && String(selectedTeamIds.B || ""))
+    ? window.__autoFetchEventMeta
+    : null;
+
   return {
     // AUDIT FIX (manual-settle-reverts-to-pending bug): when there's no
     // dropdown-matched fixture (i.e. a manually-typed game, which is every
@@ -9702,8 +9713,8 @@ function getCurrentFixtureMeta() {
     // no longer collide. (Note: this doesn't disambiguate a true same-day
     // rematch between the identical two teams — a much rarer edge case
     // than the universal collision this replaces.)
-    eventId: matchedOpt ? (matchedOpt.value || "") : ((normA || normB) ? `manual-${normA}-vs-${normB}-${new Date().toISOString().slice(0, 10)}` : ""),
-    eventDate: matchedOpt ? (matchedOpt.dataset.eventDate || "") : "",
+    eventId: matchedOpt ? (matchedOpt.value || "") : (autoFetchMeta?.eventId || ((normA || normB) ? `manual-${normA}-vs-${normB}-${new Date().toISOString().slice(0, 10)}` : "")),
+    eventDate: matchedOpt ? (matchedOpt.dataset.eventDate || "") : (autoFetchMeta?.eventDate || ""),
     homeTeam: matchedOpt ? (matchedOpt.dataset.home || teamAName) : teamAName,
     awayTeam: matchedOpt ? (matchedOpt.dataset.away || teamBName) : teamBName,
     homeId: matchedOpt ? (matchedOpt.dataset.homeId || String(selectedTeamIds.A || "")) : String(selectedTeamIds.A || ""),
@@ -14964,6 +14975,34 @@ async function fetchESPN() {
   window.__abortSignal = null;
 }
 
+// AUTO-FETCH REAL EVENT TIME FIX: resolves the actual ESPN-scheduled date/time
+// for a teamA-vs-teamB matchup when the user auto-fetched by typing team names
+// instead of picking a fixture from the dropdown. Scans the ESPN scoreboard for
+// yesterday/today/tomorrow (local) for an event containing both team IDs.
+async function resolveAutoFetchEventMeta(espnBase, teamAId, teamBId) {
+  try {
+    const queryDates = [getLocalDateKey(-1), getLocalDateKey(0), getLocalDateKey(1)];
+    const payloadResults = await Promise.allSettled(queryDates.map(dateStr =>
+      proxyFetch(espnBase + "/scoreboard?dates=" + dateStr + "&limit=200").catch(() => null)
+    ));
+    const payloads = payloadResults.filter(r => r.status === "fulfilled" && r.value).map(r => r.value);
+    for (const data of payloads) {
+      for (const ev of (data?.events || [])) {
+        const comp = ev?.competitions?.[0];
+        const competitors = comp?.competitors || [];
+        if (competitors.length < 2) continue;
+        const ids = competitors.map(c => String(c?.team?.id || ""));
+        if (ids.includes(String(teamAId)) && ids.includes(String(teamBId))) {
+          return { eventId: String(ev.id || ""), eventDate: ev.date || "" };
+        }
+      }
+    }
+  } catch (e) {
+    logDebug("resolveAutoFetchEventMeta failed", e);
+  }
+  return null;
+}
+
 async function fetchESPNCore(league, teamAName, teamBName) {
   const btn = document.getElementById("fetchBtn");
   try {
@@ -15004,6 +15043,14 @@ async function fetchESPNCore(league, teamAName, teamBName) {
     selectedTeamIds.A = String(teamAId);
     selectedTeamIds.B = String(teamBId);
     setStatusHTML('<span class="spinner"></span>Loading game stats...', "loading");
+
+    // AUTO-FETCH REAL EVENT TIME FIX: the "type team names + Fetch" path never
+    // touches the fixtureSelect dropdown, so getCurrentFixtureMeta() had no way
+    // to know the real ESPN kickoff time and downstream code was silently
+    // falling back to "now" (the moment the pick was generated). When there's
+    // no dropdown-selected fixture, look up the real scheduled event directly
+    // from the ESPN scoreboard so the tracker shows the actual start time.
+    window.__autoFetchEventMeta = getSelectedFixtureOption() ? null : await resolveAutoFetchEventMeta(espnBase, teamAId, teamBId);
 
     const selectedFixture = getSelectedFixtureOption();
     const teamAVenue = selectedFixture && String(selectedFixture.dataset.homeId || "") === String(teamAId) ? "home" : (selectedFixture && String(selectedFixture.dataset.awayId || "") === String(teamAId) ? "away" : null);
