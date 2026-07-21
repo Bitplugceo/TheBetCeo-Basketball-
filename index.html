@@ -6473,6 +6473,8 @@ function isBetterTrackerStateCandidate(nextState, bestState) {
   const next = getTrackerStateLocalScore(nextState);
   const best = getTrackerStateLocalScore(bestState);
 
+  if (next.updatedAtMs !== best.updatedAtMs) return next.updatedAtMs > best.updatedAtMs;
+
   if (next.hasPicks !== best.hasPicks) return next.hasPicks > best.hasPicks;
   if (next.settledCount !== best.settledCount) return next.settledCount > best.settledCount;
   if (next.wins !== best.wins) return next.wins > best.wins;
@@ -6482,7 +6484,6 @@ function isBetterTrackerStateCandidate(nextState, bestState) {
   if (next.activeCount !== best.activeCount) return next.activeCount > best.activeCount;
   if (next.archivedCount !== best.archivedCount) return next.archivedCount > best.archivedCount;
   if (next.pendingActive !== best.pendingActive) return next.pendingActive < best.pendingActive;
-  if (next.updatedAtMs !== best.updatedAtMs) return next.updatedAtMs > best.updatedAtMs;
 
   return false;
 }
@@ -8644,6 +8645,7 @@ function normalizeTrackerState(raw) {
     activePicks: reconciled.activePicks,
     archivedPicks: reconciled.archivedPicks,
     shadowPicks: Array.isArray(raw?.shadowPicks) ? raw.shadowPicks.map(p => ensureTrackedPickKeys(p)) : [],
+    deletedSignatures: Array.isArray(raw?.deletedSignatures) ? raw.deletedSignatures : [],
     stats: {
       total: Number(raw?.stats?.total) || 0,
       settled: Number(raw?.stats?.settled) || 0,
@@ -9361,6 +9363,16 @@ function resolveTrackedPick(localPick, serverPick) {
   return local;
 }
 
+function isPickDeleted(pick, deletedList = []) {
+  if (!pick || !deletedList || !deletedList.length) return false;
+  const deletedSet = new Set(deletedList);
+  const sig1 = makeTrackedSignature(pick);
+  const sig2 = makeTrackerActiveMergeKey(pick);
+  const sig3 = pick.signature;
+  const sig4 = pick.pickId;
+  return deletedSet.has(sig1) || deletedSet.has(sig2) || deletedSet.has(sig3) || deletedSet.has(sig4);
+}
+
 function mergeTrackerStates(localState, serverState) {
   const local = localState || {};
   const server = serverState || {};
@@ -9369,36 +9381,44 @@ function mergeTrackerStates(localState, serverState) {
   const serverTs = safeParseDate(server.updatedAt);
   const useServerStats = serverTs > localTs;
 
+  const mergedDeleted = [...new Set([
+    ...(Array.isArray(local.deletedSignatures) ? local.deletedSignatures : []),
+    ...(Array.isArray(server.deletedSignatures) ? server.deletedSignatures : [])
+  ])];
+
   return {
     vId: Math.max(local.vId || 1, server.vId || 1) + 1,
     sId: server.sId || local.sId,
-    activePicks: mergeTrackerActivePicks(local.activePicks, server.activePicks, local.archivedPicks),
-    archivedPicks: mergeTrackerArchivedPicks(local.archivedPicks, server.archivedPicks),
+    activePicks: mergeTrackerActivePicks(local.activePicks, server.activePicks, local.archivedPicks, mergedDeleted),
+    archivedPicks: mergeTrackerArchivedPicks(local.archivedPicks, server.archivedPicks, mergedDeleted),
+    deletedSignatures: mergedDeleted,
     stats: useServerStats ? (server.stats || local.stats) : (local.stats || server.stats),
     updatedAt: new Date().toISOString(),
     lineMemory: { ...(local.lineMemory || {}), ...(server.lineMemory || {}) }
   };
 }
 
-function mergeTrackerActivePicks(localActive = [], serverActive = [], localArchived = []) {
+function mergeTrackerActivePicks(localActive = [], serverActive = [], localArchived = [], deletedSignatures = []) {
   const merged = new Map();
 
   const settledArchivedKeys = new Set();
   (localArchived || []).forEach(raw => {
     const pick = ensureTrackedPickKeys(raw || {});
-    if (!isTrackedPickSettled(pick)) return;
+    if (!isTrackedPickSettled(pick) || isPickDeleted(pick, deletedSignatures)) return;
     const slotKey = makeTrackerActiveMergeKey(pick);
     if (slotKey) settledArchivedKeys.add(slotKey);
   });
 
   (localActive || []).forEach(raw => {
     const pick = ensureTrackedPickKeys(raw || {});
+    if (isPickDeleted(pick, deletedSignatures)) return;
     const key = makeTrackerActiveMergeKey(pick) || makeTrackedSignature(pick);
     if (key) merged.set(key, pick);
   });
 
   (serverActive || []).forEach(raw => {
     const pick = ensureTrackedPickKeys(raw || {});
+    if (isPickDeleted(pick, deletedSignatures)) return;
     const key = makeTrackerActiveMergeKey(pick) || makeTrackedSignature(pick);
     if (!key) return;
 
@@ -9417,17 +9437,19 @@ function mergeTrackerActivePicks(localActive = [], serverActive = [], localArchi
     .slice(0, TRACKED_PICKS_LIMIT);
 }
 
-function mergeTrackerArchivedPicks(localArchived = [], serverArchived = []) {
+function mergeTrackerArchivedPicks(localArchived = [], serverArchived = [], deletedSignatures = []) {
   const merged = new Map();
 
   (localArchived || []).forEach(raw => {
     const pick = ensureTrackedPickKeys(raw || {});
+    if (isPickDeleted(pick, deletedSignatures)) return;
     const key = makeTrackedSignature(pick);
     if (key) merged.set(key, pick);
   });
 
   (serverArchived || []).forEach(raw => {
     const pick = ensureTrackedPickKeys(raw || {});
+    if (isPickDeleted(pick, deletedSignatures)) return;
     const key = makeTrackedSignature(pick);
     if (!key) return;
 
@@ -12155,17 +12177,37 @@ async function deleteTrackedPickBySignature(signature) {
     return false;
   }
 
-  AppState.tracker.state.activePicks = AppState.tracker.state.activePicks.filter(p => makeTrackedSignature(p) !== signature && p.signature !== signature);
-  AppState.tracker.state.archivedPicks = AppState.tracker.state.archivedPicks.filter(p => makeTrackedSignature(p) !== signature && p.signature !== signature);
+  if (!Array.isArray(AppState.tracker.state.deletedSignatures)) {
+    AppState.tracker.state.deletedSignatures = [];
+  }
+  const slotKey = makeTrackerActiveMergeKey(pick);
+  const realSig = makeTrackedSignature(pick);
+  const pickSig = pick.signature;
+  const pickId = pick.pickId;
+
+  [signature, slotKey, realSig, pickSig, pickId].filter(Boolean).forEach(s => {
+    if (!AppState.tracker.state.deletedSignatures.includes(s)) {
+      AppState.tracker.state.deletedSignatures.push(s);
+    }
+  });
+
+  const isMatch = (p) => {
+    const s1 = makeTrackedSignature(p);
+    const s2 = makeTrackerActiveMergeKey(p);
+    return s1 === signature || s2 === signature || p.signature === signature || p.pickId === signature || AppState.tracker.state.deletedSignatures.includes(s1) || AppState.tracker.state.deletedSignatures.includes(s2);
+  };
+
+  AppState.tracker.state.activePicks = AppState.tracker.state.activePicks.filter(p => !isMatch(p));
+  AppState.tracker.state.archivedPicks = AppState.tracker.state.archivedPicks.filter(p => !isMatch(p));
   if (AppState.tracker.state.shadowPicks) {
-    AppState.tracker.state.shadowPicks = AppState.tracker.state.shadowPicks.filter(p => makeTrackedSignature(p) !== signature && p.signature !== signature);
+    AppState.tracker.state.shadowPicks = AppState.tracker.state.shadowPicks.filter(p => !isMatch(p));
   }
 
   AppState.tracker.state.updatedAt = new Date().toISOString();
   rebuildTrackerStats();
   await saveTrackerStateToLocal();
   renderTrackedPicks();
-  scheduleTrackerSave();
+  await forceTrackerSaveNow();
   trackerDebug("tracked pick deleted permanently", { signature, pickName, matchName });
   return true;
 }
