@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3178,22 +3179,6 @@ function ssIsBasketballEvent(ev) {
   return true;
 }
 
-function isFullRegulationGameForLeague(ev, leagueKey) {
-  const hScore = Number(ev?.homeScore?.normaltime ?? ev?.homeScore?.current ?? 0);
-  const aScore = Number(ev?.awayScore?.normaltime ?? ev?.awayScore?.current ?? 0);
-  const totalPoints = hScore + aScore;
-
-  if (totalPoints <= 0) return false;
-
-  const lk = String(leagueKey || "").toLowerCase();
-  const leagueBase = LEAGUE_BASES[lk] || LEAGUE_BASES.unknown || 160;
-
-  const minTotalPoints = leagueBase * 0.65;
-  const minTeamPoints = Math.round(leagueBase * 0.28);
-
-  return totalPoints >= minTotalPoints && hScore >= minTeamPoints && aScore >= minTeamPoints;
-}
-
 window.__seriesDateCache = window.__seriesDateCache || {};
 function stashSeriesDates(side, marketKey, dates) {
   if (!Array.isArray(dates) || !dates.length) return;
@@ -3227,11 +3212,9 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
   let competitionEvents = basketballEvents;
   if (fixtureTournamentId != null) {
     const tidStr = String(fixtureTournamentId);
-    const activeLeague = document.getElementById("leagueSelect")?.value || AppState.context.data?.league || "";
     competitionEvents = basketballEvents.filter(ev => {
       const evTid = ev?.tournament?.uniqueTournament?.id;
-      if (evTid != null && String(evTid) === tidStr) return true;
-      return isFullRegulationGameForLeague(ev, activeLeague);
+      return evTid != null && String(evTid) === tidStr;
     });
     const crossBlocked = basketballEvents.length - competitionEvents.length;
     if (crossBlocked > 0) {
@@ -3808,28 +3791,24 @@ function extractH2HFromPastedEvents() {
 
   
 
-  let h2hMatches = uniqueEvents.filter(ev => {
+    let h2hMatches = uniqueEvents.filter(ev => {
     const sType = ev.status?.type ?? "";
     const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
     if (!isTerminal) return false;
-
-    if (!ssIsBasketballEvent(ev)) return false;
-
     const hId = String(ev.homeTeam?.id ?? "");
     const aId = String(ev.awayTeam?.id ?? "");
 
+    
     if (hId && hId === aId) return false;
     if (!((hId === idA && aId === idB) || (hId === idB && aId === idA))) return false;
 
-    const activeLeague = AppState.context.data?.league || document.getElementById("leagueSelect")?.value || "";
     const fixtureTid = getFixtureTournamentId();
-
-    const evTid = String(ev?.tournament?.uniqueTournament?.id ?? "");
-    if (fixtureTid != null && evTid === String(fixtureTid)) {
-      return true;
+    if (fixtureTid != null) {
+      const evTid = ev?.tournament?.uniqueTournament?.id;
+      if (evTid == null || String(evTid) !== fixtureTid) return false;
     }
 
-    return isFullRegulationGameForLeague(ev, activeLeague);
+    return true;
   }).sort((a, b) => {
     const tA = a.startTimestamp || 0;
     const tB = b.startTimestamp || 0;
@@ -8110,21 +8089,16 @@ function applySmartLineToPick(pickRow, rawInput, league) {
 
   const conservativeLine = side === "over" ? meta.high : meta.low;
   const conservativeEdge = pickRow.proj - conservativeLine;
-
-  const marketKey = pickRow.marketKey || "ft";
-  const conservativePick = getPick(conservativeEdge, conservativeLine, league, marketKey, {});
-  const stillQualifies = conservativePick !== "NO PLAY" && getPickSideFromText(conservativePick) === side;
+  const stillQualifies = side === "over" ? conservativeEdge > 0 : conservativeEdge < 0;
 
   return {
     ...pickRow,
-    decisionLine: stillQualifies ? pickRow.line : conservativeLine,
+    decisionLine: conservativeLine,
     trackerLine: pickRow.line,
-    displayLineUsed: pickRow.line,
-    displayEdge: stillQualifies ? pickRow.edge : conservativeEdge,
+    displayLineUsed: conservativeLine,
+    displayEdge: conservativeEdge,
     displayPick: stillQualifies ? pickRow.pick : "NO PLAY",
-    pick: stillQualifies ? pickRow.pick : "NO PLAY",
-    confidence: stillQualifies ? pickRow.confidence : "—",
-    bufferedPickText: stillQualifies ? pickRow.pick : "NO PLAY",
+    bufferedPickText: pickRow.pick,
     smartLineMeta: meta
   };
 }
@@ -17105,8 +17079,16 @@ async function executeRetrospectiveBacktest(gameId) {
       : (p.bufferedPickText || p.displayPick || p.pick);
 
             const confText = isNoPlay ? "NaN" : (p.confidence === "—" || p.confidence === "NaN" ? "NaN" : (p.confidence || "D"));
-        const shownLine = isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line;
-    const shownEdge = isFinite(p.displayEdge) ? p.displayEdge : p.edge;
+        // FIX: show the line/edge that actually drove the pick decision and the
+        // confidence grade (p.line / p.edge), not the smart-line conservative
+        // boundary (displayLineUsed / displayEdge). Previously this cell compared
+        // the projection to the low end of a range market (e.g. 183.5 in
+        // "183.5 - 197.5") instead of the midpoint anchor line (190.5) that
+        // getPick()/getConfidenceGrade() actually used — making the displayed
+        // Edge look tiny (and inconsistent with the Model Grade) even when the
+        // real edge clearly cleared the market's threshold.
+        const shownLine = isFinite(p.line) ? p.line : p.displayLineUsed;
+    const shownEdge = isFinite(p.edge) ? p.edge : p.displayEdge;
 
     const row = table.insertRow();
 
