@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3179,6 +3178,22 @@ function ssIsBasketballEvent(ev) {
   return true;
 }
 
+function isFullRegulationGameForLeague(ev, leagueKey) {
+  const hScore = Number(ev?.homeScore?.normaltime ?? ev?.homeScore?.current ?? 0);
+  const aScore = Number(ev?.awayScore?.normaltime ?? ev?.awayScore?.current ?? 0);
+  const totalPoints = hScore + aScore;
+
+  if (totalPoints <= 0) return false;
+
+  const lk = String(leagueKey || "").toLowerCase();
+  const leagueBase = LEAGUE_BASES[lk] || LEAGUE_BASES.unknown || 160;
+
+  const minTotalPoints = leagueBase * 0.65;
+  const minTeamPoints = Math.round(leagueBase * 0.28);
+
+  return totalPoints >= minTotalPoints && hScore >= minTeamPoints && aScore >= minTeamPoints;
+}
+
 window.__seriesDateCache = window.__seriesDateCache || {};
 function stashSeriesDates(side, marketKey, dates) {
   if (!Array.isArray(dates) || !dates.length) return;
@@ -3212,9 +3227,11 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
   let competitionEvents = basketballEvents;
   if (fixtureTournamentId != null) {
     const tidStr = String(fixtureTournamentId);
+    const activeLeague = document.getElementById("leagueSelect")?.value || AppState.context.data?.league || "";
     competitionEvents = basketballEvents.filter(ev => {
       const evTid = ev?.tournament?.uniqueTournament?.id;
-      return evTid != null && String(evTid) === tidStr;
+      if (evTid != null && String(evTid) === tidStr) return true;
+      return isFullRegulationGameForLeague(ev, activeLeague);
     });
     const crossBlocked = basketballEvents.length - competitionEvents.length;
     if (crossBlocked > 0) {
@@ -3791,24 +3808,28 @@ function extractH2HFromPastedEvents() {
 
   
 
-    let h2hMatches = uniqueEvents.filter(ev => {
+  let h2hMatches = uniqueEvents.filter(ev => {
     const sType = ev.status?.type ?? "";
     const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
     if (!isTerminal) return false;
+
+    if (!ssIsBasketballEvent(ev)) return false;
+
     const hId = String(ev.homeTeam?.id ?? "");
     const aId = String(ev.awayTeam?.id ?? "");
 
-    
     if (hId && hId === aId) return false;
     if (!((hId === idA && aId === idB) || (hId === idB && aId === idA))) return false;
 
+    const activeLeague = AppState.context.data?.league || document.getElementById("leagueSelect")?.value || "";
     const fixtureTid = getFixtureTournamentId();
-    if (fixtureTid != null) {
-      const evTid = ev?.tournament?.uniqueTournament?.id;
-      if (evTid == null || String(evTid) !== fixtureTid) return false;
+
+    const evTid = String(ev?.tournament?.uniqueTournament?.id ?? "");
+    if (fixtureTid != null && evTid === String(fixtureTid)) {
+      return true;
     }
 
-    return true;
+    return isFullRegulationGameForLeague(ev, activeLeague);
   }).sort((a, b) => {
     const tA = a.startTimestamp || 0;
     const tB = b.startTimestamp || 0;
@@ -8089,16 +8110,21 @@ function applySmartLineToPick(pickRow, rawInput, league) {
 
   const conservativeLine = side === "over" ? meta.high : meta.low;
   const conservativeEdge = pickRow.proj - conservativeLine;
-  const stillQualifies = side === "over" ? conservativeEdge > 0 : conservativeEdge < 0;
+
+  const marketKey = pickRow.marketKey || "ft";
+  const conservativePick = getPick(conservativeEdge, conservativeLine, league, marketKey, {});
+  const stillQualifies = conservativePick !== "NO PLAY" && getPickSideFromText(conservativePick) === side;
 
   return {
     ...pickRow,
-    decisionLine: conservativeLine,
+    decisionLine: stillQualifies ? pickRow.line : conservativeLine,
     trackerLine: pickRow.line,
-    displayLineUsed: conservativeLine,
-    displayEdge: conservativeEdge,
+    displayLineUsed: pickRow.line,
+    displayEdge: stillQualifies ? pickRow.edge : conservativeEdge,
     displayPick: stillQualifies ? pickRow.pick : "NO PLAY",
-    bufferedPickText: pickRow.pick,
+    pick: stillQualifies ? pickRow.pick : "NO PLAY",
+    confidence: stillQualifies ? pickRow.confidence : "—",
+    bufferedPickText: stillQualifies ? pickRow.pick : "NO PLAY",
     smartLineMeta: meta
   };
 }
@@ -9076,15 +9102,6 @@ async function pollLiveGameClocks() {
                   } catch (err) {}
                 }
                 if (didChange) renderTrackedPicks();
-                // FIX: this clock poll cycle used to only update the cosmetic
-                // live clock/score display. Actual settlement (refreshTrackerInBackground,
-                // which is what checks isPickPeriodComplete and mid-period-settles
-                // Q1/Q2/Q3/H1 picks) only ran on window focus/pageshow/online/initial
-                // load, so a pick could sit at "LIVE" for an entire game if the tab
-                // just stayed open and focused. Piggyback a throttled settlement
-                // check onto this already-recurring live-game cycle so periods
-                // settle within one poll of ending, not just on tab refocus.
-                throttledRefreshBackground();
                 scheduleLiveClockPoll();
               }
 
