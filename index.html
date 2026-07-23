@@ -1,3 +1,4 @@
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3221,25 +3222,71 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
     }
   }
 
+  // STRICT 2025/2026 OVERALL SEASON CUTOFF (Jan 1, 2025 UTC: 1735689600)
+  const MIN_2025_TS = 1735689600;
+  let prunedOldOverallCount = 0;
+
   const completedAll = competitionEvents.filter(e => {
     const _sType = e.status?.type ?? "";
     const _isDone = _sType === "finished" || _sType === "afterExtraTime" || _sType === "afterPenalties" || e.status?.finished === true;
     if (!_isDone) return false;
     const hId = String(e.homeTeam?.id || "");
     const aId = String(e.awayTeam?.id || "");
-    return hId === String(teamId) || aId === String(teamId);
+    if (!(hId === String(teamId) || aId === String(teamId))) return false;
+
+    const startTs = Number(e.startTimestamp || 0);
+    if (startTs > 0 && startTs < MIN_2025_TS) {
+      prunedOldOverallCount++;
+      return false;
+    }
+    return true;
   }).sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
+
+  if (prunedOldOverallCount > 0) {
+    const issueMsg = `⚠️ ${label}: ${prunedOldOverallCount} pre-2025 game(s) strictly rejected from Last 10 Overall.`;
+    if (typeof setFetchAuditIssues === "function") {
+      const existing = AppState.ui.auditIssues || [];
+      if (!existing.includes(issueMsg)) setFetchAuditIssues([...existing, issueMsg]);
+    }
+    if (typeof triggerGlobalEngineAlert === "function") triggerGlobalEngineAlert(issueMsg);
+  }
 
   engineDebug("ssProcessTeamEvents completed overall count: " + completedAll.length, { label });
 
   const overallGames = completedAll.slice(0, 10);
+
+  // STRICT GAP DETECTION: Alert immediately if there is a gap > 120 days between consecutive games
+  for (let g = 0; g < overallGames.length - 1; g++) {
+    const tCurrent = Number(overallGames[g].startTimestamp || 0);
+    const tNext = Number(overallGames[g + 1].startTimestamp || 0);
+    if (tCurrent > 0 && tNext > 0) {
+      const daysDiff = (tCurrent - tNext) / 86400;
+      if (daysDiff > 120) {
+        const gapMsg = `⚠️ ${label}: ${Math.round(daysDiff)}-day gap between games ${g+1} & ${g+2}. Missing JSON pages (e.g. p1/p2)!`;
+        if (typeof setFetchAuditIssues === "function") {
+          const existing = AppState.ui.auditIssues || [];
+          if (!existing.includes(gapMsg)) setFetchAuditIssues([...existing, gapMsg]);
+        }
+        if (typeof triggerGlobalEngineAlert === "function") triggerGlobalEngineAlert(gapMsg);
+      }
+    }
+  }
+
   overallGames.forEach((ev, idx) => {
     const isHome = String(ev.homeTeam?.id) === String(teamId);
     const myScore = isHome ? ev.homeScore : ev.awayScore;
     const oppScore = isHome ? ev.awayScore : ev.homeScore;
     if (myScore && oppScore) {
-        const myFT = Number(myScore.normaltime ?? myScore.current ?? myScore.display ?? 0);
-        const oppFT = Number(oppScore.normaltime ?? oppScore.current ?? oppScore.display ?? 0);
+      const mQ1_chk = Number(myScore.period1 ?? 0), mQ2_chk = Number(myScore.period2 ?? 0);
+      const mQ3_chk = Number(myScore.period3 ?? 0), mQ4_chk = Number(myScore.period4 ?? 0);
+      const oQ1_chk = Number(oppScore.period1 ?? 0), oQ2_chk = Number(oppScore.period2 ?? 0);
+      const oQ3_chk = Number(oppScore.period3 ?? 0), oQ4_chk = Number(oppScore.period4 ?? 0);
+
+      const hasQSum = (mQ1_chk + mQ2_chk + mQ3_chk + mQ4_chk) > 0 && (oQ1_chk + oQ2_chk + oQ3_chk + oQ4_chk) > 0;
+      // STRICT OT STRIPPING: Sum Q1..Q4 regulation periods when available
+      const myFT = hasQSum ? (mQ1_chk + mQ2_chk + mQ3_chk + mQ4_chk) : Number(myScore.normaltime ?? myScore.current ?? myScore.display ?? 0);
+      const oppFT = hasQSum ? (oQ1_chk + oQ2_chk + oQ3_chk + oQ4_chk) : Number(oppScore.normaltime ?? oppScore.current ?? oppScore.display ?? 0);
+
       if (myFT > 0) {
         scoredList.push(myFT);
         allowedList.push(oppFT);
@@ -3788,16 +3835,27 @@ function extractH2HFromPastedEvents() {
     }
   });
 
-  
+  // STRICT 2022+ H2H CUTOFF (Jan 1, 2022 UTC: 1640995200)
+  const MIN_2022_H2H_TS = 1640995200;
+  let rejectedPre2022H2HCount = 0;
 
-    let h2hMatches = uniqueEvents.filter(ev => {
+  let h2hMatches = uniqueEvents.filter(ev => {
+    if (!ssIsBasketballEvent(ev)) return false;
+
     const sType = ev.status?.type ?? "";
     const isTerminal = sType === "finished" || sType === "afterExtraTime" || sType === "afterPenalties" || ev.status?.finished === true;
     if (!isTerminal) return false;
+
+    // STRICT DATE CHECK: Reject pre-2022 H2H games
+    const startTs = Number(ev.startTimestamp || 0);
+    if (startTs > 0 && startTs < MIN_2022_H2H_TS) {
+      rejectedPre2022H2HCount++;
+      return false;
+    }
+
     const hId = String(ev.homeTeam?.id ?? "");
     const aId = String(ev.awayTeam?.id ?? "");
 
-    
     if (hId && hId === aId) return false;
     if (!((hId === idA && aId === idB) || (hId === idB && aId === idA))) return false;
 
@@ -3814,23 +3872,37 @@ function extractH2HFromPastedEvents() {
     return tB - tA;
   }).slice(0, 10);
 
+  if (rejectedPre2022H2HCount > 0) {
+    const msg = `⚠️ H2H Filter: Strictly rejected ${rejectedPre2022H2HCount} pre-2022 game(s) from H2H.`;
+    if (typeof setFetchAuditIssues === "function") {
+      const existing = AppState.ui.auditIssues || [];
+      if (!existing.includes(msg)) setFetchAuditIssues([...existing, msg]);
+    }
+    if (typeof triggerGlobalEngineAlert === "function") triggerGlobalEngineAlert(msg);
+  }
+
   if (h2hMatches.length >= 2) {
     const newEntries = [];
     h2hMatches.forEach(m => {
       const isAHome = String(m.homeTeam?.id) === idA;
       const myScoreObj = isAHome ? m.homeScore : m.awayScore;
       const oppScoreObj = isAHome ? m.awayScore : m.homeScore;
-      const myFT = Number(myScoreObj?.normaltime ?? myScoreObj?.current ?? myScoreObj?.display ?? 0);
-      const oppFT = Number(oppScoreObj?.normaltime ?? oppScoreObj?.current ?? oppScoreObj?.display ?? 0);
+
+      const mQ1 = Number(myScoreObj?.period1 ?? 0);
+      const mQ2 = Number(myScoreObj?.period2 ?? 0);
+      const mQ3 = Number(myScoreObj?.period3 ?? 0);
+      const mQ4 = Number(myScoreObj?.period4 ?? 0);
+      const oQ1 = Number(oppScoreObj?.period1 ?? 0);
+      const oQ2 = Number(oppScoreObj?.period2 ?? 0);
+      const oQ3 = Number(oppScoreObj?.period3 ?? 0);
+      const oQ4 = Number(oppScoreObj?.period4 ?? 0);
+
+      const hasQSum_h2h = (mQ1 + mQ2 + mQ3 + mQ4) > 0 && (oQ1 + oQ2 + oQ3 + oQ4) > 0;
+      // STRICT OT STRIPPING: Sum Q1..Q4 regulation periods when available
+      const myFT = hasQSum_h2h ? (mQ1 + mQ2 + mQ3 + mQ4) : Number(myScoreObj?.normaltime ?? myScoreObj?.current ?? myScoreObj?.display ?? 0);
+      const oppFT = hasQSum_h2h ? (oQ1 + oQ2 + oQ3 + oQ4) : Number(oppScoreObj?.normaltime ?? oppScoreObj?.current ?? oppScoreObj?.display ?? 0);
+
       if (myFT > 0) {
-        const mQ1 = Number(myScoreObj?.period1 ?? 0);
-        const mQ2 = Number(myScoreObj?.period2 ?? 0);
-        const mQ3 = Number(myScoreObj?.period3 ?? 0);
-        const mQ4 = Number(myScoreObj?.period4 ?? 0);
-        const oQ1 = Number(oppScoreObj?.period1 ?? 0);
-        const oQ2 = Number(oppScoreObj?.period2 ?? 0);
-        const oQ3 = Number(oppScoreObj?.period3 ?? 0);
-        const oQ4 = Number(oppScoreObj?.period4 ?? 0);
         newEntries.push({
           id: m.id,
           ts: m.startTimestamp || 0,
@@ -9322,16 +9394,11 @@ function resolveTrackedPick(localPick, serverPick) {
 function isPickDeleted(pick, deletedList = []) {
   if (!pick || !deletedList || !deletedList.length) return false;
   const deletedSet = new Set(deletedList);
-  // BUG FIX: removed makeTrackerActiveMergeKey (eventId|marketKey|side) from this
-  // check. That "slot key" is a reusable bucket, not a unique pick identifier —
-  // for manual leagues eventId is only date+team-pair based, so deleting ONE pick
-  // in a slot permanently blacklisted every future pick (from any later run, any
-  // time that day the same match is retried) that ever landed in that same slot,
-  // making freshly-saved manual picks vanish on the very next hydrate/merge cycle.
   const sig1 = makeTrackedSignature(pick);
+  const sig2 = makeTrackerActiveMergeKey(pick);
   const sig3 = pick.signature;
   const sig4 = pick.pickId;
-  return deletedSet.has(sig1) || deletedSet.has(sig3) || deletedSet.has(sig4);
+  return deletedSet.has(sig1) || deletedSet.has(sig2) || deletedSet.has(sig3) || deletedSet.has(sig4);
 }
 
 function mergeTrackerStates(localState, serverState) {
@@ -9482,20 +9549,7 @@ function reconcileTrackerBucketConflicts(activePicks = [], archivedPicks = []) {
         const archivedSettled = isTrackedPickSettled(archivedPick);
         const activeSettled = isTrackedPickSettled(pick);
 
-        // BUG FIX: previously this unconditionally dropped ANY pending active
-        // pick sharing a slot (eventId|marketKey|side) with a settled archived
-        // pick. For manual leagues eventId is only date+team-pair based, so a
-        // brand-new pending pick from a same-day re-run shared its slot with an
-        // older, already-settled pick and got silently wiped on the very next
-        // save/hydrate. Only drop it when it's actually a stale leftover created
-        // BEFORE the archived pick was settled — a pick created AFTER the settle
-        // is a fresh, legitimate new prediction and must be kept.
-        if (archivedSettled && !activeSettled) {
-          const _activeCreatedTs = getTrackedPickTimeMs(pick) || safeParseDate(pick.createdAt);
-          const _archivedSettledTs = safeParseDate(archivedPick.settledAt) || getTrackedPickTimeMs(archivedPick);
-          const _activeIsFresherThanSettle = _activeCreatedTs > 0 && _archivedSettledTs > 0 && _activeCreatedTs > _archivedSettledTs;
-          if (!_activeIsFresherThanSettle) return;
-        }
+        if (archivedSettled && !activeSettled) return;
 
         if (archivedSettled && activeSettled) {
           const _archiveTs = safeParseDate(archivedPick.settledAt || archivedPick.eventDate || archivedPick.createdAt); 
@@ -10317,12 +10371,6 @@ function renderConfigsPanel() {
       const verified  = verifiedMap[metaKey];
       const candidate = candidateMap[metaKey];
 
-      // AUDIT ADD: tiny per-market progress counter toward the 25-settled-pick
-      // threshold selectBestConfig() gates candidate promotion on, shown under
-      // the WIN/LOSS badge so it's obvious how close a league/market combo is.
-      const _marketSettledCount = getTotalSettledCountForLeagueMarket(pick.league || "", pick.marketKey || "");
-      const _configProgressLabel = Math.min(_marketSettledCount, 25) + "/25";
-
       let configNote, dotClass;
       const _bestAlt = verified || (candidate && candidate.netDelta > 0 ? candidate : null);
       if (!isWin && _bestAlt) {
@@ -10366,13 +10414,8 @@ function renderConfigsPanel() {
                   ${safeText(market)} · ${safeText(String(pick.league || "").toUpperCase())}
                 </span>
               </div>
-              <div style="display:flex; flex-direction:column; align-items:center; gap:2px;">
-                <div class="tracker-review-status ${isWin ? "confirmed" : "candidate"}">
-                  ${isWin ? "WIN" : "LOSS"}
-                </div>
-                <div style="font-size:7px; font-weight:800; color:var(--muted); letter-spacing:0.2px; white-space:nowrap;">
-                  ${safeText(_configProgressLabel)}
-                </div>
+              <div class="tracker-review-status ${isWin ? "confirmed" : "candidate"}">
+                ${isWin ? "WIN" : "LOSS"}
               </div>
             </div>
             <div class="tracker-review-text">
@@ -11805,19 +11848,9 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
     }
 
                         const trustMeta = getLeagueTrustMeta(p.league);
-                    if (trustMeta.mode !== "full") {
-                      // AUDIT FIX: advisory (and blocked) leagues need their prediction volume to
-                      // keep flowing so a real sample can accumulate toward graduating to "trusted".
-                      // Previously only confidenceShift was reset here — hypotheticalNoPlay and
-                      // lockRestricted (set above by weak posteriorWinProb / team memory / matchup
-                      // memory) survived this gate untouched, so tracker influence could still force
-                      // an advisory-league pick to NO PLAY or bar it from ever being the Lock. Tracker
-                      // influence on non-full leagues is now label-only: recorded in reasons/diagnostics,
-                      // never mutating the pick.
-                      if (confidenceShift < 0) confidenceShift = 0;
-                      if (hypotheticalNoPlay) hypotheticalNoPlay = false;
-                      if (lockRestricted) lockRestricted = false;
-                      reasons.push("tracker penalty skipped (advisory league, label-only)");
+                    if (trustMeta.mode !== "full" && confidenceShift < 0) {
+                      confidenceShift = 0;
+                      reasons.push("tracker penalty skipped (advisory league)");
                     }
 
     if (advisoryOnly) {
@@ -12185,19 +12218,12 @@ async function deleteTrackedPickBySignature(signature) {
   if (!Array.isArray(AppState.tracker.state.deletedSignatures)) {
     AppState.tracker.state.deletedSignatures = [];
   }
-  // BUG FIX: no longer recording the eventId|marketKey|side "slot key" as a
-  // deleted signature, and no longer matching other picks against it below.
-  // That key is a reusable bucket (for manual leagues eventId is only
-  // date+team-pair based, not per-instance), not a unique pick id — recording
-  // and matching on it permanently blacklisted every future pick that ever
-  // landed in that same slot, so a freshly re-run manual pick would get
-  // silently deleted on the very next hydrate/merge cycle even though the
-  // user never touched it.
+  const slotKey = makeTrackerActiveMergeKey(pick);
   const realSig = makeTrackedSignature(pick);
   const pickSig = pick.signature;
   const pickId = pick.pickId;
 
-  [signature, realSig, pickSig, pickId].filter(Boolean).forEach(s => {
+  [signature, slotKey, realSig, pickSig, pickId].filter(Boolean).forEach(s => {
     if (!AppState.tracker.state.deletedSignatures.includes(s)) {
       AppState.tracker.state.deletedSignatures.push(s);
     }
@@ -12205,7 +12231,8 @@ async function deleteTrackedPickBySignature(signature) {
 
   const isMatch = (p) => {
     const s1 = makeTrackedSignature(p);
-    return s1 === signature || p.signature === signature || p.pickId === signature || AppState.tracker.state.deletedSignatures.includes(s1);
+    const s2 = makeTrackerActiveMergeKey(p);
+    return s1 === signature || s2 === signature || p.signature === signature || p.pickId === signature || AppState.tracker.state.deletedSignatures.includes(s1) || AppState.tracker.state.deletedSignatures.includes(s2);
   };
 
   AppState.tracker.state.activePicks = AppState.tracker.state.activePicks.filter(p => !isMatch(p));
@@ -17123,16 +17150,8 @@ async function executeRetrospectiveBacktest(gameId) {
       : (p.bufferedPickText || p.displayPick || p.pick);
 
             const confText = isNoPlay ? "NaN" : (p.confidence === "—" || p.confidence === "NaN" ? "NaN" : (p.confidence || "D"));
-        // FIX: show the line/edge that actually drove the pick decision and the
-        // confidence grade (p.line / p.edge), not the smart-line conservative
-        // boundary (displayLineUsed / displayEdge). Previously this cell compared
-        // the projection to the low end of a range market (e.g. 183.5 in
-        // "183.5 - 197.5") instead of the midpoint anchor line (190.5) that
-        // getPick()/getConfidenceGrade() actually used — making the displayed
-        // Edge look tiny (and inconsistent with the Model Grade) even when the
-        // real edge clearly cleared the market's threshold.
-        const shownLine = isFinite(p.line) ? p.line : p.displayLineUsed;
-    const shownEdge = isFinite(p.edge) ? p.edge : p.displayEdge;
+        const shownLine = isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line;
+    const shownEdge = isFinite(p.displayEdge) ? p.displayEdge : p.edge;
 
     const row = table.insertRow();
 
