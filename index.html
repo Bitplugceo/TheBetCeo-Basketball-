@@ -1,4 +1,3 @@
-K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3203,6 +3202,11 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
   
   const q1ScoredDates = [], q2ScoredDates = [], q3ScoredDates = [], q4ScoredDates = [];
 
+  // AUDIT: FT-level game dates (for recency-order verification) and collected
+  // game-by-game math integrity mismatches (Q-sum vs reported normaltime).
+  const ftScoredDates = [];
+  const mathIntegrityIssues = [];
+
   const basketballEvents = events.filter(ev => ssIsBasketballEvent(ev));
   const blockedCount = events.length - basketballEvents.length;
   if (blockedCount > 0) {
@@ -3288,8 +3292,24 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
       const oppFT = hasQSum ? (oQ1_chk + oQ2_chk + oQ3_chk + oQ4_chk) : Number(oppScore.normaltime ?? oppScore.current ?? oppScore.display ?? 0);
 
       if (myFT > 0) {
+        const _evDate = ev.startTimestamp ? new Date(ev.startTimestamp * 1000).toISOString() : null;
         scoredList.push(myFT);
         allowedList.push(oppFT);
+        ftScoredDates.push(_evDate);
+
+        // AUDIT CHECK #2: Game-by-Game Mathematical Integrity — cross-check the
+        // Q1-Q4 derived total against SofaScore's own reported normaltime field
+        // (when both are present) instead of silently trusting the Q-sum.
+        if (hasQSum) {
+          const _myNormaltimeChk = Number(myScore.normaltime ?? NaN);
+          const _oppNormaltimeChk = Number(oppScore.normaltime ?? NaN);
+          if (isFinite(_myNormaltimeChk) && _myNormaltimeChk > 0 && Math.abs(_myNormaltimeChk - myFT) > 0) {
+            mathIntegrityIssues.push(`⚠️ Math Integrity Error: ${label} game on ${_evDate || "unknown date"} — Q1+Q2+Q3+Q4 (${myFT}) does not equal reported normaltime score (${_myNormaltimeChk}).`);
+          }
+          if (isFinite(_oppNormaltimeChk) && _oppNormaltimeChk > 0 && Math.abs(_oppNormaltimeChk - oppFT) > 0) {
+            mathIntegrityIssues.push(`⚠️ Math Integrity Error: ${label} opponent in game on ${_evDate || "unknown date"} — Q1+Q2+Q3+Q4 (${oppFT}) does not equal reported normaltime score (${_oppNormaltimeChk}).`);
+          }
+        }
         const myQ1 = Number(myScore.period1 ?? 0);
         const myQ2 = Number(myScore.period2 ?? 0);
         const myQ3 = Number(myScore.period3 ?? 0);
@@ -3299,7 +3319,6 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
         const oppQ3 = Number(oppScore.period3 ?? 0);
         const oppQ4 = Number(oppScore.period4 ?? 0);
         
-        const _evDate = ev.startTimestamp ? new Date(ev.startTimestamp * 1000).toISOString() : null;
             if (myQ1 + myQ2 + myQ3 + myQ4 > 0) {
       q1ScoredList.push(myQ1); q2ScoredList.push(myQ2);
       q3ScoredList.push(myQ3); q4ScoredList.push(myQ4);
@@ -3364,10 +3383,11 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
            h1HomeScoredList, h1HomeAllowedList, h1AwayScoredList, h1AwayAllowedList,
            h1ScoredList, h1AllowedList,
 
-           h1ScoredDates,
+           h1ScoredDates, ftScoredDates,
            q1ScoredList, q2ScoredList, q3ScoredList, q4ScoredList,
            q1AllowedList, q2AllowedList, q3AllowedList, q4AllowedList,
-           q1ScoredDates, q2ScoredDates, q3ScoredDates, q4ScoredDates };
+           q1ScoredDates, q2ScoredDates, q3ScoredDates, q4ScoredDates,
+           mathIntegrityIssues };
 }
 
 function clearPasteJSON(side) {
@@ -3587,14 +3607,92 @@ function updateTeamUIFromStats(side, stats) {
   if (tagEl) tagEl.style.display = "inline";
 }
 
+// AUDIT CHECK #1 + #3: Chronological Recency Verification (newest -> oldest)
+// and Array Length & Symmetry Verification for a single team's SofaScore stats.
+function runSofascoreRecencyAudit(side, stats, teamLabel) {
+  const issues = [];
+  const label = teamLabel || (side === "A" ? "Team A" : "Team B");
+
+  function checkDateOrder(dates, marketName) {
+    if (!Array.isArray(dates) || dates.length < 2) return;
+    for (let i = 0; i < dates.length - 1; i++) {
+      const cur = dates[i] ? Date.parse(dates[i]) : NaN;
+      const next = dates[i + 1] ? Date.parse(dates[i + 1]) : NaN;
+      if (!isFinite(cur) || !isFinite(next)) continue;
+      if (cur < next) {
+        issues.push(`⚠️ Recency Order Error: ${label} ${marketName} Game ${i + 1} is older than Game ${i + 2}. Ensure sequence is strictly newest -> oldest.`);
+      }
+    }
+  }
+
+  checkDateOrder(stats?.ftScoredDates, "FT");
+  checkDateOrder(stats?.h1ScoredDates, "1H");
+  checkDateOrder(stats?.q1ScoredDates, "Q1");
+  checkDateOrder(stats?.q2ScoredDates, "Q2");
+  checkDateOrder(stats?.q3ScoredDates, "Q3");
+  checkDateOrder(stats?.q4ScoredDates, "Q4");
+
+  function checkSymmetry(scored, allowed, marketName) {
+    const sLen = Array.isArray(scored) ? scored.length : 0;
+    const aLen = Array.isArray(allowed) ? allowed.length : 0;
+    if (sLen !== aLen) {
+      issues.push(`⚠️ Array Symmetry Error: ${label} ${marketName} Scored (${sLen}) and Allowed (${aLen}) lengths do not match.`);
+    }
+  }
+
+  checkSymmetry(stats?.scoredList, stats?.allowedList, "FT");
+  checkSymmetry(stats?.h1ScoredList, stats?.h1AllowedList, "1H");
+  checkSymmetry(stats?.q1ScoredList, stats?.q1AllowedList, "Q1");
+  checkSymmetry(stats?.q2ScoredList, stats?.q2AllowedList, "Q2");
+  checkSymmetry(stats?.q3ScoredList, stats?.q3AllowedList, "Q3");
+  checkSymmetry(stats?.q4ScoredList, stats?.q4AllowedList, "Q4");
+
+  if (Array.isArray(stats?.scoredList) && Array.isArray(stats?.ftScoredDates) && stats.scoredList.length !== stats.ftScoredDates.length) {
+    issues.push(`⚠️ Array Symmetry Error: ${label} FT score count (${stats.scoredList.length}) does not match FT date count (${stats.ftScoredDates.length}).`);
+  }
+
+  return issues;
+}
+
+// AUDIT CHECK #4: Market Line Anomaly Flag — flags manual-league market lines
+// that deviate more than 35 pts from the combined Team A + Team B average.
+function checkMarketLineAnomaly(marketKey, marketLabel, lineInputId) {
+  const league = document.getElementById("leagueSelect")?.value || "";
+  const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","nba_summer"].includes(league);
+  if (isEspnLeague) return;
+
+  const rawVal = document.getElementById(lineInputId)?.value || "";
+  const meta = parseMarketRangeMeta(rawVal);
+  if (!meta) return;
+
+  const aSeriesId = marketKey === "h1" ? "a1HScored" : "aFTScored";
+  const bSeriesId = marketKey === "h1" ? "b1HScored" : "bFTScored";
+  const aAvg = avgOrNaN(readLooseSeries(aSeriesId));
+  const bAvg = avgOrNaN(readLooseSeries(bSeriesId));
+  if (!isFinite(aAvg) || !isFinite(bAvg)) return;
+
+  const combinedAvg = aAvg + bAvg;
+  const deviation = Math.abs(meta.mid - combinedAvg);
+  if (deviation > 35) {
+    const msg = `⚠️ Market Line Anomaly: ${marketLabel} line (${meta.mid}) deviates ${deviation.toFixed(1)} pts from combined team average (${combinedAvg.toFixed(1)}). Verify ${lineInputId} is correct.`;
+    const existing = AppState.ui.auditIssues || [];
+    if (!existing.includes(msg)) setFetchAuditIssues([...existing, msg]);
+    triggerGlobalEngineAlert(msg);
+    engineDebug(msg);
+  }
+}
+
 function reprocessBothTeamsFromEvents() {
   const tid = getFixtureTournamentId();
+  let _ssIntegrityIssues = [];
 
   if (window.__lastEventsA && window.__lastEventsA.length) {
     const idA = (document.getElementById("ssTeamAId")?.value || "").trim();
     if (idA) {
       const statsA = ssProcessTeamEvents(window.__lastEventsA, idA, "Team A", tid);
       updateTeamUIFromStats("A", statsA);
+      _ssIntegrityIssues = _ssIntegrityIssues.concat(runSofascoreRecencyAudit("A", statsA, "Team A"));
+      if (Array.isArray(statsA.mathIntegrityIssues)) _ssIntegrityIssues = _ssIntegrityIssues.concat(statsA.mathIntegrityIssues);
     }
   }
 
@@ -3603,7 +3701,17 @@ function reprocessBothTeamsFromEvents() {
     if (idB) {
       const statsB = ssProcessTeamEvents(window.__lastEventsB, idB, "Team B", tid);
       updateTeamUIFromStats("B", statsB);
+      _ssIntegrityIssues = _ssIntegrityIssues.concat(runSofascoreRecencyAudit("B", statsB, "Team B"));
+      if (Array.isArray(statsB.mathIntegrityIssues)) _ssIntegrityIssues = _ssIntegrityIssues.concat(statsB.mathIntegrityIssues);
     }
+  }
+
+  if (_ssIntegrityIssues.length) {
+    const existing = AppState.ui.auditIssues || [];
+    const merged = [...new Set([...existing, ..._ssIntegrityIssues])];
+    setFetchAuditIssues(merged);
+    triggerGlobalEngineAlert(_ssIntegrityIssues[0]);
+    _ssIntegrityIssues.forEach(msg => engineDebug(msg));
   }
 
   extractH2HFromPastedEvents();
@@ -19780,7 +19888,14 @@ window.addEventListener("beforeunload", () => {
 
            ["ftMarket","teamAMarket","teamBMarket","h1Market","q1Market","q2Market","q3Market","q4Market"].forEach(id => {
         const el = document.getElementById(id);
-        if (el) el.addEventListener("input", () => { invalidateFetchedAudit(); updateSectionLocks(); updateIntelligencePack(); });
+        if (el) el.addEventListener("input", () => {
+          invalidateFetchedAudit();
+          updateSectionLocks();
+          updateIntelligencePack();
+          // AUDIT CHECK #4: Market Line Anomaly Flag (manual/SofaScore leagues only)
+          if (id === "ftMarket") checkMarketLineAnomaly("ft", "FT Total", "ftMarket");
+          if (id === "h1Market") checkMarketLineAnomaly("h1", "1H Total", "h1Market");
+        });
       });
 
 setFetchInputErrors([]);
