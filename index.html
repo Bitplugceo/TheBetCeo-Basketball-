@@ -1,4 +1,3 @@
-K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4452,6 +4451,56 @@ window.applyTunerProposalFromUI = function(league) {
 window.applyConstantProposalFromUI = function(constantName) {
   if (!confirm("Apply the pending proposal for " + constantName + "?")) return;
   if (applyEngineConstantProposal(constantName)) {
+    if (typeof renderConfigsPanel === "function") renderConfigsPanel();
+  }
+};
+
+// PHASE 2 GAP FIX: matching apply/read helpers for the BB_PHASE2_PROPOSAL_*
+// keys now written by runPhase2Simulator (see that function) instead of it
+// auto-writing to BB_VERIFIED_TUNINGS* and mutating MODEL_TUNING live.
+function getStoredPhase2Proposal(siloKey, league) {
+  try {
+    const raw = localStorage.getItem("BB_PHASE2_PROPOSAL_" + siloKey + "_" + league);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.applied) return null;
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function applyPhase2SimulatorProposal(siloKey, league) {
+  const proposal = getStoredPhase2Proposal(siloKey, league);
+  if (!proposal) return false;
+  try {
+    const store = JSON.parse(localStorage.getItem(siloKey) || "{}") || {};
+    store[league] = { ...proposal.config, verified: true };
+    localStorage.setItem(siloKey, JSON.stringify(store));
+  } catch (e) {
+    engineDebug("applyPhase2SimulatorProposal failed to write silo store: " + (e?.message || String(e)), { error: e });
+    return false;
+  }
+  const _activeLeague = document.getElementById("leagueSelect")?.value || "";
+  if (_activeLeague === league) {
+    MODEL_TUNING.recencyWeights = proposal.config.recencyWeights;
+    window.__phase2FTRecencyWeights = proposal.config.recencyWeights;
+  }
+  try {
+    proposal.applied = true;
+    proposal.appliedAt = new Date().toISOString();
+    localStorage.setItem("BB_PHASE2_PROPOSAL_" + siloKey + "_" + league, JSON.stringify(proposal));
+  } catch (e) {
+    engineDebug("applyPhase2SimulatorProposal failed to mark proposal applied: " + (e?.message || String(e)), { error: e });
+  }
+  engineDebug("Phase 2 simulator proposal manually applied via Configs panel", { siloKey, league, config: proposal.config });
+  if (typeof window.updateLeagueDropdownIndicators === "function") window.updateLeagueDropdownIndicators();
+  return true;
+}
+
+window.applyPhase2SimulatorProposalFromUI = function(siloKey, league) {
+  if (!confirm("Apply the pending recency-weight proposal for " + league + " (" + siloKey + ")? This will overwrite the current tuning for that league.")) return;
+  if (applyPhase2SimulatorProposal(siloKey, league)) {
     if (typeof renderConfigsPanel === "function") renderConfigsPanel();
   }
 };
@@ -10414,6 +10463,25 @@ function renderConfigsPanel() {
         </div>
       `;
     });
+    if (selectedLeagueKey !== "unknown") {
+      ["BB_VERIFIED_TUNINGS_FT", "BB_VERIFIED_TUNINGS_H1", "BB_VERIFIED_TUNINGS"].forEach(siloKey => {
+        const p2proposal = getStoredPhase2Proposal(siloKey, selectedLeagueKey);
+        if (!p2proposal) return;
+        html += `
+          <div class="tracker-review-row">
+            <div class="tracker-review-top">
+              <div class="tracker-review-area">${safeText(siloKey)} · ${safeText(selectedLeagueKey.toUpperCase())}</div>
+              <div class="tracker-review-status candidate">RECENCY WEIGHTS PROPOSED</div>
+            </div>
+            <div class="tracker-review-text">Config: ${safeText(p2proposal.config.bestConfig)} · score ${safeText(p2proposal.config.score)} · ${safeText(p2proposal.config.improvement)}</div>
+            <div class="tracker-review-action" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <span>Proposed ${safeText(new Date(p2proposal.ts).toLocaleString())} · sample ${Number(p2proposal.config.sampleSize || 0)}</span>
+              <button onclick="applyPhase2SimulatorProposalFromUI('${siloKey}','${selectedLeagueKey}')" style="background:#3a9c35; color:#fff; border:none; padding:4px 10px; font-weight:800; font-size:10px; cursor:pointer;">✅ Apply</button>
+            </div>
+          </div>
+        `;
+      });
+    }
     html += `
           </div>
         </div>
@@ -17247,21 +17315,21 @@ const baseLines = Object.freeze({
   bLine: lines.bLine
 });
 
-let verifiedFtConfig = getVerifiedConfig(league, "ft");
-let verifiedH1Config = getVerifiedConfig(league, "h1");
-let verifiedTeamAConfig = getVerifiedConfig(league, "team_a");
-let verifiedTeamBConfig = getVerifiedConfig(league, "team_b");
-
-function applyVerifiedConfigToTuning(verifiedConfig, targetType) {
-  if (!verifiedConfig || !verifiedConfig.verified) return null;
-
-  engineDebug("Applying verified config for " + league + ":" + targetType, { configKey: verifiedConfig.configKey });
-
-  return verifiedConfig;
-}
-
-applyVerifiedConfigToTuning(verifiedFtConfig, "ft");
-applyVerifiedConfigToTuning(verifiedH1Config, "h1");
+// PHASE 4 ITEM 13: verifiedFtConfig/verifiedH1Config/verifiedTeamAConfig/
+// verifiedTeamBConfig used to come from getVerifiedConfig(), which reads
+// BB_VERIFIED_CONFIG_<league>_<market> — a key only ever written by
+// storeVerifiedConfig(). Per the "PHASE 2 GAP FIX" already applied to
+// runRetrospectiveAnalysis, storeVerifiedConfig() is never called anymore
+// (that pathway is log-only too), so these always resolved to null on any
+// build past that fix. Hardcoded to null directly — kept as named bindings
+// so the ftConfigOverride/h1ConfigOverride null-guards below and the audit
+// dump further down keep working unchanged — instead of leaving a network
+// of getVerifiedConfig()/applyVerifiedConfigToTuning() calls that can never
+// fire. verifiedTeamAConfig/verifiedTeamBConfig removed outright: nothing
+// downstream ever read them beyond the dead teamAConfigOverride/
+// teamBConfigOverride block (also removed, see below).
+let verifiedFtConfig = null;
+let verifiedH1Config = null;
 
 const _runFTWeights = window.__phase2FTRecencyWeights || getLeagueRecencyDefaults(currentLeagueForRun);
 const _runH1Weights = window.__phase2H1RecencyWeights || _runFTWeights;
@@ -17341,8 +17409,6 @@ function buildConfigFromVerifiedKey(configKey) {
 
 let ftConfigOverride = {};
 let h1ConfigOverride = {};
-let teamAConfigOverride = {};
-let teamBConfigOverride = {};
 
 if (verifiedFtConfig && verifiedFtConfig.configKey) {
   ftConfigOverride = buildConfigFromVerifiedKey(verifiedFtConfig.configKey);
@@ -17350,12 +17416,10 @@ if (verifiedFtConfig && verifiedFtConfig.configKey) {
 if (verifiedH1Config && verifiedH1Config.configKey) {
   h1ConfigOverride = buildConfigFromVerifiedKey(verifiedH1Config.configKey);
 }
-if (verifiedTeamAConfig && verifiedTeamAConfig.configKey) {
-  teamAConfigOverride = buildConfigFromVerifiedKey(verifiedTeamAConfig.configKey);
-}
-if (verifiedTeamBConfig && verifiedTeamBConfig.configKey) {
-  teamBConfigOverride = buildConfigFromVerifiedKey(verifiedTeamBConfig.configKey);
-}
+// PHASE 4 ITEM 13: teamAConfigOverride/teamBConfigOverride and their
+// verifiedTeamAConfig/verifiedTeamBConfig source removed — neither variable
+// was ever read by anything past this point; they were computed and
+// immediately discarded on every single run.
 
 delete ftConfigOverride.h2hFactor;
 delete h1ConfigOverride.h2hFactor;
@@ -19747,8 +19811,17 @@ try {
 
     const chosenConfig = (improvement >= 0.06 && best.label !== "standard") ? best : standard;
 
-    verifiedTunings[leagueKey] = {
-      verified:       true,
+    // PHASE 2 GAP FIX: this pathway used to write straight to
+    // BB_VERIFIED_TUNINGS*/verified:true and then immediately mutate
+    // MODEL_TUNING.recencyWeights live ("LIVE_APPLY") — an unreviewed
+    // auto-promotion loop identical to the ones already closed in
+    // runCoordinateAscentTuner/calibrateConfidenceModel/calibrateEngineConstants.
+    // It's log-only now: the proposal is stored separately (never written to
+    // the BB_VERIFIED_TUNINGS* keys runEngine reads at the top of every run)
+    // and nothing here mutates MODEL_TUNING or window.__phase2FTRecencyWeights
+    // automatically. Apply via applyPhase2SimulatorProposalFromUI() in the
+    // Configs panel.
+    const proposedConfig = {
       recencyWeights: chosenConfig.weights,
       paceAdjustment: chosenConfig.paceAdj,
       sampleSize:     settledInLeague.length,
@@ -19762,29 +19835,18 @@ try {
     };
 
     try {
-      localStorage.setItem(siloKey, JSON.stringify(verifiedTunings));
+      const proposalKey = "BB_PHASE2_PROPOSAL_" + siloKey + "_" + leagueKey;
+      localStorage.setItem(proposalKey, JSON.stringify({ league: leagueKey, siloKey, config: proposedConfig, applied: false, ts: new Date().toISOString() }));
     } catch (e) {
-      engineDebug("Phase 2 calibration save failed (storage full)", e.message);
-    }
-    if (!marketFilter) {
-      const _activeLeague = document.getElementById("leagueSelect")?.value || "";
-      if (_activeLeague === leagueKey && verifiedTunings[leagueKey]?.verified) {
-        MODEL_TUNING.recencyWeights = verifiedTunings[leagueKey].recencyWeights;
-        window.__phase2FTRecencyWeights = verifiedTunings[leagueKey].recencyWeights;
-        engineDebug("PHASE_2_LIVE_APPLY: Recency weights updated immediately for " + leagueKey, verifiedTunings[leagueKey].recencyWeights);
-      }
+      engineDebug("Phase 2 calibration proposal save failed (storage full)", e.message);
     }
     engineDebug(
-      "PHASE_2_CALIBRATOR [" + (marketFilter || "ALL") + "]: Locked '" + chosenConfig.label + "' for " + leagueKey +
+      "PHASE_2_CALIBRATOR [" + (marketFilter || "ALL") + "]: Proposed '" + chosenConfig.label + "' for " + leagueKey + " (not auto-applied — review in Configs panel)" +
       " | silo=" + siloKey +
       " | sample=" + settledInLeague.length +
       " | score=" + (chosenConfig.score * 100).toFixed(1) + "%" +
       (improvement >= 0.06 ? " | +" + (improvement * 100).toFixed(1) + "% over standard" : " | standard held")
     );
-
-    if (typeof window.updateLeagueDropdownIndicators === "function") {
-      window.updateLeagueDropdownIndicators();
-    }
 
     if (!marketFilter) {
       setTimeout(() => window.runPhase2Simulator(leagueKey, "ft"), 200);
