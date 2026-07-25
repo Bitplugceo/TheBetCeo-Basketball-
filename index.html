@@ -8450,12 +8450,16 @@ function getTrackerImpactKeyFromPickLike(pick = {}) {
   const action = String(pick?.trackerSoftInfluence?.action || "").toLowerCase();
   const advisoryOnly = !!pick?.trackerSoftInfluence?.advisoryOnly || String(pick?.shadowTrackerFeedback?.mode || "").toLowerCase() === "advisory";
 
+  // PHASE 4 CLEANUP (item 15): pick?.teamMemory was a dead reference — the
+  // team/matchup memory framework was deleted in Phase 1, so this field is
+  // never set on any pick anymore. Removed from both OR-chains below rather
+  // than left as a permanently-false leftover.
   if (action === "no_play" || action === "shadow_no_play") return "blocked";
   if (action.includes("downgrade")) return "downgraded";
   if (action.includes("boost")) return "boosted";
   if (action.includes("lock_restrict") || pick?.lockRestricted) return "restricted";
-  if (advisoryOnly && (pick?.trackerFeedback || pick?.teamMemory || pick?.shadowTrackerFeedback)) return "shadow";
-  if (pick?.trackerFeedback || pick?.teamMemory || pick?.shadowTrackerFeedback) return "observed";
+  if (advisoryOnly && (pick?.trackerFeedback || pick?.shadowTrackerFeedback)) return "shadow";
+  if (pick?.trackerFeedback || pick?.shadowTrackerFeedback) return "observed";
   return "none";
 }
 
@@ -15695,38 +15699,17 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     }
   }
 
+  // PHASE 4 CLEANUP: the advanced pace/rating branch (calculateAdvancedMetrics-fed,
+  // gated behind isEspnLeague && hasRealRatings && hasRealPace) was permanently
+  // disabled via a literal `if (false && ...)` guard — it could never execute.
+  // Deleted outright along with its now-unreachable VENUE_ADVANCED_BLEND_FACTOR
+  // block; the plain blended-average path below is the only method now, matching
+  // compute1HProjection and computeQ.
   let aS, bS;
-  if (false && isEspnLeague && hasRealRatings && hasRealPace) {
-    // AUDIT SIMPLIFICATION: advanced pace/rating branch permanently disabled.
-    // calculateAdvancedMetrics used a simplified, non-standard possessions
-    // formula that could diverge from real advanced-stats sources while
-    // looking authoritative. Falling back to the plain blended-average path
-    // below unconditionally, per the one-method simplification.
-    const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
-    const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
-
-    const _ftRegMinutes = getLeagueRegulationMinutes(league);
-    const _ftDivisor = 100 * (48 / _ftRegMinutes);
-    aS = (synPace * projectedRatingA) / _ftDivisor;
-    bS = (synPace * projectedRatingB) / _ftDivisor;
-    synNetA = avgOrNaN(ctxA.ortg10) - avgOrNaN(ctxA.drtg10);
-    synNetB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
-    usedAdvanced = true;
-
-    const VENUE_ADVANCED_BLEND_FACTOR = 0.35;
-    if (aVenueDiag.enabled && isFinite(aVenueAvg) && isFinite(aOverallAvg)) {
-      aS += (aVenueAvg - aOverallAvg) * VENUE_ADVANCED_BLEND_FACTOR;
-    }
-    if (bVenueDiag.enabled && isFinite(bVenueAvg) && isFinite(bOverallAvg)) {
-      bS += (bVenueAvg - bOverallAvg) * VENUE_ADVANCED_BLEND_FACTOR;
-    }
-  } else {
-    
-    const _tw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
-    const _ow = 1 - _tw;
-    aS = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw + bAllowed * _ow) : aS_pre;
-    bS = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw + aAllowed * _ow) : bS_pre;
-  }
+  const _tw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+  const _ow = 1 - _tw;
+  aS = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw + bAllowed * _ow) : aS_pre;
+  bS = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw + aAllowed * _ow) : bS_pre;
 
   if (!isFinite(synNetA) && isFinite(aOverallAvg) && isFinite(aAllowed)) {
     synNetA = aOverallAvg - aAllowed;
@@ -15921,25 +15904,14 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     synPace = clampNumber(rawPace, leaguePaceBase * clamp.min, leaguePaceBase * clamp.max);
   }
 
+  // PHASE 4 CLEANUP: same permanently-disabled `if (false && ...)` advanced
+  // pace/rating branch as computeFTProjection, deleted outright — the plain
+  // blended-average path below is the only method now.
   let projA1H, projB1H;
-  if (false && isEspnLeague && hasRealRatings && hasRealPace) {
-    // AUDIT SIMPLIFICATION: advanced pace/rating branch permanently disabled
-    // for H1, same reasoning as FT.
-
-    const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
-    const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
-
-    const _h1RegMinutes = getLeagueRegulationMinutes(league);
-    const halfDivisor = 200 * (48 / _h1RegMinutes);
-    projA1H = (synPace * projectedRatingA) / halfDivisor;
-    projB1H = (synPace * projectedRatingB) / halfDivisor;
-  } else {
-
-    const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
-    const _ow1 = 1 - _tw1;
-    projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw1 + bAllowed * _ow1) : aS_pre;
-    projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw1 + aAllowed * _ow1) : bS_pre;
-  }
+  const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+  const _ow1 = 1 - _tw1;
+  projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw1 + bAllowed * _ow1) : aS_pre;
+  projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw1 + aAllowed * _ow1) : bS_pre;
 
   projA1H = applyVolatility(projA1H, aS1, volLimit, league);
   projB1H = applyVolatility(projB1H, bS1, volLimit, league);
@@ -17520,31 +17492,22 @@ const h1Calc = compute1HProjection({
       const leaguePaceBaseQ = LEAGUE_PACE_BASES[league] || 74;
       const leagueRatingBaseQ = LEAGUE_RATING_BASES[league] || 110;
 
+      // PHASE 4 CLEANUP: same permanently-disabled `if (false && ...)` advanced
+      // pace/rating branch as FT/H1, deleted outright — the plain
+      // blended-average path below (via anchorProjection) is the only method
+      // for quarters now too. hasAdvancedQ/leagueRatingBaseQ are left declared
+      // above since nothing else in this function depended on removing them.
       let projA, projB;
       const _dynWeightsQ = getDynamicWeights(
         getSampleTier(aS, bS),
         globalModelState?.volState?.combinedVolRatio ?? 0.5,
         league
       );
-      if (false && hasAdvancedQ) {
-        // AUDIT SIMPLIFICATION: advanced pace/rating branch permanently
-        // disabled for quarters too, same reasoning as FT/H1.
-        const synPaceQ = (avgOrNaN(ctxAQ.pace10) + avgOrNaN(ctxBQ.pace10)) / 2;
-        const projRatingAQ = avgOrNaN(ctxAQ.ortg10) + avgOrNaN(ctxBQ.drtg10) - leagueRatingBaseQ;
-        const projRatingBQ = avgOrNaN(ctxBQ.ortg10) + avgOrNaN(ctxAQ.drtg10) - leagueRatingBaseQ;
+      const _twQ = isFinite(_dynWeightsQ?.teamWeight) ? Number(_dynWeightsQ.teamWeight) : 0.65;
+      const _owQ = 1 - _twQ;
 
-        const _qRegMinutes = getLeagueRegulationMinutes(league);
-        const qDivisor = 400 * (48 / _qRegMinutes);
-        projA = anchorProjection((synPaceQ * projRatingAQ) / qDivisor, sampleSize, leagueBaseQ);
-        projB = anchorProjection((synPaceQ * projRatingBQ) / qDivisor, sampleSize, leagueBaseQ);
-      } else {
-
-        const _twQ = isFinite(_dynWeightsQ?.teamWeight) ? Number(_dynWeightsQ.teamWeight) : 0.65;
-        const _owQ = 1 - _twQ;
-
-        projA = anchorProjection(_dateAwareAvgAQ * _twQ + avgOrNaN(bA) * _owQ, sampleSize, leagueBaseQ);
-        projB = anchorProjection(_dateAwareAvgBQ * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
-      }
+      projA = anchorProjection(_dateAwareAvgAQ * _twQ + avgOrNaN(bA) * _owQ, sampleSize, leagueBaseQ);
+      projB = anchorProjection(_dateAwareAvgBQ * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
 
       // AUDIT FIX #5: was hardcoded to 1 (always full-strength, no way to dial
       // down without editing the literal). Now reads the tunable registry entry.
