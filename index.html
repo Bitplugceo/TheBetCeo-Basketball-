@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -11734,13 +11733,15 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
       // only. Letting the tracker's own win-rate history quietly reshape the
       // edge it will later be graded against was circular.
 
+      // PHASE 2 FIX #7: posterior win-rate no longer mutates p.confidence
+      // either. confidenceShift is intentionally left at 0 here — only the
+      // reasons are recorded for visibility via p.trackerFeedback above.
+      // Nothing downstream can move the live pick's grade off the tracker's
+      // own settled-pick history anymore, same reasoning as the edge fix.
       if (posteriorWinProb >= 0.62) {
-        confidenceShift += 1;
-        reasons.push("tracker strong market");
+        reasons.push("tracker strong market (not applied — visibility only)");
       } else if (posteriorWinProb <= 0.44) {
-        confidenceShift -= 1;
-        lockRestricted = true;
-        reasons.push("tracker weak market");
+        reasons.push("tracker weak market (not applied — visibility only)");
       }
 
       if (
@@ -11751,10 +11752,6 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
         hypotheticalNoPlay = true;
         lockRestricted = true;
         reasons.push("tracker no-play caution");
-      }
-
-      if (!advisoryOnly && confidenceShift > 0) {
-        p.lockStrength = (Number(p.lockStrength) || 0) + Number(TRACKER_SOFT_EFFECTS.lockBoost || 0.20);
       }
     }
 
@@ -13486,8 +13483,15 @@ function applyIntelligenceLayerToPicks(picks, intelligencePack, league) {
       confAdj -= (qVolRatio * 2) / 8;
     }
 
-    if (p.confidence && confAdj !== 0) applyGuardedConfidenceShift(p, confAdj > 0 ? 1 : -1, "intelligenceLayer", confAdj);
-    if (confAdj !== 0) p.intelligenceAdjusted = true;
+    // PHASE 3 FIX #12: intelligence layer no longer moves the grade — it
+    // only leaves a flagged note (p.intelligenceNote) for display. Rest-days/
+    // travel/back-to-back never touch p.confidence or the pick itself now.
+    if (confAdj !== 0) {
+      p.intelligenceAdjusted = true;
+      p.intelligenceNote = (restA < 1 || restB < 1)
+        ? "Rest-days flag: one team on a back-to-back"
+        : "Travel flag: notable distance since last game";
+    }
   });
 }
 
@@ -15792,11 +15796,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     ? clampNumber(_ftVolRatioRaw + (0.5 - _ftSosAvg) * 0.5, 0, 2.5)
     : _ftVolRatioRaw;
 
-  const intel = computeIntelligencePack(league);
-  const intelSignalA = buildTeamMarketIntelSignal(intel, "A");
-  const intelSignalB = buildTeamMarketIntelSignal(intel, "B");
-  aS = applyDampedIntelSignal(aS, intelSignalA.signal, _bVolRatio);
-  bS = applyDampedIntelSignal(bS, intelSignalB.signal, _aVolRatio);
+  // PHASE 3 FIX #12: intelligence layer (rest-days/travel/back-to-back) no
+  // longer feeds into the projection itself — it's surfaced only as a
+  // flagged note via applyIntelligenceLayerToPicks, not a number that moves
+  // aS/bS or the edge.
 
   const aH2H = getH2HSeries("A", "ft", parsed);
   const bH2H = getH2HSeries("B", "ft", parsed);
@@ -15990,21 +15993,10 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const bVol1 = getVolatilityRatioForSeries(bS1, volLimit);
   const combinedVol = Math.max(aVol1, bVol1);
 
-  const intel = computeIntelligencePack(league);
-  // FIX #25: H1 previously used buildTotalMarketIntelSignal, which combines
-  // both teams' rest-days into ONE signal and applies it to BOTH projA1H and
-  // projB1H equally — so a rested Team A got dinged just because Team B was
-  // on a back-to-back. FT already does this correctly (buildTeamMarketIntelSignal,
-  // one call per team, each applied only to that team's own projection,
-  // damped by the OTHER team's volatility). Match that pattern here.
-  const intelSignalA1H = buildTeamMarketIntelSignal(intel, "A");
-  const intelSignalB1H = buildTeamMarketIntelSignal(intel, "B");
-  if (isFinite(intelSignalA1H.signal) && intelSignalA1H.signal !== 0) {
-    projA1H = applyDampedIntelSignal(projA1H, intelSignalA1H.signal / 4, bVol1);
-  }
-  if (isFinite(intelSignalB1H.signal) && intelSignalB1H.signal !== 0) {
-    projB1H = applyDampedIntelSignal(projB1H, intelSignalB1H.signal / 4, aVol1);
-  }
+  // PHASE 3 FIX #12: intelligence layer (rest-days/travel/back-to-back) no
+  // longer feeds into the H1 projection either — surfaced only as a flagged
+  // note via applyIntelligenceLayerToPicks, never a number that moves
+  // projA1H/projB1H or the edge.
 
   const aH2H = getH2HSeries("A", "h1", parsed);
   const bH2H = getH2HSeries("B", "h1", parsed);
@@ -17781,22 +17773,10 @@ const h1Calc = compute1HProjection({
       if (injA < 1) projB *= (1 + (1 - injA) * _qInjOppBoostFactor);
       if (injB < 1) projA *= (1 + (1 - injB) * _qInjOppBoostFactor);
 
-      // FIX #17: quarters previously never received the rest-days/back-to-back/
-      // travel intelligence signal that FT and H1 both apply via STEP6. Wire it
-      // in here the same way FT does (per-team signal, damped by the opponent's
-      // volatility), scaled down proportionally for a quarter: H1 already scales
-      // the signal by /4 for a half, so a quarter (half of a half) uses /8.
-      const aVolQ = getVolatilityRatioForSeries(aS, volLimit);
-      const bVolQ = getVolatilityRatioForSeries(bS, volLimit);
-      const intelQ = computeIntelligencePack(league);
-      const intelSignalAQ = buildTeamMarketIntelSignal(intelQ, "A");
-      const intelSignalBQ = buildTeamMarketIntelSignal(intelQ, "B");
-      if (isFinite(intelSignalAQ.signal) && intelSignalAQ.signal !== 0) {
-        projA = applyDampedIntelSignal(projA, intelSignalAQ.signal / 8, bVolQ);
-      }
-      if (isFinite(intelSignalBQ.signal) && intelSignalBQ.signal !== 0) {
-        projB = applyDampedIntelSignal(projB, intelSignalBQ.signal / 8, aVolQ);
-      }
+      // PHASE 3 FIX #12: intelligence layer (rest-days/travel/back-to-back)
+      // no longer feeds into the quarter projection either — surfaced only
+      // as a flagged note via applyIntelligenceLayerToPicks, never a number
+      // that moves projA/projB or the edge.
 
       const aH2H = getH2HSeries("A", qKey, parsed);
       const bH2H = getH2HSeries("B", qKey, parsed);
