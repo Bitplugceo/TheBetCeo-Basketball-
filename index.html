@@ -1,3 +1,4 @@
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4377,6 +4378,84 @@ function setTunableParam(key, newValue, scopeLeague, verifiedAt) {
 loadTunableParamRegistryOverrides();
 loadTunableParamLeagueOverrides();
 
+// PHASE 2 ITEM 8: manual "Apply tuning suggestions" plumbing. The tuner and
+// calibrateEngineConstants only ever logged their proposals to the debug
+// console with no durable place to review or promote them from — these
+// functions give the Configs panel something to read and act on, and keep
+// every promotion behind an explicit human tap.
+function getStoredTunerProposal(league) {
+  try {
+    const key = "BB_TUNER_PROPOSAL_" + (league || "global");
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.applied || !Array.isArray(parsed.promotions) || !parsed.promotions.length) return null;
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function applyTunerProposal(league) {
+  const scopeKey = league || "global";
+  const proposal = getStoredTunerProposal(league);
+  if (!proposal) return false;
+  proposal.promotions.forEach(p => {
+    setTunableParam(p.key, p.val, proposal.league || null, new Date().toISOString());
+  });
+  try {
+    proposal.applied = true;
+    proposal.appliedAt = new Date().toISOString();
+    localStorage.setItem("BB_TUNER_PROPOSAL_" + scopeKey, JSON.stringify(proposal));
+  } catch (e) {
+    engineDebug("applyTunerProposal failed to mark proposal applied: " + (e?.message || String(e)), { error: e });
+  }
+  engineDebug("Tuner proposal manually applied via Configs panel", { league: scopeKey, promotions: proposal.promotions });
+  return true;
+}
+
+function getStoredConstantProposal(constantName) {
+  try {
+    const raw = localStorage.getItem("BB_CONST_PROPOSAL_" + constantName);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.applied) return null;
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function applyEngineConstantProposal(constantName) {
+  const proposal = getStoredConstantProposal(constantName);
+  if (!proposal) return false;
+  setTunableConstant(constantName, proposal.proposedValue, proposal.netDelta, proposal.sampleCount);
+  try {
+    proposal.applied = true;
+    proposal.appliedAt = new Date().toISOString();
+    localStorage.setItem("BB_CONST_PROPOSAL_" + constantName, JSON.stringify(proposal));
+  } catch (e) {
+    engineDebug("applyEngineConstantProposal failed to mark proposal applied: " + (e?.message || String(e)), { error: e });
+  }
+  engineDebug("Engine constant proposal manually applied via Configs panel", { constantName, value: proposal.proposedValue });
+  return true;
+}
+
+window.applyTunerProposalFromUI = function(league) {
+  const scopeKey = league || "global";
+  if (!confirm("Apply the pending tuning proposal for " + scopeKey + "? This will overwrite the current tunable parameter values.")) return;
+  if (applyTunerProposal(league)) {
+    if (typeof renderConfigsPanel === "function") renderConfigsPanel();
+  }
+};
+
+window.applyConstantProposalFromUI = function(constantName) {
+  if (!confirm("Apply the pending proposal for " + constantName + "?")) return;
+  if (applyEngineConstantProposal(constantName)) {
+    if (typeof renderConfigsPanel === "function") renderConfigsPanel();
+  }
+};
+
 function getParam(key, league) {
   return getTunableParam(key, league);
 }
@@ -4559,6 +4638,16 @@ function calibrateEngineConstants() {
       // AUDIT SIMPLIFICATION: no longer auto-applies. Logged as a proposal
       // only; INJURY_OPPONENT_BOOST_FACTOR / UNDER_EDGE_FACTOR stay at their
       // last human-reviewed values until manually promoted in Configs panel.
+      // PHASE 2 ITEM 8: persist the proposal (previously debug-log-only)
+      // so the Configs panel "Apply" button has something durable to act on.
+      try {
+        localStorage.setItem("BB_CONST_PROPOSAL_" + constantName, JSON.stringify({
+          constantName, proposedValue: best.value, netDelta: best.netDelta, sampleCount: best.count,
+          ts: new Date().toISOString(), applied: false
+        }));
+      } catch(e) {
+        engineDebug("calibrateEngineConstants failed to persist proposal: " + (e?.message || String(e)), { constantName, error: e });
+      }
       engineDebug("Engine constant proposed (not auto-applied — review in Configs panel)", { constantName, proposedValue: best.value, netDelta: best.netDelta, sampleCount: best.count });
     }
   });
@@ -5059,6 +5148,21 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
     // the Configs panel. Grid-searching dozens of parameters and promoting
     // whichever clears a significance test, with no multiple-comparisons
     // correction, will eventually find a "significant" result by chance.
+    // PHASE 2 ITEM 8: persist the proposal so the Configs panel "Apply
+    // tuning suggestions" button has something durable to read and act on
+    // (previously this only existed as a formatted string inside the debug
+    // log, with no way to promote it without hand-editing localStorage).
+    try {
+      const proposalKey = "BB_TUNER_PROPOSAL_" + (targetLeague || "global");
+      localStorage.setItem(proposalKey, JSON.stringify({
+        league: targetLeague || null,
+        promotions,
+        ts: new Date().toISOString(),
+        applied: false
+      }));
+    } catch(e) {
+      engineDebug("runCoordinateAscentTuner failed to persist proposal: " + (e?.message || String(e)), { error: e });
+    }
     engineDebug(`Coordinate ascent proposed changes for ${targetLeague || "global"} (not auto-applied — review in Configs panel): ${promotions.map(p => `${p.key}: ${p.old}->${p.val} (OOS z=${p.z.toFixed(2)})`).join(", ")}`);
     return { params: currentParams, promotions };
   }
@@ -8230,7 +8334,9 @@ next.closingLine = (next.closingLine !== undefined && next.closingLine !== null 
   next.trackerSoftInfluence = next.trackerSoftInfluence || next?.diagnostics?.trackerSoftInfluence || null;
   next.trackerFeedback = next.trackerFeedback || next?.diagnostics?.trackerFeedback || null;
   next.shadowTrackerFeedback = next.shadowTrackerFeedback || next?.diagnostics?.shadowTrackerFeedback || null;
-  next.teamMemory = next.teamMemory || next?.diagnostics?.teamMemory || null;
+  // PHASE 4 CLEANUP: next.teamMemory removed — team/matchup memory was
+  // deleted in Phase 1, so next.diagnostics.teamMemory is never set anymore;
+  // this line only ever resolved to null and had no reader left either.
   next.lockRestricted = !!next.lockRestricted;
   next.trackerImpactKey = next.trackerImpactKey || next?.diagnostics?.trackerImpactKey || getTrackerImpactKeyFromPickLike(next);
   next.trackerImpactLabel = next.trackerImpactLabel || next?.diagnostics?.trackerImpactLabel || getTrackerImpactLabel(next.trackerImpactKey);
@@ -10252,6 +10358,69 @@ function renderConfigsPanel() {
   }
 
   const selectedLeagueKey = normalizeLeagueTrustKey(document.getElementById("leagueSelect")?.value || "unknown");
+
+  // PHASE 2 ITEM 8: surface any pending tuner/constant proposals with a
+  // one-tap Apply button, so promotions require an explicit human decision
+  // instead of being buried in the debug log with no way to act on them.
+  const _pendingGlobalProposal = getStoredTunerProposal(null);
+  const _pendingLeagueProposal = selectedLeagueKey !== "unknown" ? getStoredTunerProposal(selectedLeagueKey) : null;
+  const _pendingInjProposal = getStoredConstantProposal("INJURY_OPPONENT_BOOST_FACTOR");
+  const _pendingUnderProposal = getStoredConstantProposal("UNDER_EDGE_FACTOR");
+  if (_pendingGlobalProposal || _pendingLeagueProposal || _pendingInjProposal || _pendingUnderProposal) {
+    html += `
+      <div class="tracker-analytics-card" style="margin-top:12px; border-color:#4ea9ff;">
+        <div class="tracker-analytics-card-head" style="background: linear-gradient(90deg, #1a2f4a 0%, #111 100%);">
+          <div class="tracker-analytics-card-title" style="color:#4ea9ff;">🧪 Pending Tuning Suggestions</div>
+          <div class="tracker-analytics-card-meta">Awaiting manual review</div>
+        </div>
+        <div class="tracker-analytics-card-body">
+          <div class="tracker-review-list">
+    `;
+    [
+      { proposal: _pendingGlobalProposal, label: "Global (all leagues)", onclick: "applyTunerProposalFromUI('')" },
+      { proposal: _pendingLeagueProposal, label: safeText(selectedLeagueKey.toUpperCase()), onclick: `applyTunerProposalFromUI('${selectedLeagueKey}')` }
+    ].forEach(row => {
+      if (!row.proposal) return;
+      html += `
+        <div class="tracker-review-row">
+          <div class="tracker-review-top">
+            <div class="tracker-review-area">${row.label}</div>
+            <div class="tracker-review-status candidate">${row.proposal.promotions.length} PARAM(S) PROPOSED</div>
+          </div>
+          <div class="tracker-review-text">${safeText(row.proposal.promotions.map(p => `${p.key}: ${p.old}->${p.val} (z=${p.z.toFixed(2)})`).join(", "))}</div>
+          <div class="tracker-review-action" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <span>Proposed ${safeText(new Date(row.proposal.ts).toLocaleString())}</span>
+            <button onclick="${row.onclick}" style="background:#3a9c35; color:#fff; border:none; padding:4px 10px; font-weight:800; font-size:10px; cursor:pointer;">✅ Apply</button>
+          </div>
+        </div>
+      `;
+    });
+    [
+      { proposal: _pendingInjProposal, name: "INJURY_OPPONENT_BOOST_FACTOR" },
+      { proposal: _pendingUnderProposal, name: "UNDER_EDGE_FACTOR" }
+    ].forEach(row => {
+      if (!row.proposal) return;
+      html += `
+        <div class="tracker-review-row">
+          <div class="tracker-review-top">
+            <div class="tracker-review-area">${row.name}</div>
+            <div class="tracker-review-status candidate">PROPOSED</div>
+          </div>
+          <div class="tracker-review-text">New value: ${row.proposal.proposedValue} (net Δ${row.proposal.netDelta} over ${row.proposal.sampleCount} picks)</div>
+          <div class="tracker-review-action" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <span>Proposed ${safeText(new Date(row.proposal.ts).toLocaleString())}</span>
+            <button onclick="applyConstantProposalFromUI('${row.name}')" style="background:#3a9c35; color:#fff; border:none; padding:4px 10px; font-weight:800; font-size:10px; cursor:pointer;">✅ Apply</button>
+          </div>
+        </div>
+      `;
+    });
+    html += `
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   html += `
     <div class="tracker-analytics-card" style="margin-top:12px; border-color:#d4af37;">
       <div class="tracker-analytics-card-head" style="background: linear-gradient(90deg, #333 0%, #111 100%);">
@@ -12875,12 +13044,15 @@ function isConfidenceCoeffFitted(league) {
 
 function getConfidenceGrade(params) {
 
-  
-
-  
+  // PHASE 4 CLEANUP: paceGapRisk, blowoutGap, lineupQuality, and siblingEdge
+  // were destructured here but never used in the scoring formula below (see
+  // the AUDIT SIMPLIFICATION note further down) — they were bolt-on
+  // multiplicative penalties removed per the one-method simplification.
+  // Dropped from the destructure since nothing in this function reads them;
+  // callers can keep passing them harmlessly, they're just ignored now.
   const {
     pick, note, line, edge, sampleTier, hasH2H, volatility, volLimit,
-    paceGapRisk, blowoutGap, trap, lineupQuality, siblingEdge,
+    trap,
     league = ""
   } = params || {};
 
