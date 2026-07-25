@@ -1,4 +1,3 @@
-F
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -18264,10 +18263,157 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       return "";
     }
 
-    const ftBadge = getMicroStreakBadge(ctxA.ftScored10, ctxA.ftAllowed10, ctxB.ftScored10, ctxB.ftAllowed10, ftLine, false);
-    const h1Badge = getMicroStreakBadge(ctxA.h1Scored10, ctxA.h1Allowed10, ctxB.h1Scored10, ctxB.h1Allowed10, h1Line, false);
-    const aBadge = getMicroStreakBadge(ctxA.ftScored10, null, null, null, aLine, true);
-    const bBadge = getMicroStreakBadge(ctxB.ftScored10, null, null, null, bLine, true);
+    function getSideRecordBadge(scA, alA, scB, alB, line, pickText, isTeamMarket) {
+      if (!line || !pickText || pickText === "NO PLAY") return "";
+      const side = getPickSideFromText(pickText);
+      if (!side) return "";
+      const countHits = (sc, al) => {
+        if (!sc || !sc.length) return null;
+        let o=0, u=0;
+        const len = Math.min(sc.length, al ? al.length : sc.length);
+        if (len < 5) return null; 
+        for(let i=0; i<len; i++) {
+          const pts = al ? (Number(sc[i]) + Number(al[i])) : Number(sc[i]);
+          if (pts > line) o++;
+          else if (pts < line) u++;
+        }
+        return {o, u, len};
+      };
+
+      const css = "font-size:8px; padding:1px 3px; border-radius:2px; margin-left:4px; vertical-align:middle; font-weight:900; letter-spacing:0.2px;";
+
+      const _isDarkMode = document.body.classList.contains('dark-mode');
+      const _overColor = _isDarkMode ? '#ff8c69' : '#d84315';
+      const _underColor = _isDarkMode ? '#70a8ff' : '#1565c0';
+      const _overBg = _isDarkMode ? 'rgba(255,100,50,0.15)' : 'rgba(216,67,21,0.1)';
+      const _underBg = _isDarkMode ? 'rgba(78,169,255,0.15)' : 'rgba(21,101,192,0.1)';
+
+      let totalO = 0, totalU = 0;
+      if (isTeamMarket) {
+        const st = countHits(scA, alA);
+        if (!st) return "";
+        totalO = st.o; totalU = st.u;
+      } else {
+        const stA = countHits(scA, alA);
+        const stB = countHits(scB, alB);
+        if (!stA || !stB) return "";
+        totalO = stA.o + stB.o;
+        totalU = stA.u + stB.u;
+      }
+
+      const wins = side === "over" ? totalO : totalU;
+      const losses = side === "over" ? totalU : totalO;
+      const letter = side === "over" ? "O" : "U";
+      const color = side === "over" ? _overColor : _underColor;
+      const bg = side === "over" ? _overBg : _underBg;
+      return ` <span style="${css} background:${bg}; color:${color};">${wins}-${losses} ${letter}</span>`;
+    }
+
+    // CONSERVATIVE LINE-HISTORY SIGNAL: checks how often the actual combined
+    // (or single-team) score has landed on one side of the CURRENT market
+    // line over the team's last games. This is a confirming/disconfirming
+    // nudge only — it never creates a pick from NO PLAY, never flips a pick's
+    // side, and never touches the edge or line. Requires a stricter 8-game
+    // minimum sample (vs. the 5-game minimum used for the cosmetic badge
+    // above) plus the same proven 80% hit-rate bar already used for that
+    // badge, so it only engages on genuinely lopsided history — not noise.
+    function getLineHitRateVerdict(scA, alA, scB, alB, line, isTeamMarket) {
+      if (!line) return null;
+      const countHits = (sc, al) => {
+        if (!sc || !sc.length) return null;
+        let o = 0, u = 0;
+        const len = Math.min(sc.length, al ? al.length : sc.length);
+        if (len < 8) return null;
+        for (let i = 0; i < len; i++) {
+          const pts = al ? (Number(sc[i]) + Number(al[i])) : Number(sc[i]);
+          if (pts > line) o++;
+          else if (pts < line) u++;
+        }
+        return { o, u, len };
+      };
+
+      if (isTeamMarket) {
+        const st = countHits(scA, alA);
+        if (!st) return null;
+        const rate = Math.max(st.o, st.u) / st.len;
+        if (rate < 0.8) return null;
+        return { side: st.o > st.u ? "over" : "under", rate, len: st.len };
+      }
+
+      const stA = countHits(scA, alA);
+      const stB = countHits(scB, alB);
+      if (!stA || !stB) return null;
+      const tO = stA.o + stB.o;
+      const tU = stA.u + stB.u;
+      const tLen = stA.len + stB.len;
+      const rate = Math.max(tO, tU) / tLen;
+      if (rate < 0.8) return null;
+      return { side: tO > tU ? "over" : "under", rate, len: tLen };
+    }
+
+    // Applies the verdict above as a guarded confidence nudge only. Reuses
+    // applyGuardedConfidenceShift so it competes fairly (via the existing
+    // decorrelation cap) with tracker/massacre/intelligence adjustments
+    // instead of stacking on top of them, and is hard-capped at a single
+    // grade step in either direction. Scoped to ft/h1/team_a/team_b only —
+    // quarters are deliberately excluded as too thin a sample to trust here.
+    function applyLineHitRateSignalToPicks(picks, ctxA, ctxB) {
+      if (!Array.isArray(picks) || !picks.length) return;
+      picks.forEach(p => {
+        if (!p || p.pick === "NO PLAY" || !p.marketKey) return;
+        const side = getPickSideFromText(p.pick);
+        if (!side) return;
+
+        let verdict = null;
+        if (p.marketKey === "ft") {
+          verdict = getLineHitRateVerdict(ctxA.ftScored10, ctxA.ftAllowed10, ctxB.ftScored10, ctxB.ftAllowed10, p.line, false);
+        } else if (p.marketKey === "h1") {
+          verdict = getLineHitRateVerdict(ctxA.h1Scored10, ctxA.h1Allowed10, ctxB.h1Scored10, ctxB.h1Allowed10, p.line, false);
+        } else if (p.marketKey === "team_a") {
+          verdict = getLineHitRateVerdict(ctxA.ftScored10, null, null, null, p.line, true);
+        } else if (p.marketKey === "team_b") {
+          verdict = getLineHitRateVerdict(ctxB.ftScored10, null, null, null, p.line, true);
+        } else {
+          return;
+        }
+
+        if (!verdict) return;
+        p.lineHitRateSignal = verdict;
+
+        if (verdict.side === side) {
+          applyGuardedConfidenceShift(p, 1, "lineHitRateHistory", verdict.rate);
+        } else {
+          applyGuardedConfidenceShift(p, -1, "lineHitRateHistory", verdict.rate);
+        }
+      });
+    }
+
+    const ftBadge = getSideRecordBadge(ctxA.ftScored10, ctxA.ftAllowed10, ctxB.ftScored10, ctxB.ftAllowed10, ftLine, ftPick, false);
+    const h1Badge = getSideRecordBadge(ctxA.h1Scored10, ctxA.h1Allowed10, ctxB.h1Scored10, ctxB.h1Allowed10, h1Line, h1Pick, false);
+    const aBadge = getSideRecordBadge(ctxA.ftScored10, null, null, null, aLine, aPick, true);
+    const bBadge = getSideRecordBadge(ctxB.ftScored10, null, null, null, bLine, bPick, true);
+    const h1aBadge = getSideRecordBadge(ctxA.h1Scored10, ctxA.h1Allowed10, null, null, finalLines.h1aLine, h1aPick, true);
+    const h1bBadge = getSideRecordBadge(ctxB.h1Scored10, ctxB.h1Allowed10, null, null, finalLines.h1bLine, h1bPick, true);
+    const q1AScored = getManualSeries("A", "q1", parsed);
+    const q1BScored = getManualSeries("B", "q1", parsed);
+    const q1AAllowed = (parsed.aQ1Allowed && parsed.aQ1Allowed.length) ? parsed.aQ1Allowed : (AppState.context.data.A.q1Allowed || []);
+    const q1BAllowed = (parsed.bQ1Allowed && parsed.bQ1Allowed.length) ? parsed.bQ1Allowed : (AppState.context.data.B.q1Allowed || []);
+    const q1Badge = getSideRecordBadge(q1AScored, q1AAllowed, q1BScored, q1BAllowed, q1?.line, q1?.pick, false);
+    const q2AScored = getManualSeries("A", "q2", parsed);
+    const q2BScored = getManualSeries("B", "q2", parsed);
+    const q2AAllowed = (parsed.aQ2Allowed && parsed.aQ2Allowed.length) ? parsed.aQ2Allowed : (AppState.context.data.A.q2Allowed || []);
+    const q2BAllowed = (parsed.bQ2Allowed && parsed.bQ2Allowed.length) ? parsed.bQ2Allowed : (AppState.context.data.B.q2Allowed || []);
+    const q2Badge = getSideRecordBadge(q2AScored, q2AAllowed, q2BScored, q2BAllowed, q2?.line, q2?.pick, false);
+    const q3AScored = getManualSeries("A", "q3", parsed);
+    const q3BScored = getManualSeries("B", "q3", parsed);
+    const q3AAllowed = (parsed.aQ3Allowed && parsed.aQ3Allowed.length) ? parsed.aQ3Allowed : (AppState.context.data.A.q3Allowed || []);
+    const q3BAllowed = (parsed.bQ3Allowed && parsed.bQ3Allowed.length) ? parsed.bQ3Allowed : (AppState.context.data.B.q3Allowed || []);
+    const q3Badge = getSideRecordBadge(q3AScored, q3AAllowed, q3BScored, q3BAllowed, q3?.line, q3?.pick, false);
+    const q4AScored = getManualSeries("A", "q4", parsed);
+    const q4BScored = getManualSeries("B", "q4", parsed);
+    const q4AAllowed = (parsed.aQ4Allowed && parsed.aQ4Allowed.length) ? parsed.aQ4Allowed : (AppState.context.data.A.q4Allowed || []);
+    const q4BAllowed = (parsed.bQ4Allowed && parsed.bQ4Allowed.length) ? parsed.bQ4Allowed : (AppState.context.data.B.q4Allowed || []);
+    const q4Badge = getSideRecordBadge(q4AScored, q4AAllowed, q4BScored, q4BAllowed, q4?.line, q4?.pick, false);
 
     
     const oA = avgOrNaN(AppState.context.data.A.ortg10);
@@ -18347,10 +18493,10 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     bVenueAdjustment: h1Calc.bVenueAdjustment
   },
 
-      { _idx: 10, name: "Q1 Total", marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: q1?.fullModel ?? false, sampleTier: q1?.tier, hasH2H: q1?.hasH2H, trap: q1?.trap ?? false, volatility: q1?.volatility, volLimit: getMarketVolLimit(league, "q1"), coeffFitted: _coeffFitted, projectionOnly: q1?.projectionOnly ?? false },
-      { _idx: 11, name: "Q2 Total", marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: q2?.fullModel ?? false, sampleTier: q2?.tier, hasH2H: q2?.hasH2H, trap: q2?.trap ?? false, volatility: q2?.volatility, volLimit: getMarketVolLimit(league, "q2"), coeffFitted: _coeffFitted, projectionOnly: q2?.projectionOnly ?? false },
-      { _idx: 12, name: "Q3 Total", marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: q3?.fullModel ?? false, sampleTier: q3?.tier, hasH2H: q3?.hasH2H, trap: q3?.trap ?? false, volatility: q3?.volatility, volLimit: getMarketVolLimit(league, "q3"), coeffFitted: _coeffFitted, projectionOnly: q3?.projectionOnly ?? false },
-      { _idx: 13, name: "Q4 Total", marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: q4?.fullModel ?? false, sampleTier: q4?.tier, hasH2H: q4?.hasH2H, trap: q4?.trap ?? false, volatility: q4?.volatility, volLimit: getMarketVolLimit(league, "q4"), coeffFitted: _coeffFitted, projectionOnly: q4?.projectionOnly ?? false },
+      { _idx: 10, name: "Q1 Total" + q1Badge, marketKey: "q1", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q1Market")?.value), proj: q1?.proj, edge: q1?.edge, pick: q1?.pick || "NO PLAY", confidence: q1?.confidence || "NaN", note: null, fullModel: q1?.fullModel ?? false, sampleTier: q1?.tier, hasH2H: q1?.hasH2H, trap: q1?.trap ?? false, volatility: q1?.volatility, volLimit: getMarketVolLimit(league, "q1"), coeffFitted: _coeffFitted, projectionOnly: q1?.projectionOnly ?? false },
+      { _idx: 11, name: "Q2 Total" + q2Badge, marketKey: "q2", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q2Market")?.value), proj: q2?.proj, edge: q2?.edge, pick: q2?.pick || "NO PLAY", confidence: q2?.confidence || "NaN", note: null, fullModel: q2?.fullModel ?? false, sampleTier: q2?.tier, hasH2H: q2?.hasH2H, trap: q2?.trap ?? false, volatility: q2?.volatility, volLimit: getMarketVolLimit(league, "q2"), coeffFitted: _coeffFitted, projectionOnly: q2?.projectionOnly ?? false },
+      { _idx: 12, name: "Q3 Total" + q3Badge, marketKey: "q3", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q3Market")?.value), proj: q3?.proj, edge: q3?.edge, pick: q3?.pick || "NO PLAY", confidence: q3?.confidence || "NaN", note: null, fullModel: q3?.fullModel ?? false, sampleTier: q3?.tier, hasH2H: q3?.hasH2H, trap: q3?.trap ?? false, volatility: q3?.volatility, volLimit: getMarketVolLimit(league, "q3"), coeffFitted: _coeffFitted, projectionOnly: q3?.projectionOnly ?? false },
+      { _idx: 13, name: "Q4 Total" + q4Badge, marketKey: "q4", marketType: "h1", league, context: {}, line: parseMarketLine(document.getElementById("q4Market")?.value), proj: q4?.proj, edge: q4?.edge, pick: q4?.pick || "NO PLAY", confidence: q4?.confidence || "NaN", note: null, fullModel: q4?.fullModel ?? false, sampleTier: q4?.tier, hasH2H: q4?.hasH2H, trap: q4?.trap ?? false, volatility: q4?.volatility, volLimit: getMarketVolLimit(league, "q4"), coeffFitted: _coeffFitted, projectionOnly: q4?.projectionOnly ?? false },
   {
     _idx: 3,
     name: "Team A Total" + aBadge,
@@ -18402,7 +18548,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
   },
   {
     _idx: 14,
-    name: "Team A 1H",
+    name: "Team A 1H" + h1aBadge,
     marketKey: "h1_team_a",
     marketType: "h1",
     league,
@@ -18420,7 +18566,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
   },
   {
     _idx: 15,
-    name: "Team B 1H",
+    name: "Team B 1H" + h1bBadge,
     marketKey: "h1_team_b",
     marketType: "h1",
     league,
@@ -18560,6 +18706,13 @@ await applyMassacreFrameworkToPicks(finalPicksForDisplay, league, parsed, fixtur
         p.bufferedPickText = "NO PLAY";
       }
     });
+
+    // CONSERVATIVE LINE-HISTORY SIGNAL: only nudges confidence on picks that
+    // survived every gate above — never creates a pick, never flips a side,
+    // never touches edge/line. Runs after the final getPick() recompute so
+    // the side it checks against is the true final pick. See
+    // getLineHitRateVerdict/applyLineHitRateSignalToPicks defined earlier.
+    applyLineHitRateSignalToPicks(finalPicksForDisplay, ctxA, ctxB);
 
     {
       finalPicksForDisplay.forEach(p => {
