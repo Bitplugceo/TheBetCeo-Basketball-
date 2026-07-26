@@ -1,3 +1,4 @@
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16452,6 +16453,12 @@ function calculateScoresOnlyCalibration(evaluationResults) {
   const withTotal = valid.filter(r => isFinite(r.predictedTotal) && isFinite(r.actualTotal));
   const totalErrors = withTotal.map(r => r.predictedTotal - r.actualTotal);
 
+  const teamScoreErrors = [];
+  for (const r of valid) {
+    if (isFinite(r.predictedAScore) && isFinite(r.actualAScore)) teamScoreErrors.push(r.predictedAScore - r.actualAScore);
+    if (isFinite(r.predictedBScore) && isFinite(r.actualBScore)) teamScoreErrors.push(r.predictedBScore - r.actualBScore);
+  }
+
   const mae = arr => arr.reduce((s, v) => s + Math.abs(v), 0) / arr.length;
   const bias = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
 
@@ -16461,7 +16468,9 @@ function calculateScoresOnlyCalibration(evaluationResults) {
     marginMAE: mae(marginErrors),
     marginBias: bias(marginErrors),
     totalMAE: totalErrors.length ? mae(totalErrors) : null,
-    totalBias: totalErrors.length ? bias(totalErrors) : null
+    totalBias: totalErrors.length ? bias(totalErrors) : null,
+    teamScoreMAE: teamScoreErrors.length ? mae(teamScoreErrors) : null,
+    teamScoreBias: teamScoreErrors.length ? bias(teamScoreErrors) : null
   };
 }
 
@@ -16528,6 +16537,10 @@ async function runNbaSeasonBacktest(season) {
         actualMargin: game.scored - game.allowed,
         predictedTotal: calc.ftProj,
         actualTotal: game.scored + game.allowed,
+        predictedAScore: calc.projAFT,
+        actualAScore: game.scored,
+        predictedBScore: calc.projBFT,
+        actualBScore: game.allowed,
         sampleTier: calc.ftSampleTier
       });
     }
@@ -16541,14 +16554,29 @@ async function runNbaSeasonBacktest(season) {
   const full = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "full"));
   const thin = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "thin"));
 
+  const notes = [];
+  if (overall) {
+    if (isFinite(overall.totalBias) && Math.abs(overall.totalBias) >= 3) {
+      notes.push(`Total points are running ${overall.totalBias > 0 ? "high" : "low"} by about ${Math.abs(overall.totalBias).toFixed(1)} pts on average — worth checking pace assumptions.`);
+    }
+    if (isFinite(overall.teamScoreBias) && Math.abs(overall.teamScoreBias) >= 2) {
+      notes.push(`Individual team scores are running ${overall.teamScoreBias > 0 ? "high" : "low"} by about ${Math.abs(overall.teamScoreBias).toFixed(1)} pts on average.`);
+    }
+    if (full && thin && isFinite(full.straightUpAccuracy) && isFinite(thin.straightUpAccuracy) && thin.straightUpAccuracy > full.straightUpAccuracy + 0.03 && thin.n >= 30) {
+      notes.push(`Thin-sample games (5-9 prior games) are outperforming full-sample games (10) — recency weighting past game 7-9 may be worth re-checking once more seasons are in.`);
+    }
+  }
+  if (!notes.length) notes.push("No flags this run — margin, total, and team-score bias are all within a reasonable range.");
+
   const report = {
     season, league: "nba",
     totalGames: allGames.length, evaluated: results.length, skipped,
-    overall, byTier: { full, thin },
+    overall, byTier: { full, thin }, notes,
     computedAt: new Date().toISOString()
   };
   engineDebug("Season backtest complete", report);
   try { window.__lastSeasonBacktest = report; } catch (e) {}
+  try { localStorage.setItem("BB_SEASON_BACKTEST_NBA", JSON.stringify(report)); } catch (e) {}
   return report;
 }
 
@@ -16560,30 +16588,36 @@ function renderBacktestPanel() {
   panel.classList.remove("tracker-hidden");
   panel.style.display = "block";
 
-  const cached = window.__lastSeasonBacktest;
+  let cached = window.__lastSeasonBacktest;
+  if (!cached) {
+    try {
+      const stored = localStorage.getItem("BB_SEASON_BACKTEST_NBA");
+      if (stored) { cached = JSON.parse(stored); window.__lastSeasonBacktest = cached; }
+    } catch (e) {}
+  }
   const fmtPct = v => isFinite(v) ? `${(v * 100).toFixed(1)}%` : "—";
   const fmtNum = v => isFinite(v) ? v.toFixed(1) : "—";
 
   const summaryHtml = cached ? `
         <div class="tracker-summary-cell primary">
-          <div class="tracker-summary-label">Straight-Up Accuracy</div>
-          <div class="tracker-summary-value">${fmtPct(cached.overall?.straightUpAccuracy)}</div>
-          <div class="tracker-summary-sub">${cached.evaluated} games · ${cached.skipped} skipped (insufficient sample)</div>
+          <div class="tracker-summary-label">Total Points MAE / Bias</div>
+          <div class="tracker-summary-value">${fmtNum(cached.overall?.totalMAE)}</div>
+          <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.totalBias)} · ${cached.evaluated} games · ${cached.skipped} skipped</div>
+        </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">Team Points MAE / Bias</div>
+          <div class="tracker-summary-value">${fmtNum(cached.overall?.teamScoreMAE)}</div>
+          <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.teamScoreBias)}</div>
+        </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">1st Half / Quarters</div>
+          <div class="tracker-summary-value">—</div>
+          <div class="tracker-summary-sub">Not built yet — needs per-game box scores</div>
         </div>
         <div class="tracker-summary-cell">
           <div class="tracker-summary-label">Margin MAE / Bias</div>
           <div class="tracker-summary-value">${fmtNum(cached.overall?.marginMAE)}</div>
-          <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.marginBias)}</div>
-        </div>
-        <div class="tracker-summary-cell">
-          <div class="tracker-summary-label">Total MAE / Bias</div>
-          <div class="tracker-summary-value">${fmtNum(cached.overall?.totalMAE)}</div>
-          <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.totalBias)}</div>
-        </div>
-        <div class="tracker-summary-cell">
-          <div class="tracker-summary-label">Full-Sample Tier (n=${cached.byTier?.full?.n || 0})</div>
-          <div class="tracker-summary-value">${fmtPct(cached.byTier?.full?.straightUpAccuracy)}</div>
-          <div class="tracker-summary-sub">Thin tier (n=${cached.byTier?.thin?.n || 0}): ${fmtPct(cached.byTier?.thin?.straightUpAccuracy)}</div>
+          <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.marginBias)} · Straight-up: ${fmtPct(cached.overall?.straightUpAccuracy)}</div>
         </div>
   ` : `
         <div class="tracker-summary-cell primary">
@@ -16593,13 +16627,15 @@ function renderBacktestPanel() {
         </div>
   `;
 
+  const notesHtml = (cached?.notes || []).map(n => `<div style="padding:8px 12px; border-left:3px solid #3a9c35; margin-bottom:6px; font-size:12px; background:rgba(58,156,53,0.08);">${n}</div>`).join("");
+
   const html = `
     <div class="tracker-analytics-shell">
       <div class="tracker-analytics-topbar">
         <div class="tracker-analytics-heading">
           <div class="tracker-analytics-kicker">Season Backtest</div>
           <div class="tracker-analytics-title">Scores-Only Calibration — NBA</div>
-          <div class="tracker-analytics-subtitle">Projection accuracy against real final scores, no market line involved. Full-time market only. ${cached ? `Last run: ${new Date(cached.computedAt).toLocaleString()} (season ${cached.season})` : ""}</div>
+          <div class="tracker-analytics-subtitle">Total points, team points, and margin checked against real final scores, no market line involved. ${cached ? `Last run: ${new Date(cached.computedAt).toLocaleString()} (season ${cached.season})` : ""}</div>
         </div>
       </div>
 
@@ -16610,6 +16646,10 @@ function renderBacktestPanel() {
       <div style="padding:12px 16px;">
         <button type="button" id="runSeasonBacktestBtn" style="background:#3a9c35; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer;">▶ Run NBA Season Backtest</button>
         <span id="backtestStatusLabel" style="margin-left:10px; font-size:12px; opacity:0.8;"></span>
+      </div>
+
+      <div style="padding:0 16px 16px;">
+        ${notesHtml}
       </div>
     </div>
   `;
