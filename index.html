@@ -1,4 +1,3 @@
-K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16434,13 +16433,36 @@ async function fetchNbaTeamSeasonGameLog(teamId, season) {
   }
 }
 
-function _btRollingWindow(gameLog, beforeDateIso, n = 10) {
+async function fetchNbaGameH1(eventId) {
+  const base = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
+  try {
+    const data = await proxyFetch(`${base}/summary?event=${eventId}`);
+    const comp = data?.header?.competitions?.[0];
+    const competitors = comp?.competitors || [];
+    if (competitors.length < 2) return null;
+    const rv = v => parseFloat(v?.value ?? v?.displayValue ?? 0) || 0;
+    const out = {};
+    for (const c of competitors) {
+      const id = String(c?.team?.id || "");
+      const ls = c?.linescores || [];
+      if (!id || ls.length < 2) continue;
+      out[id] = rv(ls[0]) + rv(ls[1]);
+    }
+    if (Object.keys(out).length < 2) return null;
+    return out;
+  } catch (e) {
+    engineDebug("fetchNbaGameH1 failed", { eventId, error: e?.message || String(e) });
+    return null;
+  }
+}
+
+function _btRollingWindow(gameLog, beforeDateIso, n = 10, scoredField = "scored", allowedField = "allowed") {
   const cutoff = new Date(beforeDateIso).getTime();
-  const prior = (gameLog || []).filter(g => new Date(g.date).getTime() < cutoff);
+  const prior = (gameLog || []).filter(g => new Date(g.date).getTime() < cutoff && isFinite(g[scoredField]) && isFinite(g[allowedField]));
   const recent = prior.slice(-n).reverse();
   return {
-    scored: recent.map(g => g.scored),
-    allowed: recent.map(g => g.allowed)
+    scored: recent.map(g => g[scoredField]),
+    allowed: recent.map(g => g[allowedField])
   };
 }
 
@@ -16459,6 +16481,15 @@ function calculateScoresOnlyCalibration(evaluationResults) {
     if (isFinite(r.predictedBScore) && isFinite(r.actualBScore)) teamScoreErrors.push(r.predictedBScore - r.actualBScore);
   }
 
+  const withH1Total = valid.filter(r => isFinite(r.predictedH1Total) && isFinite(r.actualH1Total));
+  const h1TotalErrors = withH1Total.map(r => r.predictedH1Total - r.actualH1Total);
+
+  const h1TeamScoreErrors = [];
+  for (const r of valid) {
+    if (isFinite(r.predictedH1AScore) && isFinite(r.actualH1AScore)) h1TeamScoreErrors.push(r.predictedH1AScore - r.actualH1AScore);
+    if (isFinite(r.predictedH1BScore) && isFinite(r.actualH1BScore)) h1TeamScoreErrors.push(r.predictedH1BScore - r.actualH1BScore);
+  }
+
   const mae = arr => arr.reduce((s, v) => s + Math.abs(v), 0) / arr.length;
   const bias = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
 
@@ -16470,11 +16501,16 @@ function calculateScoresOnlyCalibration(evaluationResults) {
     totalMAE: totalErrors.length ? mae(totalErrors) : null,
     totalBias: totalErrors.length ? bias(totalErrors) : null,
     teamScoreMAE: teamScoreErrors.length ? mae(teamScoreErrors) : null,
-    teamScoreBias: teamScoreErrors.length ? bias(teamScoreErrors) : null
+    teamScoreBias: teamScoreErrors.length ? bias(teamScoreErrors) : null,
+    h1TotalMAE: h1TotalErrors.length ? mae(h1TotalErrors) : null,
+    h1TotalBias: h1TotalErrors.length ? bias(h1TotalErrors) : null,
+    h1TeamScoreMAE: h1TeamScoreErrors.length ? mae(h1TeamScoreErrors) : null,
+    h1TeamScoreBias: h1TeamScoreErrors.length ? bias(h1TeamScoreErrors) : null,
+    h1N: withH1Total.length
   };
 }
 
-async function runNbaSeasonBacktest(season) {
+async function runNbaSeasonBacktest(season, onProgress) {
   season = season || (getCurrentSeasonYear("nba") - 1);
   engineDebug("Season backtest starting", { league: "nba", season });
 
@@ -16498,6 +16534,28 @@ async function runNbaSeasonBacktest(season) {
   }
   allGames.sort((a, b) => new Date(a.date) - new Date(b.date));
 
+  const H1_CHUNK = 10;
+  const h1ByEvent = {};
+  for (let i = 0; i < allGames.length; i += H1_CHUNK) {
+    const chunk = allGames.slice(i, i + H1_CHUNK);
+    const chunkH1 = await Promise.all(chunk.map(g => fetchNbaGameH1(g.eventId)));
+    chunk.forEach((g, idx) => { h1ByEvent[g.eventId] = chunkH1[idx]; });
+    if (typeof onProgress === "function") {
+      try { onProgress(Math.min(i + H1_CHUNK, allGames.length), allGames.length); } catch (e) {}
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  for (const teamId of teamIds) {
+    for (const g of (gameLogs[teamId] || [])) {
+      const h1map = h1ByEvent[g.eventId];
+      if (h1map && isFinite(h1map[g.teamId]) && isFinite(h1map[g.oppId])) {
+        g.h1Scored = h1map[g.teamId];
+        g.h1Allowed = h1map[g.oppId];
+      }
+    }
+  }
+
   const domA = document.getElementById("aFTScored");
   const domB = document.getElementById("bFTScored");
   const savedA = domA ? domA.value : null;
@@ -16518,7 +16576,14 @@ async function runNbaSeasonBacktest(season) {
       if (domA) domA.value = teamWindow.scored.join(",");
       if (domB) domB.value = oppWindow.scored.join(",");
 
-      const parsed = { aFTAllowed: teamWindow.allowed, bFTAllowed: oppWindow.allowed };
+      const teamH1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "h1Scored", "h1Allowed");
+      const oppH1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "h1Scored", "h1Allowed");
+
+      const parsed = {
+        aFTAllowed: teamWindow.allowed, bFTAllowed: oppWindow.allowed,
+        a1HScored: teamH1Window.scored, b1HScored: oppH1Window.scored,
+        a1HAllowed: teamH1Window.allowed, b1HAllowed: oppH1Window.allowed
+      };
 
       let calc;
       try {
@@ -16529,6 +16594,15 @@ async function runNbaSeasonBacktest(season) {
       }
 
       if (!isFinite(calc.projAFT) || !isFinite(calc.projBFT)) { skipped++; continue; }
+
+      let calc1H = null;
+      try {
+        calc1H = compute1HProjection({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1, config: {} });
+      } catch (e) {
+        calc1H = null;
+      }
+
+      const h1Actual = isFinite(game.h1Scored) && isFinite(game.h1Allowed);
 
       results.push({
         date: game.date,
@@ -16541,6 +16615,12 @@ async function runNbaSeasonBacktest(season) {
         actualAScore: game.scored,
         predictedBScore: calc.projBFT,
         actualBScore: game.allowed,
+        predictedH1Total: (calc1H && isFinite(calc1H.h1Proj)) ? calc1H.h1Proj : NaN,
+        actualH1Total: h1Actual ? (game.h1Scored + game.h1Allowed) : NaN,
+        predictedH1AScore: (calc1H && isFinite(calc1H.projA1H)) ? calc1H.projA1H : NaN,
+        actualH1AScore: h1Actual ? game.h1Scored : NaN,
+        predictedH1BScore: (calc1H && isFinite(calc1H.projB1H)) ? calc1H.projB1H : NaN,
+        actualH1BScore: h1Actual ? game.h1Allowed : NaN,
         sampleTier: calc.ftSampleTier
       });
     }
@@ -16564,6 +16644,9 @@ async function runNbaSeasonBacktest(season) {
     }
     if (full && thin && isFinite(full.straightUpAccuracy) && isFinite(thin.straightUpAccuracy) && thin.straightUpAccuracy > full.straightUpAccuracy + 0.03 && thin.n >= 30) {
       notes.push(`Thin-sample games (5-9 prior games) are outperforming full-sample games (10) — recency weighting past game 7-9 may be worth re-checking once more seasons are in.`);
+    }
+    if (isFinite(overall.h1TotalBias) && Math.abs(overall.h1TotalBias) >= 2) {
+      notes.push(`1st half total is running ${overall.h1TotalBias > 0 ? "high" : "low"} by about ${Math.abs(overall.h1TotalBias).toFixed(1)} pts on average.`);
     }
   }
   if (!notes.length) notes.push("No flags this run — margin, total, and team-score bias are all within a reasonable range.");
@@ -16610,14 +16693,24 @@ function renderBacktestPanel() {
           <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.teamScoreBias)}</div>
         </div>
         <div class="tracker-summary-cell">
-          <div class="tracker-summary-label">1st Half / Quarters</div>
-          <div class="tracker-summary-value">—</div>
-          <div class="tracker-summary-sub">Not built yet — needs per-game box scores</div>
+          <div class="tracker-summary-label">1st Half Total MAE / Bias</div>
+          <div class="tracker-summary-value">${fmtNum(cached.overall?.h1TotalMAE)}</div>
+          <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.h1TotalBias)} · n=${cached.overall?.h1N || 0}</div>
+        </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">1st Half Team Points MAE / Bias</div>
+          <div class="tracker-summary-value">${fmtNum(cached.overall?.h1TeamScoreMAE)}</div>
+          <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.h1TeamScoreBias)}</div>
         </div>
         <div class="tracker-summary-cell">
           <div class="tracker-summary-label">Margin MAE / Bias</div>
           <div class="tracker-summary-value">${fmtNum(cached.overall?.marginMAE)}</div>
           <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.marginBias)} · Straight-up: ${fmtPct(cached.overall?.straightUpAccuracy)}</div>
+        </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">Quarters (Q1-4)</div>
+          <div class="tracker-summary-value">—</div>
+          <div class="tracker-summary-sub">Not built yet — next after 1st half</div>
         </div>
   ` : `
         <div class="tracker-summary-cell primary">
@@ -16635,7 +16728,7 @@ function renderBacktestPanel() {
         <div class="tracker-analytics-heading">
           <div class="tracker-analytics-kicker">Season Backtest</div>
           <div class="tracker-analytics-title">Scores-Only Calibration — NBA</div>
-          <div class="tracker-analytics-subtitle">Total points, team points, and margin checked against real final scores, no market line involved. ${cached ? `Last run: ${new Date(cached.computedAt).toLocaleString()} (season ${cached.season})` : ""}</div>
+          <div class="tracker-analytics-subtitle">Total points, team points, 1st half, and margin checked against real final scores, no market line involved. ${cached ? `Last run: ${new Date(cached.computedAt).toLocaleString()} (season ${cached.season})` : ""}</div>
         </div>
       </div>
 
@@ -16661,9 +16754,11 @@ function renderBacktestPanel() {
     runBtn.onclick = async () => {
       const statusLabel = document.getElementById("backtestStatusLabel");
       runBtn.disabled = true;
-      if (statusLabel) statusLabel.textContent = "Fetching season data and running projections… this can take a moment.";
+      if (statusLabel) statusLabel.textContent = "Fetching season schedules…";
       try {
-        await runNbaSeasonBacktest();
+        await runNbaSeasonBacktest(null, (done, total) => {
+          if (statusLabel) statusLabel.textContent = `Fetching 1st half data… ${done}/${total} games. This can take a couple minutes.`;
+        });
         renderBacktestPanel();
       } catch (e) {
         engineDebug("runNbaSeasonBacktest failed from UI", e);
