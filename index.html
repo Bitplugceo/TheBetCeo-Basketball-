@@ -1,4 +1,3 @@
-D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16552,10 +16551,20 @@ async function runNbaSeasonBacktest(season, onProgress) {
 
   const H1_CHUNK = 10;
   for (let i = 0; i < remainingGames.length; i += H1_CHUNK) {
+    const batchStart = Date.now();
     const chunk = remainingGames.slice(i, i + H1_CHUNK);
-    const chunkH1 = await Promise.all(chunk.map(g => fetchNbaGameH1(g.eventId)));
+    let chunkH1;
+    try {
+      chunkH1 = await Promise.all(chunk.map(g => fetchNbaGameH1(g.eventId)));
+    } catch (e) {
+      engineDebug("Backtest H1 batch threw unexpectedly", { batchIndex: i, error: e?.message || String(e) });
+      throw e;
+    }
     chunk.forEach((g, idx) => { h1ByEvent[g.eventId] = chunkH1[idx]; });
-    try { localStorage.setItem(h1ProgressKey, JSON.stringify({ season, h1ByEvent })); } catch (e) {}
+    try { localStorage.setItem(h1ProgressKey, JSON.stringify({ season, h1ByEvent })); } catch (e) {
+      engineDebug("Backtest progress save failed", { error: e?.message || String(e) });
+    }
+    engineDebug("Backtest H1 batch complete", { done: alreadyDone + i + H1_CHUNK, total: allGames.length, batchMs: Date.now() - batchStart });
     if (typeof onProgress === "function") {
       try { onProgress(Math.min(alreadyDone + i + H1_CHUNK, allGames.length), allGames.length); } catch (e) {}
     }
@@ -16784,16 +16793,38 @@ function renderBacktestPanel() {
       const statusLabel = document.getElementById("backtestStatusLabel");
       runBtn.disabled = true;
       if (statusLabel) statusLabel.textContent = "Fetching season schedules…";
+
+      let wakeLock = null;
+      const requestBtWakeLock = async () => {
+        try {
+          if ("wakeLock" in navigator) {
+            wakeLock = await navigator.wakeLock.request("screen");
+            engineDebug("Backtest wake lock acquired");
+          } else {
+            engineDebug("Backtest wake lock unsupported on this browser");
+          }
+        } catch (e) {
+          engineDebug("Backtest wake lock request failed", { error: e?.message || String(e) });
+        }
+      };
+      await requestBtWakeLock();
+      const reacquireBtWakeLock = () => {
+        if (document.visibilityState === "visible" && !wakeLock) requestBtWakeLock();
+      };
+      document.addEventListener("visibilitychange", reacquireBtWakeLock);
+
       try {
         await runNbaSeasonBacktest(null, (done, total) => {
-          if (statusLabel) statusLabel.textContent = `Fetching 1st half data… ${done}/${total} games. This can take a couple minutes.`;
+          if (statusLabel) statusLabel.textContent = `Fetching 1st half data… ${done}/${total} games. Keep this tab open and the screen on.`;
         });
         renderBacktestPanel();
       } catch (e) {
-        engineDebug("runNbaSeasonBacktest failed from UI", e);
-        if (statusLabel) statusLabel.textContent = "Backtest failed — check debug log.";
+        engineDebug("runNbaSeasonBacktest failed from UI", { error: e?.message || String(e), stack: e?.stack || null });
+        if (statusLabel) statusLabel.textContent = `Backtest failed — ${e?.message || "check debug log"}.`;
       } finally {
         runBtn.disabled = false;
+        document.removeEventListener("visibilitychange", reacquireBtWakeLock);
+        try { if (wakeLock) await wakeLock.release(); } catch (e) {}
       }
     };
   }
