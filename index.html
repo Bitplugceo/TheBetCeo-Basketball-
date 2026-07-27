@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16446,7 +16447,12 @@ async function fetchNbaGameH1(eventId) {
       const id = String(c?.team?.id || "");
       const ls = c?.linescores || [];
       if (!id || ls.length < 2) continue;
-      out[id] = rv(ls[0]) + rv(ls[1]);
+      const entry = { h1: rv(ls[0]) + rv(ls[1]) };
+      if (ls.length >= 4) {
+        const q = [rv(ls[0]), rv(ls[1]), rv(ls[2]), rv(ls[3])];
+        if (q.every(v => v > 0)) entry.quarters = q;
+      }
+      out[id] = entry;
     }
     if (Object.keys(out).length < 2) return null;
     return out;
@@ -16454,6 +16460,132 @@ async function fetchNbaGameH1(eventId) {
     engineDebug("fetchNbaGameH1 failed", { eventId, error: e?.message || String(e) });
     return null;
   }
+}
+
+function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, injB = 1, teamAName = "", teamBName = "", config = {} }) {
+  const aS = getManualSeries("A", qKey, parsed);
+  const bS = getManualSeries("B", qKey, parsed);
+
+  const _dateAwareAvgAQ = getDateAwareOrFallbackAverage(aS, "A", qKey);
+  const _dateAwareAvgBQ = getDateAwareOrFallbackAverage(bS, "B", qKey);
+
+  const pKeyA = "a" + qKey.toUpperCase() + "Allowed";
+  const pKeyB = "b" + qKey.toUpperCase() + "Allowed";
+  const aA = (parsed[pKeyA] && parsed[pKeyA].length) ? parsed[pKeyA] : (AppState.context.data.A[qKey + "Allowed"] || []);
+  const bA = (parsed[pKeyB] && parsed[pKeyB].length) ? parsed[pKeyB] : (AppState.context.data.B[qKey + "Allowed"] || []);
+
+  const volLimit = getMarketVolLimit(league, qKey);
+  const sampleSize = Math.min(aS.length, bS.length);
+  const leagueBaseQ = (LEAGUE_BASES[league] || 160) / 8;
+
+  let projA, projB;
+  const _dynWeightsQ = getDynamicWeights(
+    getSampleTier(aS, bS),
+    globalModelState?.volState?.combinedVolRatio ?? 0.5,
+    league
+  );
+  const _twQ = isFinite(_dynWeightsQ?.teamWeight) ? Number(_dynWeightsQ.teamWeight) : 0.65;
+  const _owQ = 1 - _twQ;
+
+  projA = anchorProjection(_dateAwareAvgAQ * _twQ + avgOrNaN(bA) * _owQ, sampleSize, leagueBaseQ);
+  projB = anchorProjection(_dateAwareAvgBQ * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
+
+  const QUARTER_VENUE_PROXY_FACTOR = isFinite(getParam("quarterVenueProxyFactor", league)) ? Number(getParam("quarterVenueProxyFactor", league)) : 1;
+  if (ftCalc.aVenueEnabled && isFinite(ftCalc.aVenueAdjustment?.offensiveAdjustment)) {
+    projA += (ftCalc.aVenueAdjustment.offensiveAdjustment / 4) * QUARTER_VENUE_PROXY_FACTOR;
+  }
+  if (ftCalc.bVenueEnabled && isFinite(ftCalc.bVenueAdjustment?.offensiveAdjustment)) {
+    projB += (ftCalc.bVenueAdjustment.offensiveAdjustment / 4) * QUARTER_VENUE_PROXY_FACTOR;
+  }
+
+  projA = applyVolatility(projA, aS, volLimit, league);
+  projB = applyVolatility(projB, bS, volLimit, league);
+
+  projA *= injA;
+  projB *= injB;
+
+  const _qInjOppBoostFactor = getParam("injuryOppBoostFactor", league) ?? INJURY_OPPONENT_BOOST_FACTOR;
+  if (injA < 1) projB *= (1 + (1 - injA) * _qInjOppBoostFactor);
+  if (injB < 1) projA *= (1 + (1 - injB) * _qInjOppBoostFactor);
+
+  const aH2H = getH2HSeries("A", qKey, parsed);
+  const bH2H = getH2HSeries("B", qKey, parsed);
+  const hasH2H = maybeReadH2HEnabled(qKey) && aH2H.length >= 2 && bH2H.length >= 2;
+  const tier = getSampleTier(aS, bS);
+
+  if (hasH2H) {
+    const massacreH2HQ = getMassacreH2HSeries(qKey, getCurrentFixtureMeta(), parsed);
+    const decayH2HA = massacreH2HQ.A.length >= 2 ? massacreH2HQ.A : aH2H;
+    const decayH2HB = massacreH2HQ.B.length >= 2 ? massacreH2HQ.B : bH2H;
+    const qVolRatio = getVolatilityRatioForSeries(aS.concat(bS), volLimit);
+    const _qH2hFactor = isFinite(config?.h2hFactor) ? Number(config.h2hFactor) : 1.0;
+    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, qKey, tier, Math.abs(projA - projB), league, leagueBaseQ, _qH2hFactor, {
+      enabled: hasH2H, injMultA: injA, injMultB: injB, volRatio: qVolRatio,
+      blowoutGap: Math.abs(projA - projB),
+      paceGapRisk: false
+    });
+    const avgH2HA = avgOrNaN(decayH2HA);
+    const avgH2HB = avgOrNaN(decayH2HB);
+    projA = isFinite(avgH2HA) ? ((projA * (1 - hw)) + (avgH2HA * hw)) : projA;
+    projB = isFinite(avgH2HB) ? ((projB * (1 - hw)) + (avgH2HB * hw)) : projB;
+
+    const _aInjAdjBaselineQ = avgOrNaN(aS) * injA * (injB < 1 ? (1 + (1 - injB) * _qInjOppBoostFactor) : 1);
+    const _bInjAdjBaselineQ = avgOrNaN(bS) * injB * (injA < 1 ? (1 + (1 - injA) * _qInjOppBoostFactor) : 1);
+    projA = applyVolatility(projA, aS, volLimit, league, _aInjAdjBaselineQ);
+    projB = applyVolatility(projB, bS, volLimit, league, _bInjAdjBaselineQ);
+  }
+
+  const shapeSignalA = getTeamQuarterShapeSignal(league, teamAName, qKey);
+  const shapeSignalB = getTeamQuarterShapeSignal(league, teamBName, qKey);
+  if (shapeSignalA && shapeSignalA.direction !== "neutral") {
+    projA *= (1 + clampNumber(shapeSignalA.z, -3, 3) * 0.02);
+  }
+  if (shapeSignalB && shapeSignalB.direction !== "neutral") {
+    projB *= (1 + clampNumber(shapeSignalB.z, -3, 3) * 0.02);
+  }
+
+  return { projA, projB, proj: projA + projB, sampleTier: tier };
+}
+
+function applyQuarterAnchorBlendBT(q1, q2, q3, q4, h1Calc, ftCalc) {
+  if (q4 && isFinite(q4.projA) && isFinite(q4.projB) &&
+      isFinite(ftCalc.blowoutGap) && ftCalc.blowoutGap > 15) {
+    const isFavorA = ftCalc.projAFT > ftCalc.projBFT;
+    q4.projA = isFavorA ? q4.projA * 0.85 : q4.projA * 1.10;
+    q4.projB = isFavorA ? q4.projB * 1.10 : q4.projB * 0.85;
+    q4.proj = q4.projA + q4.projB;
+  }
+
+  const rawQ12Sum = (q1?.proj || 0) + (q2?.proj || 0);
+  const rawQ34Sum = (q3?.proj || 0) + (q4?.proj || 0);
+  const h1Target = isFinite(h1Calc.h1Proj) && h1Calc.h1Proj > 0 ? h1Calc.h1Proj : rawQ12Sum;
+  const h2Target = isFinite(ftCalc.ftProj) && h1Target > 0 ? ftCalc.ftProj - h1Target : rawQ34Sum;
+
+  if (rawQ12Sum > 0 && isFinite(h1Target)) {
+    const totalWeightedRaw12 = (q1?.proj || 0) + (q2?.proj || 0);
+    const q1Scale = (h1Target * (q1?.proj || 0)) / (totalWeightedRaw12 || 1) / (q1?.proj || 1);
+    const q2Scale = (h1Target * (q2?.proj || 0)) / (totalWeightedRaw12 || 1) / (q2?.proj || 1);
+    if (q1 && isFinite(q1.proj)) {
+      q1.proj = q1.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q1.proj * q1Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+    }
+    if (q2 && isFinite(q2.proj)) {
+      q2.proj = q2.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q2.proj * q2Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+    }
+  }
+
+  if (rawQ34Sum > 0 && isFinite(h2Target) && h2Target > 0) {
+    const totalWeightedRaw34 = (q3?.proj || 0) + (q4?.proj || 0);
+    const q3Scale = (h2Target * (q3?.proj || 0)) / (totalWeightedRaw34 || 1) / (q3?.proj || 1);
+    const q4Scale = (h2Target * (q4?.proj || 0)) / (totalWeightedRaw34 || 1) / (q4?.proj || 1);
+    if (q3 && isFinite(q3.proj)) {
+      q3.proj = q3.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q3.proj * q3Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+    }
+    if (q4 && isFinite(q4.proj)) {
+      q4.proj = q4.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q4.proj * q4Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+    }
+  }
+
+  return { q1, q2, q3, q4 };
 }
 
 function _btRollingWindow(gameLog, beforeDateIso, n = 10, scoredField = "scored", allowedField = "allowed") {
@@ -16490,6 +16622,16 @@ function calculateScoresOnlyCalibration(evaluationResults) {
     if (isFinite(r.predictedH1BScore) && isFinite(r.actualH1BScore)) h1TeamScoreErrors.push(r.predictedH1BScore - r.actualH1BScore);
   }
 
+  const qTotalErrors = [];
+  for (const r of valid) {
+    for (const [p, a] of (r.quarterTotalPairs || [])) qTotalErrors.push(p - a);
+  }
+  const qTeamErrors = [];
+  for (const r of valid) {
+    for (const [p, a] of (r.quarterTeamPairs || [])) qTeamErrors.push(p - a);
+  }
+  const qGamesCovered = valid.filter(r => (r.quarterTotalPairs || []).length > 0).length;
+
   const mae = arr => arr.reduce((s, v) => s + Math.abs(v), 0) / arr.length;
   const bias = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
 
@@ -16506,7 +16648,12 @@ function calculateScoresOnlyCalibration(evaluationResults) {
     h1TotalBias: h1TotalErrors.length ? bias(h1TotalErrors) : null,
     h1TeamScoreMAE: h1TeamScoreErrors.length ? mae(h1TeamScoreErrors) : null,
     h1TeamScoreBias: h1TeamScoreErrors.length ? bias(h1TeamScoreErrors) : null,
-    h1N: withH1Total.length
+    h1N: withH1Total.length,
+    qTotalMAE: qTotalErrors.length ? mae(qTotalErrors) : null,
+    qTotalBias: qTotalErrors.length ? bias(qTotalErrors) : null,
+    qTeamMAE: qTeamErrors.length ? mae(qTeamErrors) : null,
+    qTeamBias: qTeamErrors.length ? bias(qTeamErrors) : null,
+    qN: qGamesCovered
   };
 }
 
@@ -16574,9 +16721,17 @@ async function runNbaSeasonBacktest(season, onProgress) {
   for (const teamId of teamIds) {
     for (const g of (gameLogs[teamId] || [])) {
       const h1map = h1ByEvent[g.eventId];
-      if (h1map && isFinite(h1map[g.teamId]) && isFinite(h1map[g.oppId])) {
-        g.h1Scored = h1map[g.teamId];
-        g.h1Allowed = h1map[g.oppId];
+      const mine = h1map?.[g.teamId];
+      const opp = h1map?.[g.oppId];
+      if (mine && opp && isFinite(mine.h1) && isFinite(opp.h1)) {
+        g.h1Scored = mine.h1;
+        g.h1Allowed = opp.h1;
+      }
+      if (mine?.quarters && opp?.quarters) {
+        g.q1Scored = mine.quarters[0]; g.q1Allowed = opp.quarters[0];
+        g.q2Scored = mine.quarters[1]; g.q2Allowed = opp.quarters[1];
+        g.q3Scored = mine.quarters[2]; g.q3Allowed = opp.quarters[2];
+        g.q4Scored = mine.quarters[3]; g.q4Allowed = opp.quarters[3];
       }
     }
   }
@@ -16588,7 +16743,9 @@ async function runNbaSeasonBacktest(season, onProgress) {
   const savedA = domA ? domA.value : null;
   const savedB = domB ? domB.value : null;
   const savedContextData = AppState.context.data;
+  const savedSeriesDateCache = window.__seriesDateCache;
   AppState.context.data = defaultMassacreFetchContext();
+  window.__seriesDateCache = {};
 
   const results = [];
   let skipped = 0;
@@ -16605,11 +16762,27 @@ async function runNbaSeasonBacktest(season, onProgress) {
 
       const teamH1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "h1Scored", "h1Allowed");
       const oppH1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "h1Scored", "h1Allowed");
+      const teamQ1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q1Scored", "q1Allowed");
+      const oppQ1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q1Scored", "q1Allowed");
+      const teamQ2Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q2Scored", "q2Allowed");
+      const oppQ2Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q2Scored", "q2Allowed");
+      const teamQ3Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q3Scored", "q3Allowed");
+      const oppQ3Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q3Scored", "q3Allowed");
+      const teamQ4Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q4Scored", "q4Allowed");
+      const oppQ4Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q4Scored", "q4Allowed");
 
       const parsed = {
         aFTAllowed: teamWindow.allowed, bFTAllowed: oppWindow.allowed,
         a1HScored: teamH1Window.scored, b1HScored: oppH1Window.scored,
-        a1HAllowed: teamH1Window.allowed, b1HAllowed: oppH1Window.allowed
+        a1HAllowed: teamH1Window.allowed, b1HAllowed: oppH1Window.allowed,
+        aQ1Scored: teamQ1Window.scored, bQ1Scored: oppQ1Window.scored,
+        aQ1Allowed: teamQ1Window.allowed, bQ1Allowed: oppQ1Window.allowed,
+        aQ2Scored: teamQ2Window.scored, bQ2Scored: oppQ2Window.scored,
+        aQ2Allowed: teamQ2Window.allowed, bQ2Allowed: oppQ2Window.allowed,
+        aQ3Scored: teamQ3Window.scored, bQ3Scored: oppQ3Window.scored,
+        aQ3Allowed: teamQ3Window.allowed, bQ3Allowed: oppQ3Window.allowed,
+        aQ4Scored: teamQ4Window.scored, bQ4Scored: oppQ4Window.scored,
+        aQ4Allowed: teamQ4Window.allowed, bQ4Allowed: oppQ4Window.allowed
       };
 
       let calc;
@@ -16629,7 +16802,33 @@ async function runNbaSeasonBacktest(season, onProgress) {
         calc1H = null;
       }
 
+      let q1 = null, q2 = null, q3 = null, q4 = null;
+      try {
+        if (calc1H) {
+          q1 = computeQuarterProjectionBT("q1", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName });
+          q2 = computeQuarterProjectionBT("q2", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName });
+          q3 = computeQuarterProjectionBT("q3", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName });
+          q4 = computeQuarterProjectionBT("q4", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName });
+          applyQuarterAnchorBlendBT(q1, q2, q3, q4, calc1H, calc);
+        }
+      } catch (e) {
+        q1 = q2 = q3 = q4 = null;
+      }
+
       const h1Actual = isFinite(game.h1Scored) && isFinite(game.h1Allowed);
+      const quartersActual = [game.q1Scored, game.q2Scored, game.q3Scored, game.q4Scored, game.q1Allowed, game.q2Allowed, game.q3Allowed, game.q4Allowed].every(isFinite);
+
+      const qPredTotals = [q1, q2, q3, q4].map(q => (q && isFinite(q.proj)) ? q.proj : NaN);
+      const qActualTotals = quartersActual ? [
+        game.q1Scored + game.q1Allowed, game.q2Scored + game.q2Allowed,
+        game.q3Scored + game.q3Allowed, game.q4Scored + game.q4Allowed
+      ] : [NaN, NaN, NaN, NaN];
+      const qPredTeamScores = [];
+      const qActualTeamScores = [];
+      [q1, q2, q3, q4].forEach((q, i) => {
+        if (q && isFinite(q.projA)) { qPredTeamScores.push(q.projA); qActualTeamScores.push(quartersActual ? [game.q1Scored, game.q2Scored, game.q3Scored, game.q4Scored][i] : NaN); }
+        if (q && isFinite(q.projB)) { qPredTeamScores.push(q.projB); qActualTeamScores.push(quartersActual ? [game.q1Allowed, game.q2Allowed, game.q3Allowed, game.q4Allowed][i] : NaN); }
+      });
 
       results.push({
         date: game.date,
@@ -16648,6 +16847,8 @@ async function runNbaSeasonBacktest(season, onProgress) {
         actualH1AScore: h1Actual ? game.h1Scored : NaN,
         predictedH1BScore: (calc1H && isFinite(calc1H.projB1H)) ? calc1H.projB1H : NaN,
         actualH1BScore: h1Actual ? game.h1Allowed : NaN,
+        quarterTotalPairs: qPredTotals.map((p, i) => [p, qActualTotals[i]]).filter(([p, a]) => isFinite(p) && isFinite(a)),
+        quarterTeamPairs: qPredTeamScores.map((p, i) => [p, qActualTeamScores[i]]).filter(([p, a]) => isFinite(p) && isFinite(a)),
         sampleTier: calc.ftSampleTier
       });
     }
@@ -16655,6 +16856,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
     if (domA) domA.value = savedA ?? "";
     if (domB) domB.value = savedB ?? "";
     AppState.context.data = savedContextData;
+    window.__seriesDateCache = savedSeriesDateCache;
   }
 
   const overall = calculateScoresOnlyCalibration(results);
@@ -16674,6 +16876,9 @@ async function runNbaSeasonBacktest(season, onProgress) {
     }
     if (isFinite(overall.h1TotalBias) && Math.abs(overall.h1TotalBias) >= 2) {
       notes.push(`1st half total is running ${overall.h1TotalBias > 0 ? "high" : "low"} by about ${Math.abs(overall.h1TotalBias).toFixed(1)} pts on average.`);
+    }
+    if (isFinite(overall.qTotalBias) && Math.abs(overall.qTotalBias) >= 1.5) {
+      notes.push(`Quarter totals are running ${overall.qTotalBias > 0 ? "high" : "low"} by about ${Math.abs(overall.qTotalBias).toFixed(1)} pts on average.`);
     }
   }
   if (!notes.length) notes.push("No flags this run — margin, total, and team-score bias are all within a reasonable range.");
@@ -16745,9 +16950,14 @@ function renderBacktestPanel() {
           <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.marginBias)} · Straight-up: ${fmtPct(cached.overall?.straightUpAccuracy)}</div>
         </div>
         <div class="tracker-summary-cell">
-          <div class="tracker-summary-label">Quarters (Q1-4)</div>
-          <div class="tracker-summary-value">—</div>
-          <div class="tracker-summary-sub">Not built yet — next after 1st half</div>
+          <div class="tracker-summary-label">Quarters (Q1-4) Total MAE / Bias</div>
+          <div class="tracker-summary-value">${fmtNum(cached.overall?.qTotalMAE)}</div>
+          <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.qTotalBias)} · n=${cached.overall?.qN || 0} games</div>
+        </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">Quarters (Q1-4) Team Points MAE / Bias</div>
+          <div class="tracker-summary-value">${fmtNum(cached.overall?.qTeamMAE)}</div>
+          <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.qTeamBias)}</div>
         </div>
   ` : `
         <div class="tracker-summary-cell primary">
@@ -16765,7 +16975,7 @@ function renderBacktestPanel() {
         <div class="tracker-analytics-heading">
           <div class="tracker-analytics-kicker">Season Backtest</div>
           <div class="tracker-analytics-title">Scores-Only Calibration — NBA</div>
-          <div class="tracker-analytics-subtitle">Total points, team points, 1st half, and margin checked against real final scores, no market line involved. ${cached ? `Last run: ${new Date(cached.computedAt).toLocaleString()} (season ${cached.season})` : ""}</div>
+          <div class="tracker-analytics-subtitle">Total points, team points, 1st half, quarters, and margin checked against real final scores, no market line involved. ${cached ? `Last run: ${new Date(cached.computedAt).toLocaleString()} (season ${cached.season})` : ""}</div>
         </div>
       </div>
 
