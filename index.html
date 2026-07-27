@@ -1,3 +1,4 @@
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3923,12 +3924,16 @@ function getDynamicWeights(sampleTier, volatility, league) {
   // description ("getDynamicWeights base.teamWeight").
   const _tunedTeamWeight = isFinite(getParam("teamWeightBase", league)) ? Number(getParam("teamWeightBase", league)) : 0.65;
   const base = { teamWeight: _tunedTeamWeight, oppWeight: 1 - _tunedTeamWeight };
-  const sampleShrink = sampleTier === "full" ? 0 : (sampleTier === "thin" ? 0.5 : 0.85);
+  const _thinShrink = isFinite(getParam("dynWeightThinShrink")) ? Number(getParam("dynWeightThinShrink")) : 0.5;
+  const _insufficientShrink = isFinite(getParam("dynWeightInsufficientShrink")) ? Number(getParam("dynWeightInsufficientShrink")) : 0.85;
+  const sampleShrink = sampleTier === "full" ? 0 : (sampleTier === "thin" ? _thinShrink : _insufficientShrink);
 
   const volRatio = isFinite(Number(volatility)) ? clampNumber(Number(volatility), 0, 2.5) : 0.5;
-  const volShrink = volRatio * 0.3;
+  const _volCoefficient = isFinite(getParam("dynWeightVolCoefficient")) ? Number(getParam("dynWeightVolCoefficient")) : 0.3;
+  const volShrink = volRatio * _volCoefficient;
   const isTrustedLeague = LEAGUE_TRUST_PROFILES?.trusted?.includes(String(league || "").toLowerCase());
-  const leagueShrink = isTrustedLeague ? 0 : 0.05;
+  const _nonTrustedShrink = isFinite(getParam("dynWeightNonTrustedLeagueShrink")) ? Number(getParam("dynWeightNonTrustedLeagueShrink")) : 0.05;
+  const leagueShrink = isTrustedLeague ? 0 : _nonTrustedShrink;
   const shrink = clampNumber(sampleShrink + volShrink + leagueShrink, 0, 0.95);
   return {
     teamWeight: base.teamWeight - (base.teamWeight - 0.5) * shrink,
@@ -4199,7 +4204,56 @@ const TUNABLE_PARAM_REGISTRY = {
     lastVerifiedAt: null
   },
 
-  injuryOppBoostFactor_NOTE: null
+  injuryOppBoostFactor_NOTE: null,
+
+  // JOB 2 OPTIMIZATION FRAMEWORK — AUDIT ADD: these seven were previously
+  // hardcoded inline inside anchorProjection / getSampleTier /
+  // getDynamicWeights with no documented derivation and no way to tune or
+  // even see them. Registering them here doesn't change current behavior
+  // (defaults match the old hardcoded values exactly) — see the matching
+  // patches to those three functions in this same batch.
+  anchorFullCredibilityGames: {
+    value: 6, min: 3, max: 12, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "team_a", "team_b"],
+    description: "Games of history needed before anchorProjection fully trusts a team's raw average instead of blending toward the league baseline (Bayesian shrinkage cutoff)",
+    lastVerifiedAt: null
+  },
+  sampleTierFullGames: {
+    value: 10, min: 8, max: 15, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
+    description: "Minimum rolling games required to classify a matchup as sample tier 'full' (getSampleTier)",
+    lastVerifiedAt: null
+  },
+  sampleTierThinGames: {
+    value: 5, min: 3, max: 8, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
+    description: "Minimum rolling games required to classify a matchup as sample tier 'thin' rather than 'insufficient' (getSampleTier)",
+    lastVerifiedAt: null
+  },
+  dynWeightThinShrink: {
+    value: 0.5, min: 0.2, max: 0.8, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "How far teamWeight shrinks toward 0.5 (neutral) for 'thin' sample-tier matchups in getDynamicWeights",
+    lastVerifiedAt: null
+  },
+  dynWeightInsufficientShrink: {
+    value: 0.85, min: 0.5, max: 0.95, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "How far teamWeight shrinks toward 0.5 (neutral) for 'insufficient' sample-tier matchups in getDynamicWeights",
+    lastVerifiedAt: null
+  },
+  dynWeightVolCoefficient: {
+    value: 0.3, min: 0.1, max: 0.6, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Multiplier scaling volatility ratio into additional teamWeight shrinkage in getDynamicWeights",
+    lastVerifiedAt: null
+  },
+  dynWeightNonTrustedLeagueShrink: {
+    value: 0.05, min: 0.0, max: 0.2, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Extra flat teamWeight shrinkage applied for leagues outside LEAGUE_TRUST_PROFILES.trusted, in getDynamicWeights",
+    lastVerifiedAt: null
+  }
 };
 delete TUNABLE_PARAM_REGISTRY.injuryOppBoostFactor_NOTE;
 
@@ -4510,6 +4564,36 @@ function getParam(key, league) {
   return getTunableParam(key, league);
 }
 window.getParam = getParam;
+
+// JOB 2 OPTIMIZATION FRAMEWORK: generic temporary-override scope, reusing
+// the exact pattern evaluatePickWithParams() already uses for the live
+// tracked-picks tuner. Swaps window.getParam (which every projection
+// function already reads through, e.g. getEffectivePaceClamp,
+// getH2HSeasonDecayWeight) and MODEL_TUNING.recencyWeights (the vector-type
+// side-channel runEngine() already relies on) for the duration of fn(),
+// and restores both in finally — even if fn() throws. Never touches
+// TUNABLE_PARAM_REGISTRY itself, so there is no risk of a crashed
+// experiment leaving live production settings altered.
+async function withParamOverrides(overrides, fn) {
+  const originalGetParam = window.getParam;
+  const originalRecencyWeights = MODEL_TUNING.recencyWeights;
+  const ov = overrides || {};
+
+  window.getParam = function(key, league) {
+    if (Object.prototype.hasOwnProperty.call(ov, key)) return ov[key];
+    return originalGetParam ? originalGetParam(key, league) : getTunableParam(key, league);
+  };
+  if (Array.isArray(ov.recencyWeights)) {
+    MODEL_TUNING.recencyWeights = ov.recencyWeights;
+  }
+
+  try {
+    return await fn();
+  } finally {
+    window.getParam = originalGetParam;
+    MODEL_TUNING.recencyWeights = originalRecencyWeights;
+  }
+}
 
 function initLeagueOverridesFromDefaults() {
   if (Object.keys(g_tunableParamLeagueOverrides).length > 0) return;
@@ -12917,8 +13001,10 @@ function getVolatilityRatioForSeries(series, leagueVolLimit) {
   const lens = arrays.map(a => Array.isArray(a) ? a.length : 0);
   const minLen = Math.min(...lens);
 
-  if (minLen >= 10) return "full";
-  if (minLen >= 5) return "thin";
+  const fullGames = isFinite(getParam("sampleTierFullGames")) ? Number(getParam("sampleTierFullGames")) : 10;
+  const thinGames = isFinite(getParam("sampleTierThinGames")) ? Number(getParam("sampleTierThinGames")) : 5;
+  if (minLen >= fullGames) return "full";
+  if (minLen >= thinGames) return "thin";
   return "insufficient";
 }
 
@@ -13190,8 +13276,9 @@ function anchorProjection(proj, sampleSize, leagueBase) {
   if (!isFinite(proj)) return proj;
   const n = Math.max(0, Number(sampleSize) || 0);
   const base = Number(leagueBase) || proj;
-  if (n >= 6) return proj;
-  const blendFactor = n / 6;
+  const fullCredibilityGames = isFinite(getParam("anchorFullCredibilityGames")) ? Number(getParam("anchorFullCredibilityGames")) : 6;
+  if (n >= fullCredibilityGames) return proj;
+  const blendFactor = n / fullCredibilityGames;
   return proj * blendFactor + base * (1 - blendFactor);
 }
 
@@ -16656,6 +16743,179 @@ function calculateScoresOnlyCalibration(evaluationResults) {
   };
 }
 
+// JOB 2 OPTIMIZATION FRAMEWORK: the per-game replay loop extracted out of
+// runNbaSeasonBacktest so both the single-run UI (Job 1) and the future
+// experiment runner (Job 2) call the exact same production pipeline — no
+// second implementation to drift out of sync. paramOverrides defaults to
+// {}, which is a no-op (identical behavior to calling with no overrides).
+//
+// AUDIT FIX: computeFTProjection/compute1HProjection only read a teamWeight
+// from their own explicit `config` argument — when config is {} (as this
+// loop always passed before this patch) they silently fall back to a
+// hardcoded 0.65 and never consult teamWeightBase at all, making that
+// registry param inert here despite being tunable everywhere else.
+// Mirrors the fix evaluatePickWithParams() already applies for the live
+// tracked-picks tuner: read teamWeightBase through getParam (now
+// overridable via withParamOverrides) and pass it explicitly, rather than
+// runEngine()'s heavier two-pass getDynamicWeights() flow, which isn't
+// worth its extra cost when this loop runs per-game across a full season,
+// potentially hundreds of times per experiment sweep.
+async function replaySeasonGames(allGames, gameLogs, paramOverrides = {}) {
+  const domA = document.getElementById("aFTScored");
+  const domB = document.getElementById("bFTScored");
+  const savedA = domA ? domA.value : null;
+  const savedB = domB ? domB.value : null;
+  const savedContextData = AppState.context.data;
+  const savedSeriesDateCache = window.__seriesDateCache;
+  AppState.context.data = defaultMassacreFetchContext();
+  window.__seriesDateCache = {};
+
+  const results = [];
+  let skipped = 0;
+
+  try {
+    await withParamOverrides(paramOverrides, async () => {
+      for (const game of allGames) {
+        const teamWindow = _btRollingWindow(gameLogs[game.teamId], game.date);
+        const oppWindow = _btRollingWindow(gameLogs[game.oppId], game.date);
+
+        if (teamWindow.scored.length < 5 || oppWindow.scored.length < 5) { skipped++; continue; }
+
+        if (domA) domA.value = teamWindow.scored.join(",");
+        if (domB) domB.value = oppWindow.scored.join(",");
+
+        const teamH1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "h1Scored", "h1Allowed");
+        const oppH1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "h1Scored", "h1Allowed");
+        const teamQ1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q1Scored", "q1Allowed");
+        const oppQ1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q1Scored", "q1Allowed");
+        const teamQ2Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q2Scored", "q2Allowed");
+        const oppQ2Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q2Scored", "q2Allowed");
+        const teamQ3Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q3Scored", "q3Allowed");
+        const oppQ3Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q3Scored", "q3Allowed");
+        const teamQ4Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q4Scored", "q4Allowed");
+        const oppQ4Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q4Scored", "q4Allowed");
+
+        const parsed = {
+          aFTAllowed: teamWindow.allowed, bFTAllowed: oppWindow.allowed,
+          a1HScored: teamH1Window.scored, b1HScored: oppH1Window.scored,
+          a1HAllowed: teamH1Window.allowed, b1HAllowed: oppH1Window.allowed,
+          aQ1Scored: teamQ1Window.scored, bQ1Scored: oppQ1Window.scored,
+          aQ1Allowed: teamQ1Window.allowed, bQ1Allowed: oppQ1Window.allowed,
+          aQ2Scored: teamQ2Window.scored, bQ2Scored: oppQ2Window.scored,
+          aQ2Allowed: teamQ2Window.allowed, bQ2Allowed: oppQ2Window.allowed,
+          aQ3Scored: teamQ3Window.scored, bQ3Scored: oppQ3Window.scored,
+          aQ3Allowed: teamQ3Window.allowed, bQ3Allowed: oppQ3Window.allowed,
+          aQ4Scored: teamQ4Window.scored, bQ4Scored: oppQ4Window.scored,
+          aQ4Allowed: teamQ4Window.allowed, bQ4Allowed: oppQ4Window.allowed
+        };
+
+        // JOB 2 FIDELITY FIX: replaced the flat teamWeightBase read with the
+        // same two-pass getDynamicWeights() flow runEngine() uses for every
+        // live prediction — a preliminary no-config pass to get sample tier
+        // + a single buildGlobalModelState() call for volatility regime,
+        // then the real, dynamically-shrunk teamWeight/oppWeight fed into
+        // the final FT and H1 calcs. This also makes the shrink-coefficient
+        // parameters registered alongside this patch (dynWeightThinShrink,
+        // dynWeightInsufficientShrink, dynWeightVolCoefficient,
+        // dynWeightNonTrustedLeagueShrink) actually active in this backtest
+        // instead of silently no-op.
+        let baseFtCalc;
+        try {
+          baseFtCalc = computeFTProjection({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1 });
+        } catch (e) {
+          skipped++;
+          continue;
+        }
+        if (!isFinite(baseFtCalc.projAFT) || !isFinite(baseFtCalc.projBFT)) { skipped++; continue; }
+
+        let combinedVolRatio = 0.5;
+        try {
+          const gms = buildGlobalModelState({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1 });
+          if (isFinite(gms?.volState?.combinedVolRatio)) combinedVolRatio = gms.volState.combinedVolRatio;
+        } catch (e) {}
+
+        const _dynWeightsFT = getDynamicWeights(baseFtCalc.ftSampleTier, combinedVolRatio, "nba");
+
+        let calc;
+        try {
+          calc = computeFTProjection({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1, config: { teamWeight: _dynWeightsFT.teamWeight, oppWeight: _dynWeightsFT.oppWeight } });
+        } catch (e) {
+          skipped++;
+          continue;
+        }
+
+        if (!isFinite(calc.projAFT) || !isFinite(calc.projBFT)) { skipped++; continue; }
+
+        let calc1H = null;
+        try {
+          const _h1SampleTier = getSampleTier(getManualSeries("A", "h1", parsed), getManualSeries("B", "h1", parsed));
+          const _dynWeightsH1 = getDynamicWeights(_h1SampleTier, combinedVolRatio, "nba");
+          calc1H = compute1HProjection({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1, config: { teamWeight: _dynWeightsH1.teamWeight, oppWeight: _dynWeightsH1.oppWeight } });
+        } catch (e) {
+          calc1H = null;
+        }
+
+        let q1 = null, q2 = null, q3 = null, q4 = null;
+        try {
+          if (calc1H) {
+            q1 = computeQuarterProjectionBT("q1", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
+            q2 = computeQuarterProjectionBT("q2", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
+            q3 = computeQuarterProjectionBT("q3", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
+            q4 = computeQuarterProjectionBT("q4", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
+            applyQuarterAnchorBlendBT(q1, q2, q3, q4, calc1H, calc);
+          }
+        } catch (e) {
+          q1 = q2 = q3 = q4 = null;
+        }
+
+        const h1Actual = isFinite(game.h1Scored) && isFinite(game.h1Allowed);
+        const quartersActual = [game.q1Scored, game.q2Scored, game.q3Scored, game.q4Scored, game.q1Allowed, game.q2Allowed, game.q3Allowed, game.q4Allowed].every(isFinite);
+
+        const qPredTotals = [q1, q2, q3, q4].map(q => (q && isFinite(q.proj)) ? q.proj : NaN);
+        const qActualTotals = quartersActual ? [
+          game.q1Scored + game.q1Allowed, game.q2Scored + game.q2Allowed,
+          game.q3Scored + game.q3Allowed, game.q4Scored + game.q4Allowed
+        ] : [NaN, NaN, NaN, NaN];
+        const qPredTeamScores = [];
+        const qActualTeamScores = [];
+        [q1, q2, q3, q4].forEach((q, i) => {
+          if (q && isFinite(q.projA)) { qPredTeamScores.push(q.projA); qActualTeamScores.push(quartersActual ? [game.q1Scored, game.q2Scored, game.q3Scored, game.q4Scored][i] : NaN); }
+          if (q && isFinite(q.projB)) { qPredTeamScores.push(q.projB); qActualTeamScores.push(quartersActual ? [game.q1Allowed, game.q2Allowed, game.q3Allowed, game.q4Allowed][i] : NaN); }
+        });
+
+        results.push({
+          date: game.date,
+          matchup: `${game.teamName} vs ${game.oppName}`,
+          predictedMargin: calc.projAFT - calc.projBFT,
+          actualMargin: game.scored - game.allowed,
+          predictedTotal: calc.ftProj,
+          actualTotal: game.scored + game.allowed,
+          predictedAScore: calc.projAFT,
+          actualAScore: game.scored,
+          predictedBScore: calc.projBFT,
+          actualBScore: game.allowed,
+          predictedH1Total: (calc1H && isFinite(calc1H.h1Proj)) ? calc1H.h1Proj : NaN,
+          actualH1Total: h1Actual ? (game.h1Scored + game.h1Allowed) : NaN,
+          predictedH1AScore: (calc1H && isFinite(calc1H.projA1H)) ? calc1H.projA1H : NaN,
+          actualH1AScore: h1Actual ? game.h1Scored : NaN,
+          predictedH1BScore: (calc1H && isFinite(calc1H.projB1H)) ? calc1H.projB1H : NaN,
+          actualH1BScore: h1Actual ? game.h1Allowed : NaN,
+          quarterTotalPairs: qPredTotals.map((p, i) => [p, qActualTotals[i]]).filter(([p, a]) => isFinite(p) && isFinite(a)),
+          quarterTeamPairs: qPredTeamScores.map((p, i) => [p, qActualTeamScores[i]]).filter(([p, a]) => isFinite(p) && isFinite(a)),
+          sampleTier: calc.ftSampleTier
+        });
+      }
+    });
+  } finally {
+    if (domA) domA.value = savedA ?? "";
+    if (domB) domB.value = savedB ?? "";
+    AppState.context.data = savedContextData;
+    window.__seriesDateCache = savedSeriesDateCache;
+  }
+
+  return { results, skipped };
+}
+
 async function runNbaSeasonBacktest(season, onProgress) {
   season = season || (getCurrentSeasonYear("nba") - 1);
   engineDebug("Season backtest starting", { league: "nba", season });
@@ -16737,131 +16997,11 @@ async function runNbaSeasonBacktest(season, onProgress) {
 
   try { localStorage.removeItem(h1ProgressKey); } catch (e) {}
 
-  const domA = document.getElementById("aFTScored");
-  const domB = document.getElementById("bFTScored");
-  const savedA = domA ? domA.value : null;
-  const savedB = domB ? domB.value : null;
-  const savedContextData = AppState.context.data;
-  const savedSeriesDateCache = window.__seriesDateCache;
-  AppState.context.data = defaultMassacreFetchContext();
-  window.__seriesDateCache = {};
-
-  const results = [];
-  let skipped = 0;
-
-  try {
-    for (const game of allGames) {
-      const teamWindow = _btRollingWindow(gameLogs[game.teamId], game.date);
-      const oppWindow = _btRollingWindow(gameLogs[game.oppId], game.date);
-
-      if (teamWindow.scored.length < 5 || oppWindow.scored.length < 5) { skipped++; continue; }
-
-      if (domA) domA.value = teamWindow.scored.join(",");
-      if (domB) domB.value = oppWindow.scored.join(",");
-
-      const teamH1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "h1Scored", "h1Allowed");
-      const oppH1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "h1Scored", "h1Allowed");
-      const teamQ1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q1Scored", "q1Allowed");
-      const oppQ1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q1Scored", "q1Allowed");
-      const teamQ2Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q2Scored", "q2Allowed");
-      const oppQ2Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q2Scored", "q2Allowed");
-      const teamQ3Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q3Scored", "q3Allowed");
-      const oppQ3Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q3Scored", "q3Allowed");
-      const teamQ4Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q4Scored", "q4Allowed");
-      const oppQ4Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q4Scored", "q4Allowed");
-
-      const parsed = {
-        aFTAllowed: teamWindow.allowed, bFTAllowed: oppWindow.allowed,
-        a1HScored: teamH1Window.scored, b1HScored: oppH1Window.scored,
-        a1HAllowed: teamH1Window.allowed, b1HAllowed: oppH1Window.allowed,
-        aQ1Scored: teamQ1Window.scored, bQ1Scored: oppQ1Window.scored,
-        aQ1Allowed: teamQ1Window.allowed, bQ1Allowed: oppQ1Window.allowed,
-        aQ2Scored: teamQ2Window.scored, bQ2Scored: oppQ2Window.scored,
-        aQ2Allowed: teamQ2Window.allowed, bQ2Allowed: oppQ2Window.allowed,
-        aQ3Scored: teamQ3Window.scored, bQ3Scored: oppQ3Window.scored,
-        aQ3Allowed: teamQ3Window.allowed, bQ3Allowed: oppQ3Window.allowed,
-        aQ4Scored: teamQ4Window.scored, bQ4Scored: oppQ4Window.scored,
-        aQ4Allowed: teamQ4Window.allowed, bQ4Allowed: oppQ4Window.allowed
-      };
-
-      let calc;
-      try {
-        calc = computeFTProjection({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1, config: {} });
-      } catch (e) {
-        skipped++;
-        continue;
-      }
-
-      if (!isFinite(calc.projAFT) || !isFinite(calc.projBFT)) { skipped++; continue; }
-
-      let calc1H = null;
-      try {
-        calc1H = compute1HProjection({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1, config: {} });
-      } catch (e) {
-        calc1H = null;
-      }
-
-      let q1 = null, q2 = null, q3 = null, q4 = null;
-      try {
-        if (calc1H) {
-          let combinedVolRatio = 0.5;
-          try {
-            const gms = buildGlobalModelState({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1 });
-            if (isFinite(gms?.volState?.combinedVolRatio)) combinedVolRatio = gms.volState.combinedVolRatio;
-          } catch (e) {}
-          q1 = computeQuarterProjectionBT("q1", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
-          q2 = computeQuarterProjectionBT("q2", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
-          q3 = computeQuarterProjectionBT("q3", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
-          q4 = computeQuarterProjectionBT("q4", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
-          applyQuarterAnchorBlendBT(q1, q2, q3, q4, calc1H, calc);
-        }
-      } catch (e) {
-        q1 = q2 = q3 = q4 = null;
-      }
-
-      const h1Actual = isFinite(game.h1Scored) && isFinite(game.h1Allowed);
-      const quartersActual = [game.q1Scored, game.q2Scored, game.q3Scored, game.q4Scored, game.q1Allowed, game.q2Allowed, game.q3Allowed, game.q4Allowed].every(isFinite);
-
-      const qPredTotals = [q1, q2, q3, q4].map(q => (q && isFinite(q.proj)) ? q.proj : NaN);
-      const qActualTotals = quartersActual ? [
-        game.q1Scored + game.q1Allowed, game.q2Scored + game.q2Allowed,
-        game.q3Scored + game.q3Allowed, game.q4Scored + game.q4Allowed
-      ] : [NaN, NaN, NaN, NaN];
-      const qPredTeamScores = [];
-      const qActualTeamScores = [];
-      [q1, q2, q3, q4].forEach((q, i) => {
-        if (q && isFinite(q.projA)) { qPredTeamScores.push(q.projA); qActualTeamScores.push(quartersActual ? [game.q1Scored, game.q2Scored, game.q3Scored, game.q4Scored][i] : NaN); }
-        if (q && isFinite(q.projB)) { qPredTeamScores.push(q.projB); qActualTeamScores.push(quartersActual ? [game.q1Allowed, game.q2Allowed, game.q3Allowed, game.q4Allowed][i] : NaN); }
-      });
-
-      results.push({
-        date: game.date,
-        matchup: `${game.teamName} vs ${game.oppName}`,
-        predictedMargin: calc.projAFT - calc.projBFT,
-        actualMargin: game.scored - game.allowed,
-        predictedTotal: calc.ftProj,
-        actualTotal: game.scored + game.allowed,
-        predictedAScore: calc.projAFT,
-        actualAScore: game.scored,
-        predictedBScore: calc.projBFT,
-        actualBScore: game.allowed,
-        predictedH1Total: (calc1H && isFinite(calc1H.h1Proj)) ? calc1H.h1Proj : NaN,
-        actualH1Total: h1Actual ? (game.h1Scored + game.h1Allowed) : NaN,
-        predictedH1AScore: (calc1H && isFinite(calc1H.projA1H)) ? calc1H.projA1H : NaN,
-        actualH1AScore: h1Actual ? game.h1Scored : NaN,
-        predictedH1BScore: (calc1H && isFinite(calc1H.projB1H)) ? calc1H.projB1H : NaN,
-        actualH1BScore: h1Actual ? game.h1Allowed : NaN,
-        quarterTotalPairs: qPredTotals.map((p, i) => [p, qActualTotals[i]]).filter(([p, a]) => isFinite(p) && isFinite(a)),
-        quarterTeamPairs: qPredTeamScores.map((p, i) => [p, qActualTeamScores[i]]).filter(([p, a]) => isFinite(p) && isFinite(a)),
-        sampleTier: calc.ftSampleTier
-      });
-    }
-  } finally {
-    if (domA) domA.value = savedA ?? "";
-    if (domB) domB.value = savedB ?? "";
-    AppState.context.data = savedContextData;
-    window.__seriesDateCache = savedSeriesDateCache;
-  }
+  // JOB 2 OPTIMIZATION FRAMEWORK: replay loop now lives in replaySeasonGames()
+  // so Job 1 (this function) and the future experiment runner share the
+  // exact same production pipeline call. Passing {} here reproduces the
+  // prior single-configuration behavior exactly.
+  const { results, skipped } = await replaySeasonGames(allGames, gameLogs, {});
 
   const overall = calculateScoresOnlyCalibration(results);
   const full = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "full"));
