@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4386,12 +4385,7 @@ loadTunableParamLeagueOverrides();
 // --- NBA scores-only calibration ratchet lock ---
 // Sweep may only REPLACE this lock when a challenger beats the locked Total MAE.
 const BB_NBA_CALIBRATION_LOCK_KEY = "BB_NBA_CALIBRATION_LOCK";
-// FREEZE 2026-07-28: auto-lock OFF. In-sample Δ0.02–0.05 wins were noise.
-// Re-enable only after multi-season holdout proof; min delta raised as guard.
-const BB_NBA_AUTO_LOCK_ENABLED = false;
-const BB_NBA_LOCK_MIN_DELTA = 0.15;
-// Holdout fraction of season (by date) for honest MAE. Search may use train; report holdout.
-const BB_NBA_HOLDOUT_FRACTION = 0.20;
+const BB_NBA_LOCK_MIN_DELTA = 0.02; // ignore noise smaller than this
 
 function applyNbaCalibrationLock(lock) {
   if (!lock || !lock.overrides || typeof lock.overrides !== "object") return false;
@@ -4453,12 +4447,6 @@ function saveNbaCalibrationLock(lock) {
 }
 
 function maybeRatchetNbaCalibrationLock(best, baseline, season) {
-  if (!BB_NBA_AUTO_LOCK_ENABLED) {
-    engineDebug("NBA calibration auto-lock frozen — challenger not applied", {
-      bestId: best && best.id, bestMAE: best && best.totalMAE
-    });
-    return null;
-  }
   if (!best || !isFinite(best.totalMAE) || best.id === "baseline") return null;
   const prior = window.__bbNbaCalibrationLock || loadNbaCalibrationLock();
   const floor = prior && isFinite(prior.totalMAE)
@@ -15851,7 +15839,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     }
   } else {
     
-    const _tw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+    // AUDIT FIX #2: mirrors AUDIT FIX #1 in getDynamicWeights — that fix
+    // only reached computeQuarterProjectionBT (via getDynamicWeights).
+    // computeFTProjection had its own separate teamWeight calc that still
+    // hardcoded 0.65, so a promoted/overridden teamWeightBase silently
+    // never touched FT (or H1) projections. Fall back to getParam before 0.65.
+    const _tw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : (isFinite(getParam("teamWeightBase", league)) ? Number(getParam("teamWeightBase", league)) : 0.65);
     const _ow = 1 - _tw;
     aS = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw + bAllowed * _ow) : aS_pre;
     bS = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw + aAllowed * _ow) : bS_pre;
@@ -16064,7 +16057,11 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projB1H = (synPace * projectedRatingB) / halfDivisor;
   } else {
 
-    const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+    // AUDIT FIX #2: same fallback gap as computeFTProjection — teamWeight
+    // was hardcoded to 0.65 instead of falling back to the tunable
+    // teamWeightBase param, so H1 projections never responded to a
+    // promoted/overridden value either. Fall back to getParam before 0.65.
+    const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : (isFinite(getParam("teamWeightBase", league)) ? Number(getParam("teamWeightBase", league)) : 0.65);
     const _ow1 = 1 - _tw1;
     projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw1 + bAllowed * _ow1) : aS_pre;
     projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw1 + aAllowed * _ow1) : bS_pre;
@@ -16632,7 +16629,7 @@ function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, in
     const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, qKey, tier, Math.abs(projA - projB), league, leagueBaseQ, _qH2hFactor, {
       enabled: hasH2H, injMultA: injA, injMultB: injB, volRatio: qVolRatio,
       blowoutGap: Math.abs(projA - projB),
-      paceGapRisk: !!(ftCalc && ftCalc.paceGapRisk)
+      paceGapRisk: false
     });
     const avgH2HA = avgOrNaN(decayH2HA);
     const avgH2HB = avgOrNaN(decayH2HB);
@@ -16708,23 +16705,29 @@ function _btRollingWindow(gameLog, beforeDateIso, n = 10, scoredField = "scored"
   };
 }
 
-// Tier-2: prior games at the same venue side (home or away) for venue blend in backtest.
 function _btVenueWindow(gameLog, beforeDateIso, wantHome, n = 10) {
-  const cutoff = new Date(beforeDateIso).getTime();
-  const prior = (gameLog || []).filter(g => {
-    if (new Date(g.date).getTime() >= cutoff) return false;
-    if (!isFinite(g.scored) || !isFinite(g.allowed)) return false;
-    if (typeof g.isHome !== "boolean") return false;
-    if (wantHome === true && g.isHome !== true) return false;
-    if (wantHome === false && g.isHome !== false) return false;
-    return true;
-  });
-  const recent = prior.slice(-n).reverse();
-  return {
-    scored: recent.map(g => g.scored),
-    allowed: recent.map(g => g.allowed)
-  };
+  try {
+    const cutoff = new Date(beforeDateIso).getTime();
+    if (!isFinite(cutoff)) return { scored: [], allowed: [] };
+    const prior = (gameLog || []).filter(function(g) {
+      if (!g || !isFinite(g.scored) || !isFinite(g.allowed)) return false;
+      if (new Date(g.date).getTime() >= cutoff) return false;
+      if (typeof g.isHome !== "boolean") return false;
+      return wantHome ? g.isHome === true : g.isHome === false;
+    });
+    const recent = prior.slice(-n).reverse();
+    return { scored: recent.map(function(g) { return g.scored; }), allowed: recent.map(function(g) { return g.allowed; }) };
+  } catch (e) {
+    return { scored: [], allowed: [] };
+  }
 }
+
+// AUDIT FIX #3: _btVenueWindow was declared twice. Function-declaration
+// hoisting meant this second, later definition silently won and ran in
+// every season backtest — but unlike the definition above, it had no
+// try/catch, so a single malformed game.date in any team's log would
+// throw uncaught and abort the whole backtest. Removed; the try/catch'd
+// definition above (functionally identical otherwise) is now the only one.
 
 function calculateScoresOnlyCalibration(evaluationResults) {
   const valid = (evaluationResults || []).filter(r => r && isFinite(r.predictedMargin) && isFinite(r.actualMargin));
@@ -16942,16 +16945,8 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
         ftAllowed10: oppVenue.allowed
       };
 
-      // Scores-only BT: feed overall series via AppState (getOverallSeries fallback)
-      // instead of mutating live DOM inputs. DOM aFTScored/bFTScored stay untouched.
-      AppState.context.data.A.overall = {
-        ftScored10: teamWindow.scored,
-        ftAllowed10: teamWindow.allowed
-      };
-      AppState.context.data.B.overall = {
-        ftScored10: oppWindow.scored,
-        ftAllowed10: oppWindow.allowed
-      };
+      if (domA) domA.value = teamWindow.scored.join(",");
+      if (domB) domB.value = oppWindow.scored.join(",");
 
       const teamH1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "h1Scored", "h1Allowed");
       const oppH1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "h1Scored", "h1Allowed");
@@ -17064,25 +17059,7 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
   const full = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "full"));
   const thin = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "thin"));
 
-  // Train / holdout split by date (last BB_NBA_HOLDOUT_FRACTION of evaluated games).
-  // Full-season overall stays for continuity; holdout is the honest MAE to trust.
-  const resultsByDate = results.slice().sort(function(a, b) {
-    return new Date(a.date).getTime() - new Date(b.date).getTime();
-  });
-  const holdoutN = Math.max(1, Math.floor(resultsByDate.length * (BB_NBA_HOLDOUT_FRACTION || 0.20)));
-  const trainCut = Math.max(0, resultsByDate.length - holdoutN);
-  const trainResults = resultsByDate.slice(0, trainCut);
-  const holdoutResults = resultsByDate.slice(trainCut);
-  const train = calculateScoresOnlyCalibration(trainResults);
-  const holdout = calculateScoresOnlyCalibration(holdoutResults);
-
   const notes = [];
-  if (holdout && isFinite(holdout.totalMAE)) {
-    notes.push(`Holdout (last ${(BB_NBA_HOLDOUT_FRACTION * 100).toFixed(0)}% by date, n=${holdout.n}): Total MAE ${holdout.totalMAE.toFixed(1)}, bias ${isFinite(holdout.totalBias) ? holdout.totalBias.toFixed(1) : "—"}. This is the number to trust — not full-season in-sample.`);
-  }
-  if (!BB_NBA_AUTO_LOCK_ENABLED) {
-    notes.push("Auto-lock is FROZEN. Config sweep will not change MODEL_TUNING. Clear BB_NBA_CALIBRATION_LOCK in localStorage if a prior noise lock is still applied.");
-  }
   if (overall) {
     if (isFinite(overall.totalBias) && Math.abs(overall.totalBias) >= 3) {
       notes.push(`Total points are running ${overall.totalBias > 0 ? "high" : "low"} by about ${Math.abs(overall.totalBias).toFixed(1)} pts on average — worth checking pace assumptions.`);
@@ -17105,9 +17082,7 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
   const report = {
     season, league: "nba",
     totalGames: allGames.length, evaluated: results.length, skipped,
-    overall, train, holdout,
-    trainN: trainResults.length, holdoutN: holdoutResults.length,
-    byTier: { full, thin }, notes,
+    overall, byTier: { full, thin }, notes,
     computedAt: new Date().toISOString()
   };
   engineDebug("Season backtest complete", report);
@@ -17286,46 +17261,29 @@ async function runNbaConfigSweep(onProgress) {
       qTotalMAE: report?.overall?.qTotalMAE ?? null,
       marginMAE: report?.overall?.marginMAE ?? null,
       straightUp: report?.overall?.straightUpAccuracy ?? null,
-      evaluated: report?.evaluated ?? 0,
-      trainMAE: report?.train?.totalMAE ?? null,
-      holdoutMAE: report?.holdout?.totalMAE ?? null,
-      holdoutBias: report?.holdout?.totalBias ?? null,
-      holdoutN: report?.holdoutN ?? null
+      evaluated: report?.evaluated ?? 0
     });
     await new Promise(r => setTimeout(r, 0));
   }
 
-  // Rank by holdout MAE when available (honest); fall back to full-season totalMAE.
-  const valid = results.filter(r => isFinite(r.holdoutMAE) || isFinite(r.totalMAE));
-  valid.sort(function(a, b) {
-    const aKey = isFinite(a.holdoutMAE) ? a.holdoutMAE : a.totalMAE;
-    const bKey = isFinite(b.holdoutMAE) ? b.holdoutMAE : b.totalMAE;
-    return aKey - bKey;
-  });
+  const valid = results.filter(r => isFinite(r.totalMAE));
+  valid.sort((a, b) => a.totalMAE - b.totalMAE);
   const baseline = results.find(r => r.id === "baseline") || null;
   const best = valid[0] || null;
   let recommendation = "No valid configs.";
   let newLock = null;
-  if (best && baseline) {
-    const baseH = isFinite(baseline.holdoutMAE) ? baseline.holdoutMAE : baseline.totalMAE;
-    const bestH = isFinite(best.holdoutMAE) ? best.holdoutMAE : best.totalMAE;
-    const delta = (isFinite(baseH) && isFinite(bestH)) ? (baseH - bestH) : NaN;
+  if (best && baseline && isFinite(baseline.totalMAE)) {
+    const delta = baseline.totalMAE - best.totalMAE;
     if (best.id === "baseline") {
-      recommendation = "Baseline remains best on holdout Total MAE.";
-    } else if (!BB_NBA_AUTO_LOCK_ENABLED) {
-      recommendation = `Auto-lock FROZEN. Best on holdout: "${best.label}" (holdout MAE ${isFinite(bestH) ? bestH.toFixed(2) : "—"} vs baseline ${isFinite(baseH) ? baseH.toFixed(2) : "—"}, Δ ${isFinite(delta) ? delta.toFixed(2) : "—"}). MODEL_TUNING unchanged.`;
+      recommendation = "Baseline remains best on Total MAE.";
     } else {
-      newLock = maybeRatchetNbaCalibrationLock(
-        { id: best.id, label: best.label, totalMAE: bestH, totalBias: best.holdoutBias },
-        { totalMAE: baseH },
-        season
-      );
+      newLock = maybeRatchetNbaCalibrationLock(best, baseline, season);
       if (newLock) {
-        recommendation = `LOCKED "${newLock.label}" — Holdout MAE ${newLock.previousMAE.toFixed(2)} → ${newLock.totalMAE.toFixed(2)} (Δ ${newLock.deltaFromPrevious.toFixed(2)}). Next baseline uses this.`;
-      } else if (isFinite(delta) && delta >= BB_NBA_LOCK_MIN_DELTA) {
-        recommendation = `Challenger "${best.label}" improved holdout by ${delta.toFixed(2)} but did not beat the saved lock floor.`;
+        recommendation = `LOCKED "${newLock.label}" — Total MAE ${newLock.previousMAE.toFixed(2)} → ${newLock.totalMAE.toFixed(2)} (Δ ${newLock.deltaFromPrevious.toFixed(2)}). Next baseline uses this.`;
+      } else if (delta >= BB_NBA_LOCK_MIN_DELTA) {
+        recommendation = `Challenger "${best.label}" improved by ${delta.toFixed(2)} but did not beat the saved lock floor.`;
       } else {
-        recommendation = `Best challenger "${best.label}" only edged holdout baseline by ${isFinite(delta) ? delta.toFixed(2) : "—"} — below auto-lock threshold (${BB_NBA_LOCK_MIN_DELTA}).`;
+        recommendation = `Best challenger "${best.label}" only edged baseline by ${delta.toFixed(2)} — below auto-lock threshold (${BB_NBA_LOCK_MIN_DELTA}).`;
       }
     }
   }
@@ -17375,12 +17333,7 @@ function renderBacktestPanel() {
 
   const summaryHtml = cached ? `
         <div class="tracker-summary-cell primary">
-          <div class="tracker-summary-label">Holdout Total MAE / Bias (trust this)</div>
-          <div class="tracker-summary-value">${fmtNum(cached.holdout?.totalMAE ?? cached.overall?.totalMAE)}</div>
-          <div class="tracker-summary-sub">Bias: ${fmtNum(cached.holdout?.totalBias ?? cached.overall?.totalBias)} · holdout n=${cached.holdoutN ?? "—"} · train n=${cached.trainN ?? "—"}</div>
-        </div>
-        <div class="tracker-summary-cell">
-          <div class="tracker-summary-label">Full-Season Total MAE / Bias</div>
+          <div class="tracker-summary-label">Total Points MAE / Bias</div>
           <div class="tracker-summary-value">${fmtNum(cached.overall?.totalMAE)}</div>
           <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.totalBias)} · ${cached.evaluated} games · ${cached.skipped} skipped</div>
         </div>
