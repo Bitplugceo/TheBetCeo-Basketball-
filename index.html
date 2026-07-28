@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16426,7 +16427,9 @@ async function fetchNbaTeamSeasonGameLog(teamId, season) {
         teamName: mine?.team?.displayName || mine?.team?.name || String(teamId),
         oppName: opp?.team?.displayName || opp?.team?.name || String(opp?.team?.id || ""),
         scored: myScore,
-        allowed: oppScore
+        allowed: oppScore,
+        // Tier-2: home/away so backtest can build venue-split series
+        isHome: String(mine?.homeAway || "").toLowerCase() === "home"
       });
     }
     games.sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -16601,6 +16604,24 @@ function _btRollingWindow(gameLog, beforeDateIso, n = 10, scoredField = "scored"
   };
 }
 
+// Tier-2: prior games at the same venue side (home or away) for venue blend in backtest.
+function _btVenueWindow(gameLog, beforeDateIso, wantHome, n = 10) {
+  const cutoff = new Date(beforeDateIso).getTime();
+  const prior = (gameLog || []).filter(g => {
+    if (new Date(g.date).getTime() >= cutoff) return false;
+    if (!isFinite(g.scored) || !isFinite(g.allowed)) return false;
+    if (typeof g.isHome !== "boolean") return false;
+    if (wantHome === true && g.isHome !== true) return false;
+    if (wantHome === false && g.isHome !== false) return false;
+    return true;
+  });
+  const recent = prior.slice(-n).reverse();
+  return {
+    scored: recent.map(g => g.scored),
+    allowed: recent.map(g => g.allowed)
+  };
+}
+
 function calculateScoresOnlyCalibration(evaluationResults) {
   const valid = (evaluationResults || []).filter(r => r && isFinite(r.predictedMargin) && isFinite(r.actualMargin));
   if (!valid.length) return null;
@@ -16664,7 +16685,8 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
   season = season || (getCurrentSeasonYear("nba") - 1);
   engineDebug("Season backtest starting", { league: "nba", season });
 
-  const cacheKey = "nba_" + season;
+  // nba_v2: cache includes isHome on game logs (Tier-2 venue wiring)
+  const cacheKey = "nba_v2_" + season;
   if (!_preloaded && window.__bbSeasonDataCache && window.__bbSeasonDataCache[cacheKey] && paramOverrides !== undefined) {
     return evaluateNbaSeasonBacktestFromCache(window.__bbSeasonDataCache[cacheKey], paramOverrides);
   }
@@ -16797,6 +16819,19 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
       const oppWindow = _btRollingWindow(gameLogs[game.oppId], game.date);
 
       if (teamWindow.scored.length < 5 || oppWindow.scored.length < 5) { skipped++; continue; }
+
+      // Tier-2: fill venue series so computeVenueBlend is live in scores-only backtest
+      const teamIsHome = game.isHome === true;
+      const teamVenue = _btVenueWindow(gameLogs[game.teamId], game.date, teamIsHome, 10);
+      const oppVenue = _btVenueWindow(gameLogs[game.oppId], game.date, !teamIsHome, 10);
+      AppState.context.data.A.venue = {
+        ftScored10: teamVenue.scored,
+        ftAllowed10: teamVenue.allowed
+      };
+      AppState.context.data.B.venue = {
+        ftScored10: oppVenue.scored,
+        ftAllowed10: oppVenue.allowed
+      };
 
       if (domA) domA.value = teamWindow.scored.join(",");
       if (domB) domB.value = oppWindow.scored.join(",");
@@ -17082,7 +17117,7 @@ async function runNbaConfigSweep(onProgress) {
   const season = getCurrentSeasonYear("nba") - 1;
   const results = [];
   const total = BB_NBA_OPT_GRID.length;
-  const cacheKey = "nba_" + season;
+  const cacheKey = "nba_v2_" + season;
 
   if (!window.__bbSeasonDataCache || !window.__bbSeasonDataCache[cacheKey]) {
     if (typeof onProgress === "function") {
