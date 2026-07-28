@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4385,7 +4386,12 @@ loadTunableParamLeagueOverrides();
 // --- NBA scores-only calibration ratchet lock ---
 // Sweep may only REPLACE this lock when a challenger beats the locked Total MAE.
 const BB_NBA_CALIBRATION_LOCK_KEY = "BB_NBA_CALIBRATION_LOCK";
-const BB_NBA_LOCK_MIN_DELTA = 0.02; // ignore noise smaller than this
+// FREEZE 2026-07-28: auto-lock OFF. In-sample Δ0.02–0.05 wins were noise.
+// Re-enable only after multi-season holdout proof; min delta raised as guard.
+const BB_NBA_AUTO_LOCK_ENABLED = false;
+const BB_NBA_LOCK_MIN_DELTA = 0.15;
+// Holdout fraction of season (by date) for honest MAE. Search may use train; report holdout.
+const BB_NBA_HOLDOUT_FRACTION = 0.20;
 
 function applyNbaCalibrationLock(lock) {
   if (!lock || !lock.overrides || typeof lock.overrides !== "object") return false;
@@ -4447,6 +4453,12 @@ function saveNbaCalibrationLock(lock) {
 }
 
 function maybeRatchetNbaCalibrationLock(best, baseline, season) {
+  if (!BB_NBA_AUTO_LOCK_ENABLED) {
+    engineDebug("NBA calibration auto-lock frozen — challenger not applied", {
+      bestId: best && best.id, bestMAE: best && best.totalMAE
+    });
+    return null;
+  }
   if (!best || !isFinite(best.totalMAE) || best.id === "baseline") return null;
   const prior = window.__bbNbaCalibrationLock || loadNbaCalibrationLock();
   const floor = prior && isFinite(prior.totalMAE)
@@ -17052,7 +17064,25 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
   const full = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "full"));
   const thin = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "thin"));
 
+  // Train / holdout split by date (last BB_NBA_HOLDOUT_FRACTION of evaluated games).
+  // Full-season overall stays for continuity; holdout is the honest MAE to trust.
+  const resultsByDate = results.slice().sort(function(a, b) {
+    return new Date(a.date).getTime() - new Date(b.date).getTime();
+  });
+  const holdoutN = Math.max(1, Math.floor(resultsByDate.length * (BB_NBA_HOLDOUT_FRACTION || 0.20)));
+  const trainCut = Math.max(0, resultsByDate.length - holdoutN);
+  const trainResults = resultsByDate.slice(0, trainCut);
+  const holdoutResults = resultsByDate.slice(trainCut);
+  const train = calculateScoresOnlyCalibration(trainResults);
+  const holdout = calculateScoresOnlyCalibration(holdoutResults);
+
   const notes = [];
+  if (holdout && isFinite(holdout.totalMAE)) {
+    notes.push(`Holdout (last ${(BB_NBA_HOLDOUT_FRACTION * 100).toFixed(0)}% by date, n=${holdout.n}): Total MAE ${holdout.totalMAE.toFixed(1)}, bias ${isFinite(holdout.totalBias) ? holdout.totalBias.toFixed(1) : "—"}. This is the number to trust — not full-season in-sample.`);
+  }
+  if (!BB_NBA_AUTO_LOCK_ENABLED) {
+    notes.push("Auto-lock is FROZEN. Config sweep will not change MODEL_TUNING. Clear BB_NBA_CALIBRATION_LOCK in localStorage if a prior noise lock is still applied.");
+  }
   if (overall) {
     if (isFinite(overall.totalBias) && Math.abs(overall.totalBias) >= 3) {
       notes.push(`Total points are running ${overall.totalBias > 0 ? "high" : "low"} by about ${Math.abs(overall.totalBias).toFixed(1)} pts on average — worth checking pace assumptions.`);
@@ -17075,7 +17105,9 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
   const report = {
     season, league: "nba",
     totalGames: allGames.length, evaluated: results.length, skipped,
-    overall, byTier: { full, thin }, notes,
+    overall, train, holdout,
+    trainN: trainResults.length, holdoutN: holdoutResults.length,
+    byTier: { full, thin }, notes,
     computedAt: new Date().toISOString()
   };
   engineDebug("Season backtest complete", report);
@@ -17254,29 +17286,46 @@ async function runNbaConfigSweep(onProgress) {
       qTotalMAE: report?.overall?.qTotalMAE ?? null,
       marginMAE: report?.overall?.marginMAE ?? null,
       straightUp: report?.overall?.straightUpAccuracy ?? null,
-      evaluated: report?.evaluated ?? 0
+      evaluated: report?.evaluated ?? 0,
+      trainMAE: report?.train?.totalMAE ?? null,
+      holdoutMAE: report?.holdout?.totalMAE ?? null,
+      holdoutBias: report?.holdout?.totalBias ?? null,
+      holdoutN: report?.holdoutN ?? null
     });
     await new Promise(r => setTimeout(r, 0));
   }
 
-  const valid = results.filter(r => isFinite(r.totalMAE));
-  valid.sort((a, b) => a.totalMAE - b.totalMAE);
+  // Rank by holdout MAE when available (honest); fall back to full-season totalMAE.
+  const valid = results.filter(r => isFinite(r.holdoutMAE) || isFinite(r.totalMAE));
+  valid.sort(function(a, b) {
+    const aKey = isFinite(a.holdoutMAE) ? a.holdoutMAE : a.totalMAE;
+    const bKey = isFinite(b.holdoutMAE) ? b.holdoutMAE : b.totalMAE;
+    return aKey - bKey;
+  });
   const baseline = results.find(r => r.id === "baseline") || null;
   const best = valid[0] || null;
   let recommendation = "No valid configs.";
   let newLock = null;
-  if (best && baseline && isFinite(baseline.totalMAE)) {
-    const delta = baseline.totalMAE - best.totalMAE;
+  if (best && baseline) {
+    const baseH = isFinite(baseline.holdoutMAE) ? baseline.holdoutMAE : baseline.totalMAE;
+    const bestH = isFinite(best.holdoutMAE) ? best.holdoutMAE : best.totalMAE;
+    const delta = (isFinite(baseH) && isFinite(bestH)) ? (baseH - bestH) : NaN;
     if (best.id === "baseline") {
-      recommendation = "Baseline remains best on Total MAE.";
+      recommendation = "Baseline remains best on holdout Total MAE.";
+    } else if (!BB_NBA_AUTO_LOCK_ENABLED) {
+      recommendation = `Auto-lock FROZEN. Best on holdout: "${best.label}" (holdout MAE ${isFinite(bestH) ? bestH.toFixed(2) : "—"} vs baseline ${isFinite(baseH) ? baseH.toFixed(2) : "—"}, Δ ${isFinite(delta) ? delta.toFixed(2) : "—"}). MODEL_TUNING unchanged.`;
     } else {
-      newLock = maybeRatchetNbaCalibrationLock(best, baseline, season);
+      newLock = maybeRatchetNbaCalibrationLock(
+        { id: best.id, label: best.label, totalMAE: bestH, totalBias: best.holdoutBias },
+        { totalMAE: baseH },
+        season
+      );
       if (newLock) {
-        recommendation = `LOCKED "${newLock.label}" — Total MAE ${newLock.previousMAE.toFixed(2)} → ${newLock.totalMAE.toFixed(2)} (Δ ${newLock.deltaFromPrevious.toFixed(2)}). Next baseline uses this.`;
-      } else if (delta >= BB_NBA_LOCK_MIN_DELTA) {
-        recommendation = `Challenger "${best.label}" improved by ${delta.toFixed(2)} but did not beat the saved lock floor.`;
+        recommendation = `LOCKED "${newLock.label}" — Holdout MAE ${newLock.previousMAE.toFixed(2)} → ${newLock.totalMAE.toFixed(2)} (Δ ${newLock.deltaFromPrevious.toFixed(2)}). Next baseline uses this.`;
+      } else if (isFinite(delta) && delta >= BB_NBA_LOCK_MIN_DELTA) {
+        recommendation = `Challenger "${best.label}" improved holdout by ${delta.toFixed(2)} but did not beat the saved lock floor.`;
       } else {
-        recommendation = `Best challenger "${best.label}" only edged baseline by ${delta.toFixed(2)} — below auto-lock threshold (${BB_NBA_LOCK_MIN_DELTA}).`;
+        recommendation = `Best challenger "${best.label}" only edged holdout baseline by ${isFinite(delta) ? delta.toFixed(2) : "—"} — below auto-lock threshold (${BB_NBA_LOCK_MIN_DELTA}).`;
       }
     }
   }
@@ -17326,7 +17375,12 @@ function renderBacktestPanel() {
 
   const summaryHtml = cached ? `
         <div class="tracker-summary-cell primary">
-          <div class="tracker-summary-label">Total Points MAE / Bias</div>
+          <div class="tracker-summary-label">Holdout Total MAE / Bias (trust this)</div>
+          <div class="tracker-summary-value">${fmtNum(cached.holdout?.totalMAE ?? cached.overall?.totalMAE)}</div>
+          <div class="tracker-summary-sub">Bias: ${fmtNum(cached.holdout?.totalBias ?? cached.overall?.totalBias)} · holdout n=${cached.holdoutN ?? "—"} · train n=${cached.trainN ?? "—"}</div>
+        </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">Full-Season Total MAE / Bias</div>
           <div class="tracker-summary-value">${fmtNum(cached.overall?.totalMAE)}</div>
           <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.totalBias)} · ${cached.evaluated} games · ${cached.skipped} skipped</div>
         </div>
