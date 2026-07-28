@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2968,7 +2969,6 @@ body.dark-mode .tracker-analytics-section-head {
 <button type="button" id="trackerMilitaryRaidBtn" class="tracker-insights-btn" title="Single-click: Military Raid · Double-click: Toggle debug view" onclick="triggerTrackerMilitaryRaid()">🚨</button>
 <button type="button" id="trackerHealthBtn" class="tracker-insights-btn" title="Engine health dashboard">❤️</button>
 <button type="button" id="trackerBacktestBtn" class="tracker-insights-btn" title="NBA season backtest">📊</button>
-<button type="button" id="trackerSweepBtn" class="tracker-insights-btn" title="Compare engine settings">🔬</button>
 <button type="button" id="trackerConfigBtn" class="tracker-insights-btn" title="View/Edit verified configs">⚙️</button>
 <button type="button" id="trackerCopyDataBtn" class="tracker-insights-btn" title="Copy tracker data to clipboard">📑</button>
 <button type="button" id="trackerCopyDataJsonBtn" class="tracker-insights-btn" title="Copy tracker data as JSON">🧾</button>
@@ -7053,10 +7053,6 @@ function isTrackerBacktestView() {
   return AppState.ui.modalView === "backtest";
 }
 
-function isTrackerSweepView() {
-  return AppState.ui.modalView === "sweep";
-}
-
 function trackerDebug(message, extra = null) {
   try {
     const stamp = new Date().toLocaleTimeString([], { hour12: false });
@@ -7512,8 +7508,7 @@ function updateTrackerInsightsButton() {
     else if (isTrackerConfigsView()) titleEl.textContent = "Verified Configs";
 
     else if (isTrackerHealthView()) titleEl.textContent = "Engine Health";
-else if (isTrackerBacktestView()) titleEl.textContent = "Season Backtest";
-    else if (isTrackerSweepView()) titleEl.textContent = "Setting Comparison";
+    else if (isTrackerBacktestView()) titleEl.textContent = "Season Backtest";
   }
 
   if (militaryBtn) {
@@ -7560,7 +7555,7 @@ function syncTrackerModalView() {
 
 function setTrackerModalView(view) {
 
-  const next = ["picks", "report", "debug", "configs", "health", "backtest", "sweep"].includes(String(view || "")) ? String(view) : "picks";
+  const next = ["picks", "report", "debug", "configs", "health", "backtest"].includes(String(view || "")) ? String(view) : "picks";
   AppState.ui.modalView = next;
   if (isTrackerDebugView()) acknowledgeGlobalEngineAlert();
   updateTrackerInsightsButton();
@@ -7586,11 +7581,6 @@ function toggleTrackerHealthView() {
 function toggleTrackerBacktestView() {
   if (isTrackerBacktestView()) setTrackerModalView("picks");
   else setTrackerModalView("backtest");
-}
-
-function toggleTrackerSweepView() {
-  if (isTrackerSweepView()) setTrackerModalView("picks");
-  else setTrackerModalView("sweep");
 }
 
 let g_trackerSaveFailureCount = 0;
@@ -10642,15 +10632,6 @@ function renderTrackerAnalytics() {
 
   if (currentView === "backtest") {
     renderBacktestPanel();
-    syncTrackerModalView();
-    panel.classList.remove("tracker-hidden");
-    panel.style.display = "block";
-    g_lastRenderedTrackerView = currentView;
-    return;
-  }
-
-  if (currentView === "sweep") {
-    renderSweepPanel();
     syncTrackerModalView();
     panel.classList.remove("tracker-hidden");
     panel.style.display = "block";
@@ -16676,100 +16657,112 @@ function calculateScoresOnlyCalibration(evaluationResults) {
   };
 }
 
-const BT_SWEEPABLE_PARAMS = {
-  recencyWeights:           { registryKey: "recencyWeights", modelTuningKey: "recencyWeights" },
-  teamWeightBase:           { registryKey: "teamWeightBase" },
-  volatilityLimit:          { registryKey: "volatilityLimit" },
-  h1VolScale:               { registryKey: "h1VolScale" },
-  quarterVolScale:          { registryKey: "quarterVolScale" },
-  quarterAnchorBlendWeight: { modelTuningKey: "quarterAnchorBlendWeight" }
-};
+async function runNbaSeasonBacktest(season, onProgress, paramOverrides) {
+  season = season || (getCurrentSeasonYear("nba") - 1);
+  engineDebug("Season backtest starting", { league: "nba", season });
 
-function btApplyParamOverrides(overrides) {
-  const saved = {};
-  for (const key of Object.keys(overrides || {})) {
-    const meta = BT_SWEEPABLE_PARAMS[key];
-    if (!meta) continue;
-    const snapshot = {};
-    if (meta.registryKey && TUNABLE_PARAM_REGISTRY[meta.registryKey]) {
-      snapshot.registryValue = TUNABLE_PARAM_REGISTRY[meta.registryKey].value;
-      TUNABLE_PARAM_REGISTRY[meta.registryKey].value = overrides[key];
-    }
-    if (meta.modelTuningKey) {
-      snapshot.modelTuningValue = MODEL_TUNING[meta.modelTuningKey];
-      MODEL_TUNING[meta.modelTuningKey] = overrides[key];
-    }
-    saved[key] = snapshot;
+  const cacheKey = "nba_" + season;
+  if (window.__bbSeasonDataCache && window.__bbSeasonDataCache[cacheKey] && paramOverrides !== undefined) {
+    return evaluateNbaSeasonBacktestFromCache(window.__bbSeasonDataCache[cacheKey], paramOverrides);
   }
-  return saved;
-}
 
-function btRestoreParamOverrides(saved) {
-  for (const key of Object.keys(saved || {})) {
-    const meta = BT_SWEEPABLE_PARAMS[key];
-    if (!meta) continue;
-    const snap = saved[key];
-    if (meta.registryKey && TUNABLE_PARAM_REGISTRY[meta.registryKey] && "registryValue" in snap) {
-      TUNABLE_PARAM_REGISTRY[meta.registryKey].value = snap.registryValue;
-    }
-    if (meta.modelTuningKey && "modelTuningValue" in snap) {
-      MODEL_TUNING[meta.modelTuningKey] = snap.modelTuningValue;
+  const teamIds = [...new Set(Object.values(NBA_TEAM_MAP))];
+  const gameLogs = {};
+  const CHUNK = 10;
+  for (let i = 0; i < teamIds.length; i += CHUNK) {
+    const chunk = teamIds.slice(i, i + CHUNK);
+    const chunkResults = await Promise.all(chunk.map(id => fetchNbaTeamSeasonGameLog(id, season)));
+    chunk.forEach((id, idx) => { gameLogs[id] = chunkResults[idx]; });
+  }
+
+  const seen = new Set();
+  const allGames = [];
+  for (const teamId of teamIds) {
+    for (const g of (gameLogs[teamId] || [])) {
+      if (seen.has(g.eventId)) continue;
+      seen.add(g.eventId);
+      allGames.push(g);
     }
   }
-}
+  allGames.sort((a, b) => new Date(a.date) - new Date(b.date));
 
-function btNormalCdf(z) {
-  const absZ = Math.abs(z);
-  const t = 1 / (1 + 0.2316419 * absZ);
-  const d = 0.3989423 * Math.exp(-absZ * absZ / 2);
-  const poly = t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
-  const cdfAbsZ = 1 - d * poly;
-  return z >= 0 ? cdfAbsZ : 1 - cdfAbsZ;
-}
+  const h1ProgressKey = `BB_H1_PROGRESS_NBA_${season}`;
+  let h1ByEvent = {};
+  try {
+    const savedProgress = JSON.parse(localStorage.getItem(h1ProgressKey) || "null");
+    if (savedProgress && savedProgress.season === season && savedProgress.h1ByEvent) {
+      h1ByEvent = savedProgress.h1ByEvent;
+    }
+  } catch (e) {}
 
-function btPairedSignificance(baselineResults, challengerResults, predKey, actualKey) {
-  const baseMap = new Map();
-  for (const r of (baselineResults || [])) baseMap.set(r.date + "|" + r.matchup, r);
-  const diffs = [];
-  for (const r of (challengerResults || [])) {
-    const b = baseMap.get(r.date + "|" + r.matchup);
-    if (!b) continue;
-    if (!isFinite(r[predKey]) || !isFinite(r[actualKey]) || !isFinite(b[predKey]) || !isFinite(b[actualKey])) continue;
-    const baseErr = Math.abs(b[predKey] - b[actualKey]);
-    const chalErr = Math.abs(r[predKey] - r[actualKey]);
-    diffs.push(baseErr - chalErr);
+  const remainingGames = allGames.filter(g => !(g.eventId in h1ByEvent));
+  const alreadyDone = allGames.length - remainingGames.length;
+  if (typeof onProgress === "function" && alreadyDone > 0) {
+    try { onProgress(alreadyDone, allGames.length); } catch (e) {}
   }
-  if (diffs.length < 10) return { n: diffs.length, meanDiff: null, pValue: null, significant: false };
-  const n = diffs.length;
-  const mean = diffs.reduce((s, v) => s + v, 0) / n;
-  const variance = diffs.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1);
-  const sd = Math.sqrt(variance);
-  const se = sd / Math.sqrt(n);
-  const zStat = se > 0 ? mean / se : 0;
-  const pValue = 2 * (1 - btNormalCdf(Math.abs(zStat)));
-  return { n, meanDiff: mean, zStat, pValue, significant: pValue < 0.05 && n >= 30 };
-}
 
-function btBuildDefaultSweepVariants() {
-  return [
-    { name: "Baseline (current settings)", overrides: {} },
-    { name: "Recency: weight recent games more", overrides: { recencyWeights: [1.6, 1.3, 1.0, 0.8, 0.6, 0.45, 0.35, 0.25, 0.18, 0.12] } },
-    { name: "Recency: flatter weighting", overrides: { recencyWeights: [1.1, 1.05, 1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65] } },
-    { name: "Team weight: favor own scoring more", overrides: { teamWeightBase: 0.75 } },
-    { name: "Team weight: favor opponent defense more", overrides: { teamWeightBase: 0.55 } },
-    { name: "Volatility: tighter clamp", overrides: { volatilityLimit: 9 } },
-    { name: "Volatility: looser clamp", overrides: { volatilityLimit: 16 } },
-    { name: "1st half volatility: tighter", overrides: { h1VolScale: 0.55 } },
-    { name: "1st half volatility: looser", overrides: { h1VolScale: 0.85 } },
-    { name: "Quarter volatility: tighter", overrides: { quarterVolScale: 0.35 } },
-    { name: "Quarter volatility: looser", overrides: { quarterVolScale: 0.7 } },
-    { name: "Quarter blend: lean more on H1/FT target", overrides: { quarterAnchorBlendWeight: 0.85 } },
-    { name: "Quarter blend: lean less on H1/FT target", overrides: { quarterAnchorBlendWeight: 0.5 } }
-  ];
-}
+  const H1_CHUNK = 10;
+  for (let i = 0; i < remainingGames.length; i += H1_CHUNK) {
+    const batchStart = Date.now();
+    const chunk = remainingGames.slice(i, i + H1_CHUNK);
+    let chunkH1;
+    try {
+      chunkH1 = await Promise.all(chunk.map(g => fetchNbaGameH1(g.eventId)));
+    } catch (e) {
+      engineDebug("Backtest H1 batch threw unexpectedly", { batchIndex: i, error: e?.message || String(e) });
+      throw e;
+    }
+    chunk.forEach((g, idx) => { h1ByEvent[g.eventId] = chunkH1[idx]; });
+    try { localStorage.setItem(h1ProgressKey, JSON.stringify({ season, h1ByEvent })); } catch (e) {
+      engineDebug("Backtest progress save failed", { error: e?.message || String(e) });
+    }
+    engineDebug("Backtest H1 batch complete", { done: alreadyDone + i + H1_CHUNK, total: allGames.length, batchMs: Date.now() - batchStart });
+    if (typeof onProgress === "function") {
+      try { onProgress(Math.min(alreadyDone + i + H1_CHUNK, allGames.length), allGames.length); } catch (e) {}
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
 
-function evaluateNbaSeasonBacktest(gameLogs, allGames, season, overrides) {
-  const savedParams = btApplyParamOverrides(overrides);
+  for (const teamId of teamIds) {
+    for (const g of (gameLogs[teamId] || [])) {
+      const h1map = h1ByEvent[g.eventId];
+      const mine = h1map?.[g.teamId];
+      const opp = h1map?.[g.oppId];
+      if (mine && opp && isFinite(mine.h1) && isFinite(opp.h1)) {
+        g.h1Scored = mine.h1;
+        g.h1Allowed = opp.h1;
+      }
+      if (mine?.quarters && opp?.quarters) {
+        g.q1Scored = mine.quarters[0]; g.q1Allowed = opp.quarters[0];
+        g.q2Scored = mine.quarters[1]; g.q2Allowed = opp.quarters[1];
+        g.q3Scored = mine.quarters[2]; g.q3Allowed = opp.quarters[2];
+        g.q4Scored = mine.quarters[3]; g.q4Allowed = opp.quarters[3];
+      }
+    }
+  }
+
+  try { localStorage.removeItem(h1ProgressKey); } catch (e) {}
+
+  try {
+    if (!window.__bbSeasonDataCache) window.__bbSeasonDataCache = {};
+    window.__bbSeasonDataCache[cacheKey] = { season, allGames, gameLogs };
+  } catch (e) {}
+
+  const _btOriginalGetParam = window.getParam;
+  const _btSavedRecencyWeights = Array.isArray(MODEL_TUNING.recencyWeights) ? MODEL_TUNING.recencyWeights.slice() : MODEL_TUNING.recencyWeights;
+  const _btSavedQBlend = MODEL_TUNING.quarterAnchorBlendWeight;
+  if (paramOverrides && typeof paramOverrides === "object") {
+    window.getParam = function(key, lg) {
+      if (Object.prototype.hasOwnProperty.call(paramOverrides, key)) return paramOverrides[key];
+      return _btOriginalGetParam ? _btOriginalGetParam(key, lg) : undefined;
+    };
+    if (Array.isArray(paramOverrides.recencyWeights)) {
+      MODEL_TUNING.recencyWeights = paramOverrides.recencyWeights.slice();
+    }
+    if (isFinite(paramOverrides.quarterAnchorBlendWeight)) {
+      MODEL_TUNING.quarterAnchorBlendWeight = Number(paramOverrides.quarterAnchorBlendWeight);
+    }
+  }
 
   const domA = document.getElementById("aFTScored");
   const domB = document.getElementById("bFTScored");
@@ -16895,18 +16888,14 @@ function evaluateNbaSeasonBacktest(gameLogs, allGames, season, overrides) {
     if (domB) domB.value = savedB ?? "";
     AppState.context.data = savedContextData;
     window.__seriesDateCache = savedSeriesDateCache;
-    btRestoreParamOverrides(savedParams);
+    window.getParam = _btOriginalGetParam;
+    MODEL_TUNING.recencyWeights = _btSavedRecencyWeights;
+    MODEL_TUNING.quarterAnchorBlendWeight = _btSavedQBlend;
   }
-
-  const splitIdx = Math.floor(results.length * 0.7);
-  const trainResults = results.slice(0, splitIdx);
-  const validResults = results.slice(splitIdx);
 
   const overall = calculateScoresOnlyCalibration(results);
   const full = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "full"));
   const thin = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "thin"));
-  const train = calculateScoresOnlyCalibration(trainResults);
-  const validation = calculateScoresOnlyCalibration(validResults);
 
   const notes = [];
   if (overall) {
@@ -16928,241 +16917,91 @@ function evaluateNbaSeasonBacktest(gameLogs, allGames, season, overrides) {
   }
   if (!notes.length) notes.push("No flags this run — margin, total, and team-score bias are all within a reasonable range.");
 
-  return {
+  const report = {
     season, league: "nba",
     totalGames: allGames.length, evaluated: results.length, skipped,
-    overall, byTier: { full, thin }, train, validation, notes,
-    computedAt: new Date().toISOString(),
-    _rawResults: results
+    overall, byTier: { full, thin }, notes,
+    computedAt: new Date().toISOString()
   };
-}
-
-async function runNbaSeasonBacktest(season, onProgress) {
-  const fetched = await fetchNbaSeasonGameData(season, onProgress);
-  const report = evaluateNbaSeasonBacktest(fetched.gameLogs, fetched.allGames, fetched.season, {});
-  delete report._rawResults;
   engineDebug("Season backtest complete", report);
   try { window.__lastSeasonBacktest = report; } catch (e) {}
   try { localStorage.setItem("BB_SEASON_BACKTEST_NBA", JSON.stringify(report)); } catch (e) {}
-  try { window.__lastSeasonGameData = fetched; } catch (e) {}
   return report;
 }
 
-async function runNbaSeasonSweep(variants, onProgress) {
-  variants = (variants && variants.length) ? variants : btBuildDefaultSweepVariants();
+const BB_NBA_OPT_GRID = [
+  { id: "baseline", label: "Baseline", overrides: {} },
+  { id: "recency_flat", label: "Recency: flat", overrides: { recencyWeights: [1,1,1,1,1,1,1,1,1,1] } },
+  { id: "recency_aggressive", label: "Recency: aggressive", overrides: { recencyWeights: [1.6,1.3,1.0,0.8,0.6,0.45,0.35,0.25,0.18,0.12] } },
+  { id: "recency_heavy", label: "Recency: heavy recent", overrides: { recencyWeights: [2.0,1.5,1.0,0.6,0.3,0.2,0.15,0.1,0.08,0.05] } },
+  { id: "tw_055", label: "Team weight 0.55", overrides: { teamWeightBase: 0.55 } },
+  { id: "tw_070", label: "Team weight 0.70", overrides: { teamWeightBase: 0.70 } },
+  { id: "tw_075", label: "Team weight 0.75", overrides: { teamWeightBase: 0.75 } },
+  { id: "qblend_065", label: "Q blend 0.65", overrides: { quarterAnchorBlendWeight: 0.65 } },
+  { id: "qblend_085", label: "Q blend 0.85", overrides: { quarterAnchorBlendWeight: 0.85 } },
+  { id: "combo_rec_tw", label: "Aggressive recency + TW 0.70", overrides: { recencyWeights: [1.6,1.3,1.0,0.8,0.6,0.45,0.35,0.25,0.18,0.12], teamWeightBase: 0.70 } }
+];
+
+function evaluateNbaSeasonBacktestFromCache(cached, paramOverrides) {
+  return runNbaSeasonBacktest(cached.season, null, paramOverrides || {});
+}
+
+async function runNbaConfigSweep(onProgress) {
   const season = getCurrentSeasonYear("nba") - 1;
-  let cachedData = window.__lastSeasonGameData;
-  if (!cachedData || cachedData.season !== season) {
-    cachedData = await fetchNbaSeasonGameData(season, (done, total) => {
-      if (typeof onProgress === "function") { try { onProgress(0, variants.length, `Fetching season data… ${done}/${total} games`); } catch (e) {} }
-    });
-    try { window.__lastSeasonGameData = cachedData; } catch (e) {}
+  const results = [];
+  const total = BB_NBA_OPT_GRID.length;
+  const cacheKey = "nba_" + season;
+
+  if (!window.__bbSeasonDataCache || !window.__bbSeasonDataCache[cacheKey]) {
+    if (typeof onProgress === "function") {
+      try { onProgress(0, total, "Loading season data (once)…"); } catch (e) {}
+    }
+    await runNbaSeasonBacktest(season, null);
   }
 
-  const { gameLogs, allGames } = cachedData;
-  const variantReports = [];
-  let baselineReport = null;
-
-  for (let i = 0; i < variants.length; i++) {
-    const variant = variants[i];
+  for (let i = 0; i < total; i++) {
+    const cfg = BB_NBA_OPT_GRID[i];
     if (typeof onProgress === "function") {
-      try { onProgress(i, variants.length, `Evaluating: ${variant.name}`); } catch (e) {}
+      try { onProgress(i + 1, total, cfg.label); } catch (e) {}
     }
-    const report = evaluateNbaSeasonBacktest(gameLogs, allGames, season, variant.overrides || {});
-    report.variantName = variant.name;
-    report.overrides = variant.overrides || {};
-    if (i === 0) baselineReport = report;
-    variantReports.push(report);
+    let report;
+    try {
+      report = await runNbaSeasonBacktest(season, null, cfg.overrides);
+    } catch (e) {
+      results.push({ id: cfg.id, label: cfg.label, error: e?.message || String(e) });
+      await new Promise(r => setTimeout(r, 0));
+      continue;
+    }
+    results.push({
+      id: cfg.id,
+      label: cfg.label,
+      totalMAE: report?.overall?.totalMAE ?? null,
+      totalBias: report?.overall?.totalBias ?? null,
+      teamMAE: report?.overall?.teamScoreMAE ?? null,
+      h1TotalMAE: report?.overall?.h1TotalMAE ?? null,
+      qTotalMAE: report?.overall?.qTotalMAE ?? null,
+      marginMAE: report?.overall?.marginMAE ?? null,
+      straightUp: report?.overall?.straightUpAccuracy ?? null,
+      evaluated: report?.evaluated ?? 0
+    });
     await new Promise(r => setTimeout(r, 0));
   }
 
-  const compositeWeights = { totalMAE: 0.25, teamScoreMAE: 0.20, h1TotalMAE: 0.15, h1TeamScoreMAE: 0.10, qTotalMAE: 0.15, qTeamMAE: 0.10, marginMAE: 0.05 };
-  for (const r of variantReports) {
-    const v = r.validation || {};
-    let composite = 0, weightSum = 0;
-    for (const [k, w] of Object.entries(compositeWeights)) {
-      if (isFinite(v[k])) { composite += v[k] * w; weightSum += w; }
-    }
-    r.compositeScore = weightSum > 0 ? composite / weightSum : null;
-
-    if (baselineReport && r !== baselineReport) {
-      const baseValid = (baselineReport._rawResults || []).slice(Math.floor((baselineReport._rawResults || []).length * 0.7));
-      const chalValid = (r._rawResults || []).slice(Math.floor((r._rawResults || []).length * 0.7));
-      r.vsBaseline = {
-        total: btPairedSignificance(baseValid, chalValid, "predictedTotal", "actualTotal"),
-        margin: btPairedSignificance(baseValid, chalValid, "predictedMargin", "actualMargin")
-      };
-    }
+  const valid = results.filter(r => isFinite(r.totalMAE));
+  valid.sort((a, b) => a.totalMAE - b.totalMAE);
+  const baseline = results.find(r => r.id === "baseline") || null;
+  const best = valid[0] || null;
+  let recommendation = "No valid configs.";
+  if (best && baseline && isFinite(baseline.totalMAE)) {
+    const delta = baseline.totalMAE - best.totalMAE;
+    if (best.id === "baseline") recommendation = "Baseline remains best on Total MAE.";
+    else if (delta >= 0.3) recommendation = `Review "${best.label}" — improved Total MAE by ${delta.toFixed(2)} (${baseline.totalMAE.toFixed(1)} → ${best.totalMAE.toFixed(1)}).`;
+    else recommendation = `Best challenger "${best.label}" only edged baseline by ${delta.toFixed(2)} — not enough yet.`;
   }
-
-  for (const r of variantReports) delete r._rawResults;
-
-  const leaderboard = {
-    season, computedAt: new Date().toISOString(),
-    variants: variantReports.map(r => ({
-      name: r.variantName, overrides: r.overrides,
-      trainN: r.train?.n || 0, validationN: r.validation?.n || 0,
-      overall: r.overall, validation: r.validation, compositeScore: r.compositeScore,
-      vsBaseline: r.vsBaseline || null
-    }))
-  };
-
-  try { window.__lastSeasonSweep = leaderboard; } catch (e) {}
-  try { localStorage.setItem("BB_SEASON_SWEEP_NBA", JSON.stringify(leaderboard)); } catch (e) {}
-  return leaderboard;
-}
-
-function renderSweepPanel() {
-  const panel = document.getElementById("trackerAnalyticsPanel");
-  if (!panel) return;
-
-  syncTrackerModalView();
-  panel.classList.remove("tracker-hidden");
-  panel.style.display = "block";
-
-  let cached = window.__lastSeasonSweep;
-  if (!cached) {
-    try {
-      const stored = localStorage.getItem("BB_SEASON_SWEEP_NBA");
-      if (stored) { cached = JSON.parse(stored); window.__lastSeasonSweep = cached; }
-    } catch (e) {}
-  }
-
-  const fmtNum = v => (v === null || v === undefined || !isFinite(v)) ? "—" : v.toFixed(1);
-  const fmtP = v => (v === null || v === undefined || !isFinite(v)) ? "—" : v.toFixed(3);
-
-  const sortKey = window.__sweepSortKey || "compositeScore";
-  let rows = (cached?.variants || []).slice();
-  rows.sort((a, b) => {
-    const av = sortKey === "straightUp" ? (a.validation?.straightUpAccuracy ?? -1) : (a[sortKey] ?? a.validation?.[sortKey] ?? Infinity);
-    const bv = sortKey === "straightUp" ? (b.validation?.straightUpAccuracy ?? -1) : (b[sortKey] ?? b.validation?.[sortKey] ?? Infinity);
-    if (sortKey === "straightUp") return bv - av;
-    return av - bv;
-  });
-
-  const rowsHtml = rows.map(r => {
-    const sig = r.vsBaseline?.total;
-    const sigLabel = !r.vsBaseline ? `<span style="opacity:0.5;">baseline</span>`
-      : (sig?.significant ? `<span style="color:#3a9c35; font-weight:700;">significant, p=${fmtP(sig.pValue)}</span>`
-      : `<span style="opacity:0.6;">not significant, p=${fmtP(sig?.pValue)}</span>`);
-    return `
-      <tr>
-        <td style="padding:8px 10px; text-align:left; font-weight:600;">${r.name}</td>
-        <td style="padding:8px 10px;">${fmtNum(r.validation?.totalMAE)}</td>
-        <td style="padding:8px 10px;">${fmtNum(r.validation?.teamScoreMAE)}</td>
-        <td style="padding:8px 10px;">${fmtNum(r.validation?.h1TotalMAE)}</td>
-        <td style="padding:8px 10px;">${fmtNum(r.validation?.qTotalMAE)}</td>
-        <td style="padding:8px 10px;">${fmtNum(r.validation?.marginMAE)}</td>
-        <td style="padding:8px 10px;">${r.validation?.straightUpAccuracy != null ? (r.validation.straightUpAccuracy * 100).toFixed(1) + "%" : "—"}</td>
-        <td style="padding:8px 10px; font-weight:700;">${fmtNum(r.compositeScore)}</td>
-        <td style="padding:8px 10px; font-size:11px;">${sigLabel}</td>
-      </tr>`;
-  }).join("");
-
-  const tableHtml = cached ? `
-    <div style="padding:12px 16px; overflow-x:auto;">
-      <div style="margin-bottom:8px; font-size:12px;">
-        Sort by:
-        <select id="sweepSortSelect" style="font-size:12px; padding:2px 6px;">
-          <option value="compositeScore">Composite score (lower = better)</option>
-          <option value="totalMAE">Total MAE</option>
-          <option value="teamScoreMAE">Team MAE</option>
-          <option value="h1TotalMAE">1st Half MAE</option>
-          <option value="qTotalMAE">Quarter MAE</option>
-          <option value="marginMAE">Margin MAE</option>
-          <option value="straightUp">Straight-up accuracy</option>
-        </select>
-      </div>
-      <table style="width:100%; border-collapse:collapse; font-size:12px;">
-        <thead>
-          <tr style="border-bottom:2px solid #ccc; text-align:left;">
-            <th style="padding:8px 10px;">Setting</th>
-            <th style="padding:8px 10px;">Total MAE</th>
-            <th style="padding:8px 10px;">Team MAE</th>
-            <th style="padding:8px 10px;">1H MAE</th>
-            <th style="padding:8px 10px;">Qtr MAE</th>
-            <th style="padding:8px 10px;">Margin MAE</th>
-            <th style="padding:8px 10px;">SU%</th>
-            <th style="padding:8px 10px;">Composite</th>
-            <th style="padding:8px 10px;">vs Baseline (held-out)</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rowsHtml}
-        </tbody>
-      </table>
-      <div style="margin-top:10px; font-size:11px; opacity:0.7;">
-        All MAE columns are on the held-out validation slice only (last 30% of the season, chronologically) — the same games never used to pick a winner.
-        "Significant" means the improvement over baseline is unlikely to be chance (p&lt;0.05, paired per-game comparison, n≥30 held-out games).
-      </div>
-    </div>
-  ` : `
-    <div style="padding:12px 16px; font-size:12px; opacity:0.7;">No comparison run yet.</div>
-  `;
-
-  const html = `
-    <div class="tracker-analytics-shell">
-      <div class="tracker-analytics-topbar">
-        <div class="tracker-analytics-heading">
-          <div class="tracker-analytics-kicker">Setting Comparison</div>
-          <div class="tracker-analytics-title">Engine Tuning Sweep — NBA</div>
-          <div class="tracker-analytics-subtitle">Tests each setting against the same season, scored only on held-out games it never saw. ${cached ? `Last run: ${new Date(cached.computedAt).toLocaleString()} (season ${cached.season})` : ""}</div>
-        </div>
-      </div>
-
-      <div style="padding:12px 16px;">
-        <button type="button" id="runSweepBtn" style="background:#2b6cb0; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer;">🔬 Run Comparison</button>
-        <span id="sweepStatusLabel" style="margin-left:10px; font-size:12px; opacity:0.8;"></span>
-      </div>
-
-      ${tableHtml}
-    </div>
-  `;
-
-  panel.innerHTML = html;
-
-  const sortSelect = document.getElementById("sweepSortSelect");
-  if (sortSelect) {
-    sortSelect.value = sortKey;
-    sortSelect.onchange = () => {
-      window.__sweepSortKey = sortSelect.value;
-      renderSweepPanel();
-    };
-  }
-
-  const runBtn = document.getElementById("runSweepBtn");
-  if (runBtn) {
-    runBtn.onclick = async () => {
-      const statusLabel = document.getElementById("sweepStatusLabel");
-      runBtn.disabled = true;
-
-      let wakeLock = null;
-      const requestSwWakeLock = async () => {
-        try {
-          if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
-        } catch (e) {}
-      };
-      await requestSwWakeLock();
-      const reacquireSwWakeLock = () => {
-        if (document.visibilityState === "visible" && !wakeLock) requestSwWakeLock();
-      };
-      document.addEventListener("visibilitychange", reacquireSwWakeLock);
-
-      try {
-        await runNbaSeasonSweep(null, (i, total, label) => {
-          if (statusLabel) statusLabel.textContent = `${label} (${i}/${total})`;
-        });
-        renderSweepPanel();
-      } catch (e) {
-        engineDebug("runNbaSeasonSweep failed from UI", { error: e?.message || String(e), stack: e?.stack || null });
-        if (statusLabel) statusLabel.textContent = `Comparison failed — ${e?.message || "check debug log"}.`;
-      } finally {
-        runBtn.disabled = false;
-        document.removeEventListener("visibilitychange", reacquireSwWakeLock);
-        try { if (wakeLock) await wakeLock.release(); } catch (e) {}
-      }
-    };
-  }
+  const sweepReport = { season, ranAt: new Date().toISOString(), results, ranked: valid, baseline, best, recommendation };
+  try { window.__bbSweepResults = sweepReport; } catch (e) {}
+  try { localStorage.setItem("BB_NBA_CONFIG_SWEEP", JSON.stringify(sweepReport)); } catch (e) {}
+  return sweepReport;
 }
 
 function renderBacktestPanel() {
@@ -17255,8 +17094,10 @@ function renderBacktestPanel() {
 
       <div style="padding:12px 16px;">
         <button type="button" id="runSeasonBacktestBtn" style="background:#3a9c35; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer;">▶ Run NBA Season Backtest</button>
+        <button type="button" id="runConfigSweepBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer; margin-left:8px;">⚙ Run Config Sweep</button>
         <span id="backtestStatusLabel" style="margin-left:10px; font-size:12px; opacity:0.8;"></span>
         ${resumeInfo ? `<div style="margin-top:8px; font-size:12px; color:#8a6d00;">A previous run was interrupted after ${resumeInfo.doneCount} of the season's games — hit Run to pick up right where it left off, nothing is lost.</div>` : ""}
+        ${window.__bbSweepResults ? `<div style="margin-top:10px; font-size:11px; line-height:1.4;"><strong>Sweep:</strong> ${window.__bbSweepResults.recommendation}<br>${(window.__bbSweepResults.ranked || []).slice(0,5).map((r,i)=>`${i+1}. ${r.label}: MAE ${Number(r.totalMAE).toFixed(1)}`).join(" · ")}</div>` : ""}
       </div>
 
       <div style="padding:0 16px 16px;">
@@ -17305,6 +17146,26 @@ function renderBacktestPanel() {
         runBtn.disabled = false;
         document.removeEventListener("visibilitychange", reacquireBtWakeLock);
         try { if (wakeLock) await wakeLock.release(); } catch (e) {}
+      }
+    };
+  }
+
+  const sweepBtn = document.getElementById("runConfigSweepBtn");
+  if (sweepBtn) {
+    sweepBtn.onclick = async () => {
+      const statusLabel = document.getElementById("backtestStatusLabel");
+      sweepBtn.disabled = true;
+      if (statusLabel) statusLabel.textContent = "Starting config sweep…";
+      try {
+        await runNbaConfigSweep((done, total, label) => {
+          if (statusLabel) statusLabel.textContent = `Sweep ${done}/${total}: ${label || ""}`;
+        });
+        renderBacktestPanel();
+      } catch (e) {
+        engineDebug("Config sweep failed from UI", { error: e?.message || String(e) });
+        if (statusLabel) statusLabel.textContent = `Sweep failed — ${e?.message || "check debug log"}.`;
+      } finally {
+        sweepBtn.disabled = false;
       }
     };
   }
@@ -20145,9 +20006,6 @@ if (headerErrorBtn) {
 
       const trackerBacktestBtn = document.getElementById("trackerBacktestBtn");
       if (trackerBacktestBtn) trackerBacktestBtn.addEventListener("click", toggleTrackerBacktestView);
-
-      const trackerSweepBtn = document.getElementById("trackerSweepBtn");
-      if (trackerSweepBtn) trackerSweepBtn.addEventListener("click", toggleTrackerSweepView);
 
       const trackerCloseBtn = document.getElementById("trackerCloseBtn");
       if (trackerCloseBtn) trackerCloseBtn.addEventListener("click", closeTrackerModal);
