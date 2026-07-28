@@ -1,3 +1,4 @@
+D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16569,7 +16570,7 @@ async function fetchNbaGameH1(eventId) {
   }
 }
 
-function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, injB = 1, teamAName = "", teamBName = "", config = {}, combinedVolRatio = 0.5 }) {
+function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, injB = 1, teamAName = "", teamBName = "", config = {}, combinedVolRatio = 0.5, shapeSignalA = null, shapeSignalB = null }) {
   const aS = getManualSeries("A", qKey, parsed);
   const bS = getManualSeries("B", qKey, parsed);
 
@@ -16642,8 +16643,12 @@ function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, in
     projB = applyVolatility(projB, bS, volLimit, league, _bInjAdjBaselineQ);
   }
 
-  const shapeSignalA = getTeamQuarterShapeSignal(league, teamAName, qKey);
-  const shapeSignalB = getTeamQuarterShapeSignal(league, teamBName, qKey);
+  // AUDIT FIX #4: shape signal now comes in as a param (shapeSignalA/B),
+  // computed by the caller from _btTeamQuarterShapeSignals() using only
+  // games strictly before this game's date — see that function for why.
+  // Previously this called the live getTeamQuarterShapeSignal(), which is
+  // not date-scoped and leaked future-season data into every historical
+  // quarter projection.
   if (shapeSignalA && shapeSignalA.direction !== "neutral") {
     projA *= (1 + clampNumber(shapeSignalA.z, -3, 3) * 0.02);
   }
@@ -16728,6 +16733,47 @@ function _btVenueWindow(gameLog, beforeDateIso, wantHome, n = 10) {
 // try/catch, so a single malformed game.date in any team's log would
 // throw uncaught and abort the whole backtest. Removed; the try/catch'd
 // definition above (functionally identical otherwise) is now the only one.
+
+// AUDIT FIX #4: computeQuarterProjectionBT was calling the live
+// getTeamQuarterShapeSignal(), which reads loadQuarterShapeStore() — a
+// single cumulative localStorage store that is not scoped to any date.
+// Every historical game in the season backtest was getting a team's
+// CURRENT full-season shape profile, including games that happened after
+// the game being scored — lookahead bias baked into every quarter
+// projection. This rebuilds the same z-score walk-forward, from only the
+// games strictly before the date in question, using the same per-team
+// game logs already loaded for the backtest.
+function _btTeamQuarterShapeSignals(teamGameLog, beforeDateIso) {
+  const cutoff = new Date(beforeDateIso).getTime();
+  const prior = (teamGameLog || []).filter(g => g && isFinite(new Date(g.date).getTime()) && new Date(g.date).getTime() < cutoff);
+  const sharesByQ = [[], [], [], []];
+  for (const g of prior) {
+    const q = [g.q1Scored, g.q2Scored, g.q3Scored, g.q4Scored].map(Number);
+    if (!q.every(isFinite)) continue;
+    const total = q[0] + q[1] + q[2] + q[3];
+    if (!isFinite(total) || total <= 0) continue;
+    for (let qi = 0; qi < 4; qi++) sharesByQ[qi].push(q[qi] / total);
+  }
+  const qKeys = ["q1", "q2", "q3", "q4"];
+  const out = {};
+  for (let qi = 0; qi < 4; qi++) {
+    const shares = sharesByQ[qi];
+    const n = shares.length;
+    if (n < QSHAPE_MIN_GAMES) { out[qKeys[qi]] = null; continue; }
+    const mean = shares.reduce((s, v) => s + v, 0) / n;
+    const variance = n > 1 ? shares.reduce((s, v) => s + (v - mean) * (v - mean), 0) / (n - 1) : 0;
+    const stdErr = Math.sqrt(Math.max(variance, 0.0001) / n);
+    if (!isFinite(stdErr) || stdErr <= 0) { out[qKeys[qi]] = null; continue; }
+    const z = (mean - 0.25) / stdErr;
+    out[qKeys[qi]] = {
+      z: Number(z.toFixed(2)),
+      share: Number((mean * 100).toFixed(1)),
+      sampleSize: n,
+      direction: z >= 1.0 ? "fast" : z <= -1.0 ? "fade" : "neutral"
+    };
+  }
+  return out;
+}
 
 function calculateScoresOnlyCalibration(evaluationResults) {
   const valid = (evaluationResults || []).filter(r => r && isFinite(r.predictedMargin) && isFinite(r.actualMargin));
@@ -16998,10 +17044,16 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
             const gms = buildGlobalModelState({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1 });
             if (isFinite(gms?.volState?.combinedVolRatio)) combinedVolRatio = gms.volState.combinedVolRatio;
           } catch (e) {}
-          q1 = computeQuarterProjectionBT("q1", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
-          q2 = computeQuarterProjectionBT("q2", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
-          q3 = computeQuarterProjectionBT("q3", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
-          q4 = computeQuarterProjectionBT("q4", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio });
+          // AUDIT FIX #4: build walk-forward shape signals from only games
+          // strictly before game.date, instead of letting
+          // computeQuarterProjectionBT pull the live (non-date-scoped)
+          // shape store internally.
+          const teamShapeSignals = _btTeamQuarterShapeSignals(gameLogs[game.teamId], game.date);
+          const oppShapeSignals = _btTeamQuarterShapeSignals(gameLogs[game.oppId], game.date);
+          q1 = computeQuarterProjectionBT("q1", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, shapeSignalA: teamShapeSignals.q1, shapeSignalB: oppShapeSignals.q1 });
+          q2 = computeQuarterProjectionBT("q2", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, shapeSignalA: teamShapeSignals.q2, shapeSignalB: oppShapeSignals.q2 });
+          q3 = computeQuarterProjectionBT("q3", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, shapeSignalA: teamShapeSignals.q3, shapeSignalB: oppShapeSignals.q3 });
+          q4 = computeQuarterProjectionBT("q4", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, shapeSignalA: teamShapeSignals.q4, shapeSignalB: oppShapeSignals.q4 });
           applyQuarterAnchorBlendBT(q1, q2, q3, q4, calc1H, calc);
         }
       } catch (e) {
