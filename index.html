@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16660,34 +16661,48 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
   season = season || (getCurrentSeasonYear("nba") - 1);
   engineDebug("Season backtest starting", { league: "nba", season, hasOverrides: !!(paramOverrides && Object.keys(paramOverrides).length) });
 
-  const teamIds = [...new Set(Object.values(NBA_TEAM_MAP))];
-  const gameLogs = {};
-  const CHUNK = 6;
-  for (let i = 0; i < teamIds.length; i += CHUNK) {
-    const chunk = teamIds.slice(i, i + CHUNK);
-    const chunkResults = await Promise.all(chunk.map(id => fetchNbaTeamSeasonGameLog(id, season)));
-    chunk.forEach((id, idx) => { gameLogs[id] = chunkResults[idx]; });
-  }
+  if (!window.__bbSeasonDataCache) window.__bbSeasonDataCache = {};
+  const _cacheKey = "nba_" + season;
+  let gameLogs, allGames, h1ByEvent;
+  const _cached = window.__bbSeasonDataCache[_cacheKey];
 
-  const seen = new Set();
-  const allGames = [];
-  for (const teamId of teamIds) {
-    for (const g of (gameLogs[teamId] || [])) {
-      if (seen.has(g.eventId)) continue;
-      seen.add(g.eventId);
-      allGames.push(g);
+  if (_cached && _cached.gameLogs && _cached.allGames && _cached.h1ByEvent) {
+    gameLogs = _cached.gameLogs;
+    allGames = _cached.allGames;
+    h1ByEvent = _cached.h1ByEvent;
+    engineDebug("Season backtest using in-memory cache", { season, games: allGames.length });
+    if (typeof onProgress === "function") {
+      try { onProgress(allGames.length, allGames.length); } catch (e) {}
     }
-  }
-  allGames.sort((a, b) => new Date(a.date) - new Date(b.date));
+  } else {
+    const teamIds = [...new Set(Object.values(NBA_TEAM_MAP))];
+    gameLogs = {};
+    const CHUNK = 6;
+    for (let i = 0; i < teamIds.length; i += CHUNK) {
+      const chunk = teamIds.slice(i, i + CHUNK);
+      const chunkResults = await Promise.all(chunk.map(id => fetchNbaTeamSeasonGameLog(id, season)));
+      chunk.forEach((id, idx) => { gameLogs[id] = chunkResults[idx]; });
+    }
 
-  const h1ProgressKey = `BB_H1_PROGRESS_NBA_${season}`;
-  let h1ByEvent = {};
-  try {
-    const savedProgress = JSON.parse(localStorage.getItem(h1ProgressKey) || "null");
-    if (savedProgress && savedProgress.season === season && savedProgress.h1ByEvent) {
-      h1ByEvent = savedProgress.h1ByEvent;
+    const seen = new Set();
+    allGames = [];
+    for (const teamId of teamIds) {
+      for (const g of (gameLogs[teamId] || [])) {
+        if (seen.has(g.eventId)) continue;
+        seen.add(g.eventId);
+        allGames.push(g);
+      }
     }
-  } catch (e) {}
+    allGames.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    const h1ProgressKey = `BB_H1_PROGRESS_NBA_${season}`;
+    h1ByEvent = {};
+    try {
+      const savedProgress = JSON.parse(localStorage.getItem(h1ProgressKey) || "null");
+      if (savedProgress && savedProgress.season === season && savedProgress.h1ByEvent) {
+        h1ByEvent = savedProgress.h1ByEvent;
+      }
+    } catch (e) {}
 
   const remainingGames = allGames.filter(g => !(g.eventId in h1ByEvent));
   const alreadyDone = allGames.length - remainingGames.length;
@@ -16736,6 +16751,11 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
   }
 
   try { localStorage.removeItem(h1ProgressKey); } catch (e) {}
+
+  if (!window.__bbSeasonDataCache[_cacheKey]) {
+    window.__bbSeasonDataCache[_cacheKey] = { gameLogs, allGames, h1ByEvent, season, cachedAt: new Date().toISOString() };
+    engineDebug("Season backtest data cached in memory", { season, games: allGames.length });
+  }
 
   const domA = document.getElementById("aFTScored");
   const domB = document.getElementById("bFTScored");
