@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16938,6 +16939,88 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
   return report;
 }
 
+const BB_NBA_OPT_GRID = [
+  { id: "baseline", label: "Baseline (current)", overrides: {} },
+  { id: "tw_055", label: "teamWeightBase 0.55", overrides: { teamWeightBase: 0.55 } },
+  { id: "tw_070", label: "teamWeightBase 0.70", overrides: { teamWeightBase: 0.70 } },
+  { id: "tw_075", label: "teamWeightBase 0.75", overrides: { teamWeightBase: 0.75 } },
+  { id: "rec_aggressive", label: "Aggressive recency", overrides: { recencyWeights: [1.60, 1.30, 0.90, 0.60, 0.40, 0.30, 0.22, 0.16, 0.12, 0.08] } },
+  { id: "rec_heavy", label: "Heavy recent", overrides: { recencyWeights: [2.00, 1.50, 1.00, 0.60, 0.30, 0.20, 0.14, 0.10, 0.07, 0.05] } },
+  { id: "rec_flat", label: "Flat weights", overrides: { recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1] } },
+  { id: "tw070_rec_agg", label: "tw 0.70 + aggressive recency", overrides: { teamWeightBase: 0.70, recencyWeights: [1.60, 1.30, 0.90, 0.60, 0.40, 0.30, 0.22, 0.16, 0.12, 0.08] } }
+];
+
+async function runNbaConfigSweep(onProgress) {
+  const season = getCurrentSeasonYear("nba") - 1;
+  const results = [];
+  const total = BB_NBA_OPT_GRID.length;
+
+  for (let i = 0; i < total; i++) {
+    const cfg = BB_NBA_OPT_GRID[i];
+    if (typeof onProgress === "function") {
+      try { onProgress(i + 1, total, cfg.label); } catch (e) {}
+    }
+    engineDebug("Config sweep running", { id: cfg.id, label: cfg.label, index: i + 1, total });
+    let report;
+    try {
+      report = await runNbaSeasonBacktest(season, null, cfg.overrides);
+    } catch (e) {
+      engineDebug("Config sweep entry failed", { id: cfg.id, error: e?.message || String(e) });
+      results.push({ id: cfg.id, label: cfg.label, overrides: cfg.overrides, error: e?.message || String(e) });
+      continue;
+    }
+    results.push({
+      id: cfg.id,
+      label: cfg.label,
+      overrides: cfg.overrides,
+      totalMAE: report?.overall?.totalMAE ?? null,
+      totalBias: report?.overall?.totalBias ?? null,
+      teamMAE: report?.overall?.teamScoreMAE ?? null,
+      teamBias: report?.overall?.teamScoreBias ?? null,
+      h1TotalMAE: report?.overall?.h1TotalMAE ?? null,
+      h1TeamMAE: report?.overall?.h1TeamScoreMAE ?? null,
+      qTotalMAE: report?.overall?.qTotalMAE ?? null,
+      qTeamMAE: report?.overall?.qTeamMAE ?? null,
+      marginMAE: report?.overall?.marginMAE ?? null,
+      straightUp: report?.overall?.straightUpAccuracy ?? null,
+      evaluated: report?.evaluated ?? 0,
+      skipped: report?.skipped ?? 0
+    });
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  const valid = results.filter(r => isFinite(r.totalMAE));
+  valid.sort((a, b) => a.totalMAE - b.totalMAE);
+  const baseline = results.find(r => r.id === "baseline") || null;
+  const best = valid[0] || null;
+
+  let recommendation = "No valid configs produced results.";
+  if (best && baseline && isFinite(baseline.totalMAE)) {
+    const delta = baseline.totalMAE - best.totalMAE;
+    if (best.id === "baseline") {
+      recommendation = "Baseline remains best on Total MAE. No config change recommended.";
+    } else if (delta >= 0.3) {
+      recommendation = `Recommend review: "${best.label}" improved Total MAE by ${delta.toFixed(2)} pts (${baseline.totalMAE.toFixed(1)} → ${best.totalMAE.toFixed(1)}). Check other markets before adopting.`;
+    } else {
+      recommendation = `Best challenger "${best.label}" only edged baseline by ${delta.toFixed(2)} pts — not enough to recommend a change yet.`;
+    }
+  }
+
+  const sweepReport = {
+    season,
+    ranAt: new Date().toISOString(),
+    results,
+    ranked: valid,
+    baseline,
+    best,
+    recommendation
+  };
+  try { window.__bbSweepResults = sweepReport; } catch (e) {}
+  try { localStorage.setItem("BB_NBA_CONFIG_SWEEP", JSON.stringify(sweepReport)); } catch (e) {}
+  engineDebug("Config sweep complete", { best: best?.id, recommendation });
+  return sweepReport;
+}
+
 function renderBacktestPanel() {
   const panel = document.getElementById("trackerAnalyticsPanel");
   if (!panel) return;
@@ -17012,6 +17095,64 @@ function renderBacktestPanel() {
 
   const notesHtml = (cached?.notes || []).map(n => `<div style="padding:8px 12px; border-left:3px solid #3a9c35; margin-bottom:6px; font-size:12px; background:rgba(58,156,53,0.08);">${n}</div>`).join("");
 
+  let sweep = window.__bbSweepResults;
+  if (!sweep) {
+    try {
+      const raw = localStorage.getItem("BB_NBA_CONFIG_SWEEP");
+      if (raw) { sweep = JSON.parse(raw); window.__bbSweepResults = sweep; }
+    } catch (e) {}
+  }
+
+  let sweepHtml = "";
+  if (sweep && Array.isArray(sweep.ranked) && sweep.ranked.length) {
+    const rows = sweep.ranked.map((r, idx) => {
+      const isBase = r.id === "baseline";
+      const isBest = sweep.best && r.id === sweep.best.id;
+      const bg = isBest ? "background:rgba(58,156,53,0.12);" : (isBase ? "background:rgba(58,64,76,0.06);" : "");
+      const tag = isBest ? " ★ BEST" : (isBase ? " (baseline)" : "");
+      return `<tr style="${bg}">
+        <td style="padding:6px 4px; font-size:11px; font-weight:800;">${idx + 1}. ${r.label}${tag}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center; font-weight:900;">${isFinite(r.totalMAE) ? r.totalMAE.toFixed(1) : "—"}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center;">${isFinite(r.teamMAE) ? r.teamMAE.toFixed(1) : "—"}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center;">${isFinite(r.h1TotalMAE) ? r.h1TotalMAE.toFixed(1) : "—"}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center;">${isFinite(r.qTotalMAE) ? r.qTotalMAE.toFixed(1) : "—"}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center;">${isFinite(r.totalBias) ? r.totalBias.toFixed(1) : "—"}</td>
+      </tr>`;
+    }).join("");
+    sweepHtml = `
+      <div style="padding:0 16px 16px;">
+        <div style="font-size:12px; font-weight:900; margin-bottom:8px; letter-spacing:0.4px; text-transform:uppercase;">Config Sweep Leaderboard (ranked by Total MAE)</div>
+        <div style="overflow-x:auto;">
+          <table style="width:100%; border-collapse:collapse; font-size:11px;">
+            <thead>
+              <tr style="background:var(--table-head); color:#fff;">
+                <th style="padding:6px 4px; text-align:left;">Config</th>
+                <th style="padding:6px 4px;">Total MAE</th>
+                <th style="padding:6px 4px;">Team MAE</th>
+                <th style="padding:6px 4px;">1H MAE</th>
+                <th style="padding:6px 4px;">Q MAE</th>
+                <th style="padding:6px 4px;">Bias</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <div style="margin-top:10px; padding:10px 12px; border-left:3px solid #d4af37; background:rgba(212,175,55,0.08); font-size:12px; font-weight:700; line-height:1.4;">
+          ${sweep.recommendation || ""}
+        </div>
+        <div style="margin-top:6px; font-size:10px; color:var(--muted);">Last sweep: ${sweep.ranAt ? new Date(sweep.ranAt).toLocaleString() : "—"} · season ${sweep.season ?? "—"} · diagnostic only — nothing auto-applied</div>
+      </div>
+    `;
+  } else {
+    sweepHtml = `
+      <div style="padding:0 16px 16px;">
+        <div style="padding:12px; border:1px dashed var(--table-border); color:var(--muted); font-size:12px; font-weight:700;">
+          Config sweep results will appear here after you run a sweep. Ranked by Total MAE across FT / Team / 1H / Quarters.
+        </div>
+      </div>
+    `;
+  }
+
   const html = `
     <div class="tracker-analytics-shell">
       <div class="tracker-analytics-topbar">
@@ -17028,6 +17169,7 @@ function renderBacktestPanel() {
 
       <div style="padding:12px 16px;">
         <button type="button" id="runSeasonBacktestBtn" style="background:#3a9c35; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer;">▶ Run NBA Season Backtest</button>
+        <button type="button" id="runConfigSweepBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer; margin-left:8px;">🔬 Run Config Sweep</button>
         <span id="backtestStatusLabel" style="margin-left:10px; font-size:12px; opacity:0.8;"></span>
         ${resumeInfo ? `<div style="margin-top:8px; font-size:12px; color:#8a6d00;">A previous run was interrupted after ${resumeInfo.doneCount} of the season's games — hit Run to pick up right where it left off, nothing is lost.</div>` : ""}
       </div>
@@ -17035,6 +17177,7 @@ function renderBacktestPanel() {
       <div style="padding:0 16px 16px;">
         ${notesHtml}
       </div>
+      ${sweepHtml}
     </div>
   `;
 
@@ -17045,6 +17188,8 @@ function renderBacktestPanel() {
     runBtn.onclick = async () => {
       const statusLabel = document.getElementById("backtestStatusLabel");
       runBtn.disabled = true;
+      const sweepBtn = document.getElementById("runConfigSweepBtn");
+      if (sweepBtn) sweepBtn.disabled = true;
       if (statusLabel) statusLabel.textContent = "Fetching season schedules…";
 
       let wakeLock = null;
@@ -17076,8 +17221,40 @@ function renderBacktestPanel() {
         if (statusLabel) statusLabel.textContent = `Backtest failed — ${e?.message || "check debug log"}.`;
       } finally {
         runBtn.disabled = false;
+        const sweepBtn2 = document.getElementById("runConfigSweepBtn");
+        if (sweepBtn2) sweepBtn2.disabled = false;
         document.removeEventListener("visibilitychange", reacquireBtWakeLock);
         try { if (wakeLock) await wakeLock.release(); } catch (e) {}
+      }
+    };
+  }
+
+  const sweepBtn = document.getElementById("runConfigSweepBtn");
+  if (sweepBtn) {
+    sweepBtn.onclick = async () => {
+      const statusLabel = document.getElementById("backtestStatusLabel");
+      sweepBtn.disabled = true;
+      if (runBtn) runBtn.disabled = true;
+      if (statusLabel) statusLabel.textContent = "Starting config sweep…";
+      try {
+        const season = getCurrentSeasonYear("nba") - 1;
+        const cacheKey = "nba_" + season;
+        if (!window.__bbSeasonDataCache || !window.__bbSeasonDataCache[cacheKey]) {
+          if (statusLabel) statusLabel.textContent = "No cached season data — running baseline fetch first…";
+          await runNbaSeasonBacktest(season, (done, total) => {
+            if (statusLabel) statusLabel.textContent = `Fetching data… ${done}/${total}`;
+          }, null);
+        }
+        await runNbaConfigSweep((idx, total, label) => {
+          if (statusLabel) statusLabel.textContent = `Sweep ${idx}/${total}: ${label}`;
+        });
+        renderBacktestPanel();
+      } catch (e) {
+        engineDebug("Config sweep failed from UI", { error: e?.message || String(e) });
+        if (statusLabel) statusLabel.textContent = `Sweep failed — ${e?.message || "check debug log"}.`;
+      } finally {
+        sweepBtn.disabled = false;
+        if (runBtn) runBtn.disabled = false;
       }
     };
   }
