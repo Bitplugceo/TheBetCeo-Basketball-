@@ -1,4 +1,3 @@
-O
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16673,9 +16672,14 @@ function calculateScoresOnlyCalibration(evaluationResults) {
   };
 }
 
-async function runNbaSeasonBacktest(season, onProgress) {
+async function runNbaSeasonBacktest(season, onProgress, paramOverrides) {
   season = season || (getCurrentSeasonYear("nba") - 1);
-  engineDebug("Season backtest starting", { league: "nba", season });
+  engineDebug("Season backtest starting", { league: "nba", season, hasOverrides: !!(paramOverrides && Object.keys(paramOverrides || {}).length) });
+
+  const cacheKey = "nba_" + season;
+  if (window.__bbSeasonDataCache && window.__bbSeasonDataCache[cacheKey] && typeof evaluateNbaSeasonBacktestFromCache === "function") {
+    return evaluateNbaSeasonBacktestFromCache(window.__bbSeasonDataCache[cacheKey], paramOverrides);
+  }
 
   const teamIds = [...new Set(Object.values(NBA_TEAM_MAP))];
   const gameLogs = {};
@@ -16731,7 +16735,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
     if (typeof onProgress === "function") {
       try { onProgress(Math.min(alreadyDone + i + H1_CHUNK, allGames.length), allGames.length); } catch (e) {}
     }
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise(r => setTimeout(r, 30));
   }
 
   for (const teamId of teamIds) {
@@ -16753,6 +16757,27 @@ async function runNbaSeasonBacktest(season, onProgress) {
   }
 
   try { localStorage.removeItem(h1ProgressKey); } catch (e) {}
+
+  try {
+    if (!window.__bbSeasonDataCache) window.__bbSeasonDataCache = {};
+    window.__bbSeasonDataCache["nba_" + season] = { season, allGames, gameLogs };
+  } catch (e) {}
+
+  const _btOriginalGetParam = window.getParam;
+  const _btSavedRecencyWeights = Array.isArray(MODEL_TUNING.recencyWeights) ? MODEL_TUNING.recencyWeights.slice() : MODEL_TUNING.recencyWeights;
+  const _btSavedQBlend = MODEL_TUNING.quarterAnchorBlendWeight;
+  if (paramOverrides && typeof paramOverrides === "object") {
+    window.getParam = function(key, lg) {
+      if (Object.prototype.hasOwnProperty.call(paramOverrides, key)) return paramOverrides[key];
+      return _btOriginalGetParam ? _btOriginalGetParam(key, lg) : undefined;
+    };
+    if (Array.isArray(paramOverrides.recencyWeights)) {
+      MODEL_TUNING.recencyWeights = paramOverrides.recencyWeights.slice();
+    }
+    if (isFinite(paramOverrides.quarterAnchorBlendWeight)) {
+      MODEL_TUNING.quarterAnchorBlendWeight = Number(paramOverrides.quarterAnchorBlendWeight);
+    }
+  }
 
   const domA = document.getElementById("aFTScored");
   const domB = document.getElementById("bFTScored");
@@ -16942,6 +16967,10 @@ async function runNbaSeasonBacktest(season, onProgress) {
   try { localStorage.setItem("BB_SEASON_BACKTEST_NBA", JSON.stringify(report)); } catch (e) {}
   return report;
   } finally {
+    if (domA) domA.value = savedA ?? "";
+    if (domB) domB.value = savedB ?? "";
+    AppState.context.data = savedContextData;
+    window.__seriesDateCache = savedSeriesDateCache;
     window.getParam = _btOriginalGetParam;
     MODEL_TUNING.recencyWeights = _btSavedRecencyWeights;
     MODEL_TUNING.quarterAnchorBlendWeight = _btSavedQBlend;
@@ -17235,7 +17264,6 @@ async function runNbaConfigSweep(onProgress) {
       evaluated: report?.evaluated ?? 0,
       skipped: report?.skipped ?? 0
     });
-    await new Promise(r => setTimeout(r, 50));
   }
 
   const valid = results.filter(r => isFinite(r.totalMAE));
