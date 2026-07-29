@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16657,6 +16656,109 @@ function calculateScoresOnlyCalibration(evaluationResults) {
   };
 }
 
+function buildScoresOnlyDiagnosis(results) {
+  const valid = (results || []).filter(r => r && isFinite(r.predictedTotal) && isFinite(r.actualTotal));
+  if (!valid.length) return null;
+
+  const mae = arr => arr.length ? arr.reduce((s, v) => s + Math.abs(v), 0) / arr.length : null;
+  const bias = arr => arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : null;
+  const absErr = r => Math.abs(r.predictedTotal - r.actualTotal);
+  const signedErr = r => r.predictedTotal - r.actualTotal;
+
+  function bucketStats(rows) {
+    const errs = rows.map(signedErr);
+    return { n: rows.length, totalMAE: mae(errs), totalBias: bias(errs) };
+  }
+
+  const full = valid.filter(r => r.sampleTier === "full");
+  const thin = valid.filter(r => r.sampleTier === "thin");
+
+  const lowTotal = valid.filter(r => r.actualTotal < 210);
+  const midTotal = valid.filter(r => r.actualTotal >= 210 && r.actualTotal <= 240);
+  const highTotal = valid.filter(r => r.actualTotal > 240);
+
+  const closeGame = valid.filter(r => Math.abs(r.actualMargin) < 6);
+  const mediumGame = valid.filter(r => Math.abs(r.actualMargin) >= 6 && Math.abs(r.actualMargin) <= 15);
+  const blowout = valid.filter(r => Math.abs(r.actualMargin) > 15);
+
+  const dated = valid.filter(r => r.date).slice().sort((a, b) => new Date(a.date) - new Date(b.date));
+  const third = Math.max(1, Math.floor(dated.length / 3));
+  const early = dated.slice(0, third);
+  const mid = dated.slice(third, third * 2);
+  const late = dated.slice(third * 2);
+
+  const absList = valid.map(absErr).sort((a, b) => a - b);
+  const pctile = p => {
+    if (!absList.length) return null;
+    const idx = Math.min(absList.length - 1, Math.floor(p * (absList.length - 1)));
+    return absList[idx];
+  };
+  const pctOver = thr => absList.length ? absList.filter(v => v >= thr).length / absList.length : null;
+
+  const bySample = { full: bucketStats(full), thin: bucketStats(thin) };
+  const byTotal = { low: bucketStats(lowTotal), mid: bucketStats(midTotal), high: bucketStats(highTotal) };
+  const byMargin = { close: bucketStats(closeGame), medium: bucketStats(mediumGame), blowout: bucketStats(blowout) };
+  const byPhase = { early: bucketStats(early), mid: bucketStats(mid), late: bucketStats(late) };
+  const errorDist = {
+    p50: pctile(0.50),
+    p75: pctile(0.75),
+    p90: pctile(0.90),
+    pctOver20: pctOver(20),
+    pctOver30: pctOver(30)
+  };
+
+  const findings = [];
+  if (bySample.full.n >= 30 && bySample.thin.n >= 30 && isFinite(bySample.full.totalMAE) && isFinite(bySample.thin.totalMAE)) {
+    const gap = bySample.thin.totalMAE - bySample.full.totalMAE;
+    if (gap >= 1.5) {
+      findings.push(`Thin samples (5–9 prior games) are ${gap.toFixed(1)} pts worse on Total MAE than full samples — sample shrinkage / league-average pull is a real lever.`);
+    } else if (gap <= -1.0) {
+      findings.push(`Thin samples are outperforming full samples by ${Math.abs(gap).toFixed(1)} pts — aggressive recency on long windows may be hurting.`);
+    } else {
+      findings.push(`Thin vs full sample MAE gap is small (${gap >= 0 ? "+" : ""}${gap.toFixed(1)}). Sample size is not the main driver of the ~15 error.`);
+    }
+  }
+
+  if (byTotal.high.n >= 40 && byTotal.mid.n >= 40 && isFinite(byTotal.high.totalMAE) && isFinite(byTotal.mid.totalMAE)) {
+    const gap = byTotal.high.totalMAE - byTotal.mid.totalMAE;
+    if (gap >= 2) {
+      findings.push(`High-scoring games (actual total > 240) are ${gap.toFixed(1)} pts harder — pace / ceiling handling is under-predicting or over-damping extremes.`);
+    } else if (gap <= -2) {
+      findings.push(`High-scoring games are easier than mid-range ones by ${Math.abs(gap).toFixed(1)} pts — unusual; check low-total buckets instead.`);
+    } else {
+      findings.push(`Error is similar across low / mid / high total games — the ~15 MAE is not concentrated only in blowout-scoring nights.`);
+    }
+  }
+
+  if (byMargin.blowout.n >= 40 && byMargin.close.n >= 40 && isFinite(byMargin.blowout.totalMAE) && isFinite(byMargin.close.totalMAE)) {
+    const gap = byMargin.blowout.totalMAE - byMargin.close.totalMAE;
+    if (Math.abs(gap) >= 2) {
+      findings.push(`Blowout games (|margin| > 15) differ from close games by ${gap >= 0 ? "+" : ""}${gap.toFixed(1)} Total MAE — margin regime matters.`);
+    } else {
+      findings.push(`Close vs blowout games have similar Total MAE — the error is not mainly a blowout problem.`);
+    }
+  }
+
+  if (byPhase.early.n >= 40 && byPhase.late.n >= 40 && isFinite(byPhase.early.totalMAE) && isFinite(byPhase.late.totalMAE)) {
+    const gap = byPhase.early.totalMAE - byPhase.late.totalMAE;
+    if (gap >= 1.5) {
+      findings.push(`Early-season MAE is ${gap.toFixed(1)} pts worse than late-season — form is unstable early; stronger early-season shrinkage would help.`);
+    } else if (gap <= -1.5) {
+      findings.push(`Late-season MAE is worse than early by ${Math.abs(gap).toFixed(1)} pts — unexpected; check for regime shifts or injuries not modeled.`);
+    } else {
+      findings.push(`Early / mid / late season MAE is fairly flat — the ~15 error is not mostly an “early season form” problem.`);
+    }
+  }
+
+  if (isFinite(errorDist.pctOver20)) {
+    findings.push(`${(errorDist.pctOver20 * 100).toFixed(0)}% of games miss by 20+ total points; ${(isFinite(errorDist.pctOver30) ? (errorDist.pctOver30 * 100).toFixed(0) : "—")}% miss by 30+. Median miss is ${isFinite(errorDist.p50) ? errorDist.p50.toFixed(1) : "—"} pts (p90 = ${isFinite(errorDist.p90) ? errorDist.p90.toFixed(1) : "—"}).`);
+  }
+
+  findings.push("Tunable constants (recency / teamWeight / pace clamps) already tested: max gain ~0.1 Total MAE. Further grids on those knobs will not break the ~15 ceiling — structural projection changes are required next.");
+
+  return { bySample, byTotal, byMargin, byPhase, errorDist, findings, n: valid.length };
+}
+
 async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
   season = season || (getCurrentSeasonYear("nba") - 1);
   engineDebug("Season backtest starting", { league: "nba", season, hasOverrides: !!(paramOverrides && Object.keys(paramOverrides).length) });
@@ -16911,6 +17013,7 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
   const overall = calculateScoresOnlyCalibration(results);
   const full = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "full"));
   const thin = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "thin"));
+  const diagnosis = buildScoresOnlyDiagnosis(results);
 
   const notes = [];
   if (overall) {
@@ -16930,12 +17033,15 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
       notes.push(`Quarter totals are running ${overall.qTotalBias > 0 ? "high" : "low"} by about ${Math.abs(overall.qTotalBias).toFixed(1)} pts on average.`);
     }
   }
+  if (diagnosis && Array.isArray(diagnosis.findings)) {
+    diagnosis.findings.forEach(f => notes.push(f));
+  }
   if (!notes.length) notes.push("No flags this run — margin, total, and team-score bias are all within a reasonable range.");
 
   const report = {
     season, league: "nba",
     totalGames: allGames.length, evaluated: results.length, skipped,
-    overall, byTier: { full, thin }, notes,
+    overall, byTier: { full, thin }, diagnosis, notes,
     computedAt: new Date().toISOString()
   };
   engineDebug("Season backtest complete", report);
@@ -17125,6 +17231,48 @@ function renderBacktestPanel() {
 
   const notesHtml = (cached?.notes || []).map(n => `<div style="padding:8px 12px; border-left:3px solid #3a9c35; margin-bottom:6px; font-size:12px; background:rgba(58,156,53,0.08);">${n}</div>`).join("");
 
+  const dx = cached?.diagnosis;
+  const fmtDx = (b) => (b && isFinite(b.totalMAE)) ? `${b.totalMAE.toFixed(1)} (n=${b.n})` : "—";
+  let diagnosisHtml = "";
+  if (dx) {
+    diagnosisHtml = `
+      <div style="padding:0 16px 16px;">
+        <div style="font-size:12px; font-weight:900; margin-bottom:8px; letter-spacing:0.4px; text-transform:uppercase;">Stage 2 — Error Diagnosis</div>
+        <div style="overflow-x:auto; margin-bottom:10px;">
+          <table style="width:100%; border-collapse:collapse; font-size:11px;">
+            <thead>
+              <tr style="background:var(--table-head); color:#fff;">
+                <th style="padding:6px 4px; text-align:left;">Slice</th>
+                <th style="padding:6px 4px;">Bucket</th>
+                <th style="padding:6px 4px;">Total MAE (n)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td style="padding:5px 4px; font-weight:800;">Sample</td><td style="padding:5px 4px;">Full (10+)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.bySample?.full)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Sample</td><td style="padding:5px 4px;">Thin (5–9)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.bySample?.thin)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Actual total</td><td style="padding:5px 4px;">Low (&lt;210)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byTotal?.low)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Actual total</td><td style="padding:5px 4px;">Mid (210–240)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byTotal?.mid)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Actual total</td><td style="padding:5px 4px;">High (&gt;240)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byTotal?.high)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Margin</td><td style="padding:5px 4px;">Close (&lt;6)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byMargin?.close)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Margin</td><td style="padding:5px 4px;">Medium (6–15)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byMargin?.medium)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Margin</td><td style="padding:5px 4px;">Blowout (&gt;15)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byMargin?.blowout)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Season phase</td><td style="padding:5px 4px;">Early</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byPhase?.early)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Season phase</td><td style="padding:5px 4px;">Mid</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byPhase?.mid)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Season phase</td><td style="padding:5px 4px;">Late</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byPhase?.late)}</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">
+          Error distribution — median miss: <strong>${isFinite(dx.errorDist?.p50) ? dx.errorDist.p50.toFixed(1) : "—"}</strong>
+          · p75: <strong>${isFinite(dx.errorDist?.p75) ? dx.errorDist.p75.toFixed(1) : "—"}</strong>
+          · p90: <strong>${isFinite(dx.errorDist?.p90) ? dx.errorDist.p90.toFixed(1) : "—"}</strong>
+          · ≥20 pts: <strong>${isFinite(dx.errorDist?.pctOver20) ? (dx.errorDist.pctOver20 * 100).toFixed(0) + "%" : "—"}</strong>
+          · ≥30 pts: <strong>${isFinite(dx.errorDist?.pctOver30) ? (dx.errorDist.pctOver30 * 100).toFixed(0) + "%" : "—"}</strong>
+        </div>
+      </div>
+    `;
+  }
+
   let sweep = window.__bbSweepResults;
   if (!sweep) {
     try {
@@ -17207,6 +17355,7 @@ function renderBacktestPanel() {
       <div style="padding:0 16px 16px;">
         ${notesHtml}
       </div>
+      ${typeof diagnosisHtml !== "undefined" ? diagnosisHtml : ""}
       ${sweepHtml}
     </div>
   `;
