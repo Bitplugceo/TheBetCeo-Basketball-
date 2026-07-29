@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16797,18 +16798,26 @@ function calculateScoresOnlyCalibration(evaluationResults) {
 // ACCURACY SCORE FIX: converts the raw MAE numbers above into one 0-100
 // composite plus a per-market breakdown, per the roadmap's "Backtest
 // Accuracy Score" definition. Each market gets 100 at MAE=0, 50 at
-// MAE=target, 0 at MAE>=2*target. Targets below are engineering estimates
-// scaled to each market's typical point total (FT ~225, team ~113, 1H ~112,
-// H1 team ~56, quarter total ~56, quarter team ~28) — flagged in the
-// roadmap as placeholders to revisit once Phase 2's real baseline error
-// distribution is in, not empirically fit yet.
+// MAE=target, 0 at MAE>=2*target.
+//
+// PHASE 2 BASELINE CALIBRATION (2026-07-30, season 2025, n=1153 games,
+// 78 skipped): targets below were originally engineering placeholders,
+// documented as "revisit once real baseline error distribution is in."
+// That run came back with every market landing at a 20-31/100 score against
+// those placeholders — a uniform ~1.5x gap across all 6 markets, meaning the
+// guesses were too strict on scale, not miscalibrated on any one market.
+// Replaced with the real measured baseline MAE per market, so today's
+// engine reads as exactly 50/100 on each — a real, non-arbitrary anchor.
+// Future sweep/config results are scored relative to this frozen baseline,
+// not re-derived from whatever the current run happens to show (that would
+// make every run center on ~50 by construction and defeat the point).
 const BT_ACCURACY_TARGETS = {
-  totalMAE: 10,
-  teamScoreMAE: 6.5,
-  h1TotalMAE: 7,
-  h1TeamScoreMAE: 4.5,
-  qTotalMAE: 4.5,
-  qTeamMAE: 3
+  totalMAE: 15.0,
+  teamScoreMAE: 9.6,
+  h1TotalMAE: 9.6,
+  h1TeamScoreMAE: 6.6,
+  qTotalMAE: 7.0,
+  qTeamMAE: 4.8
 };
 
 function computeBacktestAccuracyScore(calibration) {
@@ -16964,8 +16973,6 @@ function buildScoresOnlyDiagnosis(results) {
   if (isFinite(errorDist.pctOver20)) {
     findings.push(`${(errorDist.pctOver20 * 100).toFixed(0)}% of games miss by 20+ total points; ${(isFinite(errorDist.pctOver30) ? (errorDist.pctOver30 * 100).toFixed(0) : "—")}% miss by 30+. Median miss is ${isFinite(errorDist.p50) ? errorDist.p50.toFixed(1) : "—"} pts (p90 = ${isFinite(errorDist.p90) ? errorDist.p90.toFixed(1) : "—"}).`);
   }
-
-  findings.push("Tunable constants (recency / teamWeight / pace clamps) already tested: max gain ~0.1 Total MAE. Further grids on those knobs will not break the ~15 ceiling — structural projection changes are required next.");
 
   return { bySample, byTotal, byMargin, byPhase, lowRegime, highRegime, errorDist, findings, n: valid.length };
 }
@@ -17321,6 +17328,14 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
       notes.push(`Quarter totals are running ${overall.qTotalBias > 0 ? "high" : "low"} by about ${Math.abs(overall.qTotalBias).toFixed(1)} pts on average.`);
     }
   }
+  // TRAIN/HOLDOUT FIX: overfitting guard — flag it here as a real, computed
+  // note rather than leaving it as something you'd have to notice yourself.
+  if (isFinite(trainAccuracyScore?.composite) && isFinite(holdoutAccuracyScore?.composite)) {
+    const _acGap = trainAccuracyScore.composite - holdoutAccuracyScore.composite;
+    if (_acGap >= 8) {
+      notes.push(`Holdout Accuracy Score (${holdoutAccuracyScore.composite.toFixed(1)}) is ${_acGap.toFixed(1)} pts below train (${trainAccuracyScore.composite.toFixed(1)}) — this config may be overfit to early-season games; treat any tuning gains with caution until the gap narrows.`);
+    }
+  }
   if (diagnosis && Array.isArray(diagnosis.findings)) {
     diagnosis.findings.forEach(f => notes.push(f));
   }
@@ -17449,6 +17464,11 @@ function renderBacktestPanel() {
 
   const summaryHtml = cached ? `
         <div class="tracker-summary-cell primary">
+          <div class="tracker-summary-label">Backtest Accuracy Score</div>
+          <div class="tracker-summary-value">${isFinite(cached.accuracyScore?.composite) ? cached.accuracyScore.composite.toFixed(1) : "—"}/100</div>
+          <div class="tracker-summary-sub">Train: ${isFinite(cached.trainAccuracyScore?.composite) ? cached.trainAccuracyScore.composite.toFixed(1) : "—"} · Holdout: ${isFinite(cached.holdoutAccuracyScore?.composite) ? cached.holdoutAccuracyScore.composite.toFixed(1) : "—"} (last ${Math.round((cached.holdoutFraction ?? 0.3) * 100)}% of season)</div>
+        </div>
+        <div class="tracker-summary-cell">
           <div class="tracker-summary-label">Total Points MAE / Bias</div>
           <div class="tracker-summary-value">${fmtNum(cached.overall?.totalMAE)}</div>
           <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.totalBias)} · ${cached.evaluated} games · ${cached.skipped} skipped</div>
