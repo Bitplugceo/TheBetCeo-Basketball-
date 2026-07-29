@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -15761,7 +15762,23 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   aS *= injMultA;
   bS *= injMultB;
 
-  
+  // STAGE 3: extreme expansion — stretch team totals away from league mean
+  // when form already implies a slow or fast game. Default 1.0 = no change.
+  // Diagnosis showed mid-total MAE ~8.2 vs low/high ~23–25; this targets
+  // mean-compression without touching mid-range games as hard.
+  const _extremeExp = isFinite(config?.extremeExpansion) ? Number(config.extremeExpansion) : 1.0;
+  if (_extremeExp > 1.0 && isFinite(aS) && isFinite(bS)) {
+    const formTotal = aS + bS;
+    const leagueTotal = isFinite(eb) ? eb : 220;
+    if (isFinite(formTotal) && formTotal > 0 && isFinite(leagueTotal) && leagueTotal > 0) {
+      const expanded = leagueTotal + (formTotal - leagueTotal) * _extremeExp;
+      const scale = expanded / formTotal;
+      if (isFinite(scale) && scale > 0) {
+        aS *= scale;
+        bS *= scale;
+      }
+    }
+  }
 
   const _injOppBoostFactor = isFinite(config?.injuryOppBoostFactor) ? Number(config.injuryOppBoostFactor) : (getParam("injuryOppBoostFactor", league) ?? INJURY_OPPONENT_BOOST_FACTOR);
   if (injMultA < 1) bS *= (1 + (1 - injMultA) * _injOppBoostFactor);
@@ -16696,7 +16713,13 @@ function buildScoresOnlyDiagnosis(results) {
   const pctOver = thr => absList.length ? absList.filter(v => v >= thr).length / absList.length : null;
 
   const bySample = { full: bucketStats(full), thin: bucketStats(thin) };
-  const byTotal = { low: bucketStats(lowTotal), mid: bucketStats(midTotal), high: bucketStats(highTotal) };
+  const byTotal = {
+    low: bucketStats(lowTotal),
+    mid: bucketStats(midTotal),
+    high: bucketStats(highTotal)
+  };
+  // Bias sign on extremes: + means we predict too high, − means too low.
+  // Compression toward the middle usually shows +bias on low games and −bias on high games.
   const byMargin = { close: bucketStats(closeGame), medium: bucketStats(mediumGame), blowout: bucketStats(blowout) };
   const byPhase = { early: bucketStats(early), mid: bucketStats(mid), late: bucketStats(late) };
   const errorDist = {
@@ -16925,7 +16948,8 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
       const _btConfig = {
         teamWeight: _tw,
         oppWeight: 1 - _tw,
-        h2hFactor: (paramOverrides && paramOverrides.h2hFactor != null) ? paramOverrides.h2hFactor : (window.getParam("h2hFactor", "nba") ?? 1.0)
+        h2hFactor: (paramOverrides && paramOverrides.h2hFactor != null) ? paramOverrides.h2hFactor : (window.getParam("h2hFactor", "nba") ?? 1.0),
+        extremeExpansion: (paramOverrides && isFinite(paramOverrides.extremeExpansion)) ? Number(paramOverrides.extremeExpansion) : 1.0
       };
 
       let calc;
@@ -17051,39 +17075,15 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
 }
 
 const BB_NBA_OPT_GRID = [
-  { id: "baseline", label: "Baseline (current)", overrides: {} },
-
-  { id: "tw_045", label: "teamWeight 0.45", overrides: { teamWeightBase: 0.45 } },
-  { id: "tw_055", label: "teamWeight 0.55", overrides: { teamWeightBase: 0.55 } },
-  { id: "tw_060", label: "teamWeight 0.60", overrides: { teamWeightBase: 0.60 } },
-  { id: "tw_070", label: "teamWeight 0.70", overrides: { teamWeightBase: 0.70 } },
-  { id: "tw_075", label: "teamWeight 0.75", overrides: { teamWeightBase: 0.75 } },
-  { id: "tw_080", label: "teamWeight 0.80", overrides: { teamWeightBase: 0.80 } },
-
-  { id: "rec_flat", label: "Recency flat", overrides: { recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1] } },
-  { id: "rec_mild", label: "Recency mild", overrides: { recencyWeights: [1.20, 1.10, 1.00, 0.90, 0.80, 0.70, 0.60, 0.50, 0.40, 0.30] } },
-  { id: "rec_aggressive", label: "Recency aggressive", overrides: { recencyWeights: [1.60, 1.30, 0.90, 0.60, 0.40, 0.30, 0.22, 0.16, 0.12, 0.08] } },
-  { id: "rec_heavy", label: "Recency heavy", overrides: { recencyWeights: [2.00, 1.50, 1.00, 0.60, 0.30, 0.20, 0.14, 0.10, 0.07, 0.05] } },
-  { id: "rec_decay_fast", label: "Recency fast decay", overrides: { recencyWeights: [1.80, 1.20, 0.70, 0.40, 0.25, 0.15, 0.10, 0.07, 0.05, 0.03] } },
-  { id: "rec_long_tail", label: "Recency long tail", overrides: { recencyWeights: [1.25, 1.15, 1.05, 0.95, 0.85, 0.75, 0.65, 0.55, 0.45, 0.35] } },
-
-  { id: "pace_tight", label: "Pace clamp tight 0.80-1.20", overrides: { paceClampMinNbaNcaa: 0.80, paceClampMaxNbaNcaa: 1.20 } },
-  { id: "pace_wide", label: "Pace clamp wide 0.55-1.45", overrides: { paceClampMinNbaNcaa: 0.55, paceClampMaxNbaNcaa: 1.45 } },
-  { id: "pace_low", label: "Pace clamp low-biased 0.60-1.15", overrides: { paceClampMinNbaNcaa: 0.60, paceClampMaxNbaNcaa: 1.15 } },
-  { id: "pace_high", label: "Pace clamp high-biased 0.85-1.40", overrides: { paceClampMinNbaNcaa: 0.85, paceClampMaxNbaNcaa: 1.40 } },
-
-  { id: "qblend_030", label: "Quarter blend 0.30", overrides: { quarterAnchorBlendWeight: 0.30 } },
-  { id: "qblend_050", label: "Quarter blend 0.50", overrides: { quarterAnchorBlendWeight: 0.50 } },
-  { id: "qblend_085", label: "Quarter blend 0.85", overrides: { quarterAnchorBlendWeight: 0.85 } },
-  { id: "qblend_100", label: "Quarter blend 1.00", overrides: { quarterAnchorBlendWeight: 1.00 } },
-
-  { id: "tw055_rec_flat", label: "tw 0.55 + flat recency", overrides: { teamWeightBase: 0.55, recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1] } },
-  { id: "tw055_pace_tight", label: "tw 0.55 + pace tight", overrides: { teamWeightBase: 0.55, paceClampMinNbaNcaa: 0.80, paceClampMaxNbaNcaa: 1.20 } },
-  { id: "tw070_rec_agg", label: "tw 0.70 + aggressive recency", overrides: { teamWeightBase: 0.70, recencyWeights: [1.60, 1.30, 0.90, 0.60, 0.40, 0.30, 0.22, 0.16, 0.12, 0.08] } },
-  { id: "tw075_pace_wide", label: "tw 0.75 + pace wide", overrides: { teamWeightBase: 0.75, paceClampMinNbaNcaa: 0.55, paceClampMaxNbaNcaa: 1.45 } },
-  { id: "rec_flat_pace_tight", label: "flat recency + pace tight", overrides: { recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], paceClampMinNbaNcaa: 0.80, paceClampMaxNbaNcaa: 1.20 } },
-  { id: "rec_flat_qblend050", label: "flat recency + qblend 0.50", overrides: { recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], quarterAnchorBlendWeight: 0.50 } },
-  { id: "combo_best_guess", label: "tw 0.55 + flat + pace tight", overrides: { teamWeightBase: 0.55, recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], paceClampMinNbaNcaa: 0.80, paceClampMaxNbaNcaa: 1.20 } }
+  { id: "baseline", label: "Baseline (no expansion)", overrides: { extremeExpansion: 1.0 } },
+  { id: "exp_110", label: "Extreme expansion 1.10", overrides: { extremeExpansion: 1.10 } },
+  { id: "exp_120", label: "Extreme expansion 1.20", overrides: { extremeExpansion: 1.20 } },
+  { id: "exp_130", label: "Extreme expansion 1.30", overrides: { extremeExpansion: 1.30 } },
+  { id: "exp_140", label: "Extreme expansion 1.40", overrides: { extremeExpansion: 1.40 } },
+  { id: "exp_150", label: "Extreme expansion 1.50", overrides: { extremeExpansion: 1.50 } },
+  { id: "exp_165", label: "Extreme expansion 1.65", overrides: { extremeExpansion: 1.65 } },
+  { id: "exp_180", label: "Extreme expansion 1.80", overrides: { extremeExpansion: 1.80 } },
+  { id: "exp_200", label: "Extreme expansion 2.00", overrides: { extremeExpansion: 2.00 } }
 ];
 
 async function runNbaConfigSweep(onProgress) {
