@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16649,6 +16648,39 @@ function _btApplyRestToCalc(calc, teamRest, oppRest, restPts) {
   return calc;
 }
 
+// Stage 4: opponent-adjusted rolling form from dates already in gameLogs.
+// Scoring 120 vs a weak defense (high allowed) is down-weighted;
+// scoring 120 vs a strong defense is up-weighted. Same idea for allowed.
+function _btTeamFieldAvgBefore(gameLog, beforeDateIso, field, n = 10) {
+  const cutoff = new Date(beforeDateIso).getTime();
+  if (!isFinite(cutoff)) return NaN;
+  const prior = (gameLog || []).filter(g => g && g.date && new Date(g.date).getTime() < cutoff && isFinite(g[field]));
+  const recent = prior.slice(-n);
+  if (!recent.length) return NaN;
+  return recent.reduce((s, g) => s + Number(g[field]), 0) / recent.length;
+}
+
+function _btOppAdjWindow(gameLogs, teamId, beforeDateIso, n = 10, adjStrength = 1.0, leagueTeamBase = 115) {
+  const cutoff = new Date(beforeDateIso).getTime();
+  const teamLog = gameLogs[teamId] || [];
+  const prior = teamLog.filter(g => g && g.date && new Date(g.date).getTime() < cutoff && isFinite(g.scored) && isFinite(g.allowed));
+  const recent = prior.slice(-n).reverse();
+  const scored = [];
+  const allowed = [];
+  const strength = isFinite(adjStrength) ? Math.max(0, Math.min(1.5, Number(adjStrength))) : 1.0;
+  for (const g of recent) {
+    const oppDef = _btTeamFieldAvgBefore(gameLogs[g.oppId], g.date, "allowed", n);
+    const oppOff = _btTeamFieldAvgBefore(gameLogs[g.oppId], g.date, "scored", n);
+    let s = Number(g.scored);
+    let a = Number(g.allowed);
+    if (isFinite(oppDef) && isFinite(leagueTeamBase)) s = s - strength * (oppDef - leagueTeamBase);
+    if (isFinite(oppOff) && isFinite(leagueTeamBase)) a = a - strength * (oppOff - leagueTeamBase);
+    scored.push(s);
+    allowed.push(a);
+  }
+  return { scored, allowed };
+}
+
 function calculateScoresOnlyCalibration(evaluationResults) {
   const valid = (evaluationResults || []).filter(r => r && isFinite(r.predictedMargin) && isFinite(r.actualMargin));
   if (!valid.length) return null;
@@ -16977,8 +17009,15 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
 
   try {
     for (const game of allGames) {
-      const teamWindow = _btRollingWindow(gameLogs[game.teamId], game.date);
-      const oppWindow = _btRollingWindow(gameLogs[game.oppId], game.date);
+      const _useOppAdj = !!(paramOverrides && paramOverrides.useOppAdj);
+      const _oppAdjStr = (paramOverrides && isFinite(paramOverrides.oppAdjStrength)) ? Number(paramOverrides.oppAdjStrength) : 1.0;
+      const _leagueTeamBase = ((LEAGUE_BASES && LEAGUE_BASES.nba) ? LEAGUE_BASES.nba : 230) / 2;
+      const teamWindow = _useOppAdj
+        ? _btOppAdjWindow(gameLogs, game.teamId, game.date, 10, _oppAdjStr, _leagueTeamBase)
+        : _btRollingWindow(gameLogs[game.teamId], game.date);
+      const oppWindow = _useOppAdj
+        ? _btOppAdjWindow(gameLogs, game.oppId, game.date, 10, _oppAdjStr, _leagueTeamBase)
+        : _btRollingWindow(gameLogs[game.oppId], game.date);
 
       if (teamWindow.scored.length < 5 || oppWindow.scored.length < 5) { skipped++; continue; }
 
@@ -17145,12 +17184,11 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
 }
 
 const BB_NBA_OPT_GRID = [
-  { id: "baseline", label: "Baseline (no rest adj)", overrides: { restPts: 0 } },
-  { id: "rest_1", label: "Rest adj 1.0 pts/B2B", overrides: { restPts: 1.0 } },
-  { id: "rest_2", label: "Rest adj 2.0 pts/B2B", overrides: { restPts: 2.0 } },
-  { id: "rest_3", label: "Rest adj 3.0 pts/B2B", overrides: { restPts: 3.0 } },
-  { id: "rest_4", label: "Rest adj 4.0 pts/B2B", overrides: { restPts: 4.0 } },
-  { id: "rest_5", label: "Rest adj 5.0 pts/B2B", overrides: { restPts: 5.0 } }
+  { id: "baseline", label: "Baseline (raw form)", overrides: { useOppAdj: false } },
+  { id: "opp_050", label: "Opp-adj strength 0.50", overrides: { useOppAdj: true, oppAdjStrength: 0.50 } },
+  { id: "opp_075", label: "Opp-adj strength 0.75", overrides: { useOppAdj: true, oppAdjStrength: 0.75 } },
+  { id: "opp_100", label: "Opp-adj strength 1.00", overrides: { useOppAdj: true, oppAdjStrength: 1.00 } },
+  { id: "opp_125", label: "Opp-adj strength 1.25", overrides: { useOppAdj: true, oppAdjStrength: 1.25 } }
 ];
 
 async function runNbaConfigSweep(onProgress) {
