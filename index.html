@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -15716,36 +15717,53 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
   let aS, bS;
-  if (false && isEspnLeague && hasRealRatings && hasRealPace) {
-    // AUDIT SIMPLIFICATION: advanced pace/rating branch permanently disabled.
-    // calculateAdvancedMetrics used a simplified, non-standard possessions
-    // formula that could diverge from real advanced-stats sources while
-    // looking authoritative. Falling back to the plain blended-average path
-    // below unconditionally, per the one-method simplification.
+  // Points-path blend (always computed — proven ~8 MAE on mid totals).
+  const _tw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+  const _ow = 1 - _tw;
+  const aS_points = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw + bAllowed * _ow) : aS_pre;
+  const bS_points = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw + aAllowed * _ow) : bS_pre;
+
+  // Live ESPN advanced path: re-enabled when real pace + ratings exist (≥5 each).
+  // Blended with points (not pure replace) so mid-range strength is preserved.
+  // Sanity band rejects wild advanced totals and falls back to points.
+  if (isEspnLeague && hasRealRatings && hasRealPace) {
     const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
     const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
-
     const _ftRegMinutes = getLeagueRegulationMinutes(league);
     const _ftDivisor = 100 * (48 / _ftRegMinutes);
-    aS = (synPace * projectedRatingA) / _ftDivisor;
-    bS = (synPace * projectedRatingB) / _ftDivisor;
+    let aS_adv = (synPace * projectedRatingA) / _ftDivisor;
+    let bS_adv = (synPace * projectedRatingB) / _ftDivisor;
     synNetA = avgOrNaN(ctxA.ortg10) - avgOrNaN(ctxA.drtg10);
     synNetB = avgOrNaN(ctxB.ortg10) - avgOrNaN(ctxB.drtg10);
-    usedAdvanced = true;
 
     const VENUE_ADVANCED_BLEND_FACTOR = 0.35;
     if (aVenueDiag.enabled && isFinite(aVenueAvg) && isFinite(aOverallAvg)) {
-      aS += (aVenueAvg - aOverallAvg) * VENUE_ADVANCED_BLEND_FACTOR;
+      aS_adv += (aVenueAvg - aOverallAvg) * VENUE_ADVANCED_BLEND_FACTOR;
     }
     if (bVenueDiag.enabled && isFinite(bVenueAvg) && isFinite(bOverallAvg)) {
-      bS += (bVenueAvg - bOverallAvg) * VENUE_ADVANCED_BLEND_FACTOR;
+      bS_adv += (bVenueAvg - bOverallAvg) * VENUE_ADVANCED_BLEND_FACTOR;
+    }
+
+    const advTotal = (isFinite(aS_adv) ? aS_adv : 0) + (isFinite(bS_adv) ? bS_adv : 0);
+    const _eb = isFinite(eb) ? eb : 220;
+    const advSane = isFinite(advTotal) && advTotal >= _eb * 0.72 && advTotal <= _eb * 1.28
+      && isFinite(aS_adv) && isFinite(bS_adv);
+    const _advW = isFinite(config?.advancedBlendWeight)
+      ? Number(config.advancedBlendWeight)
+      : (isFinite(getParam("advancedBlendWeight", league)) ? Number(getParam("advancedBlendWeight", league)) : 0.45);
+
+    if (advSane && _advW > 0) {
+      const w = Math.max(0, Math.min(1, _advW));
+      aS = aS_points * (1 - w) + aS_adv * w;
+      bS = bS_points * (1 - w) + bS_adv * w;
+      usedAdvanced = true;
+    } else {
+      aS = aS_points;
+      bS = bS_points;
     }
   } else {
-    
-    const _tw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
-    const _ow = 1 - _tw;
-    aS = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw + bAllowed * _ow) : aS_pre;
-    bS = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw + aAllowed * _ow) : bS_pre;
+    aS = aS_points;
+    bS = bS_points;
   }
 
   if (!isFinite(synNetA) && isFinite(aOverallAvg) && isFinite(aAllowed)) {
@@ -15843,10 +15861,14 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     // an injury-suppressed projection back toward the healthy-roster baseline,
     // partially undoing the injury adjustment. Anchor to the same
     // injury-and-opponent-boost-adjusted baseline aS/bS were built from instead.
+    // Post-H2H re-clamp: keep the FIX #3 guard against raw H2H blow-ups, but
+    // use a milder vol limit so we do not stack full double-dampening on every
+    // H2H game (form already damped once above).
     const _aInjAdjBaseline = avgOrNaN(aFTS) * injMultA * (injMultB < 1 ? (1 + (1 - injMultB) * _injOppBoostFactor) : 1);
     const _bInjAdjBaseline = avgOrNaN(bFTS) * injMultB * (injMultA < 1 ? (1 + (1 - injMultA) * _injOppBoostFactor) : 1);
-    projAFT = applyVolatility(projAFT, aFTS, volLimit, league, _aInjAdjBaseline);
-    projBFT = applyVolatility(projBFT, bFTS, volLimit, league, _bInjAdjBaseline);
+    const _postH2HVolLimit = volLimit * 1.35;
+    projAFT = applyVolatility(projAFT, aFTS, _postH2HVolLimit, league, _aInjAdjBaseline);
+    projBFT = applyVolatility(projBFT, bFTS, _postH2HVolLimit, league, _bInjAdjBaseline);
 
     _ftRealH2HWeight = hw;
   }
@@ -15958,23 +15980,36 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
 
   let projA1H, projB1H;
-  if (false && isEspnLeague && hasRealRatings && hasRealPace) {
-    // AUDIT SIMPLIFICATION: advanced pace/rating branch permanently disabled
-    // for H1, same reasoning as FT.
+  const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+  const _ow1 = 1 - _tw1;
+  const projA1H_points = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw1 + bAllowed * _ow1) : aS_pre;
+  const projB1H_points = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw1 + aAllowed * _ow1) : bS_pre;
 
+  if (isEspnLeague && hasRealRatings && hasRealPace) {
     const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
     const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
-
     const _h1RegMinutes = getLeagueRegulationMinutes(league);
     const halfDivisor = 200 * (48 / _h1RegMinutes);
-    projA1H = (synPace * projectedRatingA) / halfDivisor;
-    projB1H = (synPace * projectedRatingB) / halfDivisor;
+    let projA1H_adv = (synPace * projectedRatingA) / halfDivisor;
+    let projB1H_adv = (synPace * projectedRatingB) / halfDivisor;
+    const advTotal1H = (isFinite(projA1H_adv) ? projA1H_adv : 0) + (isFinite(projB1H_adv) ? projB1H_adv : 0);
+    const _eb1 = isFinite(eb) ? eb : 220;
+    const advSane1H = isFinite(advTotal1H) && advTotal1H >= _eb1 * 0.36 && advTotal1H <= _eb1 * 0.64
+      && isFinite(projA1H_adv) && isFinite(projB1H_adv);
+    const _advW1 = isFinite(config?.advancedBlendWeight)
+      ? Number(config.advancedBlendWeight)
+      : (isFinite(getParam("advancedBlendWeight", league)) ? Number(getParam("advancedBlendWeight", league)) : 0.45);
+    if (advSane1H && _advW1 > 0) {
+      const w = Math.max(0, Math.min(1, _advW1));
+      projA1H = projA1H_points * (1 - w) + projA1H_adv * w;
+      projB1H = projB1H_points * (1 - w) + projB1H_adv * w;
+    } else {
+      projA1H = projA1H_points;
+      projB1H = projB1H_points;
+    }
   } else {
-
-    const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
-    const _ow1 = 1 - _tw1;
-    projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw1 + bAllowed * _ow1) : aS_pre;
-    projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw1 + aAllowed * _ow1) : bS_pre;
+    projA1H = projA1H_points;
+    projB1H = projB1H_points;
   }
 
   projA1H = applyVolatility(projA1H, aS1, volLimit, league);
@@ -16030,8 +16065,9 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     // adjustment that was already applied to projA1H/projB1H above.
     const _aInjAdjBaseline1H = avgOrNaN(aS1) * injMultA * (injMultB < 1 ? (1 + (1 - injMultB) * _injOppBoostFactorH1) : 1);
     const _bInjAdjBaseline1H = avgOrNaN(bS1) * injMultB * (injMultA < 1 ? (1 + (1 - injMultA) * _injOppBoostFactorH1) : 1);
-    projA1H = applyVolatility(projA1H, aS1, volLimit, league, _aInjAdjBaseline1H);
-    projB1H = applyVolatility(projB1H, bS1, volLimit, league, _bInjAdjBaseline1H);
+    const _postH2HVolLimit1H = volLimit * 1.35;
+    projA1H = applyVolatility(projA1H, aS1, _postH2HVolLimit1H, league, _aInjAdjBaseline1H);
+    projB1H = applyVolatility(projB1H, bS1, _postH2HVolLimit1H, league, _bInjAdjBaseline1H);
   }
   let h1Proj = (isFinite(projA1H) ? projA1H : 0) + (isFinite(projB1H) ? projB1H : 0);
 
