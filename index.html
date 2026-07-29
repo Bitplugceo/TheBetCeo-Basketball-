@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16687,6 +16686,24 @@ function buildScoresOnlyDiagnosis(results) {
     return { n: rows.length, totalMAE: mae(errs), totalBias: bias(errs) };
   }
 
+  // Stage 3b: for extreme actuals, was the model already pointing extreme, or stuck mid?
+  function regimeSplit(rows, actualSide) {
+    const predLow = rows.filter(r => r.predictedTotal < 210);
+    const predMid = rows.filter(r => r.predictedTotal >= 210 && r.predictedTotal <= 240);
+    const predHigh = rows.filter(r => r.predictedTotal > 240);
+    return {
+      actualSide,
+      n: rows.length,
+      predLow: bucketStats(predLow),
+      predMid: bucketStats(predMid),
+      predHigh: bucketStats(predHigh),
+      sharePredMid: rows.length ? predMid.length / rows.length : null,
+      sharePredAligned: rows.length
+        ? (actualSide === "low" ? predLow.length : predHigh.length) / rows.length
+        : null
+    };
+  }
+
   const full = valid.filter(r => r.sampleTier === "full");
   const thin = valid.filter(r => r.sampleTier === "thin");
 
@@ -16720,6 +16737,8 @@ function buildScoresOnlyDiagnosis(results) {
   };
   // Bias sign on extremes: + means we predict too high, − means too low.
   // Compression toward the middle usually shows +bias on low games and −bias on high games.
+  const lowRegime = regimeSplit(lowTotal, "low");
+  const highRegime = regimeSplit(highTotal, "high");
   const byMargin = { close: bucketStats(closeGame), medium: bucketStats(mediumGame), blowout: bucketStats(blowout) };
   const byPhase = { early: bucketStats(early), mid: bucketStats(mid), late: bucketStats(late) };
   const errorDist = {
@@ -16753,6 +16772,17 @@ function buildScoresOnlyDiagnosis(results) {
     }
   }
 
+  if (lowRegime && lowRegime.n >= 40 && isFinite(lowRegime.sharePredMid)) {
+    const pctMid = (lowRegime.sharePredMid * 100).toFixed(0);
+    const pctAligned = isFinite(lowRegime.sharePredAligned) ? (lowRegime.sharePredAligned * 100).toFixed(0) : "—";
+    findings.push(`Low-actual games: ${pctMid}% were still predicted mid (210–240); only ${pctAligned}% were already predicted low. MAE when pred-mid=${isFinite(lowRegime.predMid.totalMAE) ? lowRegime.predMid.totalMAE.toFixed(1) : "—"}, when pred-low=${isFinite(lowRegime.predLow.totalMAE) ? lowRegime.predLow.totalMAE.toFixed(1) : "—"}.`);
+  }
+  if (highRegime && highRegime.n >= 40 && isFinite(highRegime.sharePredMid)) {
+    const pctMid = (highRegime.sharePredMid * 100).toFixed(0);
+    const pctAligned = isFinite(highRegime.sharePredAligned) ? (highRegime.sharePredAligned * 100).toFixed(0) : "—";
+    findings.push(`High-actual games: ${pctMid}% were still predicted mid (210–240); only ${pctAligned}% were already predicted high. MAE when pred-mid=${isFinite(highRegime.predMid.totalMAE) ? highRegime.predMid.totalMAE.toFixed(1) : "—"}, when pred-high=${isFinite(highRegime.predHigh.totalMAE) ? highRegime.predHigh.totalMAE.toFixed(1) : "—"}.`);
+  }
+
   if (byMargin.blowout.n >= 40 && byMargin.close.n >= 40 && isFinite(byMargin.blowout.totalMAE) && isFinite(byMargin.close.totalMAE)) {
     const gap = byMargin.blowout.totalMAE - byMargin.close.totalMAE;
     if (Math.abs(gap) >= 2) {
@@ -16779,7 +16809,7 @@ function buildScoresOnlyDiagnosis(results) {
 
   findings.push("Tunable constants (recency / teamWeight / pace clamps) already tested: max gain ~0.1 Total MAE. Further grids on those knobs will not break the ~15 ceiling — structural projection changes are required next.");
 
-  return { bySample, byTotal, byMargin, byPhase, errorDist, findings, n: valid.length };
+  return { bySample, byTotal, byMargin, byPhase, lowRegime, highRegime, errorDist, findings, n: valid.length };
 }
 
 async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
@@ -17075,15 +17105,7 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
 }
 
 const BB_NBA_OPT_GRID = [
-  { id: "baseline", label: "Baseline (no expansion)", overrides: { extremeExpansion: 1.0 } },
-  { id: "exp_110", label: "Extreme expansion 1.10", overrides: { extremeExpansion: 1.10 } },
-  { id: "exp_120", label: "Extreme expansion 1.20", overrides: { extremeExpansion: 1.20 } },
-  { id: "exp_130", label: "Extreme expansion 1.30", overrides: { extremeExpansion: 1.30 } },
-  { id: "exp_140", label: "Extreme expansion 1.40", overrides: { extremeExpansion: 1.40 } },
-  { id: "exp_150", label: "Extreme expansion 1.50", overrides: { extremeExpansion: 1.50 } },
-  { id: "exp_165", label: "Extreme expansion 1.65", overrides: { extremeExpansion: 1.65 } },
-  { id: "exp_180", label: "Extreme expansion 1.80", overrides: { extremeExpansion: 1.80 } },
-  { id: "exp_200", label: "Extreme expansion 2.00", overrides: { extremeExpansion: 2.00 } }
+  { id: "baseline", label: "Baseline (locked — expansion discarded)", overrides: {} }
 ];
 
 async function runNbaConfigSweep(onProgress) {
@@ -17253,6 +17275,10 @@ function renderBacktestPanel() {
               <tr><td style="padding:5px 4px; font-weight:800;">Actual total</td><td style="padding:5px 4px;">Low (&lt;210)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byTotal?.low)}</td></tr>
               <tr><td style="padding:5px 4px; font-weight:800;">Actual total</td><td style="padding:5px 4px;">Mid (210–240)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byTotal?.mid)}</td></tr>
               <tr><td style="padding:5px 4px; font-weight:800;">Actual total</td><td style="padding:5px 4px;">High (&gt;240)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byTotal?.high)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Low-actual regime</td><td style="padding:5px 4px;">Predicted mid</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.lowRegime?.predMid)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">Low-actual regime</td><td style="padding:5px 4px;">Predicted low</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.lowRegime?.predLow)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">High-actual regime</td><td style="padding:5px 4px;">Predicted mid</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.highRegime?.predMid)}</td></tr>
+              <tr><td style="padding:5px 4px; font-weight:800;">High-actual regime</td><td style="padding:5px 4px;">Predicted high</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.highRegime?.predHigh)}</td></tr>
               <tr><td style="padding:5px 4px; font-weight:800;">Margin</td><td style="padding:5px 4px;">Close (&lt;6)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byMargin?.close)}</td></tr>
               <tr><td style="padding:5px 4px; font-weight:800;">Margin</td><td style="padding:5px 4px;">Medium (6–15)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byMargin?.medium)}</td></tr>
               <tr><td style="padding:5px 4px; font-weight:800;">Margin</td><td style="padding:5px 4px;">Blowout (&gt;15)</td><td style="padding:5px 4px; text-align:center;">${fmtDx(dx.byMargin?.blowout)}</td></tr>
