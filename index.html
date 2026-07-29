@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7385,6 +7386,13 @@ function maybeReadH2HEnabled(kind) {
   };
   const id = map[String(kind).toLowerCase()] || null;
   if (!id) return false;
+  // BACKTEST H2H FIX: runNbaSeasonBacktest sets window.__btH2HOverride to a
+  // real boolean for the duration of the run (and deletes it in its finally
+  // block) so H2H on/off is controlled by paramOverrides.useH2H, not by
+  // whatever a live DOM checkbox happens to be checked to at the time.
+  if (typeof window !== "undefined" && typeof window.__btH2HOverride === "boolean") {
+    return window.__btH2HOverride;
+  }
   const el = document.getElementById(id);
   return !!(el && el.checked);
 }
@@ -16648,6 +16656,18 @@ function _btRollingWindow(gameLog, beforeDateIso, n = 10, scoredField = "scored"
   };
 }
 
+// BACKTEST H2H FIX: real head-to-head series for the backtest, built from
+// this team's own game log filtered down to games against this specific
+// opponent (before the cutoff date). Mirrors the ascending-then-reverse
+// ordering _btRollingWindow uses, so index 0 is the most recent meeting.
+function _btH2HSeries(gameLogs, teamId, oppId, beforeDateIso, n = 10, scoredField = "scored") {
+  const cutoff = new Date(beforeDateIso).getTime();
+  const teamLog = (gameLogs && gameLogs[teamId]) || [];
+  const prior = teamLog.filter(g => g && g.date && g.oppId === oppId && new Date(g.date).getTime() < cutoff && isFinite(g[scoredField]));
+  const recent = prior.slice(-n).reverse();
+  return recent.map(g => g[scoredField]);
+}
+
 // Stage 3c: rest / B2B / 3-in-4 from dates already in the season cache (no network).
 function _btRestInfo(gameLog, beforeDateIso) {
   const cutoff = new Date(beforeDateIso).getTime();
@@ -17029,6 +17049,9 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
   const _btOriginalGetParam = window.getParam;
   const _btSavedRecencyWeights = MODEL_TUNING.recencyWeights;
   const _btSavedQBlend = MODEL_TUNING.quarterAnchorBlendWeight;
+  // BACKTEST H2H FIX: on by default now that real H2H arrays are built below;
+  // pass paramOverrides.useH2H === false to run an A/B comparison without it.
+  window.__btH2HOverride = !(paramOverrides && paramOverrides.useH2H === false);
   if (paramOverrides && typeof paramOverrides === "object") {
     window.getParam = function(key, lg) {
       if (Object.prototype.hasOwnProperty.call(paramOverrides, key)) return paramOverrides[key];
@@ -17070,6 +17093,21 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
       const teamQ4Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q4Scored", "q4Allowed");
       const oppQ4Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q4Scored", "q4Allowed");
 
+      // BACKTEST H2H FIX: real prior-meeting arrays, same team/opp pairing as
+      // the rolling-form windows above, just filtered down to this matchup.
+      const teamFTH2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "scored");
+      const oppFTH2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "scored");
+      const teamH1H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "h1Scored");
+      const oppH1H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "h1Scored");
+      const teamQ1H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q1Scored");
+      const oppQ1H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q1Scored");
+      const teamQ2H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q2Scored");
+      const oppQ2H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q2Scored");
+      const teamQ3H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q3Scored");
+      const oppQ3H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q3Scored");
+      const teamQ4H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q4Scored");
+      const oppQ4H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q4Scored");
+
       const parsed = {
         aFTAllowed: teamWindow.allowed, bFTAllowed: oppWindow.allowed,
         a1HScored: teamH1Window.scored, b1HScored: oppH1Window.scored,
@@ -17081,7 +17119,13 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
         aQ3Scored: teamQ3Window.scored, bQ3Scored: oppQ3Window.scored,
         aQ3Allowed: teamQ3Window.allowed, bQ3Allowed: oppQ3Window.allowed,
         aQ4Scored: teamQ4Window.scored, bQ4Scored: oppQ4Window.scored,
-        aQ4Allowed: teamQ4Window.allowed, bQ4Allowed: oppQ4Window.allowed
+        aQ4Allowed: teamQ4Window.allowed, bQ4Allowed: oppQ4Window.allowed,
+        aFTH2H: teamFTH2H, bFTH2H: oppFTH2H,
+        a1HH2H: teamH1H2H, b1HH2H: oppH1H2H,
+        aQ1H2H: teamQ1H2H, bQ1H2H: oppQ1H2H,
+        aQ2H2H: teamQ2H2H, bQ2H2H: oppQ2H2H,
+        aQ3H2H: teamQ3H2H, bQ3H2H: oppQ3H2H,
+        aQ4H2H: teamQ4H2H, bQ4H2H: oppQ4H2H
       };
 
       const _tw = isFinite(window.getParam("teamWeightBase", "nba")) ? Number(window.getParam("teamWeightBase", "nba")) : 0.65;
@@ -17176,6 +17220,7 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
     window.getParam = _btOriginalGetParam;
     MODEL_TUNING.recencyWeights = _btSavedRecencyWeights;
     MODEL_TUNING.quarterAnchorBlendWeight = _btSavedQBlend;
+    delete window.__btH2HOverride;
   }
 
   const overall = calculateScoresOnlyCalibration(results);
