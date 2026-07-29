@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3983,10 +3984,7 @@ const MODEL_TUNING = {
   anchorEnabled: { ft: true, h1: true, h2: true, team: true },
   anchorScale: { ft: 0.75, h1: 0.75, h2: 0.75, team: 0.85 },
   h2hMaxWeight: 0.30,
-  // LOCKED 2026-07-28: Phase-1 season backtest — flat beat default aggressive
-  // by ~0.09 Total MAE (15.0 → 14.9 on 1153 games). Do not revert without
-  // a new sweep that beats this baseline.
-  recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  recencyWeights: [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16],
 
   
   quarterAnchorBlendWeight: 0.7
@@ -4043,12 +4041,11 @@ const TUNABLE_PARAM_REGISTRY = {
   },
 
   recencyWeights: {
-    // LOCKED 2026-07-28 with MODEL_TUNING — Phase-1 winner (flat, Total MAE 14.9).
-    value: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    value: [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16],
     min: null, max: null, type: "weight_vector",
     scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
-    description: "Per-game-index recency weighting for weightedRecentAverage (LOCKED flat after Phase-1 season sweep)",
-    lastVerifiedAt: "2026-07-28"
+    description: "Per-game-index recency weighting for weightedRecentAverage",
+    lastVerifiedAt: null
   },
   teamWeightBase: {
     value: 0.65, min: 0.40, max: 0.85, type: "scalar",
@@ -4381,99 +4378,6 @@ function setTunableParam(key, newValue, scopeLeague, verifiedAt) {
 
 loadTunableParamRegistryOverrides();
 loadTunableParamLeagueOverrides();
-
-// --- NBA scores-only calibration ratchet lock ---
-// Sweep may only REPLACE this lock when a challenger beats the locked Total MAE.
-const BB_NBA_CALIBRATION_LOCK_KEY = "BB_NBA_CALIBRATION_LOCK";
-const BB_NBA_LOCK_MIN_DELTA = 0.02; // ignore noise smaller than this
-
-function applyNbaCalibrationLock(lock) {
-  if (!lock || !lock.overrides || typeof lock.overrides !== "object") return false;
-  const o = lock.overrides;
-  const stamp = lock.lockedAt || new Date().toISOString();
-  try {
-    if (Array.isArray(o.recencyWeights)) {
-      MODEL_TUNING.recencyWeights = o.recencyWeights.slice();
-      if (TUNABLE_PARAM_REGISTRY.recencyWeights) {
-        TUNABLE_PARAM_REGISTRY.recencyWeights.value = o.recencyWeights.slice();
-        TUNABLE_PARAM_REGISTRY.recencyWeights.lastVerifiedAt = stamp;
-      }
-    }
-    if (isFinite(o.quarterAnchorBlendWeight)) {
-      MODEL_TUNING.quarterAnchorBlendWeight = Number(o.quarterAnchorBlendWeight);
-    }
-    if (isFinite(o.h2hMaxWeight)) {
-      MODEL_TUNING.h2hMaxWeight = Number(o.h2hMaxWeight);
-    }
-    const scalarKeys = [
-      "teamWeightBase", "volatilityLimit", "venueStrongWeight", "venueModerateWeight",
-      "paceClampMinNbaNcaa", "paceClampMaxNbaNcaa", "injuryOppBoostFactor",
-      "h2hMaxWeight", "h1VolScale", "teamVolScale", "quarterVolScale"
-    ];
-    scalarKeys.forEach(function(k) {
-      if (!Object.prototype.hasOwnProperty.call(o, k) || !isFinite(o[k])) return;
-      try { setTunableParam(k, Number(o[k]), null, stamp); } catch (e) {}
-      try { setTunableParam(k, Number(o[k]), "nba", stamp); } catch (e) {}
-    });
-    engineDebug("NBA calibration lock applied", { id: lock.id, label: lock.label, totalMAE: lock.totalMAE });
-    return true;
-  } catch (e) {
-    engineDebug("NBA calibration lock apply failed", { error: e?.message || String(e) });
-    return false;
-  }
-}
-
-function loadNbaCalibrationLock() {
-  try {
-    const raw = localStorage.getItem(BB_NBA_CALIBRATION_LOCK_KEY);
-    if (!raw) return null;
-    const lock = JSON.parse(raw);
-    if (!lock || !isFinite(lock.totalMAE)) return null;
-    applyNbaCalibrationLock(lock);
-    window.__bbNbaCalibrationLock = lock;
-    return lock;
-  } catch (e) {
-    return null;
-  }
-}
-
-function saveNbaCalibrationLock(lock) {
-  try {
-    localStorage.setItem(BB_NBA_CALIBRATION_LOCK_KEY, JSON.stringify(lock));
-    window.__bbNbaCalibrationLock = lock;
-  } catch (e) {
-    engineDebug("NBA calibration lock save failed", { error: e?.message || String(e) });
-  }
-}
-
-function maybeRatchetNbaCalibrationLock(best, baseline, season) {
-  if (!best || !isFinite(best.totalMAE) || best.id === "baseline") return null;
-  const prior = window.__bbNbaCalibrationLock || loadNbaCalibrationLock();
-  const floor = prior && isFinite(prior.totalMAE)
-    ? prior.totalMAE
-    : (baseline && isFinite(baseline.totalMAE) ? baseline.totalMAE : null);
-  if (floor == null) return null;
-  const delta = floor - best.totalMAE;
-  if (!(delta >= BB_NBA_LOCK_MIN_DELTA)) return null;
-  const cfg = (typeof BB_NBA_OPT_GRID !== "undefined" ? BB_NBA_OPT_GRID : []).find(function(c) { return c.id === best.id; });
-  const overrides = cfg && cfg.overrides ? Object.assign({}, cfg.overrides) : {};
-  const lock = {
-    id: best.id,
-    label: best.label,
-    totalMAE: best.totalMAE,
-    totalBias: best.totalBias,
-    overrides: overrides,
-    season: season,
-    lockedAt: new Date().toISOString(),
-    deltaFromPrevious: delta,
-    previousMAE: floor
-  };
-  applyNbaCalibrationLock(lock);
-  saveNbaCalibrationLock(lock);
-  return lock;
-}
-
-loadNbaCalibrationLock();
 
 // PHASE 2 ITEM 8: manual "Apply tuning suggestions" plumbing. The tuner and
 // calibrateEngineConstants only ever logged their proposals to the debug
@@ -15839,12 +15743,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     }
   } else {
     
-    // AUDIT FIX #2: mirrors AUDIT FIX #1 in getDynamicWeights — that fix
-    // only reached computeQuarterProjectionBT (via getDynamicWeights).
-    // computeFTProjection had its own separate teamWeight calc that still
-    // hardcoded 0.65, so a promoted/overridden teamWeightBase silently
-    // never touched FT (or H1) projections. Fall back to getParam before 0.65.
-    const _tw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : (isFinite(getParam("teamWeightBase", league)) ? Number(getParam("teamWeightBase", league)) : 0.65);
+    const _tw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
     const _ow = 1 - _tw;
     aS = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw + bAllowed * _ow) : aS_pre;
     bS = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw + aAllowed * _ow) : bS_pre;
@@ -16057,11 +15956,7 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projB1H = (synPace * projectedRatingB) / halfDivisor;
   } else {
 
-    // AUDIT FIX #2: same fallback gap as computeFTProjection — teamWeight
-    // was hardcoded to 0.65 instead of falling back to the tunable
-    // teamWeightBase param, so H1 projections never responded to a
-    // promoted/overridden value either. Fall back to getParam before 0.65.
-    const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : (isFinite(getParam("teamWeightBase", league)) ? Number(getParam("teamWeightBase", league)) : 0.65);
+    const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
     const _ow1 = 1 - _tw1;
     projA1H = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw1 + bAllowed * _ow1) : aS_pre;
     projB1H = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw1 + aAllowed * _ow1) : bS_pre;
@@ -16528,9 +16423,7 @@ async function fetchNbaTeamSeasonGameLog(teamId, season) {
         teamName: mine?.team?.displayName || mine?.team?.name || String(teamId),
         oppName: opp?.team?.displayName || opp?.team?.name || String(opp?.team?.id || ""),
         scored: myScore,
-        allowed: oppScore,
-        // Tier-2: home/away so backtest can build venue-split series
-        isHome: String(mine?.homeAway || "").toLowerCase() === "home"
+        allowed: oppScore
       });
     }
     games.sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -16569,7 +16462,7 @@ async function fetchNbaGameH1(eventId) {
   }
 }
 
-function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, injB = 1, teamAName = "", teamBName = "", config = {}, combinedVolRatio = 0.5, shapeSignalA = null, shapeSignalB = null }) {
+function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, injB = 1, teamAName = "", teamBName = "", config = {}, combinedVolRatio = 0.5 }) {
   const aS = getManualSeries("A", qKey, parsed);
   const bS = getManualSeries("B", qKey, parsed);
 
@@ -16642,12 +16535,8 @@ function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, in
     projB = applyVolatility(projB, bS, volLimit, league, _bInjAdjBaselineQ);
   }
 
-  // AUDIT FIX #4: shape signal now comes in as a param (shapeSignalA/B),
-  // computed by the caller from _btTeamQuarterShapeSignals() using only
-  // games strictly before this game's date — see that function for why.
-  // Previously this called the live getTeamQuarterShapeSignal(), which is
-  // not date-scoped and leaked future-season data into every historical
-  // quarter projection.
+  const shapeSignalA = getTeamQuarterShapeSignal(league, teamAName, qKey);
+  const shapeSignalB = getTeamQuarterShapeSignal(league, teamBName, qKey);
   if (shapeSignalA && shapeSignalA.direction !== "neutral") {
     projA *= (1 + clampNumber(shapeSignalA.z, -3, 3) * 0.02);
   }
@@ -16709,71 +16598,6 @@ function _btRollingWindow(gameLog, beforeDateIso, n = 10, scoredField = "scored"
   };
 }
 
-function _btVenueWindow(gameLog, beforeDateIso, wantHome, n = 10) {
-  try {
-    const cutoff = new Date(beforeDateIso).getTime();
-    if (!isFinite(cutoff)) return { scored: [], allowed: [] };
-    const prior = (gameLog || []).filter(function(g) {
-      if (!g || !isFinite(g.scored) || !isFinite(g.allowed)) return false;
-      if (new Date(g.date).getTime() >= cutoff) return false;
-      if (typeof g.isHome !== "boolean") return false;
-      return wantHome ? g.isHome === true : g.isHome === false;
-    });
-    const recent = prior.slice(-n).reverse();
-    return { scored: recent.map(function(g) { return g.scored; }), allowed: recent.map(function(g) { return g.allowed; }) };
-  } catch (e) {
-    return { scored: [], allowed: [] };
-  }
-}
-
-// AUDIT FIX #3: _btVenueWindow was declared twice. Function-declaration
-// hoisting meant this second, later definition silently won and ran in
-// every season backtest — but unlike the definition above, it had no
-// try/catch, so a single malformed game.date in any team's log would
-// throw uncaught and abort the whole backtest. Removed; the try/catch'd
-// definition above (functionally identical otherwise) is now the only one.
-
-// AUDIT FIX #4: computeQuarterProjectionBT was calling the live
-// getTeamQuarterShapeSignal(), which reads loadQuarterShapeStore() — a
-// single cumulative localStorage store that is not scoped to any date.
-// Every historical game in the season backtest was getting a team's
-// CURRENT full-season shape profile, including games that happened after
-// the game being scored — lookahead bias baked into every quarter
-// projection. This rebuilds the same z-score walk-forward, from only the
-// games strictly before the date in question, using the same per-team
-// game logs already loaded for the backtest.
-function _btTeamQuarterShapeSignals(teamGameLog, beforeDateIso) {
-  const cutoff = new Date(beforeDateIso).getTime();
-  const prior = (teamGameLog || []).filter(g => g && isFinite(new Date(g.date).getTime()) && new Date(g.date).getTime() < cutoff);
-  const sharesByQ = [[], [], [], []];
-  for (const g of prior) {
-    const q = [g.q1Scored, g.q2Scored, g.q3Scored, g.q4Scored].map(Number);
-    if (!q.every(isFinite)) continue;
-    const total = q[0] + q[1] + q[2] + q[3];
-    if (!isFinite(total) || total <= 0) continue;
-    for (let qi = 0; qi < 4; qi++) sharesByQ[qi].push(q[qi] / total);
-  }
-  const qKeys = ["q1", "q2", "q3", "q4"];
-  const out = {};
-  for (let qi = 0; qi < 4; qi++) {
-    const shares = sharesByQ[qi];
-    const n = shares.length;
-    if (n < QSHAPE_MIN_GAMES) { out[qKeys[qi]] = null; continue; }
-    const mean = shares.reduce((s, v) => s + v, 0) / n;
-    const variance = n > 1 ? shares.reduce((s, v) => s + (v - mean) * (v - mean), 0) / (n - 1) : 0;
-    const stdErr = Math.sqrt(Math.max(variance, 0.0001) / n);
-    if (!isFinite(stdErr) || stdErr <= 0) { out[qKeys[qi]] = null; continue; }
-    const z = (mean - 0.25) / stdErr;
-    out[qKeys[qi]] = {
-      z: Number(z.toFixed(2)),
-      share: Number((mean * 100).toFixed(1)),
-      sampleSize: n,
-      direction: z >= 1.0 ? "fast" : z <= -1.0 ? "fade" : "neutral"
-    };
-  }
-  return out;
-}
-
 function calculateScoresOnlyCalibration(evaluationResults) {
   const valid = (evaluationResults || []).filter(r => r && isFinite(r.predictedMargin) && isFinite(r.actualMargin));
   if (!valid.length) return null;
@@ -16833,60 +16657,58 @@ function calculateScoresOnlyCalibration(evaluationResults) {
   };
 }
 
-async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preloaded) {
+async function runNbaSeasonBacktest(season, onProgress, paramOverrides = null) {
   season = season || (getCurrentSeasonYear("nba") - 1);
-  engineDebug("Season backtest starting", { league: "nba", season });
+  engineDebug("Season backtest starting", { league: "nba", season, hasOverrides: !!(paramOverrides && Object.keys(paramOverrides).length) });
 
-  // nba_v2: cache includes isHome on game logs (Tier-2 venue wiring)
-  const cacheKey = "nba_v2_" + season;
-  if (!_preloaded && window.__bbSeasonDataCache && window.__bbSeasonDataCache[cacheKey] && paramOverrides !== undefined) {
-    return evaluateNbaSeasonBacktestFromCache(window.__bbSeasonDataCache[cacheKey], paramOverrides);
-  }
+  if (!window.__bbSeasonDataCache) window.__bbSeasonDataCache = {};
+  const _cacheKey = "nba_" + season;
+  let gameLogs, allGames, h1ByEvent;
+  const _cached = window.__bbSeasonDataCache[_cacheKey];
 
-  let teamIds;
-  let gameLogs;
-  let allGames;
-
-  if (_preloaded && Array.isArray(_preloaded.allGames) && _preloaded.gameLogs) {
-    teamIds = [...new Set(Object.values(NBA_TEAM_MAP))];
-    gameLogs = _preloaded.gameLogs;
-    allGames = _preloaded.allGames;
-    engineDebug("Season backtest using cached season data", { season, games: allGames.length });
+  if (_cached && _cached.gameLogs && _cached.allGames && _cached.h1ByEvent) {
+    gameLogs = _cached.gameLogs;
+    allGames = _cached.allGames;
+    h1ByEvent = _cached.h1ByEvent;
+    engineDebug("Season backtest using in-memory cache", { season, games: allGames.length });
+    if (typeof onProgress === "function") {
+      try { onProgress(allGames.length, allGames.length); } catch (e) {}
+    }
   } else {
-  teamIds = [...new Set(Object.values(NBA_TEAM_MAP))];
-  gameLogs = {};
-  const CHUNK = 50;
-  for (let i = 0; i < teamIds.length; i += CHUNK) {
-    const chunk = teamIds.slice(i, i + CHUNK);
-    const chunkResults = await Promise.all(chunk.map(id => fetchNbaTeamSeasonGameLog(id, season)));
-    chunk.forEach((id, idx) => { gameLogs[id] = chunkResults[idx]; });
-  }
-
-  const seen = new Set();
-  allGames = [];
-  for (const teamId of teamIds) {
-    for (const g of (gameLogs[teamId] || [])) {
-      if (seen.has(g.eventId)) continue;
-      seen.add(g.eventId);
-      allGames.push(g);
+    const teamIds = [...new Set(Object.values(NBA_TEAM_MAP))];
+    gameLogs = {};
+    const CHUNK = 20;
+    for (let i = 0; i < teamIds.length; i += CHUNK) {
+      const chunk = teamIds.slice(i, i + CHUNK);
+      const chunkResults = await Promise.all(chunk.map(id => fetchNbaTeamSeasonGameLog(id, season)));
+      chunk.forEach((id, idx) => { gameLogs[id] = chunkResults[idx]; });
     }
-  }
-  allGames.sort((a, b) => new Date(a.date) - new Date(b.date));
 
-  const h1ProgressKey = `BB_H1_PROGRESS_NBA_${season}`;
-  let h1ByEvent = {};
-  try {
-    const savedProgress = JSON.parse(localStorage.getItem(h1ProgressKey) || "null");
-    if (savedProgress && savedProgress.season === season && savedProgress.h1ByEvent) {
-      h1ByEvent = savedProgress.h1ByEvent;
+    const seen = new Set();
+    allGames = [];
+    for (const teamId of teamIds) {
+      for (const g of (gameLogs[teamId] || [])) {
+        if (seen.has(g.eventId)) continue;
+        seen.add(g.eventId);
+        allGames.push(g);
+      }
     }
-  } catch (e) {}
+    allGames.sort((a, b) => new Date(a.date) - new Date(b.date));
 
-  const remainingGames = allGames.filter(g => !(g.eventId in h1ByEvent));
-  const alreadyDone = allGames.length - remainingGames.length;
-  if (typeof onProgress === "function" && alreadyDone > 0) {
-    try { onProgress(alreadyDone, allGames.length); } catch (e) {}
-  }
+    const h1ProgressKey = `BB_H1_PROGRESS_NBA_${season}`;
+    h1ByEvent = {};
+    try {
+      const savedProgress = JSON.parse(localStorage.getItem(h1ProgressKey) || "null");
+      if (savedProgress && savedProgress.season === season && savedProgress.h1ByEvent) {
+        h1ByEvent = savedProgress.h1ByEvent;
+      }
+    } catch (e) {}
+
+    const remainingGames = allGames.filter(g => !(g.eventId in h1ByEvent));
+    const alreadyDone = allGames.length - remainingGames.length;
+    if (typeof onProgress === "function" && alreadyDone > 0) {
+      try { onProgress(alreadyDone, allGames.length); } catch (e) {}
+    }
 
   const H1_CHUNK = 50;
   for (let i = 0; i < remainingGames.length; i += H1_CHUNK) {
@@ -16907,55 +16729,31 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
     if (typeof onProgress === "function") {
       try { onProgress(Math.min(alreadyDone + i + H1_CHUNK, allGames.length), allGames.length); } catch (e) {}
     }
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise(r => setTimeout(r, 20));
   }
 
-  for (const teamId of teamIds) {
-    for (const g of (gameLogs[teamId] || [])) {
-      const h1map = h1ByEvent[g.eventId];
-      const mine = h1map?.[g.teamId];
-      const opp = h1map?.[g.oppId];
-      if (mine && opp && isFinite(mine.h1) && isFinite(opp.h1)) {
-        g.h1Scored = mine.h1;
-        g.h1Allowed = opp.h1;
+    for (const teamId of teamIds) {
+      for (const g of (gameLogs[teamId] || [])) {
+        const h1map = h1ByEvent[g.eventId];
+        const mine = h1map?.[g.teamId];
+        const opp = h1map?.[g.oppId];
+        if (mine && opp && isFinite(mine.h1) && isFinite(opp.h1)) {
+          g.h1Scored = mine.h1;
+          g.h1Allowed = opp.h1;
+        }
+        if (mine?.quarters && opp?.quarters) {
+          g.q1Scored = mine.quarters[0]; g.q1Allowed = opp.quarters[0];
+          g.q2Scored = mine.quarters[1]; g.q2Allowed = opp.quarters[1];
+          g.q3Scored = mine.quarters[2]; g.q3Allowed = opp.quarters[2];
+          g.q4Scored = mine.quarters[3]; g.q4Allowed = opp.quarters[3];
+        }
       }
-      if (mine?.quarters && opp?.quarters) {
-        g.q1Scored = mine.quarters[0]; g.q1Allowed = opp.quarters[0];
-        g.q2Scored = mine.quarters[1]; g.q2Allowed = opp.quarters[1];
-        g.q3Scored = mine.quarters[2]; g.q3Allowed = opp.quarters[2];
-        g.q4Scored = mine.quarters[3]; g.q4Allowed = opp.quarters[3];
-      }
     }
-  }
 
-  try { localStorage.removeItem(h1ProgressKey); } catch (e) {}
+    try { localStorage.removeItem(h1ProgressKey); } catch (e) {}
 
-  try {
-    if (!window.__bbSeasonDataCache) window.__bbSeasonDataCache = {};
-    // Never cache an empty season — that caused the blank 0-game panel
-    if (Array.isArray(allGames) && allGames.length >= 100) {
-      window.__bbSeasonDataCache[cacheKey] = { season, allGames, gameLogs };
-    } else {
-      engineDebug("Season backtest refused to cache empty/short season", { season, games: allGames ? allGames.length : 0 });
-    }
-  } catch (e) {}
-
-  } // end else (fresh fetch path)
-
-  const _btOriginalGetParam = window.getParam;
-  const _btSavedRecencyWeights = Array.isArray(MODEL_TUNING.recencyWeights) ? MODEL_TUNING.recencyWeights.slice() : MODEL_TUNING.recencyWeights;
-  const _btSavedQBlend = MODEL_TUNING.quarterAnchorBlendWeight;
-  if (paramOverrides && typeof paramOverrides === "object") {
-    window.getParam = function(key, lg) {
-      if (Object.prototype.hasOwnProperty.call(paramOverrides, key)) return paramOverrides[key];
-      return _btOriginalGetParam ? _btOriginalGetParam(key, lg) : undefined;
-    };
-    if (Array.isArray(paramOverrides.recencyWeights)) {
-      MODEL_TUNING.recencyWeights = paramOverrides.recencyWeights.slice();
-    }
-    if (isFinite(paramOverrides.quarterAnchorBlendWeight)) {
-      MODEL_TUNING.quarterAnchorBlendWeight = Number(paramOverrides.quarterAnchorBlendWeight);
-    }
+    window.__bbSeasonDataCache[_cacheKey] = { gameLogs, allGames, h1ByEvent, season, cachedAt: new Date().toISOString() };
+    engineDebug("Season backtest data cached in memory", { season, games: allGames.length });
   }
 
   const domA = document.getElementById("aFTScored");
@@ -16967,17 +16765,24 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
   AppState.context.data = defaultMassacreFetchContext();
   window.__seriesDateCache = {};
 
-  // [LOCK: 2026-07-29] KNOWN GAP — H2H is inert in this backtest, by design
-  // of the reset above. Resetting AppState.context.data means
-  // getMassacreH2HSeries() always sees an empty h2hGames set, and parsed
-  // never carries *H2H fields, so getH2HSeries() also returns []. hasH2H
-  // is therefore always false for every quarter of every game here — the
-  // H2H blend in computeQuarterProjectionBT never fires. Total/Team/1H/
-  // Quarters/Margin numbers in this report do NOT reflect H2H-blended
-  // production behavior. Do not treat this backtest as validating H2H.
-
   const results = [];
   let skipped = 0;
+
+  const _btOriginalGetParam = window.getParam;
+  const _btSavedRecencyWeights = MODEL_TUNING.recencyWeights;
+  const _btSavedQBlend = MODEL_TUNING.quarterAnchorBlendWeight;
+  if (paramOverrides && typeof paramOverrides === "object") {
+    window.getParam = function(key, lg) {
+      if (Object.prototype.hasOwnProperty.call(paramOverrides, key)) return paramOverrides[key];
+      return _btOriginalGetParam ? _btOriginalGetParam(key, lg) : undefined;
+    };
+    if (Array.isArray(paramOverrides.recencyWeights)) {
+      MODEL_TUNING.recencyWeights = paramOverrides.recencyWeights;
+    }
+    if (isFinite(paramOverrides.quarterAnchorBlendWeight)) {
+      MODEL_TUNING.quarterAnchorBlendWeight = Number(paramOverrides.quarterAnchorBlendWeight);
+    }
+  }
 
   try {
     for (const game of allGames) {
@@ -16985,19 +16790,6 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
       const oppWindow = _btRollingWindow(gameLogs[game.oppId], game.date);
 
       if (teamWindow.scored.length < 5 || oppWindow.scored.length < 5) { skipped++; continue; }
-
-      // Tier-2: fill venue series so computeVenueBlend is live in scores-only backtest
-      const teamIsHome = game.isHome === true;
-      const teamVenue = _btVenueWindow(gameLogs[game.teamId], game.date, teamIsHome, 10);
-      const oppVenue = _btVenueWindow(gameLogs[game.oppId], game.date, !teamIsHome, 10);
-      AppState.context.data.A.venue = {
-        ftScored10: teamVenue.scored,
-        ftAllowed10: teamVenue.allowed
-      };
-      AppState.context.data.B.venue = {
-        ftScored10: oppVenue.scored,
-        ftAllowed10: oppVenue.allowed
-      };
 
       if (domA) domA.value = teamWindow.scored.join(",");
       if (domB) domB.value = oppWindow.scored.join(",");
@@ -17027,9 +16819,16 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
         aQ4Allowed: teamQ4Window.allowed, bQ4Allowed: oppQ4Window.allowed
       };
 
+      const _tw = isFinite(window.getParam("teamWeightBase", "nba")) ? Number(window.getParam("teamWeightBase", "nba")) : 0.65;
+      const _btConfig = {
+        teamWeight: _tw,
+        oppWeight: 1 - _tw,
+        h2hFactor: (paramOverrides && paramOverrides.h2hFactor != null) ? paramOverrides.h2hFactor : (window.getParam("h2hFactor", "nba") ?? 1.0)
+      };
+
       let calc;
       try {
-        calc = computeFTProjection({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1, config: {} });
+        calc = computeFTProjection({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1, config: _btConfig });
       } catch (e) {
         skipped++;
         continue;
@@ -17039,7 +16838,7 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
 
       let calc1H = null;
       try {
-        calc1H = compute1HProjection({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1, config: {} });
+        calc1H = compute1HProjection({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1, config: _btConfig });
       } catch (e) {
         calc1H = null;
       }
@@ -17052,16 +16851,10 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
             const gms = buildGlobalModelState({ league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1 });
             if (isFinite(gms?.volState?.combinedVolRatio)) combinedVolRatio = gms.volState.combinedVolRatio;
           } catch (e) {}
-          // AUDIT FIX #4: build walk-forward shape signals from only games
-          // strictly before game.date, instead of letting
-          // computeQuarterProjectionBT pull the live (non-date-scoped)
-          // shape store internally.
-          const teamShapeSignals = _btTeamQuarterShapeSignals(gameLogs[game.teamId], game.date);
-          const oppShapeSignals = _btTeamQuarterShapeSignals(gameLogs[game.oppId], game.date);
-          q1 = computeQuarterProjectionBT("q1", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, shapeSignalA: teamShapeSignals.q1, shapeSignalB: oppShapeSignals.q1 });
-          q2 = computeQuarterProjectionBT("q2", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, shapeSignalA: teamShapeSignals.q2, shapeSignalB: oppShapeSignals.q2 });
-          q3 = computeQuarterProjectionBT("q3", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, shapeSignalA: teamShapeSignals.q3, shapeSignalB: oppShapeSignals.q3 });
-          q4 = computeQuarterProjectionBT("q4", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, shapeSignalA: teamShapeSignals.q4, shapeSignalB: oppShapeSignals.q4 });
+          q1 = computeQuarterProjectionBT("q1", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, config: _btConfig });
+          q2 = computeQuarterProjectionBT("q2", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, config: _btConfig });
+          q3 = computeQuarterProjectionBT("q3", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, config: _btConfig });
+          q4 = computeQuarterProjectionBT("q4", { league: "nba", parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, config: _btConfig });
           applyQuarterAnchorBlendBT(q1, q2, q3, q4, calc1H, calc);
         }
       } catch (e) {
@@ -17152,201 +16945,97 @@ async function runNbaSeasonBacktest(season, onProgress, paramOverrides, _preload
 }
 
 const BB_NBA_OPT_GRID = [
-  { id: "baseline", label: "Baseline", overrides: {} },
+  { id: "baseline", label: "Baseline (current)", overrides: {} },
 
-  // --- Recency shapes (single-axis) ---
-  { id: "recency_flat", label: "Recency: flat", overrides: { recencyWeights: [1,1,1,1,1,1,1,1,1,1] } },
-  { id: "recency_mild", label: "Recency: mild", overrides: { recencyWeights: [1.20,1.12,1.05,0.98,0.90,0.82,0.74,0.66,0.58,0.50] } },
-  { id: "recency_default", label: "Recency: default copy", overrides: { recencyWeights: [1.35,1.20,1.00,0.85,0.70,0.56,0.44,0.33,0.24,0.16] } },
-  { id: "recency_aggressive", label: "Recency: aggressive", overrides: { recencyWeights: [1.6,1.3,1.0,0.8,0.6,0.45,0.35,0.25,0.18,0.12] } },
-  { id: "recency_heavy", label: "Recency: heavy recent", overrides: { recencyWeights: [2.0,1.5,1.0,0.6,0.3,0.2,0.15,0.1,0.08,0.05] } },
-  { id: "recency_very_heavy", label: "Recency: very heavy", overrides: { recencyWeights: [2.5,1.8,1.1,0.5,0.25,0.15,0.10,0.07,0.05,0.03] } },
-  { id: "recency_front5", label: "Recency: front-5 only", overrides: { recencyWeights: [1.8,1.5,1.2,1.0,0.8,0.15,0.10,0.08,0.05,0.03] } },
+  { id: "tw_045", label: "teamWeight 0.45", overrides: { teamWeightBase: 0.45 } },
+  { id: "tw_055", label: "teamWeight 0.55", overrides: { teamWeightBase: 0.55 } },
+  { id: "tw_060", label: "teamWeight 0.60", overrides: { teamWeightBase: 0.60 } },
+  { id: "tw_070", label: "teamWeight 0.70", overrides: { teamWeightBase: 0.70 } },
+  { id: "tw_075", label: "teamWeight 0.75", overrides: { teamWeightBase: 0.75 } },
+  { id: "tw_080", label: "teamWeight 0.80", overrides: { teamWeightBase: 0.80 } },
 
-  // --- Team weight (single-axis) ---
-  { id: "tw_050", label: "Team weight 0.50", overrides: { teamWeightBase: 0.50 } },
-  { id: "tw_055", label: "Team weight 0.55", overrides: { teamWeightBase: 0.55 } },
-  { id: "tw_060", label: "Team weight 0.60", overrides: { teamWeightBase: 0.60 } },
-  { id: "tw_065", label: "Team weight 0.65", overrides: { teamWeightBase: 0.65 } },
-  { id: "tw_070", label: "Team weight 0.70", overrides: { teamWeightBase: 0.70 } },
-  { id: "tw_075", label: "Team weight 0.75", overrides: { teamWeightBase: 0.75 } },
-  { id: "tw_080", label: "Team weight 0.80", overrides: { teamWeightBase: 0.80 } },
+  { id: "rec_flat", label: "Recency flat", overrides: { recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1] } },
+  { id: "rec_mild", label: "Recency mild", overrides: { recencyWeights: [1.20, 1.10, 1.00, 0.90, 0.80, 0.70, 0.60, 0.50, 0.40, 0.30] } },
+  { id: "rec_aggressive", label: "Recency aggressive", overrides: { recencyWeights: [1.60, 1.30, 0.90, 0.60, 0.40, 0.30, 0.22, 0.16, 0.12, 0.08] } },
+  { id: "rec_heavy", label: "Recency heavy", overrides: { recencyWeights: [2.00, 1.50, 1.00, 0.60, 0.30, 0.20, 0.14, 0.10, 0.07, 0.05] } },
+  { id: "rec_decay_fast", label: "Recency fast decay", overrides: { recencyWeights: [1.80, 1.20, 0.70, 0.40, 0.25, 0.15, 0.10, 0.07, 0.05, 0.03] } },
+  { id: "rec_long_tail", label: "Recency long tail", overrides: { recencyWeights: [1.25, 1.15, 1.05, 0.95, 0.85, 0.75, 0.65, 0.55, 0.45, 0.35] } },
 
-  // --- Quarter anchor blend (single-axis) ---
-  { id: "qblend_055", label: "Q blend 0.55", overrides: { quarterAnchorBlendWeight: 0.55 } },
-  { id: "qblend_065", label: "Q blend 0.65", overrides: { quarterAnchorBlendWeight: 0.65 } },
-  { id: "qblend_070", label: "Q blend 0.70", overrides: { quarterAnchorBlendWeight: 0.70 } },
-  { id: "qblend_075", label: "Q blend 0.75", overrides: { quarterAnchorBlendWeight: 0.75 } },
-  { id: "qblend_085", label: "Q blend 0.85", overrides: { quarterAnchorBlendWeight: 0.85 } },
-  { id: "qblend_090", label: "Q blend 0.90", overrides: { quarterAnchorBlendWeight: 0.90 } },
+  { id: "pace_tight", label: "Pace clamp tight 0.80-1.20", overrides: { paceClampMinNbaNcaa: 0.80, paceClampMaxNbaNcaa: 1.20 } },
+  { id: "pace_wide", label: "Pace clamp wide 0.55-1.45", overrides: { paceClampMinNbaNcaa: 0.55, paceClampMaxNbaNcaa: 1.45 } },
+  { id: "pace_low", label: "Pace clamp low-biased 0.60-1.15", overrides: { paceClampMinNbaNcaa: 0.60, paceClampMaxNbaNcaa: 1.15 } },
+  { id: "pace_high", label: "Pace clamp high-biased 0.85-1.40", overrides: { paceClampMinNbaNcaa: 0.85, paceClampMaxNbaNcaa: 1.40 } },
 
-  // --- H2H max weight (single-axis) ---
-  { id: "h2h_010", label: "H2H max 0.10", overrides: { h2hMaxWeight: 0.10 } },
-  { id: "h2h_020", label: "H2H max 0.20", overrides: { h2hMaxWeight: 0.20 } },
-  { id: "h2h_030", label: "H2H max 0.30", overrides: { h2hMaxWeight: 0.30 } },
-  { id: "h2h_040", label: "H2H max 0.40", overrides: { h2hMaxWeight: 0.40 } },
+  { id: "qblend_030", label: "Quarter blend 0.30", overrides: { quarterAnchorBlendWeight: 0.30 } },
+  { id: "qblend_050", label: "Quarter blend 0.50", overrides: { quarterAnchorBlendWeight: 0.50 } },
+  { id: "qblend_085", label: "Quarter blend 0.85", overrides: { quarterAnchorBlendWeight: 0.85 } },
+  { id: "qblend_100", label: "Quarter blend 1.00", overrides: { quarterAnchorBlendWeight: 1.00 } },
 
-  // --- Recency × team-weight crosses ---
-  { id: "mild_tw060", label: "Mild rec + TW 0.60", overrides: { recencyWeights: [1.20,1.12,1.05,0.98,0.90,0.82,0.74,0.66,0.58,0.50], teamWeightBase: 0.60 } },
-  { id: "mild_tw070", label: "Mild rec + TW 0.70", overrides: { recencyWeights: [1.20,1.12,1.05,0.98,0.90,0.82,0.74,0.66,0.58,0.50], teamWeightBase: 0.70 } },
-  { id: "agg_tw060", label: "Agg rec + TW 0.60", overrides: { recencyWeights: [1.6,1.3,1.0,0.8,0.6,0.45,0.35,0.25,0.18,0.12], teamWeightBase: 0.60 } },
-  { id: "agg_tw070", label: "Agg rec + TW 0.70", overrides: { recencyWeights: [1.6,1.3,1.0,0.8,0.6,0.45,0.35,0.25,0.18,0.12], teamWeightBase: 0.70 } },
-  { id: "agg_tw075", label: "Agg rec + TW 0.75", overrides: { recencyWeights: [1.6,1.3,1.0,0.8,0.6,0.45,0.35,0.25,0.18,0.12], teamWeightBase: 0.75 } },
-  { id: "heavy_tw060", label: "Heavy rec + TW 0.60", overrides: { recencyWeights: [2.0,1.5,1.0,0.6,0.3,0.2,0.15,0.1,0.08,0.05], teamWeightBase: 0.60 } },
-  { id: "heavy_tw070", label: "Heavy rec + TW 0.70", overrides: { recencyWeights: [2.0,1.5,1.0,0.6,0.3,0.2,0.15,0.1,0.08,0.05], teamWeightBase: 0.70 } },
-  { id: "heavy_tw075", label: "Heavy rec + TW 0.75", overrides: { recencyWeights: [2.0,1.5,1.0,0.6,0.3,0.2,0.15,0.1,0.08,0.05], teamWeightBase: 0.75 } },
-  { id: "flat_tw070", label: "Flat rec + TW 0.70", overrides: { recencyWeights: [1,1,1,1,1,1,1,1,1,1], teamWeightBase: 0.70 } },
-  { id: "front5_tw070", label: "Front-5 + TW 0.70", overrides: { recencyWeights: [1.8,1.5,1.2,1.0,0.8,0.15,0.10,0.08,0.05,0.03], teamWeightBase: 0.70 } },
-
-  // --- Recency × Q-blend crosses ---
-  { id: "agg_qb075", label: "Agg rec + Q 0.75", overrides: { recencyWeights: [1.6,1.3,1.0,0.8,0.6,0.45,0.35,0.25,0.18,0.12], quarterAnchorBlendWeight: 0.75 } },
-  { id: "agg_qb085", label: "Agg rec + Q 0.85", overrides: { recencyWeights: [1.6,1.3,1.0,0.8,0.6,0.45,0.35,0.25,0.18,0.12], quarterAnchorBlendWeight: 0.85 } },
-  { id: "heavy_qb075", label: "Heavy rec + Q 0.75", overrides: { recencyWeights: [2.0,1.5,1.0,0.6,0.3,0.2,0.15,0.1,0.08,0.05], quarterAnchorBlendWeight: 0.75 } },
-  { id: "heavy_qb085", label: "Heavy rec + Q 0.85", overrides: { recencyWeights: [2.0,1.5,1.0,0.6,0.3,0.2,0.15,0.1,0.08,0.05], quarterAnchorBlendWeight: 0.85 } },
-
-  // --- Triple combos (promising region probes) ---
-  { id: "agg_tw070_qb075", label: "Agg+TW0.70+Q0.75", overrides: { recencyWeights: [1.6,1.3,1.0,0.8,0.6,0.45,0.35,0.25,0.18,0.12], teamWeightBase: 0.70, quarterAnchorBlendWeight: 0.75 } },
-  { id: "agg_tw070_qb085", label: "Agg+TW0.70+Q0.85", overrides: { recencyWeights: [1.6,1.3,1.0,0.8,0.6,0.45,0.35,0.25,0.18,0.12], teamWeightBase: 0.70, quarterAnchorBlendWeight: 0.85 } },
-  { id: "heavy_tw070_qb075", label: "Heavy+TW0.70+Q0.75", overrides: { recencyWeights: [2.0,1.5,1.0,0.6,0.3,0.2,0.15,0.1,0.08,0.05], teamWeightBase: 0.70, quarterAnchorBlendWeight: 0.75 } },
-  { id: "mild_tw065_qb070", label: "Mild+TW0.65+Q0.70", overrides: { recencyWeights: [1.20,1.12,1.05,0.98,0.90,0.82,0.74,0.66,0.58,0.50], teamWeightBase: 0.65, quarterAnchorBlendWeight: 0.70 } },
-  { id: "heavy_tw075_h2h20", label: "Heavy+TW0.75+H2H0.20", overrides: { recencyWeights: [2.0,1.5,1.0,0.6,0.3,0.2,0.15,0.1,0.08,0.05], teamWeightBase: 0.75, h2hMaxWeight: 0.20 } },
-  { id: "agg_tw070_h2h20", label: "Agg+TW0.70+H2H0.20", overrides: { recencyWeights: [1.6,1.3,1.0,0.8,0.6,0.45,0.35,0.25,0.18,0.12], teamWeightBase: 0.70, h2hMaxWeight: 0.20 } },
-
-  // --- PHASE 2: pace clamps (NBA/NCAA) ---
-  { id: "pace_tight", label: "Pace clamp tight 0.75-1.25", overrides: { paceClampMinNbaNcaa: 0.75, paceClampMaxNbaNcaa: 1.25 } },
-  { id: "pace_loose", label: "Pace clamp loose 0.55-1.45", overrides: { paceClampMinNbaNcaa: 0.55, paceClampMaxNbaNcaa: 1.45 } },
-  { id: "pace_narrow", label: "Pace clamp narrow 0.85-1.15", overrides: { paceClampMinNbaNcaa: 0.85, paceClampMaxNbaNcaa: 1.15 } },
-  { id: "pace_wide_hi", label: "Pace clamp wide-hi 0.65-1.50", overrides: { paceClampMinNbaNcaa: 0.65, paceClampMaxNbaNcaa: 1.50 } },
-
-  // --- PHASE 2: volatility ---
-  { id: "vol_soft_8", label: "Vol limit 8", overrides: { volatilityLimit: 8 } },
-  { id: "vol_soft_10", label: "Vol limit 10", overrides: { volatilityLimit: 10 } },
-  { id: "vol_default_12", label: "Vol limit 12 (default copy)", overrides: { volatilityLimit: 12 } },
-  { id: "vol_hard_16", label: "Vol limit 16", overrides: { volatilityLimit: 16 } },
-  { id: "vol_hard_20", label: "Vol limit 20", overrides: { volatilityLimit: 20 } },
-  { id: "team_vol_soft", label: "Team vol scale 0.35", overrides: { teamVolScale: 0.35 } },
-  { id: "team_vol_hard", label: "Team vol scale 0.70", overrides: { teamVolScale: 0.70 } },
-  { id: "h1_vol_soft", label: "H1 vol scale 0.55", overrides: { h1VolScale: 0.55 } },
-  { id: "h1_vol_hard", label: "H1 vol scale 0.85", overrides: { h1VolScale: 0.85 } },
-
-  // --- PHASE 2: venue blend ---
-  { id: "venue_soft", label: "Venue soft 0.40/0.30", overrides: { venueStrongWeight: 0.40, venueModerateWeight: 0.30 } },
-  { id: "venue_stronger", label: "Venue stronger 0.80/0.60", overrides: { venueStrongWeight: 0.80, venueModerateWeight: 0.60 } },
-  { id: "venue_max", label: "Venue max 0.85/0.70", overrides: { venueStrongWeight: 0.85, venueModerateWeight: 0.70 } },
-
-  // --- PHASE 2: injury opp boost ---
-  { id: "inj_off", label: "Injury boost 0", overrides: { injuryOppBoostFactor: 0.0 } },
-  { id: "inj_light", label: "Injury boost 0.10", overrides: { injuryOppBoostFactor: 0.10 } },
-  { id: "inj_heavy", label: "Injury boost 0.35", overrides: { injuryOppBoostFactor: 0.35 } },
-
-  // --- PHASE 2: flat-recency anchors × pace/vol (Phase-1 winner region) ---
-  { id: "flat_pace_tight", label: "Flat+pace tight", overrides: { recencyWeights: [1,1,1,1,1,1,1,1,1,1], paceClampMinNbaNcaa: 0.75, paceClampMaxNbaNcaa: 1.25 } },
-  { id: "flat_pace_loose", label: "Flat+pace loose", overrides: { recencyWeights: [1,1,1,1,1,1,1,1,1,1], paceClampMinNbaNcaa: 0.55, paceClampMaxNbaNcaa: 1.45 } },
-  { id: "flat_vol10", label: "Flat+vol 10", overrides: { recencyWeights: [1,1,1,1,1,1,1,1,1,1], volatilityLimit: 10 } },
-  { id: "flat_vol16", label: "Flat+vol 16", overrides: { recencyWeights: [1,1,1,1,1,1,1,1,1,1], volatilityLimit: 16 } },
-  { id: "mild_pace_tight", label: "Mild+pace tight", overrides: { recencyWeights: [1.20,1.12,1.05,0.98,0.90,0.82,0.74,0.66,0.58,0.50], paceClampMinNbaNcaa: 0.75, paceClampMaxNbaNcaa: 1.25 } },
-  { id: "mild_vol10", label: "Mild+vol 10", overrides: { recencyWeights: [1.20,1.12,1.05,0.98,0.90,0.82,0.74,0.66,0.58,0.50], volatilityLimit: 10 } },
-  { id: "flat_venue_soft", label: "Flat+venue soft", overrides: { recencyWeights: [1,1,1,1,1,1,1,1,1,1], venueStrongWeight: 0.40, venueModerateWeight: 0.30 } },
-  { id: "flat_venue_strong", label: "Flat+venue stronger", overrides: { recencyWeights: [1,1,1,1,1,1,1,1,1,1], venueStrongWeight: 0.80, venueModerateWeight: 0.60 } },
-
-  // --- TIER 1: near-flat recency (only keep if Total MAE < 14.9) ---
-  { id: "nearflat_a", label: "Near-flat A mild tilt", overrides: { recencyWeights: [1.10,1.05,1.00,1.00,1.00,0.95,0.95,0.90,0.90,0.85] } },
-  { id: "nearflat_b", label: "Near-flat B soft decay", overrides: { recencyWeights: [1.08,1.04,1.00,0.98,0.96,0.94,0.92,0.90,0.88,0.86] } },
-  { id: "nearflat_c", label: "Near-flat C front-light", overrides: { recencyWeights: [1.05,1.02,1.00,1.00,0.98,0.96,0.94,0.92,0.90,0.88] } },
-  { id: "nearflat_d", label: "Near-flat D very mild", overrides: { recencyWeights: [1.04,1.02,1.00,1.00,1.00,0.98,0.98,0.96,0.96,0.94] } },
-
-  // --- TIER 1: flat × teamWeightBase ---
-  { id: "flat_tw055", label: "Flat+TW 0.55", overrides: { teamWeightBase: 0.55 } },
-  { id: "flat_tw060", label: "Flat+TW 0.60", overrides: { teamWeightBase: 0.60 } },
-  { id: "flat_tw065", label: "Flat+TW 0.65 (default)", overrides: { teamWeightBase: 0.65 } },
-  { id: "flat_tw070", label: "Flat+TW 0.70", overrides: { teamWeightBase: 0.70 } },
-  { id: "flat_tw075", label: "Flat+TW 0.75", overrides: { teamWeightBase: 0.75 } },
-  { id: "flat_tw080", label: "Flat+TW 0.80", overrides: { teamWeightBase: 0.80 } },
-
-  // --- TIER 1: flat × volatilityLimit ---
-  { id: "flat_vol08", label: "Flat+vol 8", overrides: { volatilityLimit: 8 } },
-  { id: "flat_vol10", label: "Flat+vol 10", overrides: { volatilityLimit: 10 } },
-  { id: "flat_vol14", label: "Flat+vol 14", overrides: { volatilityLimit: 14 } },
-  { id: "flat_vol18", label: "Flat+vol 18", overrides: { volatilityLimit: 18 } },
-
-  // --- TIER 1: flat × quarterAnchorBlendWeight ---
-  { id: "flat_qb055", label: "Flat+Q blend 0.55", overrides: { quarterAnchorBlendWeight: 0.55 } },
-  { id: "flat_qb070", label: "Flat+Q blend 0.70", overrides: { quarterAnchorBlendWeight: 0.70 } },
-  { id: "flat_qb085", label: "Flat+Q blend 0.85", overrides: { quarterAnchorBlendWeight: 0.85 } },
-
-  // --- TIER 1: best crosses (near-flat × TW / vol) ---
-  { id: "nearflat_tw070", label: "Near-flat A + TW 0.70", overrides: { recencyWeights: [1.10,1.05,1.00,1.00,1.00,0.95,0.95,0.90,0.90,0.85], teamWeightBase: 0.70 } },
-  { id: "nearflat_vol10", label: "Near-flat A + vol 10", overrides: { recencyWeights: [1.10,1.05,1.00,1.00,1.00,0.95,0.95,0.90,0.90,0.85], volatilityLimit: 10 } },
-  { id: "flat_tw070_vol10", label: "Flat+TW 0.70+vol 10", overrides: { teamWeightBase: 0.70, volatilityLimit: 10 } },
-  { id: "flat_tw075_vol10", label: "Flat+TW 0.75+vol 10", overrides: { teamWeightBase: 0.75, volatilityLimit: 10 } }
+  { id: "tw055_rec_flat", label: "tw 0.55 + flat recency", overrides: { teamWeightBase: 0.55, recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1] } },
+  { id: "tw055_pace_tight", label: "tw 0.55 + pace tight", overrides: { teamWeightBase: 0.55, paceClampMinNbaNcaa: 0.80, paceClampMaxNbaNcaa: 1.20 } },
+  { id: "tw070_rec_agg", label: "tw 0.70 + aggressive recency", overrides: { teamWeightBase: 0.70, recencyWeights: [1.60, 1.30, 0.90, 0.60, 0.40, 0.30, 0.22, 0.16, 0.12, 0.08] } },
+  { id: "tw075_pace_wide", label: "tw 0.75 + pace wide", overrides: { teamWeightBase: 0.75, paceClampMinNbaNcaa: 0.55, paceClampMaxNbaNcaa: 1.45 } },
+  { id: "rec_flat_pace_tight", label: "flat recency + pace tight", overrides: { recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], paceClampMinNbaNcaa: 0.80, paceClampMaxNbaNcaa: 1.20 } },
+  { id: "rec_flat_qblend050", label: "flat recency + qblend 0.50", overrides: { recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], quarterAnchorBlendWeight: 0.50 } },
+  { id: "combo_best_guess", label: "tw 0.55 + flat + pace tight", overrides: { teamWeightBase: 0.55, recencyWeights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], paceClampMinNbaNcaa: 0.80, paceClampMaxNbaNcaa: 1.20 } }
 ];
-
-function evaluateNbaSeasonBacktestFromCache(cached, paramOverrides) {
-  return runNbaSeasonBacktest(cached.season, null, paramOverrides || {}, cached);
-}
 
 async function runNbaConfigSweep(onProgress) {
   const season = getCurrentSeasonYear("nba") - 1;
   const results = [];
   const total = BB_NBA_OPT_GRID.length;
-  const cacheKey = "nba_v2_" + season;
-
-  if (!window.__bbSeasonDataCache || !window.__bbSeasonDataCache[cacheKey]) {
-    if (typeof onProgress === "function") {
-      try { onProgress(0, total, "Loading season data (once)…"); } catch (e) {}
-    }
-    await runNbaSeasonBacktest(season, null);
-  }
 
   for (let i = 0; i < total; i++) {
     const cfg = BB_NBA_OPT_GRID[i];
     if (typeof onProgress === "function") {
       try { onProgress(i + 1, total, cfg.label); } catch (e) {}
     }
+    engineDebug("Config sweep running", { id: cfg.id, label: cfg.label, index: i + 1, total });
     let report;
     try {
       report = await runNbaSeasonBacktest(season, null, cfg.overrides);
     } catch (e) {
-      results.push({ id: cfg.id, label: cfg.label, error: e?.message || String(e) });
-      await new Promise(r => setTimeout(r, 0));
+      engineDebug("Config sweep entry failed", { id: cfg.id, error: e?.message || String(e) });
+      results.push({ id: cfg.id, label: cfg.label, overrides: cfg.overrides, error: e?.message || String(e) });
       continue;
     }
     results.push({
       id: cfg.id,
       label: cfg.label,
+      overrides: cfg.overrides,
       totalMAE: report?.overall?.totalMAE ?? null,
       totalBias: report?.overall?.totalBias ?? null,
       teamMAE: report?.overall?.teamScoreMAE ?? null,
+      teamBias: report?.overall?.teamScoreBias ?? null,
       h1TotalMAE: report?.overall?.h1TotalMAE ?? null,
+      h1TeamMAE: report?.overall?.h1TeamScoreMAE ?? null,
       qTotalMAE: report?.overall?.qTotalMAE ?? null,
+      qTeamMAE: report?.overall?.qTeamMAE ?? null,
       marginMAE: report?.overall?.marginMAE ?? null,
       straightUp: report?.overall?.straightUpAccuracy ?? null,
-      evaluated: report?.evaluated ?? 0
+      evaluated: report?.evaluated ?? 0,
+      skipped: report?.skipped ?? 0
     });
-    await new Promise(r => setTimeout(r, 0));
+    await new Promise(r => setTimeout(r, 50));
   }
 
   const valid = results.filter(r => isFinite(r.totalMAE));
   valid.sort((a, b) => a.totalMAE - b.totalMAE);
   const baseline = results.find(r => r.id === "baseline") || null;
   const best = valid[0] || null;
-  let recommendation = "No valid configs.";
-  let newLock = null;
+
+  let recommendation = "No valid configs produced results.";
   if (best && baseline && isFinite(baseline.totalMAE)) {
     const delta = baseline.totalMAE - best.totalMAE;
     if (best.id === "baseline") {
-      recommendation = "Baseline remains best on Total MAE.";
+      recommendation = "Baseline remains best on Total MAE. No config change recommended.";
+    } else if (delta >= 0.3) {
+      recommendation = `Recommend review: "${best.label}" improved Total MAE by ${delta.toFixed(2)} pts (${baseline.totalMAE.toFixed(1)} → ${best.totalMAE.toFixed(1)}). Check other markets before adopting.`;
     } else {
-      newLock = maybeRatchetNbaCalibrationLock(best, baseline, season);
-      if (newLock) {
-        recommendation = `LOCKED "${newLock.label}" — Total MAE ${newLock.previousMAE.toFixed(2)} → ${newLock.totalMAE.toFixed(2)} (Δ ${newLock.deltaFromPrevious.toFixed(2)}). Next baseline uses this.`;
-      } else if (delta >= BB_NBA_LOCK_MIN_DELTA) {
-        recommendation = `Challenger "${best.label}" improved by ${delta.toFixed(2)} but did not beat the saved lock floor.`;
-      } else {
-        recommendation = `Best challenger "${best.label}" only edged baseline by ${delta.toFixed(2)} — below auto-lock threshold (${BB_NBA_LOCK_MIN_DELTA}).`;
-      }
+      recommendation = `Best challenger "${best.label}" only edged baseline by ${delta.toFixed(2)} pts — not enough to recommend a change yet.`;
     }
   }
+
   const sweepReport = {
     season,
     ranAt: new Date().toISOString(),
@@ -17354,12 +17043,11 @@ async function runNbaConfigSweep(onProgress) {
     ranked: valid,
     baseline,
     best,
-    recommendation,
-    lock: window.__bbNbaCalibrationLock || null,
-    newlyLocked: !!newLock
+    recommendation
   };
   try { window.__bbSweepResults = sweepReport; } catch (e) {}
   try { localStorage.setItem("BB_NBA_CONFIG_SWEEP", JSON.stringify(sweepReport)); } catch (e) {}
+  engineDebug("Config sweep complete", { best: best?.id, recommendation });
   return sweepReport;
 }
 
@@ -17437,6 +17125,64 @@ function renderBacktestPanel() {
 
   const notesHtml = (cached?.notes || []).map(n => `<div style="padding:8px 12px; border-left:3px solid #3a9c35; margin-bottom:6px; font-size:12px; background:rgba(58,156,53,0.08);">${n}</div>`).join("");
 
+  let sweep = window.__bbSweepResults;
+  if (!sweep) {
+    try {
+      const raw = localStorage.getItem("BB_NBA_CONFIG_SWEEP");
+      if (raw) { sweep = JSON.parse(raw); window.__bbSweepResults = sweep; }
+    } catch (e) {}
+  }
+
+  let sweepHtml = "";
+  if (sweep && Array.isArray(sweep.ranked) && sweep.ranked.length) {
+    const rows = sweep.ranked.map((r, idx) => {
+      const isBase = r.id === "baseline";
+      const isBest = sweep.best && r.id === sweep.best.id;
+      const bg = isBest ? "background:rgba(58,156,53,0.12);" : (isBase ? "background:rgba(58,64,76,0.06);" : "");
+      const tag = isBest ? " ★ BEST" : (isBase ? " (baseline)" : "");
+      return `<tr style="${bg}">
+        <td style="padding:6px 4px; font-size:11px; font-weight:800;">${idx + 1}. ${r.label}${tag}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center; font-weight:900;">${isFinite(r.totalMAE) ? r.totalMAE.toFixed(1) : "—"}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center;">${isFinite(r.teamMAE) ? r.teamMAE.toFixed(1) : "—"}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center;">${isFinite(r.h1TotalMAE) ? r.h1TotalMAE.toFixed(1) : "—"}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center;">${isFinite(r.qTotalMAE) ? r.qTotalMAE.toFixed(1) : "—"}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center;">${isFinite(r.totalBias) ? r.totalBias.toFixed(1) : "—"}</td>
+      </tr>`;
+    }).join("");
+    sweepHtml = `
+      <div style="padding:0 16px 16px;">
+        <div style="font-size:12px; font-weight:900; margin-bottom:8px; letter-spacing:0.4px; text-transform:uppercase;">Config Sweep Leaderboard (ranked by Total MAE)</div>
+        <div style="overflow-x:auto;">
+          <table style="width:100%; border-collapse:collapse; font-size:11px;">
+            <thead>
+              <tr style="background:var(--table-head); color:#fff;">
+                <th style="padding:6px 4px; text-align:left;">Config</th>
+                <th style="padding:6px 4px;">Total MAE</th>
+                <th style="padding:6px 4px;">Team MAE</th>
+                <th style="padding:6px 4px;">1H MAE</th>
+                <th style="padding:6px 4px;">Q MAE</th>
+                <th style="padding:6px 4px;">Bias</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <div style="margin-top:10px; padding:10px 12px; border-left:3px solid #d4af37; background:rgba(212,175,55,0.08); font-size:12px; font-weight:700; line-height:1.4;">
+          ${sweep.recommendation || ""}
+        </div>
+        <div style="margin-top:6px; font-size:10px; color:var(--muted);">Last sweep: ${sweep.ranAt ? new Date(sweep.ranAt).toLocaleString() : "—"} · season ${sweep.season ?? "—"} · diagnostic only — nothing auto-applied</div>
+      </div>
+    `;
+  } else {
+    sweepHtml = `
+      <div style="padding:0 16px 16px;">
+        <div style="padding:12px; border:1px dashed var(--table-border); color:var(--muted); font-size:12px; font-weight:700;">
+          Config sweep results will appear here after you run a sweep. Ranked by Total MAE across FT / Team / 1H / Quarters.
+        </div>
+      </div>
+    `;
+  }
+
   const html = `
     <div class="tracker-analytics-shell">
       <div class="tracker-analytics-topbar">
@@ -17453,65 +17199,15 @@ function renderBacktestPanel() {
 
       <div style="padding:12px 16px;">
         <button type="button" id="runSeasonBacktestBtn" style="background:#3a9c35; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer;">▶ Run NBA Season Backtest</button>
-        <button type="button" id="runConfigSweepBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer; margin-left:8px;">⚙ Run Config Sweep</button>
+        <button type="button" id="runConfigSweepBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer; margin-left:8px;">🔬 Run Config Sweep</button>
         <span id="backtestStatusLabel" style="margin-left:10px; font-size:12px; opacity:0.8;"></span>
         ${resumeInfo ? `<div style="margin-top:8px; font-size:12px; color:#8a6d00;">A previous run was interrupted after ${resumeInfo.doneCount} of the season's games — hit Run to pick up right where it left off, nothing is lost.</div>` : ""}
-        ${(() => {
-          if (!window.__bbSweepResults) {
-            try {
-              const raw = localStorage.getItem("BB_NBA_CONFIG_SWEEP");
-              if (raw) window.__bbSweepResults = JSON.parse(raw);
-            } catch (e) {}
-          }
-          const sw = window.__bbSweepResults;
-          if (!sw) return "";
-          const ranked = Array.isArray(sw.ranked) ? sw.ranked : [];
-          const baseMAE = sw.baseline && isFinite(sw.baseline.totalMAE) ? sw.baseline.totalMAE : null;
-          const fmt = (v, d) => (v == null || !isFinite(v)) ? "—" : Number(v).toFixed(d);
-          const rows = ranked.map((r, i) => {
-            const delta = (baseMAE != null && isFinite(r.totalMAE)) ? (baseMAE - r.totalMAE) : null;
-            const deltaTxt = delta == null ? "—" : ((delta >= 0 ? "+" : "") + delta.toFixed(2));
-            const bg = i === 0 ? "background:rgba(47,143,74,0.12);" : (i % 2 ? "background:var(--panel-soft);" : "");
-            return `<tr style="${bg}">
-              <td style="padding:6px 8px; text-align:center; font-weight:800;">${i + 1}</td>
-              <td style="padding:6px 8px; text-align:left; font-weight:700;">${r.label || r.id}</td>
-              <td style="padding:6px 8px; text-align:right; font-weight:800;">${fmt(r.totalMAE, 1)}</td>
-              <td style="padding:6px 8px; text-align:right;">${fmt(r.totalBias, 1)}</td>
-              <td style="padding:6px 8px; text-align:right;">${fmt(r.teamMAE, 1)}</td>
-              <td style="padding:6px 8px; text-align:right;">${fmt(r.h1TotalMAE, 1)}</td>
-              <td style="padding:6px 8px; text-align:right;">${fmt(r.marginMAE, 1)}</td>
-              <td style="padding:6px 8px; text-align:right;">${r.straightUp != null && isFinite(r.straightUp) ? (r.straightUp * 100).toFixed(1) + "%" : "—"}</td>
-              <td style="padding:6px 8px; text-align:right; font-weight:700; color:${delta != null && delta > 0 ? "#2f8f4a" : (delta != null && delta < 0 ? "#c91920" : "inherit")};">${deltaTxt}</td>
-            </tr>`;
-          }).join("");
-          return `<div style="margin-top:12px;">
-            <div style="font-size:12px; font-weight:800; margin-bottom:6px;"><strong>Sweep:</strong> ${sw.recommendation || ""}</div>
-            <div style="overflow-x:auto; border:1px solid var(--table-border); max-height:320px; overflow-y:auto;">
-              <table style="width:100%; border-collapse:collapse; font-size:11px; margin:0;">
-                <thead>
-                  <tr style="background:var(--table-head); color:#fff; position:sticky; top:0;">
-                    <th style="padding:7px 8px; text-align:center;">#</th>
-                    <th style="padding:7px 8px; text-align:left;">Config</th>
-                    <th style="padding:7px 8px; text-align:right;">Total MAE</th>
-                    <th style="padding:7px 8px; text-align:right;">Bias</th>
-                    <th style="padding:7px 8px; text-align:right;">Team MAE</th>
-                    <th style="padding:7px 8px; text-align:right;">1H MAE</th>
-                    <th style="padding:7px 8px; text-align:right;">Margin</th>
-                    <th style="padding:7px 8px; text-align:right;">SU%</th>
-                    <th style="padding:7px 8px; text-align:right;">Δ vs base</th>
-                  </tr>
-                </thead>
-                <tbody>${rows || '<tr><td colspan="9" style="padding:10px; text-align:center;">No ranked configs</td></tr>'}</tbody>
-              </table>
-            </div>
-            <div style="margin-top:4px; font-size:10px; color:var(--muted);">Showing ${ranked.length} ranked config${ranked.length === 1 ? "" : "s"}. Green Δ = better than baseline Total MAE.</div>
-          </div>`;
-        })()}
       </div>
 
       <div style="padding:0 16px 16px;">
         ${notesHtml}
       </div>
+      ${sweepHtml}
     </div>
   `;
 
@@ -17522,6 +17218,8 @@ function renderBacktestPanel() {
     runBtn.onclick = async () => {
       const statusLabel = document.getElementById("backtestStatusLabel");
       runBtn.disabled = true;
+      const sweepBtn = document.getElementById("runConfigSweepBtn");
+      if (sweepBtn) sweepBtn.disabled = true;
       if (statusLabel) statusLabel.textContent = "Fetching season schedules…";
 
       let wakeLock = null;
@@ -17553,6 +17251,8 @@ function renderBacktestPanel() {
         if (statusLabel) statusLabel.textContent = `Backtest failed — ${e?.message || "check debug log"}.`;
       } finally {
         runBtn.disabled = false;
+        const sweepBtn2 = document.getElementById("runConfigSweepBtn");
+        if (sweepBtn2) sweepBtn2.disabled = false;
         document.removeEventListener("visibilitychange", reacquireBtWakeLock);
         try { if (wakeLock) await wakeLock.release(); } catch (e) {}
       }
@@ -17564,10 +17264,19 @@ function renderBacktestPanel() {
     sweepBtn.onclick = async () => {
       const statusLabel = document.getElementById("backtestStatusLabel");
       sweepBtn.disabled = true;
+      if (runBtn) runBtn.disabled = true;
       if (statusLabel) statusLabel.textContent = "Starting config sweep…";
       try {
-        await runNbaConfigSweep((done, total, label) => {
-          if (statusLabel) statusLabel.textContent = `Sweep ${done}/${total}: ${label || ""}`;
+        const season = getCurrentSeasonYear("nba") - 1;
+        const cacheKey = "nba_" + season;
+        if (!window.__bbSeasonDataCache || !window.__bbSeasonDataCache[cacheKey]) {
+          if (statusLabel) statusLabel.textContent = "No cached season data — running baseline fetch first…";
+          await runNbaSeasonBacktest(season, (done, total) => {
+            if (statusLabel) statusLabel.textContent = `Fetching data… ${done}/${total}`;
+          }, null);
+        }
+        await runNbaConfigSweep((idx, total, label) => {
+          if (statusLabel) statusLabel.textContent = `Sweep ${idx}/${total}: ${label}`;
         });
         renderBacktestPanel();
       } catch (e) {
@@ -17575,6 +17284,7 @@ function renderBacktestPanel() {
         if (statusLabel) statusLabel.textContent = `Sweep failed — ${e?.message || "check debug log"}.`;
       } finally {
         sweepBtn.disabled = false;
+        if (runBtn) runBtn.disabled = false;
       }
     };
   }
