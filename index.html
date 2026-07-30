@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17434,6 +17433,156 @@ async function runNbaConfigSweep(onProgress) {
   return sweepReport;
 }
 
+// PHASE 3 (backtest roadmap): real sweep infrastructure. BB_NBA_OPT_GRID
+// above only ever tested one knob (opp-adj strength) across 5 fixed points.
+// This tests every knob the backtest actually respects (confirmed live in
+// runNbaSeasonBacktest's paramOverrides handling — nothing here is a knob
+// that turns out to be a no-op), using bounds pulled from
+// TUNABLE_PARAM_REGISTRY where a registry entry exists (teamWeightBase,
+// h2hFactor) so ranges aren't just guessed twice. oppAdjStrength/
+// extremeExpansion/restPts/quarterAnchorBlendWeight have no registry entry
+// (they're backtest/local concepts, not live TUNABLE_PARAM_REGISTRY knobs),
+// so their ranges are documented estimates below, not authoritative.
+// Deliberately excludes pace clamps: getEffectivePaceClamp() only affects
+// anything downstream of AppState.context.data.*.pace10, which the backtest
+// never populates (no historical advanced-stats fetch) — sweeping it would
+// burn candidates on a parameter that's a no-op in this exact code path.
+const BT_SWEEP_DEFAULT_RECENCY = [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16];
+const BT_SWEEP_PARAM_SPACE = {
+  teamWeightBase: { min: 0.40, max: 0.85, source: "TUNABLE_PARAM_REGISTRY" },
+  h2hFactor: { min: 0.5, max: 1.0, source: "TUNABLE_PARAM_REGISTRY" },
+  useH2H: { type: "bool", onProbability: 0.85, source: "new in Phase 1 — worth testing on vs off directly" },
+  useOppAdj: { type: "bool", onProbability: 0.7, source: "existing BB_NBA_OPT_GRID knob" },
+  oppAdjStrength: { min: 0.25, max: 1.5, source: "widened from BB_NBA_OPT_GRID's tested 0.5-1.25" },
+  extremeExpansion: { min: 0.7, max: 1.3, source: "estimate — no registry entry" },
+  restPts: { min: 0, max: 1.5, source: "estimate — no registry entry" },
+  quarterAnchorBlendWeight: { min: 0, max: 1.0, source: "estimate — MODEL_TUNING default is 0.7" },
+  recencyStrength: { min: 0, max: 1.5, source: "0 = flat weighting, 1 = current default curve, >1 = steeper" }
+};
+
+// Deterministic PRNG (mulberry32) so a sweep's candidates can be regenerated
+// from its stored seed later — "what exactly did candidate #142 test" is
+// answerable without having saved every candidate's full override object.
+function _btMulberry32(seed) {
+  let state = seed >>> 0;
+  return function () {
+    state |= 0; state = (state + 0x6D2B79F5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function _btRandomCandidate(rng) {
+  const between = (min, max) => min + rng() * (max - min);
+  const sp = BT_SWEEP_PARAM_SPACE;
+  const useOppAdj = rng() < sp.useOppAdj.onProbability;
+  const useH2H = rng() < sp.useH2H.onProbability;
+  const recencyStrength = between(sp.recencyStrength.min, sp.recencyStrength.max);
+  const recencyWeights = BT_SWEEP_DEFAULT_RECENCY.map(w => 1 + recencyStrength * (w - 1));
+  return {
+    teamWeightBase: Number(between(sp.teamWeightBase.min, sp.teamWeightBase.max).toFixed(3)),
+    h2hFactor: Number(between(sp.h2hFactor.min, sp.h2hFactor.max).toFixed(3)),
+    useH2H,
+    useOppAdj,
+    oppAdjStrength: Number(between(sp.oppAdjStrength.min, sp.oppAdjStrength.max).toFixed(3)),
+    extremeExpansion: Number(between(sp.extremeExpansion.min, sp.extremeExpansion.max).toFixed(3)),
+    restPts: Number(between(sp.restPts.min, sp.restPts.max).toFixed(3)),
+    quarterAnchorBlendWeight: Number(between(sp.quarterAnchorBlendWeight.min, sp.quarterAnchorBlendWeight.max).toFixed(3)),
+    recencyWeights,
+    recencyStrength: Number(recencyStrength.toFixed(3))
+  };
+}
+
+async function runNbaLargeConfigSweep(numCandidates, onProgress, options = {}) {
+  const season = getCurrentSeasonYear("nba") - 1;
+  numCandidates = Math.max(2, Math.min(5000, Number(numCandidates) || 200));
+  const seed = isFinite(options.seed) ? Number(options.seed) >>> 0 : (Date.now() >>> 0);
+  const rng = _btMulberry32(seed);
+
+  const candidates = [{ id: "baseline", label: "Baseline (current live defaults)", overrides: {} }];
+  for (let i = 1; i < numCandidates; i++) {
+    candidates.push({ id: `cand_${i}`, label: `Candidate ${i}`, overrides: _btRandomCandidate(rng) });
+  }
+
+  const results = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    if (typeof onProgress === "function") {
+      try { onProgress(i + 1, candidates.length, c.label); } catch (e) {}
+    }
+    let report;
+    try {
+      report = await runNbaSeasonBacktest(season, null, c.overrides);
+    } catch (e) {
+      results.push({ id: c.id, label: c.label, overrides: c.overrides, error: e?.message || String(e) });
+      continue;
+    }
+    const trainScore = report?.trainAccuracyScore?.composite ?? null;
+    const holdoutScore = report?.holdoutAccuracyScore?.composite ?? null;
+    const overallScore = report?.accuracyScore?.composite ?? null;
+    // Same isFinite(null)-is-true trap as the ranking filter below: without
+    // the explicit !== null checks, a missing trainScore would silently
+    // compute a fake overfitGap (0 - holdoutScore) instead of null.
+    const overfitGap = (trainScore !== null && isFinite(trainScore) && holdoutScore !== null && isFinite(holdoutScore)) ? (trainScore - holdoutScore) : null;
+    results.push({
+      id: c.id, label: c.label, overrides: c.overrides,
+      overallScore, trainScore, holdoutScore, overfitGap,
+      breakdown: report?.accuracyScore?.breakdown ?? null,
+      evaluated: report?.evaluated ?? 0, skipped: report?.skipped ?? 0
+    });
+    // Yield every candidate so progress UI / wake lock stay responsive on a
+    // run that can take a while — this is pure computation, no network, but
+    // 1153 games x hundreds of candidates still adds up in a single JS thread.
+    await new Promise(r => setTimeout(r, 0));
+  }
+
+  // OVERFIT GUARD: rank by holdout score, not train score — train is what
+  // random search implicitly optimizes against just by trying enough
+  // candidates, so it's the one number here that's NOT a fair judge of a
+  // config on its own. A candidate only counts as a real win if its holdout
+  // score backs it up too.
+  // Note: isFinite(null) is true in JS (null coerces to 0), so an errored
+  // candidate (holdoutScore: null) would otherwise silently pass this filter
+  // and pollute the ranked list — same class of bug as the earlier
+  // computeBacktestAccuracyScore fix, checked explicitly here too.
+  const valid = results.filter(r => r.holdoutScore !== null && isFinite(r.holdoutScore));
+  const ranked = valid.slice().sort((a, b) => b.holdoutScore - a.holdoutScore);
+  const baseline = results.find(r => r.id === "baseline") || null;
+  const best = ranked[0] || null;
+
+  let recommendation = "No valid candidates produced results.";
+  if (best && baseline && isFinite(baseline.holdoutScore)) {
+    const delta = best.holdoutScore - baseline.holdoutScore;
+    const overfitFlag = isFinite(best.overfitGap) && best.overfitGap >= 8;
+    if (best.id === "baseline") {
+      recommendation = "Baseline remains best on holdout Accuracy Score. No config change recommended.";
+    } else if (overfitFlag) {
+      recommendation = `Best candidate "${best.label}" scored higher (holdout ${best.holdoutScore.toFixed(1)} vs baseline ${baseline.holdoutScore.toFixed(1)}) but shows a ${best.overfitGap.toFixed(1)}-pt train/holdout gap — likely overfit to early-season games, not recommended as-is.`;
+    } else if (delta >= 2) {
+      recommendation = `Recommend review: "${best.label}" improved holdout Accuracy Score by ${delta.toFixed(1)} pts (${baseline.holdoutScore.toFixed(1)} → ${best.holdoutScore.toFixed(1)}), train/holdout gap ${isFinite(best.overfitGap) ? best.overfitGap.toFixed(1) : "—"} pts — looks real, worth reviewing for promotion via the Configs panel.`;
+    } else {
+      recommendation = `Best candidate "${best.label}" only edged baseline by ${delta.toFixed(1)} pts on holdout — not enough to recommend a change yet.`;
+    }
+  }
+
+  const sweepReportFull = {
+    season, ranAt: new Date().toISOString(), numCandidates: candidates.length, seed,
+    results, ranked, baseline, best, recommendation
+  };
+  // Persist only the top 25 + baseline/best to localStorage — a full 5000-
+  // candidate run's raw results array is fine in memory for this session but
+  // shouldn't be the thing sitting in localStorage indefinitely.
+  const sweepReportPersist = {
+    season, ranAt: sweepReportFull.ranAt, numCandidates: candidates.length, seed,
+    ranked: ranked.slice(0, 25), baseline, best, recommendation
+  };
+  try { window.__bbLargeSweepResults = sweepReportFull; } catch (e) {}
+  try { localStorage.setItem("BB_NBA_LARGE_SWEEP", JSON.stringify(sweepReportPersist)); } catch (e) {}
+  engineDebug("Large config sweep complete", { best: best?.id, recommendation, numCandidates: candidates.length });
+  return sweepReportFull;
+}
+
 function renderBacktestPanel() {
   const panel = document.getElementById("trackerAnalyticsPanel");
   if (!panel) return;
@@ -17567,6 +17716,28 @@ function renderBacktestPanel() {
     } catch (e) {}
   }
 
+  // PHASE 3 (backtest roadmap): read the large sweep the same way the small
+  // one is read above — window first, localStorage fallback.
+  let largeSweep = window.__bbLargeSweepResults;
+  if (!largeSweep) {
+    try {
+      const raw = localStorage.getItem("BB_NBA_LARGE_SWEEP");
+      if (raw) { largeSweep = JSON.parse(raw); window.__bbLargeSweepResults = largeSweep; }
+    } catch (e) {}
+  }
+  function _btFormatCandidateOverrides(o) {
+    if (!o || !Object.keys(o).length) return "no overrides (live defaults)";
+    const parts = [];
+    if (isFinite(o.teamWeightBase)) parts.push(`tw=${o.teamWeightBase.toFixed(2)}`);
+    parts.push(`h2h=${o.useH2H === false ? "off" : "on" + (isFinite(o.h2hFactor) ? `(${o.h2hFactor.toFixed(2)})` : "")}`);
+    parts.push(`oppAdj=${o.useOppAdj ? "on" + (isFinite(o.oppAdjStrength) ? `(${o.oppAdjStrength.toFixed(2)})` : "") : "off"}`);
+    if (isFinite(o.extremeExpansion)) parts.push(`ext=${o.extremeExpansion.toFixed(2)}`);
+    if (isFinite(o.restPts)) parts.push(`rest=${o.restPts.toFixed(2)}`);
+    if (isFinite(o.quarterAnchorBlendWeight)) parts.push(`qBlend=${o.quarterAnchorBlendWeight.toFixed(2)}`);
+    if (isFinite(o.recencyStrength)) parts.push(`recStr=${o.recencyStrength.toFixed(2)}`);
+    return parts.join(" · ");
+  }
+
   let sweepHtml = "";
   if (sweep && Array.isArray(sweep.ranked) && sweep.ranked.length) {
     const rows = sweep.ranked.map((r, idx) => {
@@ -17617,6 +17788,60 @@ function renderBacktestPanel() {
     `;
   }
 
+  // PHASE 3 (backtest roadmap): large sweep leaderboard, ranked by holdout
+  // Accuracy Score (not train — see the overfit-guard comment in
+  // runNbaLargeConfigSweep). Overfit candidates are shown with a warning
+  // tag rather than hidden, so a sweep with only overfit "winners" is
+  // visibly that, not silently empty.
+  let largeSweepHtml = "";
+  if (largeSweep && Array.isArray(largeSweep.ranked) && largeSweep.ranked.length) {
+    const topRows = largeSweep.ranked.slice(0, 15).map((r, idx) => {
+      const isBase = r.id === "baseline";
+      const isBest = largeSweep.best && r.id === largeSweep.best.id;
+      const isOverfit = isFinite(r.overfitGap) && r.overfitGap >= 8;
+      const bg = isBest && !isOverfit ? "background:rgba(58,156,53,0.12);" : (isBase ? "background:rgba(58,64,76,0.06);" : (isOverfit ? "background:rgba(200,60,60,0.08);" : ""));
+      const tag = isBest && !isOverfit ? " ★ BEST" : (isBase ? " (baseline)" : (isOverfit ? " ⚠ overfit" : ""));
+      return `<tr style="${bg}">
+        <td style="padding:6px 4px; font-size:11px; font-weight:800;">${idx + 1}. ${r.label}${tag}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center; font-weight:900;">${isFinite(r.holdoutScore) ? r.holdoutScore.toFixed(1) : "—"}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center;">${isFinite(r.trainScore) ? r.trainScore.toFixed(1) : "—"}</td>
+        <td style="padding:6px 4px; font-size:11px; text-align:center; ${isOverfit ? "color:#c83c3c; font-weight:800;" : ""}">${isFinite(r.overfitGap) ? r.overfitGap.toFixed(1) : "—"}</td>
+        <td style="padding:6px 4px; font-size:10px; color:var(--muted);">${_btFormatCandidateOverrides(r.overrides)}</td>
+      </tr>`;
+    }).join("");
+    largeSweepHtml = `
+      <div style="padding:0 16px 16px;">
+        <div style="font-size:12px; font-weight:900; margin-bottom:8px; letter-spacing:0.4px; text-transform:uppercase;">Large Sweep Leaderboard (ranked by Holdout Accuracy Score, top 15 of ${largeSweep.numCandidates})</div>
+        <div style="overflow-x:auto;">
+          <table style="width:100%; border-collapse:collapse; font-size:11px;">
+            <thead>
+              <tr style="background:var(--table-head); color:#fff;">
+                <th style="padding:6px 4px; text-align:left;">Config</th>
+                <th style="padding:6px 4px;">Holdout</th>
+                <th style="padding:6px 4px;">Train</th>
+                <th style="padding:6px 4px;">Gap</th>
+                <th style="padding:6px 4px; text-align:left;">Overrides</th>
+              </tr>
+            </thead>
+            <tbody>${topRows}</tbody>
+          </table>
+        </div>
+        <div style="margin-top:10px; padding:10px 12px; border-left:3px solid #d4af37; background:rgba(212,175,55,0.08); font-size:12px; font-weight:700; line-height:1.4;">
+          ${largeSweep.recommendation || ""}
+        </div>
+        <div style="margin-top:6px; font-size:10px; color:var(--muted);">Last large sweep: ${largeSweep.ranAt ? new Date(largeSweep.ranAt).toLocaleString() : "—"} · season ${largeSweep.season ?? "—"} · seed ${largeSweep.seed ?? "—"} · ${largeSweep.numCandidates ?? 0} candidates · diagnostic only — nothing auto-applied</div>
+      </div>
+    `;
+  } else {
+    largeSweepHtml = `
+      <div style="padding:0 16px 16px;">
+        <div style="padding:12px; border:1px dashed var(--table-border); color:var(--muted); font-size:12px; font-weight:700;">
+          Large sweep results will appear here after you run one. Ranked by holdout Accuracy Score, with an overfit flag when a candidate's train score doesn't hold up on unseen games.
+        </div>
+      </div>
+    `;
+  }
+
   const html = `
     <div class="tracker-analytics-shell">
       <div class="tracker-analytics-topbar">
@@ -17634,8 +17859,11 @@ function renderBacktestPanel() {
       <div style="padding:12px 16px;">
         <button type="button" id="runSeasonBacktestBtn" style="background:#3a9c35; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer;">▶ Run NBA Season Backtest</button>
         <button type="button" id="runConfigSweepBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer; margin-left:8px;">🔬 Run Config Sweep</button>
+        <button type="button" id="runLargeSweepBtn" style="background:#5a3a9c; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer; margin-left:8px;">🧬 Run Large Sweep</button>
+        <input type="number" id="largeSweepCount" value="200" min="2" max="5000" step="10" style="width:70px; margin-left:6px; padding:7px; font-size:12px; font-weight:700; border:1px solid var(--table-border);" title="Number of candidates to test">
         <span id="backtestStatusLabel" style="margin-left:10px; font-size:12px; opacity:0.8;"></span>
         ${resumeInfo ? `<div style="margin-top:8px; font-size:12px; color:#8a6d00;">A previous run was interrupted after ${resumeInfo.doneCount} of the season's games — hit Run to pick up right where it left off, nothing is lost.</div>` : ""}
+        <div style="margin-top:6px; font-size:10px; color:var(--muted);">Large sweep runs pure computation against cached season data — no network — but scales roughly linearly with candidate count. 200 candidates is a reasonable start; go higher once you know it runs cleanly.</div>
       </div>
 
       <div style="padding:0 16px 16px;">
@@ -17643,6 +17871,7 @@ function renderBacktestPanel() {
       </div>
       ${typeof diagnosisHtml !== "undefined" ? diagnosisHtml : ""}
       ${sweepHtml}
+      ${largeSweepHtml}
     </div>
   `;
 
@@ -17720,6 +17949,49 @@ function renderBacktestPanel() {
       } finally {
         sweepBtn.disabled = false;
         if (runBtn) runBtn.disabled = false;
+      }
+    };
+  }
+
+  // PHASE 3 (backtest roadmap): Run Large Sweep button. Same cached-data
+  // guard and wake-lock pattern as the other two run buttons above.
+  const largeSweepBtn = document.getElementById("runLargeSweepBtn");
+  if (largeSweepBtn) {
+    largeSweepBtn.onclick = async () => {
+      const statusLabel = document.getElementById("backtestStatusLabel");
+      const countInput = document.getElementById("largeSweepCount");
+      const numCandidates = Math.max(2, Math.min(5000, parseInt(countInput?.value, 10) || 200));
+      largeSweepBtn.disabled = true;
+      if (runBtn) runBtn.disabled = true;
+      if (sweepBtn) sweepBtn.disabled = true;
+      if (statusLabel) statusLabel.textContent = `Starting large sweep (${numCandidates} candidates)…`;
+
+      let wakeLock = null;
+      try {
+        if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
+      } catch (e) {}
+
+      try {
+        const season = getCurrentSeasonYear("nba") - 1;
+        const cacheKey = "nba_" + season;
+        if (!window.__bbSeasonDataCache || !window.__bbSeasonDataCache[cacheKey]) {
+          if (statusLabel) statusLabel.textContent = "No cached season data — running baseline fetch first…";
+          await runNbaSeasonBacktest(season, (done, total) => {
+            if (statusLabel) statusLabel.textContent = `Fetching data… ${done}/${total}`;
+          }, null);
+        }
+        await runNbaLargeConfigSweep(numCandidates, (idx, total, label) => {
+          if (statusLabel) statusLabel.textContent = `Large sweep ${idx}/${total}: ${label}`;
+        });
+        renderBacktestPanel();
+      } catch (e) {
+        engineDebug("Large sweep failed from UI", { error: e?.message || String(e) });
+        if (statusLabel) statusLabel.textContent = `Large sweep failed — ${e?.message || "check debug log"}.`;
+      } finally {
+        largeSweepBtn.disabled = false;
+        if (runBtn) runBtn.disabled = false;
+        if (sweepBtn) sweepBtn.disabled = false;
+        try { if (wakeLock) wakeLock.release(); } catch (e) {}
       }
     };
   }
