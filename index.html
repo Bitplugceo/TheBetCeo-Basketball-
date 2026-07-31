@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3999,6 +4000,17 @@ const MODEL_TUNING = {
 // teamWeightBase/h2hFactor/extremeExpansion ARE live-reachable and take
 // effect immediately once written here.
 const BB_NBA_CORE_OVERRIDE_KEY = "BB_NBA_CORE_OVERRIDES";
+const BB_NBA_CORE_LOCKED_KEY = "BB_NBA_CORE_LOCKED";
+function isNbaCoreLocked() {
+  try { return localStorage.getItem(BB_NBA_CORE_LOCKED_KEY) === "1"; } catch (e) { return false; }
+}
+function setNbaCoreLocked(locked) {
+  try {
+    if (locked) localStorage.setItem(BB_NBA_CORE_LOCKED_KEY, "1");
+    else localStorage.removeItem(BB_NBA_CORE_LOCKED_KEY);
+    return true;
+  } catch (e) { return false; }
+}
 function getNbaCoreOverrides() {
   try {
     return JSON.parse(localStorage.getItem(BB_NBA_CORE_OVERRIDE_KEY) || "null") || {};
@@ -4007,6 +4019,12 @@ function getNbaCoreOverrides() {
   }
 }
 function setNbaCoreOverrides(next) {
+  // BATCH 4: once NBA core is locked, refuse all further writes.
+  // Promote, tuner, and any manual call are blocked until unlocked.
+  if (isNbaCoreLocked()) {
+    engineDebug("setNbaCoreOverrides BLOCKED — NBA core is locked", { attemptedKeys: Object.keys(next || {}) });
+    return false;
+  }
   // FIX (Batch 2/3 audit): this used to overwrite BB_NBA_CORE_OVERRIDES
   // wholesale. If Promote (Batch 3) ever calls this with a partial config
   // (only the winning candidate's fields), a full overwrite would silently
@@ -5135,6 +5153,13 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
   const trainPicks = settled.slice(0, splitIdx);
   const valPicks = settled.slice(splitIdx);
 
+  // BATCH 4: NBA-core keys that the large-sweep / promote path owns.
+  // Once the lock flag is set, the retrospective tuner must not even
+  // propose changes to these — they are frozen.
+  const NBA_CORE_TUNER_KEYS = new Set([
+    "teamWeightBase", "h2hFactor", "h2hMaxWeight", "h2hLookbackSeasons",
+    "quarterAnchorBlendWeight", "recencyStrength"
+  ]);
   const keysToTune = [
     "teamWeightBase",
     "h2hFactor",
@@ -5153,7 +5178,13 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
     "confidenceAThresh",
     "confidenceBThresh",
     "confidenceCThresh"
-  ];
+  ].filter(function (k) {
+    if (isNbaCoreLocked() && NBA_CORE_TUNER_KEYS.has(k) && String(targetLeague || "").toLowerCase() === "nba") {
+      engineDebug("Coordinate ascent SKIP locked NBA-core key", { key: k, league: targetLeague });
+      return false;
+    }
+    return true;
+  });
 
   const candidateGrids = {
     teamWeightBase: [0.55, 0.60, 0.65, 0.70, 0.75],
@@ -18300,6 +18331,7 @@ function renderBacktestPanel() {
         <button type="button" id="runLargeSweepBtn" style="background:#5a3a9c; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer; margin-left:8px;">🧬 Run Large Sweep</button>
         <input type="number" id="largeSweepCount" value="200" min="2" max="5000" step="10" style="width:70px; margin-left:6px; padding:7px; font-size:12px; font-weight:700; border:1px solid var(--table-border);" title="Number of candidates to test">
         <label style="margin-left:10px; font-size:11px; font-weight:700; vertical-align:middle;"><input type="checkbox" id="largeSweepFastPath" checked style="vertical-align:middle;"> Fast scoring</label>
+        <button type="button" id="nbaCoreLockBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 12px; font-weight:800; font-size:11px; cursor:pointer; margin-left:8px;">🔒 Lock NBA Core</button>
         <span id="backtestStatusLabel" style="margin-left:10px; font-size:12px; opacity:0.8;"></span>
         ${resumeInfo ? `<div style="margin-top:8px; font-size:12px; color:#8a6d00;">A previous run was interrupted after ${resumeInfo.doneCount} of the season's games — hit Run to pick up right where it left off, nothing is lost.</div>` : ""}
         <div style="margin-top:6px; font-size:10px; color:var(--muted);">Large sweep runs pure computation against cached season data — no network — but scales roughly linearly with candidate count. 200 candidates is a reasonable start; go higher once you know it runs cleanly. Uncheck "Fast scoring" to cross-check a run against the original, slower per-candidate method — the baseline row should read identically either way.</div>
@@ -18321,6 +18353,11 @@ function renderBacktestPanel() {
   // never have to re-serialize the override object into the DOM.
   panel.querySelectorAll(".bt-promote-btn").forEach(btn => {
     btn.addEventListener("click", function () {
+      if (isNbaCoreLocked()) {
+        engineDebug("Promote BLOCKED — NBA core is locked");
+        alert("🔒 NBA core is LOCKED.\n\nPromote is refused. Unlock first if you intentionally want to change core params.");
+        return;
+      }
       const idx = Number(this.getAttribute("data-cand-idx"));
       const sweep = window.__bbLargeSweepResults;
       if (!sweep || !Array.isArray(sweep.ranked) || !sweep.ranked[idx]) {
@@ -18336,7 +18373,9 @@ function renderBacktestPanel() {
       const ok = setNbaCoreOverrides(cand.overrides);
       if (!ok) {
         engineDebug("Promote failed: setNbaCoreOverrides returned false", { id: cand.id });
-        alert("Promote failed — could not write overrides (storage full?).");
+        alert(isNbaCoreLocked()
+          ? "🔒 Promote blocked — NBA core is locked."
+          : "Promote failed — could not write overrides (storage full?).");
         return;
       }
       engineDebug("BATCH 3 PROMOTE applied", {
@@ -18349,6 +18388,32 @@ function renderBacktestPanel() {
       alert("✅ Promoted \"" + cand.label + "\"\n\nHoldout " + (isFinite(cand.holdoutScore) ? cand.holdoutScore.toFixed(1) : "—") + " · Train " + (isFinite(cand.trainScore) ? cand.trainScore.toFixed(1) : "—") + "\n\nOverrides are now live. Re-run Season Backtest to confirm numbers match.");
     });
   });
+
+  // BATCH 4: Lock / Unlock NBA core button
+  const lockBtn = document.getElementById("nbaCoreLockBtn");
+  if (lockBtn) {
+    const refreshLockBtn = function () {
+      const locked = isNbaCoreLocked();
+      lockBtn.textContent = locked ? "🔓 Unlock NBA Core" : "🔒 Lock NBA Core";
+      lockBtn.style.background = locked ? "#c91920" : "#3a404c";
+    };
+    refreshLockBtn();
+    lockBtn.onclick = function () {
+      const currentlyLocked = isNbaCoreLocked();
+      if (!currentlyLocked) {
+        if (!confirm("Lock NBA core params?\n\nAfter this, Promote and any write to BB_NBA_CORE_OVERRIDES will be refused. The retrospective tuner will skip NBA-core keys.\n\nThis is the permanent freeze step after max-out search.")) return;
+        setNbaCoreLocked(true);
+        engineDebug("BATCH 4: NBA core LOCKED");
+        alert("🔒 NBA core is now LOCKED.\n\nPromote is blocked. Tuner will skip core keys.");
+      } else {
+        if (!confirm("Unlock NBA core?\n\nOnly do this if you intentionally want to re-open the core params.")) return;
+        setNbaCoreLocked(false);
+        engineDebug("BATCH 4: NBA core UNLOCKED");
+        alert("🔓 NBA core unlocked.");
+      }
+      refreshLockBtn();
+    };
+  }
 
   const runBtn = document.getElementById("runSeasonBacktestBtn");
   if (runBtn) {
