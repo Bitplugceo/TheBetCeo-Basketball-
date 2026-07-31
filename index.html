@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17793,25 +17794,70 @@ function _btScoreCandidateFast(bundle, paramOverrides) {
 async function runNbaLargeConfigSweep(numCandidates, onProgress, options = {}) {
   const season = getCurrentSeasonYear("nba") - 1;
   numCandidates = Math.max(2, Math.min(5000, Number(numCandidates) || 200));
-  const seed = isFinite(options.seed) ? Number(options.seed) >>> 0 : (Date.now() >>> 0);
-  const rng = _btMulberry32(seed);
+  const useFastPath = options.useFastPath !== false;
+  const PROGRESS_KEY = "BB_NBA_LARGE_SWEEP_PROGRESS";
+  const CHECKPOINT_EVERY = 10;
 
+  // Resume: if a prior incomplete run matches season + count, reuse its seed
+  // and already-scored results so closing the tab doesn't waste work.
+  let resumeFrom = 0;
+  let results = [];
+  let seed = isFinite(options.seed) ? Number(options.seed) >>> 0 : (Date.now() >>> 0);
+  try {
+    const raw = localStorage.getItem(PROGRESS_KEY);
+    if (raw) {
+      const prog = JSON.parse(raw);
+      if (prog && prog.season === season && prog.numCandidates === numCandidates &&
+          Array.isArray(prog.results) && prog.results.length > 0 && prog.results.length < numCandidates &&
+          isFinite(prog.seed)) {
+        seed = prog.seed >>> 0;
+        results = prog.results;
+        resumeFrom = results.length;
+        engineDebug("Large sweep resuming from checkpoint", { resumeFrom, seed, numCandidates });
+      }
+    }
+  } catch (e) {}
+
+  const rng = _btMulberry32(seed);
   const candidates = [{ id: "baseline", label: "Baseline (current live defaults)", overrides: {} }];
   for (let i = 1; i < numCandidates; i++) {
     candidates.push({ id: `cand_${i}`, label: `Candidate ${i}`, overrides: _btRandomCandidate(rng) });
   }
 
-  const results = [];
-  for (let i = 0; i < candidates.length; i++) {
+  // Fast path: build (or reuse) per-game context bundle once for the season.
+  let fastBundle = null;
+  if (useFastPath) {
+    if (typeof onProgress === "function") {
+      try { onProgress(resumeFrom, candidates.length, "Building game contexts (once)…"); } catch (e) {}
+    }
+    fastBundle = await _btBuildGameContexts(season);
+  }
+
+  function _saveProgressCheckpoint() {
+    try {
+      localStorage.setItem(PROGRESS_KEY, JSON.stringify({
+        season, seed, numCandidates, results, useFastPath,
+        updatedAt: new Date().toISOString()
+      }));
+    } catch (e) {}
+  }
+
+  for (let i = resumeFrom; i < candidates.length; i++) {
     const c = candidates[i];
     if (typeof onProgress === "function") {
       try { onProgress(i + 1, candidates.length, c.label); } catch (e) {}
     }
     let report;
     try {
-      report = await runNbaSeasonBacktest(season, null, c.overrides, { skipCache: true });
+      if (useFastPath && fastBundle) {
+        report = _btScoreCandidateFast(fastBundle, c.overrides);
+      } else {
+        report = await runNbaSeasonBacktest(season, null, c.overrides, { skipCache: true });
+      }
     } catch (e) {
       results.push({ id: c.id, label: c.label, overrides: c.overrides, error: e?.message || String(e) });
+      if ((i + 1) % CHECKPOINT_EVERY === 0 || i === candidates.length - 1) _saveProgressCheckpoint();
+      await new Promise(r => setTimeout(r, 0));
       continue;
     }
     const trainScore = report?.trainAccuracyScore?.composite ?? null;
@@ -17827,6 +17873,10 @@ async function runNbaLargeConfigSweep(numCandidates, onProgress, options = {}) {
       breakdown: report?.accuracyScore?.breakdown ?? null,
       evaluated: report?.evaluated ?? 0, skipped: report?.skipped ?? 0
     });
+    // Checkpoint every N candidates so a refresh / tab close is recoverable.
+    if ((i + 1) % CHECKPOINT_EVERY === 0 || i === candidates.length - 1) {
+      _saveProgressCheckpoint();
+    }
     // Yield every candidate so progress UI / wake lock stay responsive on a
     // run that can take a while — this is pure computation, no network, but
     // 1153 games x hundreds of candidates still adds up in a single JS thread.
@@ -17864,18 +17914,20 @@ async function runNbaLargeConfigSweep(numCandidates, onProgress, options = {}) {
 
   const sweepReportFull = {
     season, ranAt: new Date().toISOString(), numCandidates: candidates.length, seed,
-    results, ranked, baseline, best, recommendation
+    results, ranked, baseline, best, recommendation, useFastPath, resumedFrom: resumeFrom
   };
   // Persist only the top 25 + baseline/best to localStorage — a full 5000-
   // candidate run's raw results array is fine in memory for this session but
   // shouldn't be the thing sitting in localStorage indefinitely.
   const sweepReportPersist = {
     season, ranAt: sweepReportFull.ranAt, numCandidates: candidates.length, seed,
-    ranked: ranked.slice(0, 25), baseline, best, recommendation
+    ranked: ranked.slice(0, 25), baseline, best, recommendation, useFastPath
   };
   try { window.__bbLargeSweepResults = sweepReportFull; } catch (e) {}
   try { localStorage.setItem("BB_NBA_LARGE_SWEEP", JSON.stringify(sweepReportPersist)); } catch (e) {}
-  engineDebug("Large config sweep complete", { best: best?.id, recommendation, numCandidates: candidates.length });
+  // Clear the in-progress checkpoint now that the run finished cleanly.
+  try { localStorage.removeItem(PROGRESS_KEY); } catch (e) {}
+  engineDebug("Large config sweep complete", { best: best?.id, recommendation, numCandidates: candidates.length, useFastPath, resumedFrom: resumeFrom });
   return sweepReportFull;
 }
 
