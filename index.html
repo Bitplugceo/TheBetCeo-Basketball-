@@ -1,3 +1,4 @@
+B
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -15638,8 +15639,18 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const leagueBase = eb / 2;
   const volLimit = getMarketVolLimit(league, "ft");
 
-  const aFTS = getOverallSeries("A", 10);
-  const bFTS = getOverallSeries("B", 10);
+  // BACKTEST FAST-PATH FIX: prefer explicit parsed series when present (backtest
+  // / sweep pass rolling windows here). Fall back to DOM/AppState only for live.
+  // Without this, computeFTProjection always hit getOverallSeries → DOM and
+  // every fast-path candidate scored null unless DOM was rewritten every game.
+  const _parsedA = parsed && (Array.isArray(parsed.aFTScored) ? parsed.aFTScored : null);
+  const _parsedB = parsed && (Array.isArray(parsed.bFTScored) ? parsed.bFTScored : null);
+  const aFTS = (_parsedA && _parsedA.filter(v => isFinite(v) && v > 0).length >= 2)
+    ? _parsedA.filter(v => isFinite(v) && v > 0).slice(0, 10)
+    : getOverallSeries("A", 10);
+  const bFTS = (_parsedB && _parsedB.filter(v => isFinite(v) && v > 0).length >= 2)
+    ? _parsedB.filter(v => isFinite(v) && v > 0).slice(0, 10)
+    : getOverallSeries("B", 10);
   const aFTA = getManualAllowedSeries("A", "ft", parsed);
   const bFTA = getManualAllowedSeries("B", "ft", parsed);
 
@@ -17627,6 +17638,12 @@ function _btScoreCandidateFast(bundle, paramOverrides) {
 
   const savedContextData = AppState.context.data;
   const savedSeriesDateCache = window.__seriesDateCache;
+  // Mirror full backtest: save live DOM scored values so a sweep cannot leave
+  // the last candidate's rolling window sitting in the team input fields.
+  const _domA = document.getElementById("aFTScored");
+  const _domB = document.getElementById("bFTScored");
+  const _savedA = _domA ? _domA.value : null;
+  const _savedB = _domB ? _domB.value : null;
   AppState.context.data = defaultMassacreFetchContext();
   window.__seriesDateCache = {};
 
@@ -17654,6 +17671,13 @@ function _btScoreCandidateFast(bundle, paramOverrides) {
       const game = ctx.game;
       const teamWindow = _useOppAdj ? _btApplyOppAdjStrength(ctx.teamOppAdjPre, _oppAdjStr) : ctx.rawWindow;
       const oppWindow = _useOppAdj ? _btApplyOppAdjStrength(ctx.oppOppAdjPre, _oppAdjStr) : ctx.rawOppWindow;
+
+      // computeFTProjection reads scored series from the DOM via getOverallSeries,
+      // not from the parsed object — mirror the full backtest path and write them.
+      const _domA = document.getElementById("aFTScored");
+      const _domB = document.getElementById("bFTScored");
+      if (_domA) _domA.value = teamWindow.scored.join(",");
+      if (_domB) _domB.value = oppWindow.scored.join(",");
 
       const parsed = {
         aFTScored: teamWindow.scored, bFTScored: oppWindow.scored,
