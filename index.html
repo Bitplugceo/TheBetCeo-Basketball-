@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5153,9 +5152,10 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
   const trainPicks = settled.slice(0, splitIdx);
   const valPicks = settled.slice(splitIdx);
 
-  // BATCH 4: NBA-core keys that the large-sweep / promote path owns.
-  // Once the lock flag is set, the retrospective tuner must not even
-  // propose changes to these — they are frozen.
+  // BATCH 4 + 5: NBA-core keys owned by the large-sweep / promote path.
+  // When locked, the tuner still evaluates them (so we know what it would
+  // have wanted) but routes any "winning" change to a suggestion log only —
+  // never into the promotions list that the Configs panel can apply.
   const NBA_CORE_TUNER_KEYS = new Set([
     "teamWeightBase", "h2hFactor", "h2hMaxWeight", "h2hLookbackSeasons",
     "quarterAnchorBlendWeight", "recencyStrength"
@@ -5178,13 +5178,7 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
     "confidenceAThresh",
     "confidenceBThresh",
     "confidenceCThresh"
-  ].filter(function (k) {
-    if (isNbaCoreLocked() && NBA_CORE_TUNER_KEYS.has(k) && String(targetLeague || "").toLowerCase() === "nba") {
-      engineDebug("Coordinate ascent SKIP locked NBA-core key", { key: k, league: targetLeague });
-      return false;
-    }
-    return true;
-  });
+  ];
 
   const candidateGrids = {
     teamWeightBase: [0.55, 0.60, 0.65, 0.70, 0.75],
@@ -5272,11 +5266,34 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
         const calibrationOk = challengerValCalibration.brier <= baselineValCalibration.brier + 0.002;
 
         if (winRateImproves && sigTest.significant && calibrationOk) {
-          currentParams[key] = bestValue;
-          passChanged = true;
-          overallChanged = true;
-          promotions.push({ key, old: originalValue, val: bestValue, z: sigTest.z, brier: challengerValCalibration.brier });
-          logPromotionEvent(targetLeague, key, originalValue, bestValue, sigTest.z, challengerValCalibration.brier);
+          // BATCH 5: post-lock, NBA-core key changes become suggestions only.
+          const _isNbaCoreLockedHit =
+            isNbaCoreLocked() &&
+            NBA_CORE_TUNER_KEYS.has(key) &&
+            String(targetLeague || "").toLowerCase() === "nba";
+          if (_isNbaCoreLockedHit) {
+            engineDebug("BATCH 5 SUGGESTION (locked NBA-core — not applied)", {
+              key, old: originalValue, suggested: bestValue,
+              z: sigTest.z, brier: challengerValCalibration.brier, league: targetLeague
+            });
+            try {
+              const sugKey = "BB_NBA_CORE_SUGGESTIONS";
+              const prev = JSON.parse(localStorage.getItem(sugKey) || "[]");
+              prev.push({
+                key, old: originalValue, suggested: bestValue,
+                z: sigTest.z, brier: challengerValCalibration.brier,
+                ts: new Date().toISOString()
+              });
+              localStorage.setItem(sugKey, JSON.stringify(prev.slice(-50)));
+            } catch (e) {}
+            // Do NOT mutate currentParams, do NOT push to promotions.
+          } else {
+            currentParams[key] = bestValue;
+            passChanged = true;
+            overallChanged = true;
+            promotions.push({ key, old: originalValue, val: bestValue, z: sigTest.z, brier: challengerValCalibration.brier });
+            logPromotionEvent(targetLeague, key, originalValue, bestValue, sigTest.z, challengerValCalibration.brier);
+          }
         }
       }
     }
