@@ -1,3 +1,4 @@
+L
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4212,6 +4213,19 @@ const TUNABLE_PARAM_REGISTRY = {
     value: 3.0, min: 1.0, max: 10.0, type: "scalar",
     scope: "global", appliesTo: ["q1", "q2", "q3", "q4"],
     description: "Point edge threshold required for Quarter picks",
+    lastVerifiedAt: null
+  },
+
+  fatigueB2BPenalty: {
+    value: -2.5, min: -6.0, max: 0, type: "scalar",
+    scope: "global", appliesTo: ["ft", "team_a", "team_b"],
+    description: "Point signal applied by buildTotalMarketIntelSignal/buildTeamMarketIntelSignal when a team has under 1 day of rest (back-to-back). Was hardcoded; now tunable.",
+    lastVerifiedAt: null
+  },
+  quarterAnchorBlendWeight: {
+    value: 0.7, min: 0.3, max: 1.0, type: "scalar",
+    scope: "global", appliesTo: ["q1", "q2", "q3", "q4"],
+    description: "Blend weight pulling each quarter's raw projection toward its H1/H2-anchored scale. Applied in applyQuarterAnchorBlendBT (backtest) and the matching live quarter-anchor block. Was hardcoded in MODEL_TUNING only; now tunable.",
     lastVerifiedAt: null
   },
 
@@ -13333,10 +13347,11 @@ function buildTotalMarketIntelSignal(pack) {
   let signal = 0;
   if (!pack) return { signal: 0 };
 
+  const _fatigueB2B = getParam("fatigueB2BPenalty") ?? -2.5;
   const restDaysA = pack.restDaysA ?? 99;
   const restDaysB = pack.restDaysB ?? 99;
-  if (restDaysA < 1) signal -= 2.5;
-  if (restDaysB < 1) signal -= 2.5;
+  if (restDaysA < 1) signal += _fatigueB2B;
+  if (restDaysB < 1) signal += _fatigueB2B;
   return { signal: clampNumber(signal, -3, 3) };
 }
 
@@ -13345,9 +13360,9 @@ function buildTeamMarketIntelSignal(pack, teamSide) {
   if (!pack) return { signal: 0 };
   const restDays = teamSide === "A" ? (pack.restDaysA ?? 99) : (pack.restDaysB ?? 99);
 
-  
+  const _fatigueB2B = getParam("fatigueB2BPenalty") ?? -2.5;
 
-  if (restDays < 1) signal -= 2.5;
+  if (restDays < 1) signal += _fatigueB2B;
   return { signal: clampNumber(signal, -3, 3) };
 }
 
@@ -16684,6 +16699,7 @@ function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, in
 }
 
 function applyQuarterAnchorBlendBT(q1, q2, q3, q4, h1Calc, ftCalc) {
+  const _qAnchorW = getParam("quarterAnchorBlendWeight") ?? MODEL_TUNING.quarterAnchorBlendWeight;
   if (q4 && isFinite(q4.projA) && isFinite(q4.projB) &&
       isFinite(ftCalc.blowoutGap) && ftCalc.blowoutGap > 15) {
     const isFavorA = ftCalc.projAFT > ftCalc.projBFT;
@@ -16702,10 +16718,10 @@ function applyQuarterAnchorBlendBT(q1, q2, q3, q4, h1Calc, ftCalc) {
     const q1Scale = (h1Target * (q1?.proj || 0)) / (totalWeightedRaw12 || 1) / (q1?.proj || 1);
     const q2Scale = (h1Target * (q2?.proj || 0)) / (totalWeightedRaw12 || 1) / (q2?.proj || 1);
     if (q1 && isFinite(q1.proj)) {
-      q1.proj = q1.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q1.proj * q1Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+      q1.proj = q1.proj * (1 - _qAnchorW) + (q1.proj * q1Scale) * _qAnchorW;
     }
     if (q2 && isFinite(q2.proj)) {
-      q2.proj = q2.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q2.proj * q2Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+      q2.proj = q2.proj * (1 - _qAnchorW) + (q2.proj * q2Scale) * _qAnchorW;
     }
   }
 
@@ -16714,10 +16730,10 @@ function applyQuarterAnchorBlendBT(q1, q2, q3, q4, h1Calc, ftCalc) {
     const q3Scale = (h2Target * (q3?.proj || 0)) / (totalWeightedRaw34 || 1) / (q3?.proj || 1);
     const q4Scale = (h2Target * (q4?.proj || 0)) / (totalWeightedRaw34 || 1) / (q4?.proj || 1);
     if (q3 && isFinite(q3.proj)) {
-      q3.proj = q3.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q3.proj * q3Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+      q3.proj = q3.proj * (1 - _qAnchorW) + (q3.proj * q3Scale) * _qAnchorW;
     }
     if (q4 && isFinite(q4.proj)) {
-      q4.proj = q4.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q4.proj * q4Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+      q4.proj = q4.proj * (1 - _qAnchorW) + (q4.proj * q4Scale) * _qAnchorW;
     }
   }
 
@@ -18860,6 +18876,7 @@ const h1Calc = compute1HProjection({
     const rawQ34Sum = (q3?.proj || 0) + (q4?.proj || 0);
     const h1Target = isFinite(h1Calc.h1Proj) && h1Calc.h1Proj > 0 ? h1Calc.h1Proj : rawQ12Sum;
     const h2Target = isFinite(ftCalc.ftProj) && h1Target > 0 ? ftCalc.ftProj - h1Target : rawQ34Sum;
+    const _qAnchorW = getParam("quarterAnchorBlendWeight") ?? MODEL_TUNING.quarterAnchorBlendWeight;
 
             if (rawQ12Sum > 0 && isFinite(h1Target)) {
           // AUDIT FIX #10: q1Weight/q2Weight were always hardcoded to 1.0,
@@ -18872,7 +18889,7 @@ const h1Calc = compute1HProjection({
 
           if (q1 && isFinite(q1.proj) && isFinite(q1.line)) {
 
-            q1.proj = q1.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q1.proj * q1Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+            q1.proj = q1.proj * (1 - _qAnchorW) + (q1.proj * q1Scale) * _qAnchorW;
             q1.edge = q1.proj - q1.line;
 
             q1.pick = getPick(q1.edge, q1.line, league, "q1", {});
@@ -18896,7 +18913,7 @@ const h1Calc = compute1HProjection({
           }
           if (q2 && isFinite(q2.proj) && isFinite(q2.line)) {
 
-            q2.proj = q2.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q2.proj * q2Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+            q2.proj = q2.proj * (1 - _qAnchorW) + (q2.proj * q2Scale) * _qAnchorW;
             q2.edge = q2.proj - q2.line;
 
             q2.pick = getPick(q2.edge, q2.line, league, "q2", {});
@@ -18924,7 +18941,7 @@ const h1Calc = compute1HProjection({
 
           if (q3 && isFinite(q3.proj) && isFinite(q3.line)) {
 
-            q3.proj = q3.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q3.proj * q3Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+            q3.proj = q3.proj * (1 - _qAnchorW) + (q3.proj * q3Scale) * _qAnchorW;
             q3.edge = q3.proj - q3.line;
 
             q3.pick = getPick(q3.edge, q3.line, league, "q3", {});
@@ -18943,7 +18960,7 @@ const h1Calc = compute1HProjection({
           }
           if (q4 && isFinite(q4.proj) && isFinite(q4.line)) {
 
-            q4.proj = q4.proj * (1 - MODEL_TUNING.quarterAnchorBlendWeight) + (q4.proj * q4Scale) * MODEL_TUNING.quarterAnchorBlendWeight;
+            q4.proj = q4.proj * (1 - _qAnchorW) + (q4.proj * q4Scale) * _qAnchorW;
             q4.edge = q4.proj - q4.line;
 
             q4.pick = getPick(q4.edge, q4.line, league, "q4", {});
