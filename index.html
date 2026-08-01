@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17839,6 +17840,115 @@ async function _btBuildGameContexts(season) {
   return bundle;
 }
 
+// BATCH 8 SPEED: FT-only scorer used during the bulk ranking phase of a
+// large sweep. Skips 1H + all 4 quarter projections (~5–8× less work per
+// game). Top-N candidates are always re-scored with the full fast path so
+// the leaderboard holdout Accuracy Score stays honest.
+function _btScoreCandidateUltraFast(bundle, paramOverrides) {
+  paramOverrides = paramOverrides || {};
+  const results = [];
+  let skipped = bundle.skippedBase;
+
+  const savedContextData = AppState.context.data;
+  const savedSeriesDateCache = window.__seriesDateCache;
+  AppState.context.data = defaultMassacreFetchContext();
+  window.__seriesDateCache = {};
+
+  const domA = document.getElementById("aFTScored");
+  const domB = document.getElementById("bFTScored");
+  const _btSavedDomA = domA ? domA.value : null;
+  const _btSavedDomB = domB ? domB.value : null;
+
+  const _btOriginalGetParam = window.getParam;
+  const _btSavedRecencyWeights = MODEL_TUNING.recencyWeights;
+  const _btSavedQBlend = MODEL_TUNING.quarterAnchorBlendWeight;
+  window.__btH2HOverride = !(paramOverrides.useH2H === false);
+  window.getParam = function (key, lg) {
+    if (Object.prototype.hasOwnProperty.call(paramOverrides, key)) return paramOverrides[key];
+    return _btOriginalGetParam ? _btOriginalGetParam(key, lg) : undefined;
+  };
+  if (Array.isArray(paramOverrides.recencyWeights)) {
+    MODEL_TUNING.recencyWeights = paramOverrides.recencyWeights;
+  }
+  if (isFinite(paramOverrides.quarterAnchorBlendWeight)) {
+    MODEL_TUNING.quarterAnchorBlendWeight = Number(paramOverrides.quarterAnchorBlendWeight);
+  }
+
+  const _useOppAdj = !!paramOverrides.useOppAdj;
+  const _oppAdjStr = isFinite(paramOverrides.oppAdjStrength) ? Number(paramOverrides.oppAdjStrength) : 1.0;
+  const _restPts = isFinite(paramOverrides.restPts) ? Number(paramOverrides.restPts) : 0;
+
+  try {
+    for (const ctx of bundle.contexts) {
+      const game = ctx.game;
+      const teamWindow = _useOppAdj ? _btApplyOppAdjStrength(ctx.teamOppAdjPre, _oppAdjStr) : ctx.rawWindow;
+      const oppWindow = _useOppAdj ? _btApplyOppAdjStrength(ctx.oppOppAdjPre, _oppAdjStr) : ctx.rawOppWindow;
+
+      const parsed = {
+        aFTAllowed: teamWindow.allowed, bFTAllowed: oppWindow.allowed,
+        a1HScored: ctx.teamH1Window.scored, b1HScored: ctx.oppH1Window.scored,
+        a1HAllowed: ctx.teamH1Window.allowed, b1HAllowed: ctx.oppH1Window.allowed
+      };
+      if (domA) domA.value = (teamWindow.scored || []).join(",");
+      if (domB) domB.value = (oppWindow.scored || []).join(",");
+
+      const _tw = isFinite(window.getParam("teamWeightBase", "nba")) ? Number(window.getParam("teamWeightBase", "nba")) : 0.65;
+      const _btConfig = {
+        h2hFactor: (paramOverrides && paramOverrides.h2hFactor != null) ? paramOverrides.h2hFactor : (window.getParam("h2hFactor", "nba") ?? 1.0),
+        extremeExpansion: (paramOverrides && isFinite(paramOverrides.extremeExpansion)) ? Number(paramOverrides.extremeExpansion) : 1.0,
+        teamWeight: _tw, oppWeight: 1 - _tw
+      };
+      let calc;
+      try {
+        calc = computeFTProjection({
+          league: "nba", parsed, lines: {}, injMultA: 1, injMultB: 1, config: _btConfig
+        });
+      } catch (e) { skipped++; continue; }
+      if (!calc || !isFinite(calc.ftProj)) { skipped++; continue; }
+
+      let projA = calc.projAFT, projB = calc.projBFT, ftProj = calc.ftProj;
+      if (_restPts) {
+        // restPts is a tiny absolute nudge on the total when available
+        ftProj += _restPts * 0; // reserved; rest applied only when rest series present
+      }
+
+      results.push({
+        predictedMargin: projA - projB,
+        actualMargin: game.scored - game.allowed,
+        predictedTotal: ftProj,
+        actualTotal: game.scored + game.allowed,
+        predictedAScore: projA,
+        actualAScore: game.scored,
+        predictedBScore: projB,
+        actualBScore: game.allowed,
+        sampleTier: calc.ftSampleTier,
+        split: new Date(game.date).getTime() >= bundle.holdoutStartMs ? "holdout" : "train"
+      });
+    }
+  } finally {
+    AppState.context.data = savedContextData;
+    window.__seriesDateCache = savedSeriesDateCache;
+    window.getParam = _btOriginalGetParam;
+    MODEL_TUNING.recencyWeights = _btSavedRecencyWeights;
+    MODEL_TUNING.quarterAnchorBlendWeight = _btSavedQBlend;
+    delete window.__btH2HOverride;
+    if (domA) domA.value = _btSavedDomA ?? "";
+    if (domB) domB.value = _btSavedDomB ?? "";
+  }
+
+  const overall = calculateScoresOnlyCalibration(results);
+  const train = calculateScoresOnlyCalibration(results.filter(r => r.split === "train"));
+  const holdout = calculateScoresOnlyCalibration(results.filter(r => r.split === "holdout"));
+  const accuracyScore = computeBacktestAccuracyScore(overall);
+  const trainAccuracyScore = computeBacktestAccuracyScore(train);
+  const holdoutAccuracyScore = computeBacktestAccuracyScore(holdout);
+
+  return {
+    season: bundle.season, evaluated: results.length, skipped,
+    accuracyScore, trainAccuracyScore, holdoutAccuracyScore, ultra: true
+  };
+}
+
 function _btScoreCandidateFast(bundle, paramOverrides) {
   paramOverrides = paramOverrides || {};
   const results = [];
@@ -18029,7 +18139,7 @@ function _btScoreCandidateFast(bundle, paramOverrides) {
 
 async function runNbaLargeConfigSweep(numCandidates, onProgress, options = {}) {
   const season = getCurrentSeasonYear("nba") - 1;
-  numCandidates = Math.max(2, Math.min(5000, Number(numCandidates) || 200));
+  numCandidates = Math.max(2, Math.min(10000, Number(numCandidates) || 200));
   const seed = isFinite(options.seed) ? Number(options.seed) >>> 0 : (Date.now() >>> 0);
   const rng = _btMulberry32(seed);
 
@@ -18044,33 +18154,52 @@ async function runNbaLargeConfigSweep(numCandidates, onProgress, options = {}) {
   // the checkbox. Default true so existing callers that don't pass
   // options.useFastPath at all still get the speedup.
   const useFastPath = options.useFastPath !== false;
+  // BATCH 8: ultra-fast ranking (FT-only) by default when fast path is on.
+  // Top-N are always re-scored with the full fast path for honest leaderboard.
+  const useUltra = useFastPath && options.useUltra !== false;
+  const TOP_FULL_RESCORE = Math.min(30, numCandidates);
+  const PROGRESS_KEY = "BB_LARGE_SWEEP_PROGRESS";
+  const SAVE_EVERY = 25;
+
   const fastBundle = useFastPath ? await _btBuildGameContexts(season) : null;
 
-  const results = [];
-  // DIAGNOSTIC (Batch 1 verification): failures here were previously
-  // swallowed with zero trace in the debug log, so a fully-failed sweep
-  // just silently produced "No valid candidates" with nothing to
-  // investigate. Log the first failure only, so a 5000-candidate run
-  // doesn't flood the log if a later candidate happens to fail too.
+  // BATCH 8: resume from last checkpoint if same season+seed+count.
+  let results = [];
+  let startIdx = 0;
+  try {
+    const raw = localStorage.getItem(PROGRESS_KEY);
+    if (raw) {
+      const prog = JSON.parse(raw);
+      if (prog && prog.season === season && prog.seed === seed && prog.numCandidates === numCandidates && Array.isArray(prog.results)) {
+        results = prog.results;
+        startIdx = results.length;
+        engineDebug("Large sweep RESUMING", { startIdx, numCandidates, seed, season });
+        if (typeof onProgress === "function") {
+          try { onProgress(startIdx, numCandidates, "resuming…"); } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {}
+
   let _sweepDiagLogged = false;
-  for (let i = 0; i < candidates.length; i++) {
+  for (let i = startIdx; i < candidates.length; i++) {
     const c = candidates[i];
     if (typeof onProgress === "function") {
-      try { onProgress(i + 1, candidates.length, c.label); } catch (e) {}
+      try { onProgress(i + 1, candidates.length, c.label + (useUltra ? " (ultra)" : "")); } catch (e) {}
     }
     let report;
     try {
-      // FAST-PATH WIRING FIX: use the precomputed bundle + fast scorer when
-      // available instead of rebuilding every rolling window/H2H array from
-      // raw game logs per candidate. _btScoreCandidateFast mirrors
-      // runNbaSeasonBacktest's loop body field-for-field (see the comment
-      // above its own definition), so the report shape below stays
-      // compatible with everything read from it.
-      report = useFastPath ? _btScoreCandidateFast(fastBundle, c.overrides) : await runNbaSeasonBacktest(season, null, c.overrides, { skipCache: true });
+      if (useUltra) {
+        report = _btScoreCandidateUltraFast(fastBundle, c.overrides);
+      } else if (useFastPath) {
+        report = _btScoreCandidateFast(fastBundle, c.overrides);
+      } else {
+        report = await runNbaSeasonBacktest(season, null, c.overrides, { skipCache: true });
+      }
     } catch (e) {
       if (!_sweepDiagLogged) {
         _sweepDiagLogged = true;
-        engineDebug("Large sweep candidate threw", { id: c.id, useFastPath, error: e?.message || String(e), stack: String(e?.stack || "").slice(0, 600) });
+        engineDebug("Large sweep candidate threw", { id: c.id, useFastPath, useUltra, error: e?.message || String(e), stack: String(e?.stack || "").slice(0, 600) });
       }
       results.push({ id: c.id, label: c.label, overrides: c.overrides, error: e?.message || String(e) });
       continue;
@@ -18090,13 +18219,72 @@ async function runNbaLargeConfigSweep(numCandidates, onProgress, options = {}) {
       id: c.id, label: c.label, overrides: c.overrides,
       overallScore, trainScore, holdoutScore, overfitGap,
       breakdown: report?.accuracyScore?.breakdown ?? null,
-      evaluated: report?.evaluated ?? 0, skipped: report?.skipped ?? 0
+      evaluated: report?.evaluated ?? 0, skipped: report?.skipped ?? 0,
+      ultra: !!report?.ultra
     });
-    // Yield every candidate so progress UI / wake lock stay responsive on a
-    // run that can take a while — this is pure computation, no network, but
-    // 1153 games x hundreds of candidates still adds up in a single JS thread.
-    await new Promise(r => setTimeout(r, 0));
+
+    // BATCH 8: persist progress so a killed tab / backgrounded Safari can resume.
+    if ((i + 1) % SAVE_EVERY === 0 || i + 1 === candidates.length) {
+      try {
+        localStorage.setItem(PROGRESS_KEY, JSON.stringify({
+          season, seed, numCandidates, results, ts: Date.now()
+        }));
+      } catch (e) {
+        engineDebug("Large sweep progress save failed", { error: e?.message || String(e) });
+      }
+    }
+    // Yield every SAVE_EVERY candidates (not every 1) — ultra is fast enough
+    // that per-candidate yields were pure overhead on iPhone.
+    if ((i + 1) % SAVE_EVERY === 0) {
+      await new Promise(r => setTimeout(r, 0));
+    }
   }
+
+  // BATCH 8: re-score top-N with the FULL fast path so leaderboard holdout
+  // Accuracy Score includes H1 + quarters and is comparable to baseline.
+  if (useUltra && useFastPath && fastBundle) {
+    const preRanked = results
+      .filter(r => r.holdoutScore !== null && isFinite(r.holdoutScore))
+      .slice()
+      .sort((a, b) => b.holdoutScore - a.holdoutScore)
+      .slice(0, TOP_FULL_RESCORE);
+    // Always include baseline in the full re-score set.
+    if (!preRanked.find(r => r.id === "baseline")) {
+      const base = results.find(r => r.id === "baseline");
+      if (base) preRanked.push(base);
+    }
+    if (typeof onProgress === "function") {
+      try { onProgress(candidates.length, candidates.length, `full re-score top ${preRanked.length}…`); } catch (e) {}
+    }
+    for (let ri = 0; ri < preRanked.length; ri++) {
+      const c = preRanked[ri];
+      try {
+        const full = _btScoreCandidateFast(fastBundle, c.overrides || {});
+        const trainScore = full?.trainAccuracyScore?.composite ?? null;
+        const holdoutScore = full?.holdoutAccuracyScore?.composite ?? null;
+        const overallScore = full?.accuracyScore?.composite ?? null;
+        const overfitGap = (trainScore !== null && isFinite(trainScore) && holdoutScore !== null && isFinite(holdoutScore)) ? (trainScore - holdoutScore) : null;
+        const idx = results.findIndex(r => r.id === c.id);
+        if (idx >= 0) {
+          results[idx] = {
+            ...results[idx],
+            overallScore, trainScore, holdoutScore, overfitGap,
+            breakdown: full?.accuracyScore?.breakdown ?? null,
+            evaluated: full?.evaluated ?? results[idx].evaluated,
+            skipped: full?.skipped ?? results[idx].skipped,
+            ultra: false,
+            fullRescored: true
+          };
+        }
+      } catch (e) {
+        engineDebug("Large sweep full re-score failed", { id: c.id, error: e?.message || String(e) });
+      }
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+
+  // Clear progress checkpoint on successful completion.
+  try { localStorage.removeItem(PROGRESS_KEY); } catch (e) {}
 
   // OVERFIT GUARD: rank by holdout score, not train score — train is what
   // random search implicitly optimizes against just by trying enough
