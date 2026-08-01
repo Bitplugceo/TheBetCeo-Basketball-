@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -18240,30 +18239,33 @@ async function runNbaLargeConfigSweep(numCandidates, onProgress, options = {}) {
     }
   }
 
-  // BATCH 8: re-score top-N with the FULL fast path so leaderboard holdout
-  // Accuracy Score includes H1 + quarters and is comparable to baseline.
+  // BATCH 8 FIX: ultra scores inflate composite (~83 vs ~51) because H1/Q
+  // bands are missing. ALWAYS full-rescore top-N + baseline, then rank only
+  // on full-rescored rows so the leaderboard is honest.
   if (useUltra && useFastPath && fastBundle) {
-    const preRanked = results
+    const ultraRanked = results
       .filter(r => r.holdoutScore !== null && isFinite(r.holdoutScore))
       .slice()
       .sort((a, b) => b.holdoutScore - a.holdoutScore)
       .slice(0, TOP_FULL_RESCORE);
-    // Always include baseline in the full re-score set.
-    if (!preRanked.find(r => r.id === "baseline")) {
-      const base = results.find(r => r.id === "baseline");
-      if (base) preRanked.push(base);
-    }
+    const base = results.find(r => r.id === "baseline");
+    const toRescore = ultraRanked.slice();
+    if (base && !toRescore.find(r => r.id === "baseline")) toRescore.push(base);
+
     if (typeof onProgress === "function") {
-      try { onProgress(candidates.length, candidates.length, `full re-score top ${preRanked.length}…`); } catch (e) {}
+      try { onProgress(candidates.length, candidates.length, `full re-score ${toRescore.length}…`); } catch (e) {}
     }
-    for (let ri = 0; ri < preRanked.length; ri++) {
-      const c = preRanked[ri];
+    engineDebug("Large sweep full re-score starting", { count: toRescore.length });
+
+    for (let ri = 0; ri < toRescore.length; ri++) {
+      const c = toRescore[ri];
       try {
         const full = _btScoreCandidateFast(fastBundle, c.overrides || {});
         const trainScore = full?.trainAccuracyScore?.composite ?? null;
         const holdoutScore = full?.holdoutAccuracyScore?.composite ?? null;
         const overallScore = full?.accuracyScore?.composite ?? null;
-        const overfitGap = (trainScore !== null && isFinite(trainScore) && holdoutScore !== null && isFinite(holdoutScore)) ? (trainScore - holdoutScore) : null;
+        const overfitGap = (trainScore !== null && isFinite(trainScore) && holdoutScore !== null && isFinite(holdoutScore))
+          ? (trainScore - holdoutScore) : null;
         const idx = results.findIndex(r => r.id === c.id);
         if (idx >= 0) {
           results[idx] = {
@@ -18276,10 +18278,22 @@ async function runNbaLargeConfigSweep(numCandidates, onProgress, options = {}) {
             fullRescored: true
           };
         }
+        engineDebug("Large sweep full re-score row", {
+          id: c.id, holdoutScore, trainScore
+        });
       } catch (e) {
         engineDebug("Large sweep full re-score failed", { id: c.id, error: e?.message || String(e) });
       }
       await new Promise(r => setTimeout(r, 0));
+    }
+
+    // Drop any row that is still ultra-only so inflated scores cannot rank.
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].ultra && !results[i].fullRescored) {
+        results[i].holdoutScore = null;
+        results[i].trainScore = null;
+        results[i].overallScore = null;
+      }
     }
   }
 
