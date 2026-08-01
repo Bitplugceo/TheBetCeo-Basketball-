@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4217,17 +4218,22 @@ const TUNABLE_PARAM_REGISTRY = {
 
   // ===================================================================
   // BACKTEST ROADMAP — PHASE 1 (fatigue + quarter-anchor tunable wiring):
-  // COMPLETE. fatigueB2BPenalty and quarterAnchorBlendWeight below are both
-  // registered here AND read via getParam(...) ?? <old hardcoded value> at
-  // every call site (buildTotalMarketIntelSignal, buildTeamMarketIntelSignal,
+  // COMPLETE. Both params below are registered here AND read via
+  // getParam(...) ?? <old hardcoded value> at every call site
+  // (buildTotalMarketIntelSignal, buildTeamMarketIntelSignal,
   // applyQuarterAnchorBlendBT, and the matching live quarter-anchor block).
-  // Live output is unchanged until a backtest promotes a different value.
+  // quarterAnchorBlendWeight: live output unchanged until a backtest
+  // promotes a different value. fatigueB2BPenalty: UPDATE — as of the
+  // separate "FATIGUE LIVE-WIRING" change in computeFTProjection, this
+  // parameter now actually reaches ft/team_a/team_b projections (it did
+  // not before; buildTotalMarketIntelSignal's output was dead code). See
+  // that comment block for the full explanation.
   // Do not re-wire these or touch this pattern — continue with Phase 2+.
   // ===================================================================
   fatigueB2BPenalty: {
     value: -2.5, min: -6.0, max: 0, type: "scalar",
     scope: "global", appliesTo: ["ft", "team_a", "team_b"],
-    description: "Point signal applied by buildTotalMarketIntelSignal/buildTeamMarketIntelSignal when a team has under 1 day of rest (back-to-back). Was hardcoded; now tunable.",
+    description: "Point signal applied by buildTotalMarketIntelSignal/buildTeamMarketIntelSignal (via applyDampedIntelSignal in computeFTProjection) when a team has under 1 day of rest (back-to-back). Was hardcoded; now tunable AND live-wired.",
     lastVerifiedAt: null
   },
   quarterAnchorBlendWeight: {
@@ -15957,6 +15963,32 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   }
   let ftProj = (isFinite(projAFT) ? projAFT : 0) + (isFinite(projBFT) ? projBFT : 0);
 
+  // ===================================================================
+  // FATIGUE LIVE-WIRING (reviewed change, separate from the backtest
+  // roadmap phases): fatigueB2BPenalty was registered as tunable in Phase 1,
+  // but buildTotalMarketIntelSignal/buildTeamMarketIntelSignal's output was
+  // never actually consumed anywhere — applyDampedIntelSignal, the only
+  // function that reads it, was never called. Confirmed dead on a full-file
+  // search. This connects it, for ft/team_a/team_b only, matching the
+  // registry's appliesTo list (h1 and quarters are untouched).
+  // restDaysA/B come from config first — so the backtest feature cache
+  // (Phase 3) can inject a real per-game value — falling back to the same
+  // AppState.context.data restDays already read elsewhere in this function
+  // for live single-pick runs. KNOWN GAP: the retrospective tuner
+  // (evaluatePickWithParams / runCoordinateAscentTuner) does not thread a
+  // historical restDays through config either, so until pick.snapshot is
+  // extended to store it, tuner replays of past picks will pick up
+  // whatever AppState.context.data currently holds, not the real value at
+  // pick time. Flagging, not fixing here — that tuner is explicitly
+  // deferred until real season picks exist.
+  const _restDaysA = isFinite(config?.restDaysA) ? Number(config.restDaysA) : (ctxA.restDays ?? 99);
+  const _restDaysB = isFinite(config?.restDaysB) ? Number(config.restDaysB) : (ctxB.restDays ?? 99);
+  const _fatigueIntelPack = { restDaysA: _restDaysA, restDaysB: _restDaysB };
+  ftProj = applyDampedIntelSignal(ftProj, buildTotalMarketIntelSignal(_fatigueIntelPack).signal, _ftVolRatio);
+  projAFT = applyDampedIntelSignal(projAFT, buildTeamMarketIntelSignal(_fatigueIntelPack, "A").signal, _ftVolRatio);
+  projBFT = applyDampedIntelSignal(projBFT, buildTeamMarketIntelSignal(_fatigueIntelPack, "B").signal, _ftVolRatio);
+  // ===================================================================
+
   const netVenueEffect = (aVenueDiag?.enabled ? (Number(aVenueDiag.offensiveAdjustment) || 0) : 0)
     + (bVenueDiag?.enabled ? (Number(bVenueDiag.offensiveAdjustment) || 0) : 0);
 
@@ -16770,6 +16802,109 @@ function _btH2HSeries(gameLogs, teamId, oppId, beforeDateIso, n = 10, scoredFiel
   return recent.map(g => g[scoredField]);
 }
 
+// BACKTEST ROADMAP PHASE 3 helper: same "days since last game, capped at
+// 14, else unknown" formula the live restDays fetch uses (see the aStats/
+// bStats restDays block that populates AppState.context.data.A/B.restDays),
+// just computed from a team's own gameLog instead of a live fetch. 99 is
+// the "unknown" sentinel — the same one computeFTProjection's `?? 99`
+// fallback already treats as no-penalty.
+function _btRestDays(gameLog, beforeDateIso) {
+  const cutoff = new Date(beforeDateIso).getTime();
+  const prior = (gameLog || []).filter(g => g && g.date && new Date(g.date).getTime() < cutoff);
+  if (!prior.length) return 99;
+  const lastMs = new Date(prior[prior.length - 1].date).getTime();
+  if (!isFinite(lastMs)) return 99;
+  const rawDays = Math.max(0, Math.round((cutoff - lastMs) / 86400000) - 1);
+  return rawDays <= 14 ? rawDays : 99;
+}
+
+// BACKTEST ROADMAP — PHASE 3 (precompute once, sweep in memory): COMPLETE.
+// Precomputes every config-independent per-game input — rolling series,
+// H2H arrays, rest days, and the Phase 2 chronological split tag — exactly
+// once per league, so a future multi-config sweep (Phase 4) evaluates each
+// candidate as a pure function over this cache instead of re-deriving the
+// same rolling windows and H2H series from gameLogs on every candidate.
+// Deliberately excludes ortg/drtg "ratings" (BATCH 7 PERMANENT DECISION —
+// NO PACE MODEL, elsewhere in this file, stands — not revisited here) and
+// "line" (the season backtest never uses real market lines — every
+// computeFTProjection/compute1HProjection call below passes lines: {}).
+function buildBacktestFeatureCache(gameLogs, allGames, splitBoundaries, onProgress) {
+  const t0 = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+  const { validationStartMs, testStartMs } = splitBoundaries || {};
+  const features = new Array(allGames.length);
+
+  allGames.forEach((game, idx) => {
+    const teamWindow = _btRollingWindow(gameLogs[game.teamId], game.date);
+    const oppWindow = _btRollingWindow(gameLogs[game.oppId], game.date);
+    const teamH1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "h1Scored", "h1Allowed");
+    const oppH1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "h1Scored", "h1Allowed");
+    const teamQ1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q1Scored", "q1Allowed");
+    const oppQ1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q1Scored", "q1Allowed");
+    const teamQ2Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q2Scored", "q2Allowed");
+    const oppQ2Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q2Scored", "q2Allowed");
+    const teamQ3Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q3Scored", "q3Allowed");
+    const oppQ3Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q3Scored", "q3Allowed");
+    const teamQ4Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q4Scored", "q4Allowed");
+    const oppQ4Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q4Scored", "q4Allowed");
+
+    const teamFTH2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "scored");
+    const oppFTH2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "scored");
+    const teamH1H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "h1Scored");
+    const oppH1H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "h1Scored");
+    const teamQ1H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q1Scored");
+    const oppQ1H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q1Scored");
+    const teamQ2H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q2Scored");
+    const oppQ2H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q2Scored");
+    const teamQ3H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q3Scored");
+    const oppQ3H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q3Scored");
+    const teamQ4H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q4Scored");
+    const oppQ4H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q4Scored");
+
+    const gameMs = new Date(game.date).getTime();
+    features[idx] = {
+      teamScored: teamWindow.scored, teamAllowed: teamWindow.allowed,
+      oppScored: oppWindow.scored, oppAllowed: oppWindow.allowed,
+      teamH1Scored: teamH1Window.scored, oppH1Scored: oppH1Window.scored,
+      restDaysA: _btRestDays(gameLogs[game.teamId], game.date),
+      restDaysB: _btRestDays(gameLogs[game.oppId], game.date),
+      split: gameMs >= testStartMs ? "test" : gameMs >= validationStartMs ? "validation" : "train",
+      parsed: {
+        aFTAllowed: teamWindow.allowed, bFTAllowed: oppWindow.allowed,
+        a1HScored: teamH1Window.scored, b1HScored: oppH1Window.scored,
+        a1HAllowed: teamH1Window.allowed, b1HAllowed: oppH1Window.allowed,
+        aQ1Scored: teamQ1Window.scored, bQ1Scored: oppQ1Window.scored,
+        aQ1Allowed: teamQ1Window.allowed, bQ1Allowed: oppQ1Window.allowed,
+        aQ2Scored: teamQ2Window.scored, bQ2Scored: oppQ2Window.scored,
+        aQ2Allowed: teamQ2Window.allowed, bQ2Allowed: oppQ2Window.allowed,
+        aQ3Scored: teamQ3Window.scored, bQ3Scored: oppQ3Window.scored,
+        aQ3Allowed: teamQ3Window.allowed, bQ3Allowed: oppQ3Window.allowed,
+        aQ4Scored: teamQ4Window.scored, bQ4Scored: oppQ4Window.scored,
+        aQ4Allowed: teamQ4Window.allowed, bQ4Allowed: oppQ4Window.allowed,
+        aFTH2H: teamFTH2H, bFTH2H: oppFTH2H,
+        a1HH2H: teamH1H2H, b1HH2H: oppH1H2H,
+        aQ1H2H: teamQ1H2H, bQ1H2H: oppQ1H2H,
+        aQ2H2H: teamQ2H2H, bQ2H2H: oppQ2H2H,
+        aQ3H2H: teamQ3H2H, bQ3H2H: oppQ3H2H,
+        aQ4H2H: teamQ4H2H, bQ4H2H: oppQ4H2H
+      }
+    };
+    if (typeof onProgress === "function" && (idx % 200 === 0 || idx === allGames.length - 1)) {
+      try { onProgress(idx + 1, allGames.length); } catch (e) {}
+    }
+  });
+
+  const elapsedMs = ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now()) - t0;
+  const stats = {
+    games: allGames.length,
+    elapsedMs: Math.round(elapsedMs),
+    gamesPerSecond: elapsedMs > 0 ? Math.round((allGames.length / elapsedMs) * 1000) : allGames.length,
+    builtAt: new Date().toISOString()
+  };
+  engineDebug("Backtest feature cache built", stats);
+  try { window.__btFeatureCacheStats = stats; } catch (e) {}
+  return { features, stats };
+}
+
 function calculateScoresOnlyCalibration(evaluationResults) {
   const valid = (evaluationResults || []).filter(r => r && isFinite(r.predictedMargin) && isFinite(r.actualMargin));
   if (!valid.length) return null;
@@ -17142,66 +17277,40 @@ async function runNbaSeasonBacktest(season, onProgress) {
   const _btTestStartMs = allGames.length ? new Date(allGames[_btTestStartIdx].date).getTime() : Infinity;
 
   window.__btRunInProgress = true;
+  // BACKTEST ROADMAP — PHASE 3 (precompute once, sweep in memory): COMPLETE.
+  // Every per-game input that doesn't depend on a candidate config — rolling
+  // series, H2H arrays, rest days, chronological split — is built exactly
+  // once here, before the loop, instead of being re-derived every game on
+  // every future sweep candidate (Phase 4). The loop below is now a lookup
+  // into this cache plus the config-dependent math only.
+  const _btFeatureCache = buildBacktestFeatureCache(gameLogs, allGames, { validationStartMs: _btValidationStartMs, testStartMs: _btTestStartMs }, onProgress);
+  const _btFeatures = _btFeatureCache.features;
   try {
-    for (const game of allGames) {
-      const teamWindow = _btRollingWindow(gameLogs[game.teamId], game.date);
-      const oppWindow = _btRollingWindow(gameLogs[game.oppId], game.date);
+    for (let _btGameIdx = 0; _btGameIdx < allGames.length; _btGameIdx++) {
+      const game = allGames[_btGameIdx];
+      const feat = _btFeatures[_btGameIdx];
+      const teamWindow = { scored: feat.teamScored, allowed: feat.teamAllowed };
+      const oppWindow = { scored: feat.oppScored, allowed: feat.oppAllowed };
 
       if (teamWindow.scored.length < 5 || oppWindow.scored.length < 5) { skipped++; continue; }
 
       if (domA) domA.value = teamWindow.scored.join(",");
       if (domB) domB.value = oppWindow.scored.join(",");
 
-      const teamH1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "h1Scored", "h1Allowed");
-      const oppH1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "h1Scored", "h1Allowed");
-      const teamQ1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q1Scored", "q1Allowed");
-      const oppQ1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q1Scored", "q1Allowed");
-      const teamQ2Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q2Scored", "q2Allowed");
-      const oppQ2Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q2Scored", "q2Allowed");
-      const teamQ3Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q3Scored", "q3Allowed");
-      const oppQ3Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q3Scored", "q3Allowed");
-      const teamQ4Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q4Scored", "q4Allowed");
-      const oppQ4Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "q4Scored", "q4Allowed");
-
-      // BACKTEST H2H FIX: real prior-meeting arrays, same team/opp pairing as
-      // the rolling-form windows above, just filtered down to this matchup.
-      const teamFTH2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "scored");
-      const oppFTH2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "scored");
-      const teamH1H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "h1Scored");
-      const oppH1H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "h1Scored");
-      const teamQ1H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q1Scored");
-      const oppQ1H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q1Scored");
-      const teamQ2H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q2Scored");
-      const oppQ2H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q2Scored");
-      const teamQ3H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q3Scored");
-      const oppQ3H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q3Scored");
-      const teamQ4H2H = _btH2HSeries(gameLogs, game.teamId, game.oppId, game.date, 10, "q4Scored");
-      const oppQ4H2H  = _btH2HSeries(gameLogs, game.oppId, game.teamId, game.date, 10, "q4Scored");
-
-      const parsed = {
-        aFTAllowed: teamWindow.allowed, bFTAllowed: oppWindow.allowed,
-        a1HScored: teamH1Window.scored, b1HScored: oppH1Window.scored,
-        a1HAllowed: teamH1Window.allowed, b1HAllowed: oppH1Window.allowed,
-        aQ1Scored: teamQ1Window.scored, bQ1Scored: oppQ1Window.scored,
-        aQ1Allowed: teamQ1Window.allowed, bQ1Allowed: oppQ1Window.allowed,
-        aQ2Scored: teamQ2Window.scored, bQ2Scored: oppQ2Window.scored,
-        aQ2Allowed: teamQ2Window.allowed, bQ2Allowed: oppQ2Window.allowed,
-        aQ3Scored: teamQ3Window.scored, bQ3Scored: oppQ3Window.scored,
-        aQ3Allowed: teamQ3Window.allowed, bQ3Allowed: oppQ3Window.allowed,
-        aQ4Scored: teamQ4Window.scored, bQ4Scored: oppQ4Window.scored,
-        aQ4Allowed: teamQ4Window.allowed, bQ4Allowed: oppQ4Window.allowed,
-        aFTH2H: teamFTH2H, bFTH2H: oppFTH2H,
-        a1HH2H: teamH1H2H, b1HH2H: oppH1H2H,
-        aQ1H2H: teamQ1H2H, bQ1H2H: oppQ1H2H,
-        aQ2H2H: teamQ2H2H, bQ2H2H: oppQ2H2H,
-        aQ3H2H: teamQ3H2H, bQ3H2H: oppQ3H2H,
-        aQ4H2H: teamQ4H2H, bQ4H2H: oppQ4H2H
-      };
+      const teamH1Window = { scored: feat.teamH1Scored, allowed: feat.parsed.a1HAllowed };
+      const oppH1Window = { scored: feat.oppH1Scored, allowed: feat.parsed.b1HAllowed };
+      const parsed = feat.parsed;
 
       const _tw = isFinite(window.getParam("teamWeightBase", "nba")) ? Number(window.getParam("teamWeightBase", "nba")) : 0.65;
       const _btBaseConfig = {
         h2hFactor: window.getParam("h2hFactor", "nba") ?? 1.0,
-        extremeExpansion: 1.0
+        extremeExpansion: 1.0,
+        // FATIGUE LIVE-WIRING follow-through: computeFTProjection now reads
+        // config.restDaysA/B (see that comment block). feat.restDaysA/B come
+        // from the Phase 3 cache above, derived once per game from gameLogs
+        // — no live AppState.context.data dependency in the backtest.
+        restDaysA: feat.restDaysA,
+        restDaysB: feat.restDaysB
       };
 
       // LIVE-PARITY FIX: quarters (computeQuarterProjectionBT) already compute
@@ -17295,12 +17404,11 @@ async function runNbaSeasonBacktest(season, onProgress) {
         quarterTotalPairs: qPredTotals.map((p, i) => [p, qActualTotals[i]]).filter(([p, a]) => isFinite(p) && isFinite(a)),
         quarterTeamPairs: qPredTeamScores.map((p, i) => [p, qActualTeamScores[i]]).filter(([p, a]) => isFinite(p) && isFinite(a)),
         sampleTier: calc.ftSampleTier,
-        // BACKTEST ROADMAP PHASE 2: three-way chronological split tag — see
-        // _btValidationStartMs/_btTestStartMs above. "test" is the final
-        // slice; nothing in this function scores against it more than once.
-        split: new Date(game.date).getTime() >= _btTestStartMs ? "test"
-             : new Date(game.date).getTime() >= _btValidationStartMs ? "validation"
-             : "train"
+        // BACKTEST ROADMAP PHASE 2 + 3: split tag now comes straight from
+        // the Phase 3 feature cache (feat.split), which applies the exact
+        // same _btValidationStartMs/_btTestStartMs boundary Phase 2 set up
+        // — computed once per game there instead of recomputed here.
+        split: feat.split
       });
     }
   } finally {
