@@ -1,4 +1,3 @@
-L
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4216,6 +4215,15 @@ const TUNABLE_PARAM_REGISTRY = {
     lastVerifiedAt: null
   },
 
+  // ===================================================================
+  // BACKTEST ROADMAP — PHASE 1 (fatigue + quarter-anchor tunable wiring):
+  // COMPLETE. fatigueB2BPenalty and quarterAnchorBlendWeight below are both
+  // registered here AND read via getParam(...) ?? <old hardcoded value> at
+  // every call site (buildTotalMarketIntelSignal, buildTeamMarketIntelSignal,
+  // applyQuarterAnchorBlendBT, and the matching live quarter-anchor block).
+  // Live output is unchanged until a backtest promotes a different value.
+  // Do not re-wire these or touch this pattern — continue with Phase 2+.
+  // ===================================================================
   fatigueB2BPenalty: {
     value: -2.5, min: -6.0, max: 0, type: "scalar",
     scope: "global", appliesTo: ["ft", "team_a", "team_b"],
@@ -17114,12 +17122,24 @@ async function runNbaSeasonBacktest(season, onProgress) {
   const results = [];
   let skipped = 0;
 
-  // TRAIN/HOLDOUT FIX: chronological cutoff so late-season games can validate
-  // against early-season games instead of the same games doing both jobs.
-  // Holds out the last 30% of the season by date.
-  const _btHoldoutFraction = 0.3;
-  const _btHoldoutStartIdx = Math.max(0, Math.min(allGames.length - 1, Math.floor(allGames.length * (1 - _btHoldoutFraction))));
-  const _btHoldoutStartMs = allGames.length ? new Date(allGames[_btHoldoutStartIdx].date).getTime() : Infinity;
+  // BACKTEST ROADMAP — PHASE 2 (true three-way split): COMPLETE.
+  // Chronological split so later games validate against earlier ones instead
+  // of the same games doing every job. Previously a two-way 70/30
+  // train/holdout split, where "holdout" silently did double duty as both
+  // the set search/tuning validates against AND the set that would need to
+  // prove a config safe to lock — those are not the same claim. Now:
+  //   ~55% train      — search/tuning fits against this (Phase 4-6)
+  //   ~25% validation — search/tuning is scored against this (Phase 4-6)
+  //   ~20% final test — untouched by search; read exactly once, by Phase 6,
+  //                     right before a lock decision
+  // Do not add any search/tuning code path that reads the "test" split
+  // before Phase 6 — that would defeat the entire point of this split.
+  const _btValidationFraction = 0.25;
+  const _btTestFraction = 0.20;
+  const _btValidationStartIdx = Math.max(0, Math.min(allGames.length - 1, Math.floor(allGames.length * (1 - _btValidationFraction - _btTestFraction))));
+  const _btTestStartIdx = Math.max(0, Math.min(allGames.length - 1, Math.floor(allGames.length * (1 - _btTestFraction))));
+  const _btValidationStartMs = allGames.length ? new Date(allGames[_btValidationStartIdx].date).getTime() : Infinity;
+  const _btTestStartMs = allGames.length ? new Date(allGames[_btTestStartIdx].date).getTime() : Infinity;
 
   window.__btRunInProgress = true;
   try {
@@ -17275,8 +17295,12 @@ async function runNbaSeasonBacktest(season, onProgress) {
         quarterTotalPairs: qPredTotals.map((p, i) => [p, qActualTotals[i]]).filter(([p, a]) => isFinite(p) && isFinite(a)),
         quarterTeamPairs: qPredTeamScores.map((p, i) => [p, qActualTeamScores[i]]).filter(([p, a]) => isFinite(p) && isFinite(a)),
         sampleTier: calc.ftSampleTier,
-        // TRAIN/HOLDOUT FIX: chronological split tag, see _btHoldoutStartMs above.
-        split: new Date(game.date).getTime() >= _btHoldoutStartMs ? "holdout" : "train"
+        // BACKTEST ROADMAP PHASE 2: three-way chronological split tag — see
+        // _btValidationStartMs/_btTestStartMs above. "test" is the final
+        // slice; nothing in this function scores against it more than once.
+        split: new Date(game.date).getTime() >= _btTestStartMs ? "test"
+             : new Date(game.date).getTime() >= _btValidationStartMs ? "validation"
+             : "train"
       });
     }
   } finally {
@@ -17291,15 +17315,20 @@ async function runNbaSeasonBacktest(season, onProgress) {
   const thin = calculateScoresOnlyCalibration(results.filter(r => r.sampleTier === "thin"));
   const diagnosis = buildScoresOnlyDiagnosis(results);
 
-  // TRAIN/HOLDOUT + ACCURACY SCORE FIX: same calibration function, split by
-  // the chronological tag set in the loop above, then converted to the 0-100
-  // Accuracy Score. A config is only trustworthy if holdoutAccuracyScore
+  // BACKTEST ROADMAP PHASE 2: same calibration function, split by the
+  // chronological tag set in the loop above, then converted to the 0-100
+  // Accuracy Score. A config is only trustworthy if validationAccuracyScore
   // tracks trainAccuracyScore — a big gap between them is overfitting.
+  // testAccuracyScore is computed here for visibility only — Phase 2 is
+  // infrastructure; nothing in this function searches or locks against it.
+  // Phase 6 is the only place allowed to use it as a gate.
   const train = calculateScoresOnlyCalibration(results.filter(r => r.split === "train"));
-  const holdout = calculateScoresOnlyCalibration(results.filter(r => r.split === "holdout"));
+  const validation = calculateScoresOnlyCalibration(results.filter(r => r.split === "validation"));
+  const test = calculateScoresOnlyCalibration(results.filter(r => r.split === "test"));
   const accuracyScore = computeBacktestAccuracyScore(overall);
   const trainAccuracyScore = computeBacktestAccuracyScore(train);
-  const holdoutAccuracyScore = computeBacktestAccuracyScore(holdout);
+  const validationAccuracyScore = computeBacktestAccuracyScore(validation);
+  const testAccuracyScore = computeBacktestAccuracyScore(test);
 
   const notes = [];
   if (overall) {
@@ -17319,12 +17348,14 @@ async function runNbaSeasonBacktest(season, onProgress) {
       notes.push(`Quarter totals are running ${overall.qTotalBias > 0 ? "high" : "low"} by about ${Math.abs(overall.qTotalBias).toFixed(1)} pts on average.`);
     }
   }
-  // TRAIN/HOLDOUT FIX: overfitting guard — flag it here as a real, computed
-  // note rather than leaving it as something you'd have to notice yourself.
-  if (isFinite(trainAccuracyScore?.composite) && isFinite(holdoutAccuracyScore?.composite)) {
-    const _acGap = trainAccuracyScore.composite - holdoutAccuracyScore.composite;
+  // BACKTEST ROADMAP PHASE 2: overfitting guard — train vs validation is the
+  // meaningful comparison now (validation is what search fits against in
+  // Phase 4-6); test is reported separately below and is excluded from this
+  // guard, since nothing may tune toward it, even indirectly via a warning.
+  if (isFinite(trainAccuracyScore?.composite) && isFinite(validationAccuracyScore?.composite)) {
+    const _acGap = trainAccuracyScore.composite - validationAccuracyScore.composite;
     if (_acGap >= 8) {
-      notes.push(`Holdout Accuracy Score (${holdoutAccuracyScore.composite.toFixed(1)}) is ${_acGap.toFixed(1)} pts below train (${trainAccuracyScore.composite.toFixed(1)}) — this config may be overfit to early-season games; treat any tuning gains with caution until the gap narrows.`);
+      notes.push(`Validation Accuracy Score (${validationAccuracyScore.composite.toFixed(1)}) is ${_acGap.toFixed(1)} pts below train (${trainAccuracyScore.composite.toFixed(1)}) — this config may be overfit to early-season games; treat any tuning gains with caution until the gap narrows.`);
     }
   }
   if (diagnosis && Array.isArray(diagnosis.findings)) {
@@ -17336,8 +17367,9 @@ async function runNbaSeasonBacktest(season, onProgress) {
     season, league: "nba",
     totalGames: allGames.length, evaluated: results.length, skipped,
     overall, byTier: { full, thin }, diagnosis, notes,
-    holdoutFraction: _btHoldoutFraction, train, holdout,
-    accuracyScore, trainAccuracyScore, holdoutAccuracyScore,
+    validationFraction: _btValidationFraction, testFraction: _btTestFraction,
+    train, validation, test,
+    accuracyScore, trainAccuracyScore, validationAccuracyScore, testAccuracyScore,
     computedAt: new Date().toISOString()
   };
   engineDebug("Season backtest complete", report);
@@ -17378,7 +17410,7 @@ function renderBacktestPanel() {
         <div class="tracker-summary-cell primary">
           <div class="tracker-summary-label">Backtest Accuracy Score</div>
           <div class="tracker-summary-value">${isFinite(cached.accuracyScore?.composite) ? cached.accuracyScore.composite.toFixed(1) : "—"}/100</div>
-          <div class="tracker-summary-sub">Train: ${isFinite(cached.trainAccuracyScore?.composite) ? cached.trainAccuracyScore.composite.toFixed(1) : "—"} · Holdout: ${isFinite(cached.holdoutAccuracyScore?.composite) ? cached.holdoutAccuracyScore.composite.toFixed(1) : "—"} (last ${Math.round((cached.holdoutFraction ?? 0.3) * 100)}% of season)</div>
+          <div class="tracker-summary-sub">Train: ${isFinite(cached.trainAccuracyScore?.composite) ? cached.trainAccuracyScore.composite.toFixed(1) : "—"} · Validation: ${isFinite(cached.validationAccuracyScore?.composite) ? cached.validationAccuracyScore.composite.toFixed(1) : "—"} (${Math.round((cached.validationFraction ?? 0.25) * 100)}% of season) · Test: ${isFinite(cached.testAccuracyScore?.composite) ? cached.testAccuracyScore.composite.toFixed(1) : "—"} (last ${Math.round((cached.testFraction ?? 0.20) * 100)}% of season)</div>
         </div>
         <div class="tracker-summary-cell">
           <div class="tracker-summary-label">Total Points MAE / Bias</div>
