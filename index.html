@@ -16905,6 +16905,375 @@ function buildBacktestFeatureCache(gameLogs, allGames, splitBoundaries, onProgre
   return { features, stats };
 }
 
+// ===================================================================
+// BACKTEST ROADMAP — PHASE 4 (grouped search, not exhaustive joint grid)
+// SCAFFOLDING + first working pass. Groups correlated params, samples a
+// modest joint space inside each group, evaluates every candidate as a
+// pure function over the Phase 3 feature cache, scores on the validation
+// split only, and never reads the final test split (reserved for Phase 6).
+// Do not expand into Phase 5 cross-group re-validation or Phase 6 lock
+// gates here — those are separate phases. Continue with Phase 5 next.
+// ===================================================================
+const BACKTEST_PARAM_GROUPS = {
+  A_H2H: {
+    id: "A_H2H",
+    label: "H2H",
+    keys: ["h2hFactor", "h2hMaxWeight", "h2hLookbackSeasons", "h2hDecayCurrent", "h2hDecayMinus1", "h2hDecayMinus2", "h2hDecayOlder"],
+    candidates: {
+      h2hFactor:          [0.70, 0.85, 1.00],
+      h2hMaxWeight:       [0.20, 0.25, 0.30, 0.35, 0.40],
+      h2hLookbackSeasons: [3, 4, 5],
+      h2hDecayCurrent:    [0.90, 1.00],
+      h2hDecayMinus1:     [0.60, 0.75, 0.90],
+      h2hDecayMinus2:     [0.35, 0.50, 0.65],
+      h2hDecayOlder:      [0.15, 0.30, 0.45]
+    }
+  },
+  B_FORM_VENUE: {
+    id: "B_FORM_VENUE",
+    label: "Form/venue",
+    keys: ["teamWeightBase", "venueMinGames", "venueStrongGames", "venueModerateWeight", "venueStrongWeight", "quarterVenueProxyFactor"],
+    // recencyWeights is a vector — handled via the existing TUNING_GRID profiles
+    candidates: {
+      teamWeightBase:         [0.55, 0.60, 0.65, 0.70, 0.75],
+      venueMinGames:          [4, 6, 8],
+      venueStrongGames:       [8, 10, 12],
+      venueModerateWeight:    [0.35, 0.50, 0.60],
+      venueStrongWeight:      [0.55, 0.70, 0.80],
+      quarterVenueProxyFactor:[0.5, 1.0, 1.25]
+    },
+    recencyProfiles: true
+  },
+  C_FATIGUE_ANCHOR: {
+    id: "C_FATIGUE_ANCHOR",
+    label: "Fatigue & quarter-anchor",
+    keys: ["fatigueB2BPenalty", "quarterAnchorBlendWeight"],
+    candidates: {
+      fatigueB2BPenalty:      [-4.0, -3.0, -2.5, -1.5, 0],
+      quarterAnchorBlendWeight:[0.5, 0.6, 0.7, 0.8, 0.9]
+    }
+  },
+  D_THRESHOLDS: {
+    id: "D_THRESHOLDS",
+    label: "Thresholds & clamps",
+    keys: [
+      "edgeFTPointThreshold", "edgeH1PointThreshold", "edgeTeamPointThreshold", "edgeQPointThreshold",
+      "underEdgeFactor", "injuryOppBoostFactor",
+      "confidenceAThresh", "confidenceBThresh", "confidenceCThresh",
+      "volatilityLimit"
+    ],
+    candidates: {
+      edgeFTPointThreshold:   [4.0, 5.0, 6.0, 7.0, 8.0],
+      edgeH1PointThreshold:   [5.0, 6.0, 7.0, 8.0],
+      edgeTeamPointThreshold: [7.0, 8.0, 10.0, 12.0],
+      edgeQPointThreshold:    [2.5, 3.0, 4.0, 5.0],
+      underEdgeFactor:        [1.0, 1.1, 1.2, 1.3],
+      injuryOppBoostFactor:   [0.10, 0.15, 0.20, 0.25, 0.30],
+      confidenceAThresh:      [0.60, 0.66, 0.72],
+      confidenceBThresh:      [0.52, 0.58, 0.64],
+      confidenceCThresh:      [0.47, 0.51, 0.55],
+      volatilityLimit:        [10, 12, 14, 16]
+    }
+  }
+};
+
+function _btSampleFromCandidates(candMap, n, rng) {
+  const keys = Object.keys(candMap);
+  const out = [];
+  const seen = new Set();
+  let guard = 0;
+  while (out.length < n && guard < n * 20) {
+    guard++;
+    const sample = {};
+    keys.forEach(k => {
+      const arr = candMap[k];
+      sample[k] = arr[Math.floor(rng() * arr.length)];
+    });
+    const sig = keys.map(k => sample[k]).join("|");
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    out.push(sample);
+  }
+  return out;
+}
+
+function _btMulberry32(seed) {
+  let t = seed >>> 0;
+  return function() {
+    t += 0x6D2B79F5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Evaluate a candidate paramOverrides object over the Phase 3 feature cache.
+ * Only train + validation games are scored (split !== "test"). The final
+ * test slice is deliberately never touched here — Phase 6 owns that gate.
+ * Uses the proven temporary getParam override pattern from evaluatePickWithParams.
+ */
+function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, options) {
+  options = options || {};
+  const league = options.league || "nba";
+  const includeTest = !!options.includeTest; // must stay false for Phase 4/5
+  const results = [];
+  let skipped = 0;
+
+  const originalGetParam = window.getParam;
+  window.getParam = function(key, lg) {
+    if (paramOverrides && Object.prototype.hasOwnProperty.call(paramOverrides, key)) {
+      return paramOverrides[key];
+    }
+    return originalGetParam ? originalGetParam(key, lg) : getTunableParam(key, lg);
+  };
+
+  try {
+    for (let i = 0; i < allGames.length; i++) {
+      const game = allGames[i];
+      const feat = features[i];
+      if (!feat) { skipped++; continue; }
+      if (!includeTest && feat.split === "test") continue;
+
+      const teamWindow = { scored: feat.teamScored, allowed: feat.teamAllowed };
+      const oppWindow  = { scored: feat.oppScored,  allowed: feat.oppAllowed };
+      if (!teamWindow.scored || teamWindow.scored.length < 5 || !oppWindow.scored || oppWindow.scored.length < 5) {
+        skipped++; continue;
+      }
+
+      const teamH1Window = { scored: feat.teamH1Scored, allowed: feat.parsed.a1HAllowed };
+      const oppH1Window  = { scored: feat.oppH1Scored,  allowed: feat.parsed.b1HAllowed };
+      const parsed = feat.parsed;
+
+      const _tw = isFinite(window.getParam("teamWeightBase", league)) ? Number(window.getParam("teamWeightBase", league)) : 0.65;
+      const _btBaseConfig = {
+        h2hFactor: window.getParam("h2hFactor", league) ?? 1.0,
+        extremeExpansion: 1.0,
+        restDaysA: feat.restDaysA,
+        restDaysB: feat.restDaysB
+      };
+
+      let combinedVolRatio = 0.5;
+      try {
+        const gms = buildGlobalModelState({ league, parsed, lines: {}, injMultA: 1, injMultB: 1 });
+        if (isFinite(gms?.volState?.combinedVolRatio)) combinedVolRatio = gms.volState.combinedVolRatio;
+      } catch (e) {}
+
+      const _ftSampleTier = getSampleTier(teamWindow.scored, oppWindow.scored);
+      const _h1SampleTier = getSampleTier(teamH1Window.scored, oppH1Window.scored);
+      const _dynWeightsFT = getDynamicWeights(_ftSampleTier, combinedVolRatio, league);
+      const _dynWeightsH1 = getDynamicWeights(_h1SampleTier, combinedVolRatio, league);
+      const _btConfig = {
+        ..._btBaseConfig,
+        teamWeight: isFinite(_dynWeightsFT?.teamWeight) ? _dynWeightsFT.teamWeight : _tw,
+        oppWeight:  isFinite(_dynWeightsFT?.oppWeight)  ? _dynWeightsFT.oppWeight  : 1 - _tw
+      };
+      const _btConfigH1 = {
+        ..._btBaseConfig,
+        teamWeight: isFinite(_dynWeightsH1?.teamWeight) ? _dynWeightsH1.teamWeight : _tw,
+        oppWeight:  isFinite(_dynWeightsH1?.oppWeight)  ? _dynWeightsH1.oppWeight  : 1 - _tw
+      };
+
+      let calc;
+      try {
+        calc = computeFTProjection({ league, parsed, lines: {}, injMultA: 1, injMultB: 1, config: _btConfig });
+      } catch (e) { skipped++; continue; }
+      if (!isFinite(calc.projAFT) || !isFinite(calc.projBFT)) { skipped++; continue; }
+
+      let calc1H = null;
+      try {
+        calc1H = compute1HProjection({ league, parsed, lines: {}, injMultA: 1, injMultB: 1, config: _btConfigH1 });
+      } catch (e) { calc1H = null; }
+
+      let q1 = null, q2 = null, q3 = null, q4 = null;
+      try {
+        if (calc1H) {
+          q1 = computeQuarterProjectionBT("q1", { league, parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, config: _btConfig });
+          q2 = computeQuarterProjectionBT("q2", { league, parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, config: _btConfig });
+          q3 = computeQuarterProjectionBT("q3", { league, parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, config: _btConfig });
+          q4 = computeQuarterProjectionBT("q4", { league, parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: game.teamName, teamBName: game.oppName, combinedVolRatio, config: _btConfig });
+          applyQuarterAnchorBlendBT(q1, q2, q3, q4, calc1H, calc);
+        }
+      } catch (e) { q1 = q2 = q3 = q4 = null; }
+
+      const h1Actual = isFinite(game.h1Scored) && isFinite(game.h1Allowed);
+      const quartersActual = [game.q1Scored, game.q2Scored, game.q3Scored, game.q4Scored, game.q1Allowed, game.q2Allowed, game.q3Allowed, game.q4Allowed].every(isFinite);
+      const qPredTotals = [q1, q2, q3, q4].map(q => (q && isFinite(q.proj)) ? q.proj : NaN);
+      const qActualTotals = quartersActual ? [
+        game.q1Scored + game.q1Allowed, game.q2Scored + game.q2Allowed,
+        game.q3Scored + game.q3Allowed, game.q4Scored + game.q4Allowed
+      ] : [NaN, NaN, NaN, NaN];
+
+      results.push({
+        date: game.date,
+        predictedMargin: calc.projAFT - calc.projBFT,
+        actualMargin: game.scored - game.allowed,
+        predictedTotal: calc.ftProj,
+        actualTotal: game.scored + game.allowed,
+        predictedAScore: calc.projAFT,
+        actualAScore: game.scored,
+        predictedBScore: calc.projBFT,
+        actualBScore: game.allowed,
+        predictedH1Total: (calc1H && isFinite(calc1H.h1Proj)) ? calc1H.h1Proj : NaN,
+        actualH1Total: h1Actual ? (game.h1Scored + game.h1Allowed) : NaN,
+        predictedH1AScore: (calc1H && isFinite(calc1H.projA1H)) ? calc1H.projA1H : NaN,
+        actualH1AScore: h1Actual ? game.h1Scored : NaN,
+        predictedH1BScore: (calc1H && isFinite(calc1H.projB1H)) ? calc1H.projB1H : NaN,
+        actualH1BScore: h1Actual ? game.h1Allowed : NaN,
+        quarterTotalPairs: qPredTotals.map((p, i) => [p, qActualTotals[i]]).filter(([p, a]) => isFinite(p) && isFinite(a)),
+        sampleTier: calc.ftSampleTier,
+        split: feat.split
+      });
+    }
+  } finally {
+    window.getParam = originalGetParam;
+  }
+
+  const trainCal = calculateScoresOnlyCalibration(results.filter(r => r.split === "train"));
+  const valCal   = calculateScoresOnlyCalibration(results.filter(r => r.split === "validation"));
+  return {
+    results,
+    skipped,
+    trainCalibration: trainCal,
+    validationCalibration: valCal,
+    trainAccuracyScore: computeBacktestAccuracyScore(trainCal),
+    validationAccuracyScore: computeBacktestAccuracyScore(valCal)
+  };
+}
+
+/**
+ * One outer pass of grouped search (Phase 4).
+ * Starts from the live baseline. For each group, samples `samplesPerGroup`
+ * joint candidates, scores them on validation, and keeps a candidate only
+ * when it improves validation composite without a large train-val gap.
+ * Returns a search report; does not write locks (Phase 6/8).
+ */
+function runGroupedParamSearchPhase4(features, allGames, baselineValComposite, options) {
+  options = options || {};
+  const samplesPerGroup = Math.max(4, Math.min(24, options.samplesPerGroup || 8));
+  const maxTrainValGap  = isFinite(options.maxTrainValGap) ? options.maxTrainValGap : 8;
+  const minValGain      = isFinite(options.minValGain) ? options.minValGain : 0.5;
+  const seed            = options.seed || 42;
+  const rng             = _btMulberry32(seed);
+  const league          = options.league || "nba";
+
+  const baselineOverrides = {};
+  Object.keys(TUNABLE_PARAM_REGISTRY).forEach(k => {
+    const v = getParam(k, league);
+    if (v !== undefined && v !== null) baselineOverrides[k] = v;
+  });
+
+  let bestBundle = { ...baselineOverrides };
+  let bestValComposite = isFinite(baselineValComposite) ? baselineValComposite : -Infinity;
+  const groupReports = [];
+
+  const groupOrder = ["A_H2H", "B_FORM_VENUE", "C_FATIGUE_ANCHOR", "D_THRESHOLDS"];
+  for (const gid of groupOrder) {
+    const group = BACKTEST_PARAM_GROUPS[gid];
+    if (!group) continue;
+
+    const samples = _btSampleFromCandidates(group.candidates, samplesPerGroup, rng);
+    // Always include the pure baseline for this group so we never regress by accident.
+    const baselineSample = {};
+    group.keys.forEach(k => { if (baselineOverrides[k] !== undefined) baselineSample[k] = baselineOverrides[k]; });
+    samples.unshift(baselineSample);
+
+    let groupBest = null;
+    let groupBestVal = -Infinity;
+    let evaluated = 0;
+
+    for (const sample of samples) {
+      const overrides = { ...bestBundle, ...sample };
+      // Optional recency profile for Group B
+      if (group.recencyProfiles && typeof TUNING_GRID !== "undefined" && Array.isArray(TUNING_GRID.recencyProfiles)) {
+        const profiles = TUNING_GRID.recencyProfiles;
+        overrides.recencyWeights = profiles[Math.floor(rng() * profiles.length)];
+      }
+
+      let evalOut;
+      try {
+        evalOut = evaluateFeatureCacheWithOverrides(features, allGames, overrides, { league, includeTest: false });
+      } catch (e) {
+        engineDebug("Phase 4 candidate evaluation failed (skipped)", { group: gid, error: e?.message || String(e) });
+        continue;
+      }
+      evaluated++;
+
+      const valComp   = evalOut.validationAccuracyScore?.composite;
+      const trainComp = evalOut.trainAccuracyScore?.composite;
+      if (!isFinite(valComp)) continue;
+
+      const gap = (isFinite(trainComp) ? trainComp : valComp) - valComp;
+      if (gap > maxTrainValGap) continue; // reject clear overfitting
+
+      if (valComp > groupBestVal + 1e-9) {
+        groupBestVal = valComp;
+        groupBest = {
+          overrides: { ...overrides },
+          validationComposite: valComp,
+          trainComposite: trainComp,
+          gap
+        };
+      }
+    }
+
+    const improved = groupBest && isFinite(groupBest.validationComposite) &&
+      (groupBest.validationComposite >= bestValComposite + minValGain);
+
+    if (improved) {
+      bestBundle = { ...groupBest.overrides };
+      bestValComposite = groupBest.validationComposite;
+    }
+
+    groupReports.push({
+      groupId: gid,
+      label: group.label,
+      evaluated,
+      bestValidationComposite: groupBest ? groupBest.validationComposite : null,
+      bestTrainComposite: groupBest ? groupBest.trainComposite : null,
+      gap: groupBest ? groupBest.gap : null,
+      adopted: !!improved,
+      deltaVsPreviousBest: groupBest && isFinite(bestValComposite)
+        ? (groupBest.validationComposite - (improved ? bestValComposite - (groupBest.validationComposite - bestValComposite) : bestValComposite))
+        : null
+    });
+  }
+
+  // Diff only the keys that actually differ from the original live baseline
+  const proposedDiff = {};
+  Object.keys(bestBundle).forEach(k => {
+    const live = baselineOverrides[k];
+    const prop = bestBundle[k];
+    if (Array.isArray(live) || Array.isArray(prop)) {
+      if (JSON.stringify(live) !== JSON.stringify(prop)) proposedDiff[k] = { live, proposed: prop };
+    } else if (live !== prop) {
+      proposedDiff[k] = { live, proposed: prop };
+    }
+  });
+
+  const report = {
+    phase: 4,
+    samplesPerGroup,
+    maxTrainValGap,
+    minValGain,
+    baselineValidationComposite: baselineValComposite,
+    bestValidationComposite: bestValComposite,
+    improved: bestValComposite > (isFinite(baselineValComposite) ? baselineValComposite : -Infinity) + minValGain,
+    groupReports,
+    proposedDiff,
+    bestBundle,
+    computedAt: new Date().toISOString()
+  };
+  engineDebug("Phase 4 grouped search complete", {
+    improved: report.improved,
+    baselineVal: baselineValComposite,
+    bestVal: bestValComposite,
+    groupsAdopted: groupReports.filter(g => g.adopted).map(g => g.groupId)
+  });
+  try { window.__lastPhase4GroupedSearch = report; } catch (e) {}
+  return report;
+}
+
 function calculateScoresOnlyCalibration(evaluationResults) {
   const valid = (evaluationResults || []).filter(r => r && isFinite(r.predictedMargin) && isFinite(r.actualMargin));
   if (!valid.length) return null;
@@ -17471,6 +17840,30 @@ async function runNbaSeasonBacktest(season, onProgress) {
   }
   if (!notes.length) notes.push("No flags this run — margin, total, and team-score bias are all within a reasonable range.");
 
+  // BACKTEST ROADMAP — PHASE 4: after the live-baseline evaluation, run one
+  // pass of grouped search over the Phase 3 feature cache. Scores only on
+  // the validation split. Final test split remains untouched (Phase 6 gate).
+  // Results are attached for inspection; nothing is locked or written live.
+  let groupedSearch = null;
+  try {
+    if (_btFeatures && allGames && allGames.length >= 50) {
+      groupedSearch = runGroupedParamSearchPhase4(
+        _btFeatures,
+        allGames,
+        validationAccuracyScore?.composite,
+        { samplesPerGroup: 8, maxTrainValGap: 8, minValGain: 0.5, seed: 42, league: "nba" }
+      );
+      if (groupedSearch?.improved) {
+        notes.push(`Phase 4 grouped search found a validation improvement (${(validationAccuracyScore?.composite ?? 0).toFixed(1)} → ${groupedSearch.bestValidationComposite.toFixed(1)}). Diff is in report.groupedSearch.proposedDiff — not applied live.`);
+      } else {
+        notes.push("Phase 4 grouped search ran; no group produced a clear validation gain over the live baseline (or gains failed the train-val gap guard).");
+      }
+    }
+  } catch (e) {
+    engineDebug("Phase 4 grouped search failed (non-fatal)", { error: e?.message || String(e) });
+    notes.push("Phase 4 grouped search errored — baseline report is still valid.");
+  }
+
   const report = {
     season, league: "nba",
     totalGames: allGames.length, evaluated: results.length, skipped,
@@ -17478,6 +17871,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
     validationFraction: _btValidationFraction, testFraction: _btTestFraction,
     train, validation, test,
     accuracyScore, trainAccuracyScore, validationAccuracyScore, testAccuracyScore,
+    groupedSearch,
     computedAt: new Date().toISOString()
   };
   engineDebug("Season backtest complete", report);
