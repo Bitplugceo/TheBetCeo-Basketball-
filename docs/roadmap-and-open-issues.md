@@ -23,15 +23,16 @@ effort.
 Status: 🟡 IN PROGRESS
 
 ## Active Work
-Current Phase: Phase 4 — Grouped search (real implementation exists,
-needs a real in-browser validation run + a decision on its scoring
-method before being called done — see Phase 4 below).
-Current Task: Run one real "Run Season Backtest" click in-browser
-against actual season data and confirm report.groupedSearch produces a
-sane, non-crashing result (nothing in this repo's automated tooling has
-executed this against real data yet — see "Verification performed" in
-Phase 3/4 below for what has been checked, and how).
-Next Task: Decide whether Phase 4's Accuracy-Score-based gate is the
+Current Phase: Phase 4 — Grouped search. First real in-browser run
+completed (1,231 games, 2025 season) and surfaced a real bug — see
+"REAL BUG FOUND AND FIXED THIS SESSION" in Phase 4 below. Fixed, not
+yet re-verified against real data.
+Current Task: Get a fresh in-browser "Run Season Backtest" click
+post-fix and confirm the numbers look plausible (smaller, more
+believable baseline-vs-candidate gap; any group marked adopted:true
+actually shows up in proposedDiff).
+Next Task: Once that's confirmed, decide whether Phase 4's
+Accuracy-Score-based gate (flat threshold + overfitting guard) is the
 final design, or whether real statistical significance testing should
 be layered on before Phase 5 (multi-pass re-validation) is built on top
 of it.
@@ -112,6 +113,26 @@ This session (see commit history for exact diffs):
   runGroupedParamSearchPhase4 chain (see Phase 3/4 "Verification
   performed" below)
 - Rewrote this Current Status dashboard and the per-phase notes below
+
+Follow-up, same engagement, after a real in-browser run:
+- User ran "Run Season Backtest" for real (1,231 games, 2025 season,
+  78 skipped) — first real-data execution of Phase 3/4
+- Result showed report.groupedSearch.proposedDiff was empty ({}) despite
+  improved:true and groupsAdopted:["A_H2H"] — a contradiction worth
+  investigating rather than accepting
+- Traced it to a real bug: evaluateFeatureCacheWithOverrides never
+  cleared AppState.context.data before evaluating candidates, so every
+  game during Phase 4's search picked up one stale matchup's real venue
+  data (via getFetchedSeries, which reads AppState.context.data
+  directly) instead of its own — a constant, config-independent
+  distortion. Full reasoning in Phase 4's section below.
+- Fixed: added the same AppState.context.data reset
+  runNbaSeasonBacktest's own loop already does. Verified the fix doesn't
+  break control flow (updated smoke test); did not yet verify the fix's
+  actual effect on real numbers — needs a fresh real run.
+- The 51.0 → 59.3 result and the A_H2H adoption from that first run are
+  flagged as untrustworthy — likely measuring the leaked venue data, not
+  a real H2H effect
 
 ## Pending Work
 Next Milestone: get a real in-browser season-backtest run recorded (see
@@ -494,7 +515,65 @@ Status: 🟡 Partially complete. A real, working, integrated
 implementation exists and runs automatically at the end of every
 runNbaSeasonBacktest call — this is further than "not started," but it
 deviates from this section's original spec in one material way (below),
-and hasn't been run against real data yet, so it isn't marked ✅.
+had a real, confirmed bug (also below, now fixed), and hasn't been
+re-run against real data since the fix, so it isn't marked ✅.
+
+REAL BUG FOUND AND FIXED THIS SESSION: the first real in-browser run
+(1,231 games, 2025 season) reported Phase 4 found a validation
+improvement of 51.0 → 59.3 with Group A (H2H) adopted — but
+report.groupedSearch.proposedDiff came back completely empty ({}),
+even though an "adopted" H2H candidate should differ from the live
+baseline in at least one parameter. Investigated: all 9 evaluated H2H
+candidates (spanning h2hFactor 0.70-1.00, h2hMaxWeight 0.20-0.40, etc.)
+scored bit-identical composite values (59.307912155721375, matching to
+the full double-precision digit) — as did all 9 Threshold-group
+candidates. That level of identical-to-15-digits agreement across
+genuinely different parameter values is not "no real effect," it's a
+sign the override isn't reaching the computation that should vary with
+it.
+
+Root cause, confirmed by reading the code: evaluateFeatureCacheWithOverrides
+saves AppState.context.data (to restore later) but never clears it to a
+known-empty state, unlike runNbaSeasonBacktest's own loop, which
+explicitly sets AppState.context.data = defaultMassacreFetchContext()
+before it starts. By the time Phase 4's search runs (after
+runNbaSeasonBacktest's own loop has finished and its finally block has
+already restored AppState.context.data to whatever the live app had
+loaded before the backtest button was clicked), AppState.context.data
+holds one real matchup's real venue data — not each game's own context.
+getFetchedSeries(), which computeFTProjection's venue-blend logic calls
+internally, reads AppState.context.data directly (not the per-game
+feature cache), so every game evaluated during Phase 4's search was
+picking up that same one stale matchup's venue numbers instead of its
+own. That's a constant, config-independent distortion applied
+identically to every candidate — consistent with H2H/threshold
+candidates (which don't touch venue blending) tying exactly, and with
+Group B/C showing small real variation on top of it (teamWeightBase and
+fatigueB2BPenalty are correctly threaded through and do have a small
+real effect). It also explains why the "baseline" candidate inside the
+search (which should reproduce the live config exactly) scored ~8
+Accuracy Score points above the same config evaluated cleanly by the
+main loop — the gap is the leaked venue data, not a measurement
+difference in method.
+
+Fix applied: added the same AppState.context.data =
+defaultMassacreFetchContext() reset to evaluateFeatureCacheWithOverrides
+that runNbaSeasonBacktest's own loop already does, restored via the
+existing finally block exactly as before. This is what the function's
+own pre-existing comment ("do not inherit leftover state from the
+baseline run") already claimed happened — it just didn't, until now.
+
+Practical implication: the 51.0 → 59.3 improvement and the
+groupsAdopted: ["A_H2H"] result from that first run should not be
+trusted — it's very likely measuring leaked venue data, not a genuine
+H2H parameter effect. Needs a fresh in-browser run post-fix before any
+Phase 4 output is treated as meaningful. Verified only that the fix
+doesn't break the function's control flow (syntax check + a
+stub-based smoke test, which can't exercise this specific bug since the
+stub never calls the real getFetchedSeries/AppState path) — the real
+confirmation is a fresh real-data run producing a smaller, more
+plausible baseline-vs-candidate gap and groups whose adopted candidates
+actually show up in proposedDiff when adopted:true.
 
 What's actually in the code:
 - BACKTEST_PARAM_GROUPS defines the four groups from this section
