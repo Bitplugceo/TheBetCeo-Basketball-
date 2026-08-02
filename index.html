@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17018,6 +17019,19 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
   const includeTest = !!options.includeTest; // must stay false for Phase 4/5
   const results = [];
   let skipped = 0;
+  let firstError = null;
+  let finiteProjCount = 0;
+
+  // Mirror the main season-backtest loop: some compute paths still read the
+  // team-series inputs / series-date cache. Prime them from the feature cache
+  // so Phase 4 evaluations are not DOM-dependent and do not inherit leftover
+  // state from the baseline run.
+  const domA = document.getElementById("aFTScored");
+  const domB = document.getElementById("bFTScored");
+  const savedA = domA ? domA.value : null;
+  const savedB = domB ? domB.value : null;
+  const savedContextData = (typeof AppState !== "undefined" && AppState.context) ? AppState.context.data : null;
+  const savedSeriesDateCache = window.__seriesDateCache;
 
   const originalGetParam = window.getParam;
   window.getParam = function(key, lg) {
@@ -17028,6 +17042,7 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
   };
 
   try {
+    window.__seriesDateCache = {};
     for (let i = 0; i < allGames.length; i++) {
       const game = allGames[i];
       const feat = features[i];
@@ -17039,6 +17054,9 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
       if (!teamWindow.scored || teamWindow.scored.length < 5 || !oppWindow.scored || oppWindow.scored.length < 5) {
         skipped++; continue;
       }
+
+      if (domA) domA.value = (teamWindow.scored || []).join(",");
+      if (domB) domB.value = (oppWindow.scored || []).join(",");
 
       const teamH1Window = { scored: feat.teamH1Scored, allowed: feat.parsed.a1HAllowed };
       const oppH1Window  = { scored: feat.oppH1Scored,  allowed: feat.parsed.b1HAllowed };
@@ -17056,7 +17074,9 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
       try {
         const gms = buildGlobalModelState({ league, parsed, lines: {}, injMultA: 1, injMultB: 1 });
         if (isFinite(gms?.volState?.combinedVolRatio)) combinedVolRatio = gms.volState.combinedVolRatio;
-      } catch (e) {}
+      } catch (e) {
+        if (!firstError) firstError = "buildGlobalModelState: " + (e?.message || String(e));
+      }
 
       const _ftSampleTier = getSampleTier(teamWindow.scored, oppWindow.scored);
       const _h1SampleTier = getSampleTier(teamH1Window.scored, oppH1Window.scored);
@@ -17076,8 +17096,12 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
       let calc;
       try {
         calc = computeFTProjection({ league, parsed, lines: {}, injMultA: 1, injMultB: 1, config: _btConfig });
-      } catch (e) { skipped++; continue; }
-      if (!isFinite(calc.projAFT) || !isFinite(calc.projBFT)) { skipped++; continue; }
+      } catch (e) {
+        if (!firstError) firstError = "computeFTProjection: " + (e?.message || String(e));
+        skipped++; continue;
+      }
+      if (!calc || !isFinite(calc.projAFT) || !isFinite(calc.projBFT)) { skipped++; continue; }
+      finiteProjCount++;
 
       let calc1H = null;
       try {
@@ -17126,17 +17150,40 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
     }
   } finally {
     window.getParam = originalGetParam;
+    if (domA) domA.value = savedA ?? "";
+    if (domB) domB.value = savedB ?? "";
+    if (typeof AppState !== "undefined" && AppState.context) AppState.context.data = savedContextData;
+    window.__seriesDateCache = savedSeriesDateCache;
   }
 
   const trainCal = calculateScoresOnlyCalibration(results.filter(r => r.split === "train"));
   const valCal   = calculateScoresOnlyCalibration(results.filter(r => r.split === "validation"));
+  const trainScore = computeBacktestAccuracyScore(trainCal);
+  const valScore   = computeBacktestAccuracyScore(valCal);
+
+  // Diagnostic: surface why a candidate produced no usable score (first error,
+  // how many games actually produced finite projections, result counts).
+  if (!isFinite(valScore?.composite) && typeof engineDebug === "function") {
+    engineDebug("Phase 4 evaluateFeatureCacheWithOverrides: non-finite validation score", {
+      results: results.length,
+      skipped,
+      finiteProjCount,
+      trainN: trainCal?.n ?? 0,
+      valN: valCal?.n ?? 0,
+      firstError: firstError || null,
+      overrideKeys: paramOverrides ? Object.keys(paramOverrides).slice(0, 12) : []
+    });
+  }
+
   return {
     results,
     skipped,
+    finiteProjCount,
+    firstError,
     trainCalibration: trainCal,
     validationCalibration: valCal,
-    trainAccuracyScore: computeBacktestAccuracyScore(trainCal),
-    validationAccuracyScore: computeBacktestAccuracyScore(valCal)
+    trainAccuracyScore: trainScore,
+    validationAccuracyScore: valScore
   };
 }
 
@@ -17200,7 +17247,22 @@ function runGroupedParamSearchPhase4(features, allGames, baselineValComposite, o
 
       const valComp   = evalOut.validationAccuracyScore?.composite;
       const trainComp = evalOut.trainAccuracyScore?.composite;
-      if (!isFinite(valComp)) continue;
+      if (!isFinite(valComp)) {
+        // Keep the first non-finite reason visible so we can see whether the
+        // evaluator is still short-circuiting after the DOM/series priming fix.
+        if (evaluated <= 2) {
+          engineDebug("Phase 4 candidate non-finite val score", {
+            group: gid,
+            evaluated,
+            finiteProjCount: evalOut.finiteProjCount,
+            skipped: evalOut.skipped,
+            firstError: evalOut.firstError || null,
+            trainN: evalOut.trainCalibration?.n,
+            valN: evalOut.validationCalibration?.n
+          });
+        }
+        continue;
+      }
 
       const gap = (isFinite(trainComp) ? trainComp : valComp) - valComp;
       if (gap > maxTrainValGap) continue; // reject clear overfitting
