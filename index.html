@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17238,11 +17237,22 @@ function runGroupedParamSearchPhase4(features, allGames, baselineValComposite, o
   const rng             = _btMulberry32(seed);
   const league          = options.league || "nba";
 
+  // BACKTEST ROADMAP PHASE 5 HOOK: optional startingOverrides lets an outer
+  // caller (runCrossGroupRevalidationPhase5) re-run this same single-pass
+  // group loop starting from a previous pass's best bundle instead of the
+  // live registry config. Omitted (as at the original Phase 4 call site),
+  // behavior is unchanged — baselineOverrides still comes straight from
+  // getParam(). This is the only change made to Phase 4 code; the group
+  // loop logic itself is untouched.
   const baselineOverrides = {};
-  Object.keys(TUNABLE_PARAM_REGISTRY).forEach(k => {
-    const v = getParam(k, league);
-    if (v !== undefined && v !== null) baselineOverrides[k] = v;
-  });
+  if (options.startingOverrides && typeof options.startingOverrides === "object") {
+    Object.assign(baselineOverrides, options.startingOverrides);
+  } else {
+    Object.keys(TUNABLE_PARAM_REGISTRY).forEach(k => {
+      const v = getParam(k, league);
+      if (v !== undefined && v !== null) baselineOverrides[k] = v;
+    });
+  }
 
   let bestBundle = { ...baselineOverrides };
   let bestValComposite = isFinite(baselineValComposite) ? baselineValComposite : -Infinity;
@@ -17367,6 +17377,106 @@ function runGroupedParamSearchPhase4(features, allGames, baselineValComposite, o
     groupsAdopted: groupReports.filter(g => g.adopted).map(g => g.groupId)
   });
   try { window.__lastPhase4GroupedSearch = report; } catch (e) {}
+  return report;
+}
+
+// ===================================================================
+// BACKTEST ROADMAP — PHASE 5 (cross-group re-validation loop): COMPLETE.
+// Continues from Phase 4's single pass — reused here as pass 1, never
+// recomputed — with additional outer passes, each starting from the
+// previous pass's best full bundle instead of the live config, so a
+// later group can still react to (or force a re-check of) an earlier
+// group's pick. Stops once a full pass adopts nothing new, or after
+// maxOuterPasses (default 4). Validation-only; final test slice still
+// untouched (Phase 6 owns that gate). Nothing is written live.
+// Do not re-run pass 1's evaluation here or add a lock/write step —
+// continue with Phase 6 next.
+// ===================================================================
+function runCrossGroupRevalidationPhase5(features, allGames, phase4Result, options) {
+  options = options || {};
+  const maxOuterPasses = Math.max(1, Math.min(8, options.maxOuterPasses || 4));
+  const league = options.league || "nba";
+
+  if (!phase4Result || !phase4Result.bestBundle) {
+    return null;
+  }
+
+  const liveOverrides = {};
+  Object.keys(TUNABLE_PARAM_REGISTRY).forEach(k => {
+    const v = getParam(k, league);
+    if (v !== undefined && v !== null) liveOverrides[k] = v;
+  });
+
+  let currentOverrides = { ...phase4Result.bestBundle };
+  let currentValComposite = phase4Result.bestValidationComposite;
+  const passReports = [{
+    pass: 1,
+    anyAdopted: phase4Result.groupReports.some(g => g.adopted),
+    bestValidationComposite: currentValComposite,
+    groupsAdopted: phase4Result.groupReports.filter(g => g.adopted).map(g => g.groupId),
+    reused: true
+  }];
+
+  let stoppedEarly = !passReports[0].anyAdopted;
+
+  for (let pass = 2; pass <= maxOuterPasses && !stoppedEarly; pass++) {
+    const passResult = runGroupedParamSearchPhase4(
+      features, allGames, currentValComposite,
+      {
+        samplesPerGroup: options.samplesPerGroup || 8,
+        maxTrainValGap: options.maxTrainValGap || 8,
+        minValGain: options.minValGain || 0.5,
+        seed: (options.seed || 42) + pass,
+        league,
+        startingOverrides: currentOverrides
+      }
+    );
+
+    const anyAdopted = passResult.groupReports.some(g => g.adopted);
+    passReports.push({
+      pass,
+      anyAdopted,
+      bestValidationComposite: passResult.bestValidationComposite,
+      groupsAdopted: passResult.groupReports.filter(g => g.adopted).map(g => g.groupId)
+    });
+
+    currentOverrides = { ...passResult.bestBundle };
+    currentValComposite = passResult.bestValidationComposite;
+
+    if (!anyAdopted) stoppedEarly = true;
+  }
+
+  const proposedDiff = {};
+  Object.keys(currentOverrides).forEach(k => {
+    const live = liveOverrides[k];
+    const prop = currentOverrides[k];
+    if (Array.isArray(live) || Array.isArray(prop)) {
+      if (JSON.stringify(live) !== JSON.stringify(prop)) proposedDiff[k] = { live, proposed: prop };
+    } else if (live !== prop) {
+      proposedDiff[k] = { live, proposed: prop };
+    }
+  });
+
+  const report = {
+    phase: 5,
+    maxOuterPasses,
+    passesRun: passReports.length,
+    stoppedEarly,
+    baselineValidationComposite: phase4Result.baselineValidationComposite,
+    bestValidationComposite: currentValComposite,
+    improved: currentValComposite > (isFinite(phase4Result.baselineValidationComposite) ? phase4Result.baselineValidationComposite : -Infinity) + (options.minValGain || 0.5),
+    passReports,
+    proposedDiff,
+    bestBundle: currentOverrides,
+    computedAt: new Date().toISOString()
+  };
+  engineDebug("Phase 5 cross-group revalidation complete", {
+    improved: report.improved,
+    passesRun: report.passesRun,
+    stoppedEarly,
+    bestVal: currentValComposite
+  });
+  try { window.__lastPhase5CrossGroupSearch = report; } catch (e) {}
   return report;
 }
 
@@ -17960,6 +18070,30 @@ async function runNbaSeasonBacktest(season, onProgress) {
     notes.push("Phase 4 grouped search errored — baseline report is still valid.");
   }
 
+  // BACKTEST ROADMAP — PHASE 5 (cross-group re-validation): runs after
+  // Phase 4's single pass, reusing its result as pass 1. Validation-only;
+  // final test slice untouched (Phase 6 gate). See function header above
+  // for the full Phase 5 lock note.
+  let crossGroupSearch = null;
+  try {
+    if (groupedSearch) {
+      crossGroupSearch = runCrossGroupRevalidationPhase5(
+        _btFeatures,
+        allGames,
+        groupedSearch,
+        { samplesPerGroup: 8, maxTrainValGap: 8, minValGain: 0.5, seed: 42, maxOuterPasses: 4, league: "nba" }
+      );
+      if (crossGroupSearch?.improved) {
+        notes.push(`Phase 5 cross-group re-validation found a further validation improvement over Phase 4 (${crossGroupSearch.passesRun} pass${crossGroupSearch.passesRun === 1 ? "" : "es"}, best ${crossGroupSearch.bestValidationComposite.toFixed(1)}). Diff is in report.crossGroupSearch.proposedDiff — not applied live.`);
+      } else {
+        notes.push(`Phase 5 cross-group re-validation ran (${crossGroupSearch?.passesRun ?? 0} pass${crossGroupSearch?.passesRun === 1 ? "" : "es"}); no further gain beyond Phase 4's result.`);
+      }
+    }
+  } catch (e) {
+    engineDebug("Phase 5 cross-group revalidation failed (non-fatal)", { error: e?.message || String(e) });
+    notes.push("Phase 5 cross-group re-validation errored — Phase 4 report is still valid.");
+  }
+
   const report = {
     season, league: "nba",
     totalGames: allGames.length, evaluated: results.length, skipped,
@@ -17968,6 +18102,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
     train, validation, test,
     accuracyScore, trainAccuracyScore, validationAccuracyScore, testAccuracyScore,
     groupedSearch,
+    crossGroupSearch,
     computedAt: new Date().toISOString()
   };
   engineDebug("Season backtest complete", report);
