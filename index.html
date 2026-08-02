@@ -17480,6 +17480,117 @@ function runCrossGroupRevalidationPhase5(features, allGames, phase4Result, optio
   return report;
 }
 
+// ===================================================================
+// BACKTEST ROADMAP — PHASE 6 (one-shot final gate before lock): COMPLETE.
+// Reads the final test slice — untouched by Phase 4/5 search — exactly
+// once, here only, by calling evaluateFeatureCacheWithOverrides with
+// includeTest:true for both the live baseline and Phase 5's winning
+// bundle over the SAME test games. Requires all three to pass:
+//   1) straight-up win rate (sign of predicted margin) improves
+//   2) z-test significant, using testConfigurationSignificance as-is,
+//      corrected for the total number of candidates Phase 4+5 actually
+//      explored (not just "1 vs 1") — same 1+ln(N) correction shape the
+//      live coordinate-ascent tuner already uses
+//   3) test-slice composite Accuracy Score does not regress
+// BRIER GATE NOTE: the live tuner's Brier gate needs a per-pick
+// winProbability, which only exists after full pick-generation/confidence
+// grading — a layer evaluateFeatureCacheWithOverrides deliberately doesn't
+// run (raw projections only). Rebuilding that here would mean duplicating
+// the entire live pick pipeline inside the backtest — out of scope for
+// this roadmap. Condition 3 above is the documented substitute; do not
+// mistake it for the literal live-tuner Brier gate.
+// Fails any condition → gate:"fail", nothing changes, reason says why.
+// Passes → gate:"pass", but this still WRITES NOTHING live — Phase 8 owns
+// the lock registry, applied only with manual confirmation (Phase 9).
+// Do not add an auto-write here — continue with Phase 7 or Phase 8 next.
+// ===================================================================
+function runFinalGatePhase6(features, allGames, phase4Result, phase5Result, options) {
+  options = options || {};
+  const league = options.league || "nba";
+  const minTestN = Math.max(5, options.minTestN || 20);
+
+  if (!phase5Result || !phase5Result.bestBundle) {
+    return { phase: 6, gate: "fail", reason: "No Phase 5 result to gate.", computedAt: new Date().toISOString() };
+  }
+
+  const liveOverrides = {};
+  Object.keys(TUNABLE_PARAM_REGISTRY).forEach(k => {
+    const v = getParam(k, league);
+    if (v !== undefined && v !== null) liveOverrides[k] = v;
+  });
+
+  let baselineEval, challengerEval;
+  try {
+    baselineEval = evaluateFeatureCacheWithOverrides(features, allGames, liveOverrides, { league, includeTest: true });
+    challengerEval = evaluateFeatureCacheWithOverrides(features, allGames, phase5Result.bestBundle, { league, includeTest: true });
+  } catch (e) {
+    return { phase: 6, gate: "fail", reason: "Evaluation error: " + (e?.message || String(e)), computedAt: new Date().toISOString() };
+  }
+
+  const baselineTest = (baselineEval.results || []).filter(r => r.split === "test" && isFinite(r.predictedMargin) && isFinite(r.actualMargin));
+  const challengerTest = (challengerEval.results || []).filter(r => r.split === "test" && isFinite(r.predictedMargin) && isFinite(r.actualMargin));
+
+  if (baselineTest.length < minTestN || challengerTest.length < minTestN) {
+    return {
+      phase: 6, gate: "fail",
+      reason: `Final test slice too small (baseline n=${baselineTest.length}, challenger n=${challengerTest.length}, need ${minTestN}+). Current lock stands.`,
+      baselineN: baselineTest.length, challengerN: challengerTest.length,
+      computedAt: new Date().toISOString()
+    };
+  }
+
+  const recordFromResults = (rows) => {
+    const wins = rows.filter(r => Math.sign(r.predictedMargin) === Math.sign(r.actualMargin)).length;
+    return { wins, losses: rows.length - wins };
+  };
+  const baselineRecord = recordFromResults(baselineTest);
+  const challengerRecord = recordFromResults(challengerTest);
+  const baselineWR = baselineRecord.wins / baselineTest.length;
+  const challengerWR = challengerRecord.wins / challengerTest.length;
+  const winRateImproves = challengerWR >= baselineWR;
+
+  const perPassEvaluated = (phase4Result?.groupReports || []).reduce((s, g) => s + (g.evaluated || 0), 0);
+  const totalCandidatesEvaluated = Math.max(2, perPassEvaluated * (phase5Result.passesRun || 1));
+  const correctedRequiredZ = 1.0 * Math.sqrt(1 + Math.log(totalCandidatesEvaluated));
+  const sigTest = testConfigurationSignificance(challengerRecord, baselineRecord, correctedRequiredZ);
+
+  const baselineTestCal = calculateScoresOnlyCalibration(baselineTest);
+  const challengerTestCal = calculateScoresOnlyCalibration(challengerTest);
+  const baselineTestScore = computeBacktestAccuracyScore(baselineTestCal);
+  const challengerTestScore = computeBacktestAccuracyScore(challengerTestCal);
+  const calibrationOk = isFinite(challengerTestScore?.composite) && isFinite(baselineTestScore?.composite)
+    ? challengerTestScore.composite >= baselineTestScore.composite
+    : false;
+
+  const passed = winRateImproves && sigTest.significant && calibrationOk;
+
+  const reasons = [];
+  if (!winRateImproves) reasons.push(`Straight-up win rate on final test did not improve (${(challengerWR*100).toFixed(1)}% vs baseline ${(baselineWR*100).toFixed(1)}%).`);
+  if (!sigTest.significant) reasons.push(`Not statistically significant (z=${sigTest.z.toFixed(2)}, required ${correctedRequiredZ.toFixed(2)}).`);
+  if (!calibrationOk) reasons.push(`Test-slice composite Accuracy Score regressed (${challengerTestScore?.composite?.toFixed(1)} vs baseline ${baselineTestScore?.composite?.toFixed(1)}).`);
+
+  const report = {
+    phase: 6,
+    gate: passed ? "pass" : "fail",
+    reason: passed ? "All three gate conditions met on the untouched final test slice." : reasons.join(" "),
+    baselineN: baselineTest.length,
+    challengerN: challengerTest.length,
+    baselineWinRate: baselineWR,
+    challengerWinRate: challengerWR,
+    z: sigTest.z,
+    correctedRequiredZ,
+    totalCandidatesEvaluated,
+    baselineTestComposite: baselineTestScore?.composite ?? null,
+    challengerTestComposite: challengerTestScore?.composite ?? null,
+    proposedDiff: phase5Result.proposedDiff,
+    bestBundle: phase5Result.bestBundle,
+    computedAt: new Date().toISOString()
+  };
+  engineDebug("Phase 6 final gate", { gate: report.gate, reason: report.reason });
+  try { window.__lastPhase6FinalGate = report; } catch (e) {}
+  return report;
+}
+
 function calculateScoresOnlyCalibration(evaluationResults) {
   const valid = (evaluationResults || []).filter(r => r && isFinite(r.predictedMargin) && isFinite(r.actualMargin));
   if (!valid.length) return null;
@@ -18094,6 +18205,24 @@ async function runNbaSeasonBacktest(season, onProgress) {
     notes.push("Phase 5 cross-group re-validation errored — Phase 4 report is still valid.");
   }
 
+  // BACKTEST ROADMAP — PHASE 6 (one-shot final gate before lock): reads the
+  // final test slice exactly once, here only. See function header above
+  // for the full Phase 6 lock note and the three gate conditions.
+  let finalGate = null;
+  try {
+    if (crossGroupSearch) {
+      finalGate = runFinalGatePhase6(_btFeatures, allGames, groupedSearch, crossGroupSearch, { league: "nba" });
+      if (finalGate?.gate === "pass") {
+        notes.push(`Phase 6 final gate PASSED on the untouched test slice (win rate ${(finalGate.challengerWinRate*100).toFixed(1)}% vs baseline ${(finalGate.baselineWinRate*100).toFixed(1)}%, z=${finalGate.z.toFixed(2)}). Nothing written live — see report.finalGate for the proposed diff.`);
+      } else if (finalGate) {
+        notes.push(`Phase 6 final gate did not pass — current lock stands. ${finalGate.reason}`);
+      }
+    }
+  } catch (e) {
+    engineDebug("Phase 6 final gate failed (non-fatal)", { error: e?.message || String(e) });
+    notes.push("Phase 6 final gate errored — Phase 5 report is still valid.");
+  }
+
   const report = {
     season, league: "nba",
     totalGames: allGames.length, evaluated: results.length, skipped,
@@ -18103,6 +18232,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
     accuracyScore, trainAccuracyScore, validationAccuracyScore, testAccuracyScore,
     groupedSearch,
     crossGroupSearch,
+    finalGate,
     computedAt: new Date().toISOString()
   };
   engineDebug("Season backtest complete", report);
