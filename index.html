@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13056,22 +13055,11 @@ function getEffectivePaceClamp(league) {
   return validateLines(league, lines.ftLine, lines.h1Line, lines.aLine, lines.bLine);
 }
 
-function getOverallSeries(side, limit, parsed) {
+function getOverallSeries(side, limit) {
   const n = Math.max(2, Math.min(Number(limit) || 25, 25));
 
-  // BACKTEST PURITY: when a parsed bag is supplied (feature cache / headless
-  // path), read scored series from it first. Never touch DOM or AppState in
-  // that path — removes the last reason the BT loops had to write into
-  // #aFTScored / #bFTScored.
-  if (parsed && typeof parsed === "object") {
-    const fromParsed = side === "A" ? parsed.aFTScored : parsed.bFTScored;
-    const clean = Array.isArray(fromParsed)
-      ? fromParsed.map(Number).filter(v => isFinite(v) && v > 0)
-      : [];
-    if (clean.length >= 2) return clean.slice(0, n);
-  }
-
-  const fieldId = side === "A" ? "aFTScored" : "bFTScored";
+  
+  const fieldId = side = "A" ? "aFTScored" : "bFTScored";
 
   const manual = readLooseSeries(fieldId);
   if (manual.length >= 2) return manual.slice(0, n);
@@ -15726,11 +15714,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const leagueBase = eb / 2;
   const volLimit = getMarketVolLimit(league, "ft");
 
-  // BACKTEST PURITY: pass parsed so headless / feature-cache runs never
-  // touch DOM. Live single-pick runs still fall through to DOM / AppState
-  // when parsed has no aFTScored / bFTScored.
-  const aFTS = getOverallSeries("A", 10, parsed);
-  const bFTS = getOverallSeries("B", 10, parsed);
+  const aFTS = getOverallSeries("A", 10);
+  const bFTS = getOverallSeries("B", 10);
   const aFTA = getManualAllowedSeries("A", "ft", parsed);
   const bFTA = getManualAllowedSeries("B", "ft", parsed);
 
@@ -16885,10 +16870,6 @@ function buildBacktestFeatureCache(gameLogs, allGames, splitBoundaries, onProgre
       restDaysB: _btRestDays(gameLogs[game.oppId], game.date),
       split: gameMs >= testStartMs ? "test" : gameMs >= validationStartMs ? "validation" : "train",
       parsed: {
-        // BACKTEST PURITY: FT scored series now live in parsed so
-        // getOverallSeries(side, n, parsed) can feed computeFTProjection
-        // without any DOM write.
-        aFTScored: teamWindow.scored, bFTScored: oppWindow.scored,
         aFTAllowed: teamWindow.allowed, bFTAllowed: oppWindow.allowed,
         a1HScored: teamH1Window.scored, b1HScored: oppH1Window.scored,
         a1HAllowed: teamH1Window.allowed, b1HAllowed: oppH1Window.allowed,
@@ -17042,12 +17023,36 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
   let firstError = null;
   let finiteProjCount = 0;
 
-  // BACKTEST PURITY: series now flow through feat.parsed → getOverallSeries.
-  // No DOM priming. Still clear AppState.context.data so getFetchedSeries
-  // (venue) cannot leak a live matchup's venue splits into every candidate.
-  const savedContextData = (typeof AppState !== "undefined" && AppState.context) ? AppState.context.data : null;
+  // Mirror the main season-backtest loop: some compute paths still read the
+  // team-series inputs / series-date cache. Prime them from the feature cache
+  // so Phase 4 evaluations are not DOM-dependent and do not inherit leftover
+  // state from the baseline run.
+  const domA = document.getElementById("aFTScored");
+  const domB = document.getElementById("bFTScored");
+  const savedA = domA ? domA.value : null;
+  const savedB = domB ? domB.value : null;
+  const savedContextData = (typeof AppState ! "undefined" && AppState.context) ? AppState.context.data : null;
   const savedSeriesDateCache = window.__seriesDateCache;
-  if (typeof AppState !== "undefined" && AppState.context) AppState.context.data = defaultMassacreFetchContext();
+  // BUGFIX (found verifying a real backtest run — see roadmap Phase 4 notes):
+  // this function saved AppState.context.data but never cleared it, unlike
+  // runNbaSeasonBacktest's own loop (which sets it to
+  // defaultMassacreFetchContext() before it starts). By the time this runs,
+  // runNbaSeasonBacktest's own `finally` block has already restored
+  // AppState.context.data to whatever the live app had loaded *before* the
+  // backtest button was clicked — a real matchup's real venue splits.
+  // getFetchedSeries() (used inside computeFTProjection's venue-blend logic)
+  // reads AppState.context.data directly, not the per-game feature cache, so
+  // every game evaluated here was picking up that one stale matchup's venue
+  // data instead of its own — a constant, config-independent distortion
+  // applied identically to every candidate. That's consistent with what a
+  // real run showed: groups whose parameters don't touch venue blending
+  // (H2H, thresholds) produced bit-identical composite scores across every
+  // sampled candidate, and the "baseline" candidate here scored ~8 Accuracy
+  // Score points above the same config evaluated cleanly by the main loop.
+  // Resetting here — matching runNbaSeasonBacktest's own pattern — is what
+  // the comment above ("do not inherit leftover state from the baseline
+  // run") already claimed this function did.
+  if (typeof AppState ! "undefined" && AppState.context) AppState.context.data = defaultMassacreFetchContext();
 
   const originalGetParam = window.getParam;
   window.getParam = function(key, lg) {
@@ -17059,17 +17064,20 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
 
   try {
     window.__seriesDateCache = {};
-    for (let i = 0; i < allGames.length; i++) {
+    for (let i = 0; i < allGames.length; i) {
       const game = allGames[i];
       const feat = features[i];
-      if (!feat) { skipped++; continue; }
-      if (!includeTest && feat.split === "test") continue;
+      if (!feat) { skipped; continue; }
+      if (!includeTest && feat.split = "test") continue;
 
       const teamWindow = { scored: feat.teamScored, allowed: feat.teamAllowed };
       const oppWindow  = { scored: feat.oppScored,  allowed: feat.oppAllowed };
       if (!teamWindow.scored || teamWindow.scored.length < 5 || !oppWindow.scored || oppWindow.scored.length < 5) {
-        skipped++; continue;
+        skipped; continue;
       }
+
+      if (domA) domA.value = (teamWindow.scored || []).join(",");
+      if (domB) domB.value = (oppWindow.scored || []).join(",");
 
       const teamH1Window = { scored: feat.teamH1Scored, allowed: feat.parsed.a1HAllowed };
       const oppH1Window  = { scored: feat.oppH1Scored,  allowed: feat.parsed.b1HAllowed };
@@ -17178,11 +17186,13 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
     }
   } finally {
     window.getParam = originalGetParam;
-    if (typeof AppState !== "undefined" && AppState.context) AppState.context.data = savedContextData;
+    if (domA) domA.value = savedA ?? "";
+    if (domB) domB.value = savedB ?? "";
+    if (typeof AppState ! "undefined" && AppState.context) AppState.context.data = savedContextData;
     window.__seriesDateCache = savedSeriesDateCache;
   }
 
-  const trainCal = calculateScoresOnlyCalibration(results.filter(r => r.split === "train"));
+  const trainCal = calculateScoresOnlyCalibration(results.filter(r => r.split = "train"));
   const valCal   = calculateScoresOnlyCalibration(results.filter(r => r.split = "validation"));
   const trainScore = computeBacktestAccuracyScore(trainCal);
   const valScore   = computeBacktestAccuracyScore(valCal);
@@ -17923,9 +17933,10 @@ async function runNbaSeasonBacktest(season, onProgress) {
     engineDebug("Season backtest data cached in memory", { season, games: allGames.length });
   }
 
-  // BACKTEST PURITY: series flow through feat.parsed. No DOM priming.
-  // AppState.context.data is still cleared so venue reads cannot leak a
-  // live matchup into the season sweep.
+  const domA = document.getElementById("aFTScored");
+  const domB = document.getElementById("bFTScored");
+  const savedA = domA ? domA.value : null;
+  const savedB = domB ? domB.value : null;
   const savedContextData = AppState.context.data;
   const savedSeriesDateCache = window.__seriesDateCache;
   AppState.context.data = defaultMassacreFetchContext();
@@ -17969,7 +17980,10 @@ async function runNbaSeasonBacktest(season, onProgress) {
       const teamWindow = { scored: feat.teamScored, allowed: feat.teamAllowed };
       const oppWindow = { scored: feat.oppScored, allowed: feat.oppAllowed };
 
-      if (teamWindow.scored.length < 5 || oppWindow.scored.length < 5) { skipped++; continue; }
+      if (teamWindow.scored.length < 5 || oppWindow.scored.length < 5) { skipped; continue; }
+
+      if (domA) domA.value = teamWindow.scored.join(",");
+      if (domB) domB.value = oppWindow.scored.join(",");
 
       const teamH1Window = { scored: feat.teamH1Scored, allowed: feat.parsed.a1HAllowed };
       const oppH1Window = { scored: feat.oppH1Scored, allowed: feat.parsed.b1HAllowed };
@@ -18086,6 +18100,8 @@ async function runNbaSeasonBacktest(season, onProgress) {
       });
     }
   } finally {
+    if (domA) domA.value = savedA ?? "";
+    if (domB) domB.value = savedB ?? "";
     AppState.context.data = savedContextData;
     window.__seriesDateCache = savedSeriesDateCache;
   }
