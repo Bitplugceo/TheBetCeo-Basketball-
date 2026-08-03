@@ -1,4 +1,3 @@
-k
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -12275,6 +12274,43 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
   return true;
 }
 
+async function clearAllPendingTrackedPicks() {
+  if (!AppState?.tracker?.state) return { removed: 0 };
+  const active = Array.isArray(AppState.tracker.state.activePicks) ? AppState.tracker.state.activePicks : [];
+  const pending = active.filter(p => String(p?.resultStatus || "pending").toLowerCase() === "pending");
+  if (!pending.length) return { removed: 0 };
+
+  if (!Array.isArray(AppState.tracker.state.deletedSignatures)) {
+    AppState.tracker.state.deletedSignatures = [];
+  }
+  pending.forEach(pick => {
+    const slotKey = makeTrackerActiveMergeKey(pick);
+    const realSig = makeTrackedSignature(pick);
+    [slotKey, realSig, pick.signature, pick.pickId].filter(Boolean).forEach(s => {
+      if (!AppState.tracker.state.deletedSignatures.includes(s)) {
+        AppState.tracker.state.deletedSignatures.push(s);
+      }
+    });
+  });
+
+  const pendingKeys = new Set();
+  pending.forEach(p => {
+    [makeTrackedSignature(p), makeTrackerActiveMergeKey(p), p.signature, p.pickId].filter(Boolean).forEach(k => pendingKeys.add(k));
+  });
+  AppState.tracker.state.activePicks = active.filter(p => {
+    const keys = [makeTrackedSignature(p), makeTrackerActiveMergeKey(p), p.signature, p.pickId].filter(Boolean);
+    return !keys.some(k => pendingKeys.has(k));
+  });
+
+  AppState.tracker.state.updatedAt = new Date().toISOString();
+  rebuildTrackerStats();
+  await saveTrackerStateToLocal();
+  if (typeof renderTrackedPicks === "function") renderTrackedPicks();
+  engineDebug("clearAllPendingTrackedPicks", { removed: pending.length });
+  return { removed: pending.length };
+}
+window.clearAllPendingTrackedPicks = clearAllPendingTrackedPicks;
+
 async function deleteTrackedPickBySignature(signature) {
   if (!signature) return false;
   let pick = AppState.tracker.state.activePicks.find(p => makeTrackedSignature(p) === signature || p.signature === signature);
@@ -16687,6 +16723,7 @@ async function fetchNbaGameH1(eventId) {
     if (competitors.length < 2) return null;
     const rv = v => parseFloat(v?.value ?? v?.displayValue ?? 0) || 0;
     const out = {};
+    const teamPts = {};
     for (const c of competitors) {
       const id = String(c?.team?.id || "");
       const ls = c?.linescores || [];
@@ -16696,9 +16733,46 @@ async function fetchNbaGameH1(eventId) {
         const q = [rv(ls[0]), rv(ls[1]), rv(ls[2]), rv(ls[3])];
         if (q.every(v => v > 0)) entry.quarters = q;
       }
+      const pts = rv(c?.score);
+      if (pts > 0) teamPts[id] = pts;
       out[id] = entry;
     }
     if (Object.keys(out).length < 2) return null;
+
+    // Piggyback advanced metrics on the same summary fetch (no extra network).
+    try {
+      const boxscore = data?.boxscore;
+      const ids = Object.keys(out);
+      if (boxscore && typeof boxscore === "object" && ids.length >= 2 && typeof calculateAdvancedMetrics === "function") {
+        const safeTeams = Array.isArray(boxscore.teams) ? boxscore.teams : [];
+        const idA = ids[0], idB = ids[1];
+        let sMapA = typeof _extractTeamBoxStatMap === "function" ? _extractTeamBoxStatMap(safeTeams.find(t => matchesTeam(t, idA))) : {};
+        let sMapB = typeof _extractTeamBoxStatMap === "function" ? _extractTeamBoxStatMap(safeTeams.find(t => matchesTeam(t, idB))) : {};
+        if ((!isFinite(_readBoxStat(sMapA, ["fieldGoalsAttempted", "fieldGoals", "FGA"])) ||
+             !isFinite(_readBoxStat(sMapB, ["fieldGoalsAttempted", "fieldGoals", "FGA"]))) &&
+            Array.isArray(boxscore.players) && typeof _extractTeamBoxStatMapFromPlayers === "function") {
+          sMapA = _extractTeamBoxStatMapFromPlayers(boxscore.players, idA);
+          sMapB = _extractTeamBoxStatMapFromPlayers(boxscore.players, idB);
+        }
+        const regMins = getLeagueRegulationMinutes("nba");
+        const ptsA = teamPts[idA], ptsB = teamPts[idB];
+        if (isFinite(ptsA) && isFinite(ptsB)) {
+          const advA = calculateAdvancedMetrics(sMapA, sMapB, ptsA, ptsB, regMins);
+          const advB = calculateAdvancedMetrics(sMapB, sMapA, ptsB, ptsA, regMins);
+          if (advA && out[idA]) {
+            out[idA].ortg = advA.ortg;
+            out[idA].drtg = advA.drtg;
+            out[idA].pace = advA.pace;
+          }
+          if (advB && out[idB]) {
+            out[idB].ortg = advB.ortg;
+            out[idB].drtg = advB.drtg;
+            out[idB].pace = advB.pace;
+          }
+        }
+      }
+    } catch (_advErr) { /* non-fatal — scores-only fallback */ }
+
     return out;
   } catch (e) {
     engineDebug("fetchNbaGameH1 failed", { eventId, error: e?.message || String(e) });
@@ -16896,6 +16970,32 @@ function _btRestDays(gameLog, beforeDateIso) {
   return rawDays <= 14 ? rawDays : 99;
 }
 
+function _btRollingAdv(gameLog, beforeDateIso, n = 10) {
+  const cutoff = new Date(beforeDateIso).getTime();
+  const prior = (gameLog || []).filter(g =>
+    g && g.date && new Date(g.date).getTime() < cutoff &&
+    isFinite(g.ortg) && isFinite(g.drtg) && isFinite(g.pace)
+  );
+  const recent = prior.slice(-n).reverse();
+  return {
+    ortg10: recent.map(g => g.ortg),
+    drtg10: recent.map(g => g.drtg),
+    pace10: recent.map(g => g.pace)
+  };
+}
+
+function _btInjectAdvancedContext(feat) {
+  if (typeof AppState === "undefined" || !AppState.context || !AppState.context.data) return;
+  if (!AppState.context.data.A) AppState.context.data.A = {};
+  if (!AppState.context.data.B) AppState.context.data.B = {};
+  AppState.context.data.A.ortg10 = (feat && feat.teamOrtg10) || [];
+  AppState.context.data.A.drtg10 = (feat && feat.teamDrtg10) || [];
+  AppState.context.data.A.pace10 = (feat && feat.teamPace10) || [];
+  AppState.context.data.B.ortg10 = (feat && feat.oppOrtg10) || [];
+  AppState.context.data.B.drtg10 = (feat && feat.oppDrtg10) || [];
+  AppState.context.data.B.pace10 = (feat && feat.oppPace10) || [];
+}
+
 // BACKTEST ROADMAP — PHASE 3 (precompute once, sweep in memory): COMPLETE.
 // Precomputes every config-independent per-game input — rolling series,
 // H2H arrays, rest days, and the Phase 2 chronological split tag — exactly
@@ -16914,6 +17014,8 @@ function buildBacktestFeatureCache(gameLogs, allGames, splitBoundaries, onProgre
   allGames.forEach((game, idx) => {
     const teamWindow = _btRollingWindow(gameLogs[game.teamId], game.date);
     const oppWindow = _btRollingWindow(gameLogs[game.oppId], game.date);
+    const teamAdv = _btRollingAdv(gameLogs[game.teamId], game.date);
+    const oppAdv = _btRollingAdv(gameLogs[game.oppId], game.date);
     const teamH1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "h1Scored", "h1Allowed");
     const oppH1Window = _btRollingWindow(gameLogs[game.oppId], game.date, 10, "h1Scored", "h1Allowed");
     const teamQ1Window = _btRollingWindow(gameLogs[game.teamId], game.date, 10, "q1Scored", "q1Allowed");
@@ -16952,6 +17054,12 @@ function buildBacktestFeatureCache(gameLogs, allGames, splitBoundaries, onProgre
       teamH1Scored: teamH1Window.scored, oppH1Scored: oppH1Window.scored,
       restDaysA: _btRestDays(gameLogs[game.teamId], game.date),
       restDaysB: _btRestDays(gameLogs[game.oppId], game.date),
+      teamOrtg10: teamAdv.ortg10,
+      teamDrtg10: teamAdv.drtg10,
+      teamPace10: teamAdv.pace10,
+      oppOrtg10: oppAdv.ortg10,
+      oppDrtg10: oppAdv.drtg10,
+      oppPace10: oppAdv.pace10,
       split: gameMs >= testStartMs ? "test" : gameMs >= validationStartMs ? "validation" : "train",
       parsed: {
         aFTAllowed: teamWindow.allowed, bFTAllowed: oppWindow.allowed,
@@ -17166,6 +17274,7 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
       const teamH1Window = { scored: feat.teamH1Scored, allowed: feat.parsed.a1HAllowed };
       const oppH1Window  = { scored: feat.oppH1Scored,  allowed: feat.parsed.b1HAllowed };
       const parsed = feat.parsed;
+      _btInjectAdvancedContext(feat);
 
       const _tw = isFinite(window.getParam("teamWeightBase", league)) ? Number(window.getParam("teamWeightBase", league)) : 0.65;
       const _btBaseConfig = {
@@ -18167,6 +18276,11 @@ async function runNbaSeasonBacktest(season, onProgress) {
           g.q3Scored = mine.quarters[2]; g.q3Allowed = opp.quarters[2];
           g.q4Scored = mine.quarters[3]; g.q4Allowed = opp.quarters[3];
         }
+        if (mine && isFinite(mine.ortg) && isFinite(mine.drtg) && isFinite(mine.pace)) {
+          g.ortg = mine.ortg;
+          g.drtg = mine.drtg;
+          g.pace = mine.pace;
+        }
       }
     }
 
@@ -18231,6 +18345,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
       const teamH1Window = { scored: feat.teamH1Scored, allowed: feat.parsed.a1HAllowed };
       const oppH1Window = { scored: feat.oppH1Scored, allowed: feat.parsed.b1HAllowed };
       const parsed = feat.parsed;
+      _btInjectAdvancedContext(feat);
 
       const _tw = isFinite(window.getParam("teamWeightBase", "nba")) ? Number(window.getParam("teamWeightBase", "nba")) : 0.65;
       const _btBaseConfig = {
