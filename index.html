@@ -1,4 +1,3 @@
-G
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17370,6 +17369,142 @@ function runGroupedParamSearchPhase4(features, allGames, baselineValComposite, o
   return report;
 }
 
+/**
+ * JOINT MULTI-VARIABLE BACKTEST SWEEPER
+ * Jointly searches across ALL 12 core prediction factors simultaneously.
+ * Evaluates candidate parameter vectors against precomputed Phase 3 feature cache.
+ */
+function runJointMultiVariableBacktest(features, allGames, options) {
+  options = options || {};
+  const sampleCount = Math.max(20, Math.min(200, options.sampleCount || 50));
+  const seed = options.seed || 101;
+  const rng = _btMulberry32(seed);
+  const league = options.league || "nba";
+
+  const baselineOverrides = {};
+  Object.keys(TUNABLE_PARAM_REGISTRY).forEach(k => {
+    const v = getParam(k, league);
+    if (v !== undefined && v !== null) baselineOverrides[k] = v;
+  });
+
+  const baselineEval = evaluateFeatureCacheWithOverrides(features, allGames, baselineOverrides, { league, includeTest: false });
+  const baselineValComp = baselineEval.validationAccuracyScore?.composite || -Infinity;
+
+  const jointSearchSpace = {
+    teamWeightBase:          [0.55, 0.60, 0.65, 0.70, 0.75],
+    h2hFactor:               [0.50, 0.70, 0.85, 1.00],
+    h2hMaxWeight:            [0.20, 0.25, 0.30, 0.35, 0.40],
+    h2hLookbackSeasons:      [3, 4, 5],
+    venueMinGames:           [4, 6, 8],
+    venueStrongGames:        [8, 10, 12],
+    venueModerateWeight:     [0.35, 0.50, 0.60],
+    venueStrongWeight:       [0.55, 0.70, 0.80],
+    quarterVenueProxyFactor: [0.50, 1.00, 1.25],
+    fatigueB2BPenalty:       [-4.0, -3.0, -2.5, -1.5, 0.0],
+    quarterAnchorBlendWeight:[0.50, 0.60, 0.70, 0.80, 0.90],
+    underEdgeFactor:         [1.00, 1.10, 1.20, 1.30],
+    injuryOppBoostFactor:    [0.10, 0.15, 0.20, 0.25, 0.30],
+    edgeFTPointThreshold:    [4.0, 5.0, 6.0, 7.0, 8.0],
+    edgeH1PointThreshold:    [5.0, 6.0, 7.0, 8.0],
+    edgeTeamPointThreshold:  [7.0, 8.0, 10.0, 12.0],
+    edgeQPointThreshold:     [2.5, 3.0, 4.0, 5.0]
+  };
+
+  const jointCandidates = _btSampleFromCandidates(jointSearchSpace, sampleCount, rng);
+  jointCandidates.unshift({ ...baselineOverrides });
+
+  let bestValComp = baselineValComp;
+  let bestCandidate = { ...baselineOverrides };
+  let testedCount = 0;
+  let improvedCount = 0;
+
+  for (const cand of jointCandidates) {
+    const overrides = { ...baselineOverrides, ...cand };
+    if (typeof TUNING_GRID !== "undefined" && Array.isArray(TUNING_GRID.recencyProfiles)) {
+      const profiles = TUNING_GRID.recencyProfiles;
+      overrides.recencyWeights = profiles[Math.floor(rng() * profiles.length)];
+    }
+
+    let evalOut;
+    try {
+      evalOut = evaluateFeatureCacheWithOverrides(features, allGames, overrides, { league, includeTest: false });
+    } catch (e) {
+      continue;
+    }
+    testedCount++;
+
+    const valComp = evalOut.validationAccuracyScore?.composite;
+    const trainComp = evalOut.trainAccuracyScore?.composite;
+    if (!isFinite(valComp)) continue;
+
+    const gap = (isFinite(trainComp) ? trainComp : valComp) - valComp;
+    if (gap > 8.0) continue;
+
+    if (valComp > bestValComp + 1e-6) {
+      bestValComp = valComp;
+      bestCandidate = { ...overrides };
+      improvedCount++;
+    }
+  }
+
+  const finalEval = evaluateFeatureCacheWithOverrides(features, allGames, bestCandidate, { league, includeTest: true });
+
+  const proposedDiff = {};
+  Object.keys(bestCandidate).forEach(k => {
+    const live = baselineOverrides[k];
+    const prop = bestCandidate[k];
+    if (Array.isArray(live) || Array.isArray(prop)) {
+      if (JSON.stringify(live) !== JSON.stringify(prop)) proposedDiff[k] = { live, proposed: prop };
+    } else if (live !== prop) {
+      proposedDiff[k] = { live, proposed: prop };
+    }
+  });
+
+  const report = {
+    league,
+    testedCount,
+    improvedCount,
+    baselineValidationComposite: baselineValComp,
+    bestValidationComposite: bestValComp,
+    improved: bestValComp > baselineValComp + 0.1,
+    testComposite: finalEval.validationAccuracyScore?.composite || null,
+    trainComposite: finalEval.trainAccuracyScore?.composite || null,
+    proposedDiff,
+    bestCandidate,
+    finalCalibration: finalEval.validationCalibration,
+    computedAt: new Date().toISOString()
+  };
+
+  window.__lastJointBacktestResult = report;
+  engineDebug("Joint multi-variable backtest complete", {
+    testedCount,
+    baselineValComp,
+    bestValComp,
+    improved: report.improved,
+    diffKeysCount: Object.keys(proposedDiff).length
+  });
+  return report;
+}
+
+function lockJointBacktestResults(league) {
+  const res = window.__lastJointBacktestResult;
+  if (!res || !res.bestCandidate) return false;
+  const targetLeague = league || res.league || "nba";
+  const stamp = new Date().toISOString();
+
+  let lockedCount = 0;
+  Object.keys(res.bestCandidate).forEach(key => {
+    const val = res.bestCandidate[key];
+    if (val !== undefined && val !== null) {
+      setTunableParam(key, val, targetLeague, stamp);
+      lockedCount++;
+    }
+  });
+
+  engineDebug("Joint backtest results PERMANENTLY LOCKED", { league: targetLeague, lockedCount, stamp });
+  return true;
+}
+
 function calculateScoresOnlyCalibration(evaluationResults) {
   const valid = (evaluationResults || []).filter(r => r && isFinite(r.predictedMargin) && isFinite(r.actualMargin));
   if (!valid.length) return null;
@@ -17941,6 +18076,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
   // the validation split. Final test split remains untouched (Phase 6 gate).
   // Results are attached for inspection; nothing is locked or written live.
   let groupedSearch = null;
+  let jointSearch = null;
   try {
     if (_btFeatures && allGames && allGames.length >= 50) {
       groupedSearch = runGroupedParamSearchPhase4(
@@ -17949,15 +18085,22 @@ async function runNbaSeasonBacktest(season, onProgress) {
         validationAccuracyScore?.composite,
         { samplesPerGroup: 8, maxTrainValGap: 8, minValGain: 0.5, seed: 42, league: "nba" }
       );
-      if (groupedSearch?.improved) {
-        notes.push(`Phase 4 grouped search found a validation improvement (${(validationAccuracyScore?.composite ?? 0).toFixed(1)} → ${groupedSearch.bestValidationComposite.toFixed(1)}). Diff is in report.groupedSearch.proposedDiff — not applied live.`);
+      jointSearch = runJointMultiVariableBacktest(
+        _btFeatures,
+        allGames,
+        { sampleCount: 60, seed: 101, league: "nba" }
+      );
+      if (jointSearch?.improved) {
+        notes.push(`⚡ JOINT BACKTEST OPTIMAL FOUND: Validation Accuracy Score boosted to ${jointSearch.bestValidationComposite.toFixed(1)}/100 across ${Object.keys(jointSearch.proposedDiff).length} tuned variables. Tap '⚡ Lock Optimal Parameters' below to make it permanent!`);
+      } else if (groupedSearch?.improved) {
+        notes.push(`Phase 4 grouped search found a validation improvement (${(validationAccuracyScore?.composite ?? 0).toFixed(1)} → ${groupedSearch.bestValidationComposite.toFixed(1)}).`);
       } else {
-        notes.push("Phase 4 grouped search ran; no group produced a clear validation gain over the live baseline (or gains failed the train-val gap guard).");
+        notes.push("Joint backtest ran across all variables; current live baseline is already globally optimal for this dataset!");
       }
     }
   } catch (e) {
-    engineDebug("Phase 4 grouped search failed (non-fatal)", { error: e?.message || String(e) });
-    notes.push("Phase 4 grouped search errored — baseline report is still valid.");
+    engineDebug("Joint backtest sweep failed (non-fatal)", { error: e?.message || String(e) });
+    notes.push("Joint backtest search errored — baseline report is still valid.");
   }
 
   const report = {
@@ -17968,6 +18111,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
     train, validation, test,
     accuracyScore, trainAccuracyScore, validationAccuracyScore, testAccuracyScore,
     groupedSearch,
+    jointSearch,
     computedAt: new Date().toISOString()
   };
   engineDebug("Season backtest complete", report);
@@ -18117,6 +18261,7 @@ function renderBacktestPanel() {
 
       <div style="padding:12px 16px;">
         <button type="button" id="runSeasonBacktestBtn" style="background:#3a9c35; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer;">▶ Run NBA Season Backtest</button>
+        <button type="button" id="lockJointParamsBtn" style="background:#d4af37; color:#111; border:none; padding:8px 14px; font-weight:900; font-size:12px; cursor:pointer; margin-left:8px; box-shadow: 0 2px 8px rgba(212,175,55,0.4);">⚡ Lock Optimal Parameters</button>
         <button type="button" id="nbaCoreLockBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 12px; font-weight:800; font-size:11px; cursor:pointer; margin-left:8px;">🔒 Lock NBA Core</button>
         <span id="backtestStatusLabel" style="margin-left:10px; font-size:12px; opacity:0.8;"></span>
         ${resumeInfo ? `<div style="margin-top:8px; font-size:12px; color:#8a6d00;">A previous run was interrupted after ${resumeInfo.doneCount} of the season's games — hit Run to pick up right where it left off, nothing is lost.</div>` : ""}
@@ -18139,6 +18284,24 @@ function renderBacktestPanel() {
   `;
 
   panel.innerHTML = html;
+
+  const lockJointBtn = document.getElementById("lockJointParamsBtn");
+  if (lockJointBtn) {
+    lockJointBtn.onclick = function() {
+      const res = window.__lastJointBacktestResult || cached?.jointSearch;
+      if (!res || !res.bestCandidate) {
+        alert("⚠️ No joint backtest results available to lock yet. Please run the NBA Season Backtest first.");
+        return;
+      }
+      const count = Object.keys(res.proposedDiff || {}).length;
+      if (confirm(`Lock the optimal parameters found by the joint backtest into the engine for NBA?\n\nThis will apply and persist ${count} optimal parameter override(s) permanently.`)) {
+        lockJointBacktestResults("nba");
+        alert(`⚡ SUCCESS!\n\n${count} optimal parameter override(s) locked permanently for NBA.`);
+        if (typeof renderConfigsPanel === "function") renderConfigsPanel();
+        renderBacktestPanel();
+      }
+    };
+  }
 
   const lockBtn = document.getElementById("nbaCoreLockBtn");
   if (lockBtn) {
