@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7885,22 +7886,45 @@ function buildFetchAuditIssues({
 // Standard possessions estimate: FGA + 0.44*FTA - ORB + TOV (both teams averaged).
 // Projection path already blends when ortg10/drtg10/pace10 have ≥5 real values.
 
+function _parseMadeAttempted(raw) {
+  // ESPN team stats use "42-88" (made-attempted). Player FG/FT same shape.
+  if (raw == null || raw === "") return { made: NaN, attempted: NaN };
+  const s = String(raw).trim();
+  const m = s.match(/^(\d+(?:\.\d+)?)\s*[-/]\s*(\d+(?:\.\d+)?)$/);
+  if (m) {
+    return { made: parseFloat(m[1]), attempted: parseFloat(m[2]) };
+  }
+  const n = parseFloat(s.replace(/[^0-9.\-]/g, ""));
+  return { made: NaN, attempted: isFinite(n) ? n : NaN };
+}
+
 function _readBoxStat(sMap, aliases) {
   if (!sMap || typeof sMap !== "object") return NaN;
+  const keys = Object.keys(sMap);
   for (let i = 0; i < aliases.length; i++) {
     const a = aliases[i];
     if (sMap[a] != null && sMap[a] !== "") {
-      const n = parseFloat(String(sMap[a]).replace(/[^0-9.\-]/g, ""));
-      if (isFinite(n)) return n;
+      const pair = _parseMadeAttempted(sMap[a]);
+      if (isFinite(pair.attempted) && pair.attempted > 0) return pair.attempted;
+      if (isFinite(pair.made)) return pair.made;
     }
   }
-  const keys = Object.keys(sMap);
   for (let i = 0; i < aliases.length; i++) {
     const want = String(aliases[i]).toLowerCase();
-    const found = keys.find(k => String(k).toLowerCase() === want);
+    const found = keys.find(function (k) { return String(k).toLowerCase() === want; });
     if (found != null && sMap[found] != null && sMap[found] !== "") {
-      const n = parseFloat(String(sMap[found]).replace(/[^0-9.\-]/g, ""));
-      if (isFinite(n)) return n;
+      const pair = _parseMadeAttempted(sMap[found]);
+      if (isFinite(pair.attempted) && pair.attempted > 0) return pair.attempted;
+      if (isFinite(pair.made)) return pair.made;
+    }
+  }
+  // Substring match for ESPN compound names e.g. fieldGoalsMade-fieldGoalsAttempted
+  for (let i = 0; i < aliases.length; i++) {
+    const want = String(aliases[i]).toLowerCase();
+    const found = keys.find(function (k) { return String(k).toLowerCase().indexOf(want.toLowerCase()) >= 0; });
+    if (found != null && sMap[found] != null && sMap[found] !== "") {
+      const pair = _parseMadeAttempted(sMap[found]);
+      if (isFinite(pair.attempted) && pair.attempted > 0) return pair.attempted;
     }
   }
   return NaN;
@@ -7924,31 +7948,47 @@ function _extractTeamBoxStatMapFromPlayers(boxscorePlayers, teamId) {
   if (!myPlayers || !Array.isArray(myPlayers.statistics) || !myPlayers.statistics[0]) return sMap;
   const block = myPlayers.statistics[0];
   if (!Array.isArray(block.athletes)) return sMap;
-  const keys = block.names || [];
-  const iFga = keys.indexOf("FGA");
-  const iFta = keys.indexOf("FTA");
+  // ESPN player line names: MIN, PTS, FG, 3PT, FT, REB, AST, TO, STL, BLK, OREB, ...
+  const keys = block.names || block.labels || [];
+  const iFg = keys.indexOf("FG") >= 0 ? keys.indexOf("FG") : keys.indexOf("FGA");
+  const iFt = keys.indexOf("FT") >= 0 ? keys.indexOf("FT") : keys.indexOf("FTA");
   const iOrb = keys.indexOf("OREB");
   const iTov = keys.indexOf("TO");
   let fga = 0, fta = 0, orb = 0, tov = 0;
   block.athletes.forEach(function (ath) {
     const st = ath.stats || [];
-    if (iFga >= 0) fga += parseFloat(st[iFga]) || 0;
-    if (iFta >= 0) fta += parseFloat(st[iFta]) || 0;
+    if (iFg >= 0) {
+      const p = _parseMadeAttempted(st[iFg]);
+      if (isFinite(p.attempted)) fga += p.attempted;
+    }
+    if (iFt >= 0) {
+      const p = _parseMadeAttempted(st[iFt]);
+      if (isFinite(p.attempted)) fta += p.attempted;
+    }
     if (iOrb >= 0) orb += parseFloat(st[iOrb]) || 0;
     if (iTov >= 0) tov += parseFloat(st[iTov]) || 0;
   });
-  sMap.fieldGoals = fga;
-  sMap.freeThrows = fta;
+  sMap.fieldGoalsAttempted = fga;
+  sMap.freeThrowsAttempted = fta;
   sMap.offensiveRebounds = orb;
   sMap.turnovers = tov;
   return sMap;
 }
 
 function calculateAdvancedMetrics(sMapMine, sMapOpp, ptsMine, ptsOpp, regMinutes) {
-  const FGA_ALIASES = ["fieldGoalsAttempted", "fieldGoals", "FGA", "avgFieldGoalsAttempted"];
-  const FTA_ALIASES = ["freeThrowsAttempted", "freeThrows", "FTA", "avgFreeThrowsAttempted"];
+  // ESPN team boxscore names (real sample):
+  //   fieldGoalsMade-fieldGoalsAttempted -> "42-88"
+  //   freeThrowsMade-freeThrowsAttempted -> "10-13"
+  //   offensiveRebounds -> "11"
+  //   totalTurnovers / turnovers -> "11"
+  const FGA_ALIASES = [
+    "fieldGoalsMade-fieldGoalsAttempted", "fieldGoalsAttempted", "fieldGoals", "FGA", "avgFieldGoalsAttempted", "FG"
+  ];
+  const FTA_ALIASES = [
+    "freeThrowsMade-freeThrowsAttempted", "freeThrowsAttempted", "freeThrows", "FTA", "avgFreeThrowsAttempted", "FT"
+  ];
   const ORB_ALIASES = ["offensiveRebounds", "OREB", "offensiveRebound", "avgOffensiveRebounds"];
-  const TOV_ALIASES = ["turnovers", "TO", "TOV", "avgTurnovers"];
+  const TOV_ALIASES = ["totalTurnovers", "turnovers", "TO", "TOV", "avgTurnovers"];
 
   const fgaM = _readBoxStat(sMapMine, FGA_ALIASES);
   const ftaM = _readBoxStat(sMapMine, FTA_ALIASES);
