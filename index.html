@@ -1,4 +1,4 @@
-G
+D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7882,13 +7882,108 @@ function buildFetchAuditIssues({
   return isValid;
 }
 
-// PHASE 1 CLEANUP: calculateAdvancedMetrics deleted. Its possessions formula
-// was a simplified, non-standard estimate that could diverge from real
-// advanced-stats sources while looking authoritative, and the branches that
-// consumed its output in FT/H1/quarter projections were already permanently
-// disabled (if (false && ...)). Its only call site in fetchScheduleCore has
-// been removed too — ortg10/drtg10/pace10 now simply stay empty, which is
-// the correct fallback state now that the advanced path is gone for good.
+// Advanced metrics restored: per-game pace / OffRtg / DefRtg from ESPN boxscore.
+// Standard possessions estimate: FGA + 0.44*FTA - ORB + TOV (both teams averaged).
+// Projection path already blends when ortg10/drtg10/pace10 have ≥5 real values.
+
+function _readBoxStat(sMap, aliases) {
+  if (!sMap || typeof sMap !== "object") return NaN;
+  for (let i = 0; i < aliases.length; i++) {
+    const a = aliases[i];
+    if (sMap[a] != null && sMap[a] !== "") {
+      const n = parseFloat(String(sMap[a]).replace(/[^0-9.\-]/g, ""));
+      if (isFinite(n)) return n;
+    }
+  }
+  const keys = Object.keys(sMap);
+  for (let i = 0; i < aliases.length; i++) {
+    const want = String(aliases[i]).toLowerCase();
+    const found = keys.find(k => String(k).toLowerCase() === want);
+    if (found != null && sMap[found] != null && sMap[found] !== "") {
+      const n = parseFloat(String(sMap[found]).replace(/[^0-9.\-]/g, ""));
+      if (isFinite(n)) return n;
+    }
+  }
+  return NaN;
+}
+
+function _extractTeamBoxStatMap(boxTeam) {
+  const sMap = {};
+  if (!boxTeam) return sMap;
+  if (Array.isArray(boxTeam.statistics) && boxTeam.statistics.length > 0) {
+    boxTeam.statistics.forEach(function (s) {
+      if (s && s.name != null) sMap[String(s.name)] = s.displayValue != null ? s.displayValue : s.value;
+    });
+  }
+  return sMap;
+}
+
+function _extractTeamBoxStatMapFromPlayers(boxscorePlayers, teamId) {
+  const sMap = {};
+  if (!Array.isArray(boxscorePlayers)) return sMap;
+  const myPlayers = boxscorePlayers.find(function (p) { return matchesTeam(p, teamId); });
+  if (!myPlayers || !Array.isArray(myPlayers.statistics) || !myPlayers.statistics[0]) return sMap;
+  const block = myPlayers.statistics[0];
+  if (!Array.isArray(block.athletes)) return sMap;
+  const keys = block.names || [];
+  const iFga = keys.indexOf("FGA");
+  const iFta = keys.indexOf("FTA");
+  const iOrb = keys.indexOf("OREB");
+  const iTov = keys.indexOf("TO");
+  let fga = 0, fta = 0, orb = 0, tov = 0;
+  block.athletes.forEach(function (ath) {
+    const st = ath.stats || [];
+    if (iFga >= 0) fga += parseFloat(st[iFga]) || 0;
+    if (iFta >= 0) fta += parseFloat(st[iFta]) || 0;
+    if (iOrb >= 0) orb += parseFloat(st[iOrb]) || 0;
+    if (iTov >= 0) tov += parseFloat(st[iTov]) || 0;
+  });
+  sMap.fieldGoals = fga;
+  sMap.freeThrows = fta;
+  sMap.offensiveRebounds = orb;
+  sMap.turnovers = tov;
+  return sMap;
+}
+
+function calculateAdvancedMetrics(sMapMine, sMapOpp, ptsMine, ptsOpp, regMinutes) {
+  const FGA_ALIASES = ["fieldGoalsAttempted", "fieldGoals", "FGA", "avgFieldGoalsAttempted"];
+  const FTA_ALIASES = ["freeThrowsAttempted", "freeThrows", "FTA", "avgFreeThrowsAttempted"];
+  const ORB_ALIASES = ["offensiveRebounds", "OREB", "offensiveRebound", "avgOffensiveRebounds"];
+  const TOV_ALIASES = ["turnovers", "TO", "TOV", "avgTurnovers"];
+
+  const fgaM = _readBoxStat(sMapMine, FGA_ALIASES);
+  const ftaM = _readBoxStat(sMapMine, FTA_ALIASES);
+  const orbM = _readBoxStat(sMapMine, ORB_ALIASES);
+  const tovM = _readBoxStat(sMapMine, TOV_ALIASES);
+  const fgaO = _readBoxStat(sMapOpp, FGA_ALIASES);
+  const ftaO = _readBoxStat(sMapOpp, FTA_ALIASES);
+  const orbO = _readBoxStat(sMapOpp, ORB_ALIASES);
+  const tovO = _readBoxStat(sMapOpp, TOV_ALIASES);
+
+  if (!(isFinite(fgaM) && fgaM > 0 && isFinite(fgaO) && fgaO > 0)) return null;
+  if (!(isFinite(ptsMine) && ptsMine > 0 && isFinite(ptsOpp) && ptsOpp > 0)) return null;
+
+  const possM = fgaM + 0.44 * (isFinite(ftaM) ? ftaM : 0) - (isFinite(orbM) ? orbM : 0) + (isFinite(tovM) ? tovM : 0);
+  const possO = fgaO + 0.44 * (isFinite(ftaO) ? ftaO : 0) - (isFinite(orbO) ? orbO : 0) + (isFinite(tovO) ? tovO : 0);
+  if (!(possM > 40 && possO > 40)) return null;
+
+  const poss = (possM + possO) / 2;
+  const mins = isFinite(regMinutes) && regMinutes > 0 ? regMinutes : 48;
+  const pace = poss * (48 / mins);
+  const ortg = 100 * ptsMine / poss;
+  const drtg = 100 * ptsOpp / poss;
+
+  if (!(isFinite(pace) && pace > 0 && isFinite(ortg) && ortg > 0 && isFinite(drtg) && drtg > 0)) return null;
+  if (pace < 70 || pace > 130) return null;
+  if (ortg < 70 || ortg > 150 || drtg < 70 || drtg > 150) return null;
+
+  return {
+    pace: Number(pace.toFixed(2)),
+    ortg: Number(ortg.toFixed(2)),
+    drtg: Number(drtg.toFixed(2)),
+    possessions: Number(poss.toFixed(2))
+  };
+}
 
     function logDebug(...args) {
       if (DEBUG) console.log("[BB Engine]", ...args);
@@ -14488,41 +14583,24 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
         }
 
         if (boxscore && typeof boxscore === 'object') {
-          let sMap = {};
           const safeTeams = Array.isArray(boxscore.teams) ? boxscore.teams : [];
           const myBox = safeTeams.find(t => matchesTeam(t, tId));
-          
-          if (myBox && Array.isArray(myBox.statistics) && myBox.statistics.length > 0) {
-            myBox.statistics.forEach(s => { sMap[s.name] = s.displayValue; });
-          } else if (Array.isArray(boxscore.players)) {
-            const safePlayers = boxscore.players || [];
-            const myPlayers = safePlayers.find(p => matchesTeam(p, tId));
-            if (myPlayers && Array.isArray(myPlayers.statistics) && myPlayers.statistics[0] && Array.isArray(myPlayers.statistics[0].athletes)) {
-              let fga = 0, fta = 0, orb = 0, tov = 0;
-              const keys = myPlayers.statistics[0].names || [];
-              const iFga = keys.indexOf("FGA");
-              const iFta = keys.indexOf("FTA");
-              const iOrb = keys.indexOf("OREB");
-              const iTov = keys.indexOf("TO");
-              
-              myPlayers.statistics[0].athletes.forEach(ath => {
-                const st = ath.stats || [];
-                if (iFga >= 0) fga += parseFloat(st[iFga]) || 0;
-                if (iFta >= 0) fta += parseFloat(st[iFta]) || 0;
-                if (iOrb >= 0) orb += parseFloat(st[iOrb]) || 0;
-                if (iTov >= 0) tov += parseFloat(st[iTov]) || 0;
-              });
-              sMap = { fieldGoals: fga, freeThrows: fta, offensiveRebounds: orb, turnovers: tov };
+          const oppBox = safeTeams.find(t => !matchesTeam(t, tId));
+          let sMapMine = _extractTeamBoxStatMap(myBox);
+          let sMapOpp = _extractTeamBoxStatMap(oppBox);
+
+          if ((!isFinite(_readBoxStat(sMapMine, ["fieldGoalsAttempted", "fieldGoals", "FGA"])) ||
+               !isFinite(_readBoxStat(sMapOpp, ["fieldGoalsAttempted", "fieldGoals", "FGA"]))) &&
+              Array.isArray(boxscore.players)) {
+            const oppIdForBox = opp?.team?.id || opp?.id || null;
+            sMapMine = _extractTeamBoxStatMapFromPlayers(boxscore.players, tId);
+            if (oppIdForBox != null) {
+              sMapOpp = _extractTeamBoxStatMapFromPlayers(boxscore.players, oppIdForBox);
             }
           }
 
-          
-          
-          // PHASE 1 CLEANUP: calculateAdvancedMetrics call removed — the
-          // function was deleted, and its output was only ever consumed by
-          // the permanently-disabled advanced pace/rating branches. advanced
-          // stays at its declared null default, which is the correct
-          // permanent fallback state now.
+          const _regMins = getLeagueRegulationMinutes(leagueKey);
+          advanced = calculateAdvancedMetrics(sMapMine, sMapOpp, ms, os, _regMins);
         }
       }
     }
