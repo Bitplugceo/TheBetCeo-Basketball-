@@ -1,3 +1,4 @@
+G
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3989,6 +3990,57 @@ const MODEL_TUNING = {
   quarterAnchorBlendWeight: 0.7
 };
 
+// ============================================================
+// MAXIMUM-POWER BACKTEST — Phase 0/1 foundations
+// Joint search space + historical replay (2024/25 + 2025/26)
+// ============================================================
+
+const RECENCY_PROFILES = {
+  standard:     [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16],
+  aggressive:   [1.60, 1.30, 0.90, 0.60, 0.40, 0.28, 0.18, 0.11, 0.07, 0.04],
+  heavy_recent: [2.00, 1.50, 1.00, 0.60, 0.30, 0.20, 0.12, 0.08, 0.05, 0.03],
+  flat:         [1.00, 1.00, 1.00, 1.00, 1.00, 0.80, 0.63, 0.50, 0.40, 0.32],
+  moderate:     [1.45, 1.25, 1.00, 0.80, 0.60, 0.45, 0.32, 0.22, 0.15, 0.10]
+};
+
+const BACKTEST_LEVERS = {
+  teamWeightBase:          { min: 0.45, max: 0.80, step: 0.05, type: "scalar" },
+  h2hMaxWeight:            { min: 0.15, max: 0.45, step: 0.05, type: "scalar" },
+  h2hFactor:               { min: 0.60, max: 1.00, step: 0.10, type: "scalar" },
+  h2hLookbackSeasons:      { min: 2,    max: 5,    step: 1,    type: "scalar" },
+  h2hDecayCurrent:         { min: 0.80, max: 1.00, step: 0.10, type: "scalar" },
+  h2hDecayMinus1:          { min: 0.40, max: 0.90, step: 0.10, type: "scalar" },
+  h2hDecayMinus2:          { min: 0.20, max: 0.70, step: 0.10, type: "scalar" },
+  recencyProfile: {
+    type: "profile",
+    options: ["standard", "aggressive", "heavy_recent", "flat", "moderate"]
+  },
+  venueMinGames:           { min: 4,    max: 8,    step: 1,    type: "scalar" },
+  venueStrongGames:        { min: 8,    max: 12,   step: 1,    type: "scalar" },
+  venueModerateWeight:     { min: 0.30, max: 0.60, step: 0.10, type: "scalar" },
+  venueStrongWeight:       { min: 0.50, max: 0.80, step: 0.10, type: "scalar" },
+  quarterVenueProxyFactor: { min: 0.5,  max: 1.5,  step: 0.25, type: "scalar" },
+  injuryOppBoostFactor:    { min: 0.0,  max: 0.40, step: 0.10, type: "scalar" },
+  underEdgeFactor:         { min: 1.0,  max: 1.5,  step: 0.10, type: "scalar" },
+  quarterAnchorBlendWeight:{ min: 0.4,  max: 0.9,  step: 0.1,  type: "scalar" },
+  paceClampMinNbaNcaa:     { min: 0.55, max: 0.75, step: 0.05, type: "scalar" },
+  paceClampMaxNbaNcaa:     { min: 1.20, max: 1.45, step: 0.05, type: "scalar" },
+  edgeThreshold_ft:        { min: 5.0,  max: 10.0, step: 0.5,  type: "scalar" },
+  edgeThreshold_h1:        { min: 6.0,  max: 11.0, step: 0.5,  type: "scalar" },
+  edgeThreshold_team:      { min: 7.0,  max: 13.0, step: 0.5,  type: "scalar" },
+  edgeThreshold_q:         { min: 3.5,  max: 7.0,  step: 0.5,  type: "scalar" }
+};
+
+// In-memory store for last-season + this-season historical games.
+// Populated by loadHistoricalSeasonGames() (Phase 1 data layer).
+// Shape of each game: { season, date, league, homeTeamId, awayTeamId,
+//   homeTeamName, awayTeamName, finalHome, finalAway, actualTotal,
+//   homeRecentScored, homeRecentAllowed, awayRecentScored, awayRecentAllowed,
+//   homeH1Scored, homeH1Allowed, awayH1Scored, awayH1Allowed,
+//   h2hHome, h2hAway, h2hDates, homeRestDays, awayRestDays,
+//   homeInjuries, awayInjuries, line }
+let g_historicalGamesStore = [];
+
 // NBA-CORE LOCK FLAG: the retrospective tuner (see NBA_CORE_TUNER_KEYS
 // below) checks this before auto-adjusting certain NBA settings, so it's
 // kept independent of the backtest. Backtest now always reads live
@@ -4599,6 +4651,175 @@ const TUNING_GRID = {
   paceDampenings: [0.35],
   injuryMults: [1.0]
 };
+
+/**
+ * Replay one historical game under a complete joint lever set.
+ * Snapshot → inject → run pure projection path → restore.
+ * No UI, no network. Returns pick vs actual result.
+ *
+ * @param {object} game     historical game from g_historicalGamesStore
+ * @param {object} leverSet full joint values drawn from BACKTEST_LEVERS
+ * @returns {object} { pick, side, edge, grade, projectedTotal, actualTotal, result, market }
+ */
+function replayHistoricalGame(game, leverSet) {
+  if (!game || !leverSet) {
+    return { pick: "NO PLAY", side: "", edge: 0, grade: "NaN", projectedTotal: NaN, actualTotal: game?.actualTotal ?? NaN, result: "noplay", market: "ft" };
+  }
+  const league = String(game.league || "nba").toLowerCase();
+  const snapshot = {};
+  const scalarKeys = Object.keys(leverSet).filter(k => k !== "recencyProfile" && !String(k).startsWith("edgeThreshold_"));
+
+  // 1. Snapshot current live values
+  scalarKeys.forEach(key => {
+    try { snapshot[key] = getParam(key, league); } catch (e) { snapshot[key] = undefined; }
+  });
+  let snapshotRecency = null;
+  try { snapshotRecency = getParam("recencyWeights", league) || MODEL_TUNING.recencyWeights; } catch (e) {}
+
+  // Temporary edge-threshold overrides (read by getLeagueEdgePointThreshold shim if present)
+  const edgeSnap = {
+    ft:   leverSet.edgeThreshold_ft,
+    h1:   leverSet.edgeThreshold_h1,
+    team: leverSet.edgeThreshold_team,
+    q:    leverSet.edgeThreshold_q
+  };
+  const prevEdgeOverride = window.__BACKTEST_EDGE_OVERRIDE;
+  window.__BACKTEST_EDGE_OVERRIDE = edgeSnap;
+
+  try {
+    // 2. Inject scalar levers
+    scalarKeys.forEach(key => {
+      const val = leverSet[key];
+      if (val !== undefined && typeof setTunableParam === "function") {
+        setTunableParam(key, val, league);
+      }
+    });
+    // Inject recency profile
+    if (leverSet.recencyProfile && RECENCY_PROFILES[leverSet.recencyProfile]) {
+      const vec = RECENCY_PROFILES[leverSet.recencyProfile];
+      if (typeof setTunableParam === "function") {
+        setTunableParam("recencyWeights", vec, league);
+      } else {
+        MODEL_TUNING.recencyWeights = vec.slice();
+      }
+    }
+
+    // 3. Build projection from point-in-time series.
+    //    For now this is a thin pure-math path that uses the same
+    //    helpers the live engine uses (trimmedAvg / getDynamicWeights /
+    //    getH2HWeight / getPick / getConfidenceGrade). Full wiring to
+    //    the complete multi-step projectionBuild will be completed in
+    //    the next patch once the historical data loader exists.
+    const aScored  = Array.isArray(game.homeRecentScored)  ? game.homeRecentScored  : [];
+    const aAllowed = Array.isArray(game.homeRecentAllowed) ? game.homeRecentAllowed : [];
+    const bScored  = Array.isArray(game.awayRecentScored)  ? game.awayRecentScored  : [];
+    const bAllowed = Array.isArray(game.awayRecentAllowed) ? game.awayRecentAllowed : [];
+    const h2hA     = Array.isArray(game.h2hHome)           ? game.h2hHome           : [];
+    const h2hB     = Array.isArray(game.h2hAway)           ? game.h2hAway           : [];
+
+    const sampleTier = (typeof getSampleTier === "function")
+      ? getSampleTier(aScored, bScored)
+      : (aScored.length >= 5 && bScored.length >= 5 ? "full" : (aScored.length >= 3 ? "thin" : "insufficient"));
+
+    const aOff = (typeof trimmedAvg === "function") ? trimmedAvg(aScored)  : (aScored.reduce((s,v)=>s+v,0)/(aScored.length||1));
+    const aDef = (typeof trimmedAvg === "function") ? trimmedAvg(aAllowed) : (aAllowed.reduce((s,v)=>s+v,0)/(aAllowed.length||1));
+    const bOff = (typeof trimmedAvg === "function") ? trimmedAvg(bScored)  : (bScored.reduce((s,v)=>s+v,0)/(bScored.length||1));
+    const bDef = (typeof trimmedAvg === "function") ? trimmedAvg(bAllowed) : (bAllowed.reduce((s,v)=>s+v,0)/(bAllowed.length||1));
+
+    const volLimit = (typeof getMarketVolLimit === "function") ? getMarketVolLimit(league, "ft") : 12;
+    const volState = (typeof getUnifiedVolatilityState === "function")
+      ? getUnifiedVolatilityState(aScored, bScored, volLimit)
+      : { combinedVolRatio: 0.5 };
+    const dyn = (typeof getDynamicWeights === "function")
+      ? getDynamicWeights(sampleTier, volState.combinedVolRatio, league)
+      : { teamWeight: 0.65, oppWeight: 0.35 };
+
+    let projA = aOff * dyn.teamWeight + bDef * dyn.oppWeight;
+    let projB = bOff * dyn.teamWeight + aDef * dyn.oppWeight;
+
+    // H2H blend (capped by live getH2HWeight / h2hMaxWeight)
+    if (h2hA.length >= 2 && h2hB.length >= 2) {
+      const avgH2HA = h2hA.reduce((s,v)=>s+v,0) / h2hA.length;
+      const avgH2HB = h2hB.reduce((s,v)=>s+v,0) / h2hB.length;
+      let hw = 0.20;
+      if (typeof getH2HWeight === "function") {
+        try { hw = getH2HWeight(h2hA.length, league, "ft") || 0.20; } catch (e) {}
+      } else {
+        const cap = (typeof getParam === "function") ? (getParam("h2hMaxWeight", league) ?? 0.30) : 0.30;
+        hw = Math.min(cap, 0.10 + h2hA.length * 0.04);
+      }
+      const factor = (typeof getParam === "function") ? (getParam("h2hFactor", league) ?? 1.0) : 1.0;
+      hw = Math.min(hw * factor, (typeof getParam === "function") ? (getParam("h2hMaxWeight", league) ?? 0.30) : 0.30);
+      projA = projA * (1 - hw) + avgH2HA * hw;
+      projB = projB * (1 - hw) + avgH2HB * hw;
+    }
+
+    const projectedTotal = projA + projB;
+    const line = isFinite(Number(game.line)) ? Number(game.line) : null;
+    const edge = (line != null && isFinite(projectedTotal)) ? (projectedTotal - line) : 0;
+
+    let pickText = "NO PLAY";
+    if (typeof getPick === "function" && line != null) {
+      pickText = getPick(edge, line, league, "ft", {}) || "NO PLAY";
+    } else if (line != null && Math.abs(edge) >= 1) {
+      pickText = edge > 0 ? ("OVER " + line) : ("UNDER " + line);
+    }
+
+    const side = (typeof getPickSideFromText === "function")
+      ? getPickSideFromText(pickText)
+      : (String(pickText).toUpperCase().includes("OVER") ? "over" : (String(pickText).toUpperCase().includes("UNDER") ? "under" : ""));
+
+    let grade = "NaN";
+    if (typeof getConfidenceGrade === "function" && pickText !== "NO PLAY") {
+      try {
+        grade = getConfidenceGrade({
+          pick: pickText, line, edge, sampleTier,
+          projectionOnly: false, fullModel: true, trap: false,
+          hasH2H: h2hA.length >= 2, volatility: volState.combinedVolRatio * (volLimit || 12),
+          volLimit: volLimit || 12, marketKey: "ft", note: null
+        }) || "NaN";
+      } catch (e) { grade = "C"; }
+    }
+
+    const actualTotal = isFinite(Number(game.actualTotal))
+      ? Number(game.actualTotal)
+      : (Number(game.finalHome || 0) + Number(game.finalAway || 0));
+
+    let result = "noplay";
+    if (side === "over" || side === "under") {
+      if (!isFinite(actualTotal) || line == null) result = "noplay";
+      else if (actualTotal === line) result = "push";
+      else if (side === "over")  result = actualTotal > line ? "win" : "loss";
+      else                       result = actualTotal < line ? "win" : "loss";
+    }
+
+    return {
+      pick: pickText,
+      side,
+      edge,
+      grade,
+      projectedTotal,
+      actualTotal,
+      result,
+      market: "ft"
+    };
+  } finally {
+    // 4. Always restore original levers
+    window.__BACKTEST_EDGE_OVERRIDE = prevEdgeOverride;
+    scalarKeys.forEach(key => {
+      if (snapshot[key] !== undefined && typeof setTunableParam === "function") {
+        setTunableParam(key, snapshot[key], league);
+      }
+    });
+    if (snapshotRecency && typeof setTunableParam === "function") {
+      setTunableParam("recencyWeights", snapshotRecency, league);
+    } else if (snapshotRecency) {
+      MODEL_TUNING.recencyWeights = Array.isArray(snapshotRecency) ? snapshotRecency.slice() : MODEL_TUNING.recencyWeights;
+    }
+  }
+}
+
+window.replayHistoricalGame = replayHistoricalGame;
 
 const TUNABLE_CONSTANTS_GRID = {
   INJURY_OPPONENT_BOOST_FACTOR: [0.1, 0.15, 0.2, 0.25, 0.3],
