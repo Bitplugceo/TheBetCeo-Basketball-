@@ -1,4 +1,3 @@
-G
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4040,6 +4039,183 @@ const BACKTEST_LEVERS = {
 //   h2hHome, h2hAway, h2hDates, homeRestDays, awayRestDays,
 //   homeInjuries, awayInjuries, line }
 let g_historicalGamesStore = [];
+
+/**
+ * Phase 1 data layer — load (or accept) historical games for a season.
+ * Currently accepts a pre-built array. Real ESPN/history wiring comes next.
+ * Does NOT touch the old season-backtest path.
+ *
+ * @param {string} season  "2024/25" | "2025/26"
+ * @param {string} league  "nba" (default)
+ * @param {Array}  games   optional pre-built game records
+ * @returns {number} count of games now in the store for that season
+ */
+function loadHistoricalSeasonGames(season, league, games) {
+  const s = String(season || "").trim();
+  const l = String(league || "nba").toLowerCase();
+  if (!s) {
+    if (typeof engineDebug === "function") engineDebug("loadHistoricalSeasonGames: missing season");
+    return 0;
+  }
+  // Remove any previous entries for this season+league so reloads are clean
+  g_historicalGamesStore = g_historicalGamesStore.filter(g =>
+    !(String(g.season) === s && String(g.league || "nba").toLowerCase() === l)
+  );
+  if (Array.isArray(games) && games.length) {
+    games.forEach(g => {
+      if (!g || typeof g !== "object") return;
+      g_historicalGamesStore.push({
+        season: s,
+        league: l,
+        date: g.date || "",
+        homeTeamId: g.homeTeamId || null,
+        awayTeamId: g.awayTeamId || null,
+        homeTeamName: g.homeTeamName || "",
+        awayTeamName: g.awayTeamName || "",
+        finalHome: Number(g.finalHome) || 0,
+        finalAway: Number(g.finalAway) || 0,
+        actualTotal: isFinite(Number(g.actualTotal))
+          ? Number(g.actualTotal)
+          : (Number(g.finalHome) || 0) + (Number(g.finalAway) || 0),
+        homeRecentScored: Array.isArray(g.homeRecentScored) ? g.homeRecentScored.slice() : [],
+        homeRecentAllowed: Array.isArray(g.homeRecentAllowed) ? g.homeRecentAllowed.slice() : [],
+        awayRecentScored: Array.isArray(g.awayRecentScored) ? g.awayRecentScored.slice() : [],
+        awayRecentAllowed: Array.isArray(g.awayRecentAllowed) ? g.awayRecentAllowed.slice() : [],
+        homeH1Scored: Array.isArray(g.homeH1Scored) ? g.homeH1Scored.slice() : [],
+        homeH1Allowed: Array.isArray(g.homeH1Allowed) ? g.homeH1Allowed.slice() : [],
+        awayH1Scored: Array.isArray(g.awayH1Scored) ? g.awayH1Scored.slice() : [],
+        awayH1Allowed: Array.isArray(g.awayH1Allowed) ? g.awayH1Allowed.slice() : [],
+        h2hHome: Array.isArray(g.h2hHome) ? g.h2hHome.slice() : [],
+        h2hAway: Array.isArray(g.h2hAway) ? g.h2hAway.slice() : [],
+        h2hDates: Array.isArray(g.h2hDates) ? g.h2hDates.slice() : [],
+        homeRestDays: isFinite(Number(g.homeRestDays)) ? Number(g.homeRestDays) : null,
+        awayRestDays: isFinite(Number(g.awayRestDays)) ? Number(g.awayRestDays) : null,
+        homeInjuries: g.homeInjuries || null,
+        awayInjuries: g.awayInjuries || null,
+        line: isFinite(Number(g.line)) ? Number(g.line) : null
+      });
+    });
+  }
+  const count = g_historicalGamesStore.filter(g =>
+    String(g.season) === s && String(g.league || "nba").toLowerCase() === l
+  ).length;
+  if (typeof engineDebug === "function") {
+    engineDebug("loadHistoricalSeasonGames", { season: s, league: l, loaded: count, storeTotal: g_historicalGamesStore.length });
+  }
+  return count;
+}
+window.loadHistoricalSeasonGames = loadHistoricalSeasonGames;
+
+/**
+ * Returns a default lever set taken from live getParam / MODEL_TUNING defaults.
+ * Used as the baseline when testing one replay.
+ */
+function getDefaultBacktestLeverSet(league) {
+  const l = String(league || "nba").toLowerCase();
+  const get = (key, fallback) => {
+    try {
+      const v = (typeof getParam === "function") ? getParam(key, l) : undefined;
+      return (v !== undefined && v !== null) ? v : fallback;
+    } catch (e) { return fallback; }
+  };
+  return {
+    teamWeightBase: get("teamWeightBase", 0.65),
+    h2hMaxWeight: get("h2hMaxWeight", 0.30),
+    h2hFactor: get("h2hFactor", 1.0),
+    h2hLookbackSeasons: get("h2hLookbackSeasons", 4),
+    h2hDecayCurrent: get("h2hDecayCurrent", 1.0),
+    h2hDecayMinus1: get("h2hDecayMinus1", 0.75),
+    h2hDecayMinus2: get("h2hDecayMinus2", 0.50),
+    recencyProfile: "standard",
+    venueMinGames: get("venueMinGames", 6),
+    venueStrongGames: get("venueStrongGames", 10),
+    venueModerateWeight: get("venueModerateWeight", 0.50),
+    venueStrongWeight: get("venueStrongWeight", 0.70),
+    quarterVenueProxyFactor: get("quarterVenueProxyFactor", 1.0),
+    injuryOppBoostFactor: get("injuryOppBoostFactor", 0.20),
+    underEdgeFactor: get("underEdgeFactor", 1.20),
+    quarterAnchorBlendWeight: get("quarterAnchorBlendWeight", 0.70),
+    paceClampMinNbaNcaa: get("paceClampMinNbaNcaa", 0.65),
+    paceClampMaxNbaNcaa: get("paceClampMaxNbaNcaa", 1.35),
+    edgeThreshold_ft: get("edgeFTPointThreshold", 5.5),
+    edgeThreshold_h1: get("edgeH1PointThreshold", 5.0),
+    edgeThreshold_team: get("edgeTeamPointThreshold", 5.5),
+    edgeThreshold_q: get("edgeQPointThreshold", 3.5)
+  };
+}
+window.getDefaultBacktestLeverSet = getDefaultBacktestLeverSet;
+
+/**
+ * Smoke-test: run one replay on the first game in the store (or a synthetic game).
+ * Logs the result via engineDebug so it appears in AFDB without a console.
+ */
+function runOneBacktestReplayTest() {
+  let game = g_historicalGamesStore[0];
+  if (!game) {
+    // Synthetic game so the path can be proven before real data arrives
+    game = {
+      season: "2024/25",
+      league: "nba",
+      date: "2025-01-15",
+      homeTeamName: "Test Home",
+      awayTeamName: "Test Away",
+      finalHome: 112,
+      finalAway: 108,
+      actualTotal: 220,
+      homeRecentScored:  [110, 105, 118, 102, 115, 108, 112],
+      homeRecentAllowed: [108, 112, 105, 110, 100, 115, 107],
+      awayRecentScored:  [105, 112, 98,  120, 108, 111, 104],
+      awayRecentAllowed: [110, 100, 115, 105, 112, 108, 109],
+      h2hHome: [108, 115, 102],
+      h2hAway: [110, 100, 118],
+      line: 218.5
+    };
+  }
+  const levers = getDefaultBacktestLeverSet(game.league);
+  let result;
+  try {
+    result = replayHistoricalGame(game, levers);
+  } catch (e) {
+    result = { error: String(e && e.message ? e.message : e) };
+  }
+  if (typeof engineDebug === "function") {
+    engineDebug("runOneBacktestReplayTest", {
+      usedSynthetic: !g_historicalGamesStore.length,
+      storeSize: g_historicalGamesStore.length,
+      pick: result && result.pick,
+      side: result && result.side,
+      edge: result && result.edge,
+      grade: result && result.grade,
+      projectedTotal: result && result.projectedTotal,
+      actualTotal: result && result.actualTotal,
+      result: result && result.result,
+      error: result && result.error
+    });
+  }
+  return result;
+}
+window.runOneBacktestReplayTest = runOneBacktestReplayTest;
+
+// Self-check on load — appears in AFDB / engine log
+(function backtestPhase0SelfCheck() {
+  try {
+    const ok = {
+      BACKTEST_LEVERS: typeof BACKTEST_LEVERS === "object" && !!BACKTEST_LEVERS,
+      RECENCY_PROFILES: typeof RECENCY_PROFILES === "object" && !!RECENCY_PROFILES,
+      g_historicalGamesStore: Array.isArray(g_historicalGamesStore),
+      replayHistoricalGame: typeof replayHistoricalGame === "function",
+      loadHistoricalSeasonGames: typeof loadHistoricalSeasonGames === "function",
+      runOneBacktestReplayTest: typeof runOneBacktestReplayTest === "function"
+    };
+    if (typeof engineDebug === "function") {
+      engineDebug("BACKTEST Phase0/1 self-check", ok);
+    }
+  } catch (e) {
+    if (typeof engineDebug === "function") {
+      engineDebug("BACKTEST Phase0/1 self-check FAILED", { error: String(e && e.message ? e.message : e) });
+    }
+  }
+})();
 
 // NBA-CORE LOCK FLAG: the retrospective tuner (see NBA_CORE_TUNER_KEYS
 // below) checks this before auto-adjusting certain NBA settings, so it's
