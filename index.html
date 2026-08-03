@@ -1,3 +1,4 @@
+M
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17370,16 +17371,17 @@ function runGroupedParamSearchPhase4(features, allGames, baselineValComposite, o
 }
 
 /**
- * JOINT MULTI-VARIABLE BACKTEST SWEEPER
+ * JOINT MULTI-VARIABLE BACKTEST SWEEPER (EXPANDED TO THOUSANDS)
  * Jointly searches across ALL 12 core prediction factors simultaneously.
  * Evaluates candidate parameter vectors against precomputed Phase 3 feature cache.
  */
-function runJointMultiVariableBacktest(features, allGames, options) {
+async function runJointMultiVariableBacktest(features, allGames, options) {
   options = options || {};
-  const sampleCount = Math.max(20, Math.min(200, options.sampleCount || 50));
+  const sampleCount = Math.max(100, Math.min(5000, options.sampleCount || 2000));
   const seed = options.seed || 101;
   const rng = _btMulberry32(seed);
   const league = options.league || "nba";
+  const onProgress = options.onProgress;
 
   const baselineOverrides = {};
   Object.keys(TUNABLE_PARAM_REGISTRY).forEach(k => {
@@ -17391,23 +17393,31 @@ function runJointMultiVariableBacktest(features, allGames, options) {
   const baselineValComp = baselineEval.validationAccuracyScore?.composite || -Infinity;
 
   const jointSearchSpace = {
-    teamWeightBase:          [0.55, 0.60, 0.65, 0.70, 0.75],
-    h2hFactor:               [0.50, 0.70, 0.85, 1.00],
-    h2hMaxWeight:            [0.20, 0.25, 0.30, 0.35, 0.40],
-    h2hLookbackSeasons:      [3, 4, 5],
-    venueMinGames:           [4, 6, 8],
+    teamWeightBase:          [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80],
+    h2hFactor:               [0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
+    h2hMaxWeight:            [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
+    h2hLookbackSeasons:      [2, 3, 4, 5],
+    h2hDecayCurrent:         [0.85, 0.95, 1.00],
+    h2hDecayMinus1:          [0.55, 0.70, 0.80, 0.90],
+    h2hDecayMinus2:          [0.30, 0.45, 0.60],
+    h2hDecayOlder:           [0.10, 0.25, 0.40],
+    venueMinGames:           [4, 5, 6, 7, 8],
     venueStrongGames:        [8, 10, 12],
-    venueModerateWeight:     [0.35, 0.50, 0.60],
-    venueStrongWeight:       [0.55, 0.70, 0.80],
-    quarterVenueProxyFactor: [0.50, 1.00, 1.25],
-    fatigueB2BPenalty:       [-4.0, -3.0, -2.5, -1.5, 0.0],
-    quarterAnchorBlendWeight:[0.50, 0.60, 0.70, 0.80, 0.90],
-    underEdgeFactor:         [1.00, 1.10, 1.20, 1.30],
-    injuryOppBoostFactor:    [0.10, 0.15, 0.20, 0.25, 0.30],
-    edgeFTPointThreshold:    [4.0, 5.0, 6.0, 7.0, 8.0],
-    edgeH1PointThreshold:    [5.0, 6.0, 7.0, 8.0],
-    edgeTeamPointThreshold:  [7.0, 8.0, 10.0, 12.0],
-    edgeQPointThreshold:     [2.5, 3.0, 4.0, 5.0]
+    venueModerateWeight:     [0.30, 0.40, 0.50, 0.60],
+    venueStrongWeight:       [0.50, 0.65, 0.75, 0.85],
+    quarterVenueProxyFactor: [0.25, 0.50, 0.75, 1.00, 1.25],
+    fatigueB2BPenalty:       [-5.0, -4.0, -3.0, -2.5, -1.5, -0.5, 0.0],
+    quarterAnchorBlendWeight:[0.30, 0.50, 0.65, 0.75, 0.85, 0.95],
+    underEdgeFactor:         [0.90, 1.00, 1.10, 1.20, 1.30, 1.40],
+    injuryOppBoostFactor:    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35],
+    edgeFTPointThreshold:    [3.5, 4.5, 5.5, 6.5, 7.5, 8.5],
+    edgeH1PointThreshold:    [4.0, 5.0, 6.0, 7.0, 8.0],
+    edgeTeamPointThreshold:  [5.0, 6.5, 8.0, 10.0, 12.0],
+    edgeQPointThreshold:     [2.0, 3.0, 4.0, 5.0],
+    confidenceAThresh:       [0.60, 0.64, 0.68, 0.72],
+    confidenceBThresh:       [0.52, 0.56, 0.60],
+    confidenceCThresh:       [0.45, 0.50, 0.54],
+    volatilityLimit:        [8, 10, 12, 14, 16]
   };
 
   const jointCandidates = _btSampleFromCandidates(jointSearchSpace, sampleCount, rng);
@@ -17418,33 +17428,42 @@ function runJointMultiVariableBacktest(features, allGames, options) {
   let testedCount = 0;
   let improvedCount = 0;
 
-  for (const cand of jointCandidates) {
-    const overrides = { ...baselineOverrides, ...cand };
-    if (typeof TUNING_GRID !== "undefined" && Array.isArray(TUNING_GRID.recencyProfiles)) {
-      const profiles = TUNING_GRID.recencyProfiles;
-      overrides.recencyWeights = profiles[Math.floor(rng() * profiles.length)];
+  const BATCH_SIZE = 100;
+  for (let i = 0; i < jointCandidates.length; i += BATCH_SIZE) {
+    const chunk = jointCandidates.slice(i, i + BATCH_SIZE);
+    for (const cand of chunk) {
+      const overrides = { ...baselineOverrides, ...cand };
+      if (typeof TUNING_GRID !== "undefined" && Array.isArray(TUNING_GRID.recencyProfiles)) {
+        const profiles = TUNING_GRID.recencyProfiles;
+        overrides.recencyWeights = profiles[Math.floor(rng() * profiles.length)];
+      }
+
+      let evalOut;
+      try {
+        evalOut = evaluateFeatureCacheWithOverrides(features, allGames, overrides, { league, includeTest: false });
+      } catch (e) {
+        continue;
+      }
+      testedCount++;
+
+      const valComp = evalOut.validationAccuracyScore?.composite;
+      const trainComp = evalOut.trainAccuracyScore?.composite;
+      if (!isFinite(valComp)) continue;
+
+      const gap = (isFinite(trainComp) ? trainComp : valComp) - valComp;
+      if (gap > 8.0) continue;
+
+      if (valComp > bestValComp + 1e-6) {
+        bestValComp = valComp;
+        bestCandidate = { ...overrides };
+        improvedCount++;
+      }
     }
 
-    let evalOut;
-    try {
-      evalOut = evaluateFeatureCacheWithOverrides(features, allGames, overrides, { league, includeTest: false });
-    } catch (e) {
-      continue;
+    if (typeof onProgress === "function") {
+      try { onProgress(testedCount, jointCandidates.length, bestValComp); } catch (e) {}
     }
-    testedCount++;
-
-    const valComp = evalOut.validationAccuracyScore?.composite;
-    const trainComp = evalOut.trainAccuracyScore?.composite;
-    if (!isFinite(valComp)) continue;
-
-    const gap = (isFinite(trainComp) ? trainComp : valComp) - valComp;
-    if (gap > 8.0) continue;
-
-    if (valComp > bestValComp + 1e-6) {
-      bestValComp = valComp;
-      bestCandidate = { ...overrides };
-      improvedCount++;
-    }
+    await new Promise(r => setTimeout(r, 0));
   }
 
   const finalEval = evaluateFeatureCacheWithOverrides(features, allGames, bestCandidate, { league, includeTest: true });
@@ -17484,6 +17503,56 @@ function runJointMultiVariableBacktest(features, allGames, options) {
     diffKeysCount: Object.keys(proposedDiff).length
   });
   return report;
+}
+
+function exportHardcodedSourceDefaults(league) {
+  const res = window.__lastJointBacktestResult;
+  if (!res || !res.bestCandidate) return null;
+  const c = res.bestCandidate;
+  const targetLeague = (league || res.league || "nba").toLowerCase();
+
+  const code = `// =====================================================================
+// OPTIMAL HARDCODED DEFAULTS FOR ${targetLeague.toUpperCase()}
+// Generated by Joint Backtest on ${new Date().toLocaleDateString()}
+// Validation Accuracy Score: ${res.bestValidationComposite.toFixed(1)}/100
+// =====================================================================
+
+// 1. Update TUNABLE_PARAM_REGISTRY defaults:
+TUNABLE_PARAM_REGISTRY.teamWeightBase.value = ${c.teamWeightBase};
+TUNABLE_PARAM_REGISTRY.h2hFactor.value = ${c.h2hFactor};
+TUNABLE_PARAM_REGISTRY.h2hMaxWeight.value = ${c.h2hMaxWeight};
+TUNABLE_PARAM_REGISTRY.h2hLookbackSeasons.value = ${c.h2hLookbackSeasons};
+TUNABLE_PARAM_REGISTRY.h2hDecayCurrent.value = ${c.h2hDecayCurrent};
+TUNABLE_PARAM_REGISTRY.h2hDecayMinus1.value = ${c.h2hDecayMinus1};
+TUNABLE_PARAM_REGISTRY.h2hDecayMinus2.value = ${c.h2hDecayMinus2};
+TUNABLE_PARAM_REGISTRY.h2hDecayOlder.value = ${c.h2hDecayOlder};
+TUNABLE_PARAM_REGISTRY.venueMinGames.value = ${c.venueMinGames};
+TUNABLE_PARAM_REGISTRY.venueStrongGames.value = ${c.venueStrongGames};
+TUNABLE_PARAM_REGISTRY.venueModerateWeight.value = ${c.venueModerateWeight};
+TUNABLE_PARAM_REGISTRY.venueStrongWeight.value = ${c.venueStrongWeight};
+TUNABLE_PARAM_REGISTRY.quarterVenueProxyFactor.value = ${c.quarterVenueProxyFactor};
+TUNABLE_PARAM_REGISTRY.fatigueB2BPenalty.value = ${c.fatigueB2BPenalty};
+TUNABLE_PARAM_REGISTRY.quarterAnchorBlendWeight.value = ${c.quarterAnchorBlendWeight};
+TUNABLE_PARAM_REGISTRY.underEdgeFactor.value = ${c.underEdgeFactor};
+TUNABLE_PARAM_REGISTRY.injuryOppBoostFactor.value = ${c.injuryOppBoostFactor};
+TUNABLE_PARAM_REGISTRY.edgeFTPointThreshold.value = ${c.edgeFTPointThreshold};
+TUNABLE_PARAM_REGISTRY.edgeH1PointThreshold.value = ${c.edgeH1PointThreshold};
+TUNABLE_PARAM_REGISTRY.edgeTeamPointThreshold.value = ${c.edgeTeamPointThreshold};
+TUNABLE_PARAM_REGISTRY.edgeQPointThreshold.value = ${c.edgeQPointThreshold};
+TUNABLE_PARAM_REGISTRY.confidenceAThresh.value = ${c.confidenceAThresh};
+TUNABLE_PARAM_REGISTRY.confidenceBThresh.value = ${c.confidenceBThresh};
+TUNABLE_PARAM_REGISTRY.confidenceCThresh.value = ${c.confidenceCThresh};
+TUNABLE_PARAM_REGISTRY.volatilityLimit.value = ${c.volatilityLimit};
+
+// 2. Update LEAGUE_EDGE_POINT_THRESHOLDS["${targetLeague}"]:
+LEAGUE_EDGE_POINT_THRESHOLDS["${targetLeague}"] = {
+  ft: ${c.edgeFTPointThreshold},
+  h1: ${c.edgeH1PointThreshold},
+  team: ${c.edgeTeamPointThreshold},
+  q: ${c.edgeQPointThreshold}
+};`;
+
+  return code;
 }
 
 function lockJointBacktestResults(league) {
@@ -18085,13 +18154,22 @@ async function runNbaSeasonBacktest(season, onProgress) {
         validationAccuracyScore?.composite,
         { samplesPerGroup: 8, maxTrainValGap: 8, minValGain: 0.5, seed: 42, league: "nba" }
       );
-      jointSearch = runJointMultiVariableBacktest(
+      jointSearch = await runJointMultiVariableBacktest(
         _btFeatures,
         allGames,
-        { sampleCount: 60, seed: 101, league: "nba" }
+        {
+          sampleCount: 2000,
+          seed: 101,
+          league: "nba",
+          onProgress: (tested, total, bestVal) => {
+            if (typeof onProgress === "function") {
+              try { onProgress(allGames.length, allGames.length, `Sweeping joint configs: ${tested}/${total} (Best: ${isFinite(bestVal) ? bestVal.toFixed(1) : "—"}/100)`); } catch (e) {}
+            }
+          }
+        }
       );
       if (jointSearch?.improved) {
-        notes.push(`⚡ JOINT BACKTEST OPTIMAL FOUND: Validation Accuracy Score boosted to ${jointSearch.bestValidationComposite.toFixed(1)}/100 across ${Object.keys(jointSearch.proposedDiff).length} tuned variables. Tap '⚡ Lock Optimal Parameters' below to make it permanent!`);
+        notes.push(`⚡ JOINT BACKTEST OPTIMAL FOUND: Validation Accuracy Score boosted to ${jointSearch.bestValidationComposite.toFixed(1)}/100 across ${Object.keys(jointSearch.proposedDiff).length} tuned variables (${jointSearch.testedCount} tested). Tap '⚡ Lock Optimal Parameters' below to make it permanent!`);
       } else if (groupedSearch?.improved) {
         notes.push(`Phase 4 grouped search found a validation improvement (${(validationAccuracyScore?.composite ?? 0).toFixed(1)} → ${groupedSearch.bestValidationComposite.toFixed(1)}).`);
       } else {
@@ -18262,6 +18340,7 @@ function renderBacktestPanel() {
       <div style="padding:12px 16px;">
         <button type="button" id="runSeasonBacktestBtn" style="background:#3a9c35; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer;">▶ Run NBA Season Backtest</button>
         <button type="button" id="lockJointParamsBtn" style="background:#d4af37; color:#111; border:none; padding:8px 14px; font-weight:900; font-size:12px; cursor:pointer; margin-left:8px; box-shadow: 0 2px 8px rgba(212,175,55,0.4);">⚡ Lock Optimal Parameters</button>
+        <button type="button" id="copySourceCodeDefaultsBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 12px; font-weight:800; font-size:11px; cursor:pointer; margin-left:8px;">📋 Copy Hardcoded Source Defaults</button>
         <button type="button" id="nbaCoreLockBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 12px; font-weight:800; font-size:11px; cursor:pointer; margin-left:8px;">🔒 Lock NBA Core</button>
         <span id="backtestStatusLabel" style="margin-left:10px; font-size:12px; opacity:0.8;"></span>
         ${resumeInfo ? `<div style="margin-top:8px; font-size:12px; color:#8a6d00;">A previous run was interrupted after ${resumeInfo.doneCount} of the season's games — hit Run to pick up right where it left off, nothing is lost.</div>` : ""}
@@ -18299,6 +18378,28 @@ function renderBacktestPanel() {
         alert(`⚡ SUCCESS!\n\n${count} optimal parameter override(s) locked permanently for NBA.`);
         if (typeof renderConfigsPanel === "function") renderConfigsPanel();
         renderBacktestPanel();
+      }
+    };
+  }
+
+  const copySourceBtn = document.getElementById("copySourceCodeDefaultsBtn");
+  if (copySourceBtn) {
+    copySourceBtn.onclick = async function() {
+      const code = exportHardcodedSourceDefaults("nba");
+      if (!code) {
+        alert("⚠️ No joint backtest results available yet. Please run the NBA Season Backtest first.");
+        return;
+      }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(code);
+        } else {
+          const ta = Object.assign(document.createElement("textarea"), { value: code, style: "position:fixed;opacity:0" });
+          document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+        }
+        alert("📋 COPIED HARDCODED JS DEFAULTS!\n\nYou can now paste this directly into patched_master.txt to permanently hardcode the winning NBA parameters into the source file.");
+      } catch(e) {
+        alert("Copy failed: " + e.message);
       }
     };
   }
@@ -18355,8 +18456,10 @@ function renderBacktestPanel() {
       document.addEventListener("visibilitychange", reacquireBtWakeLock);
 
       try {
-        await runNbaSeasonBacktest(null, (done, total) => {
-          if (statusLabel) statusLabel.textContent = `Fetching 1st half data… ${done}/${total} games. Keep this tab open and the screen on.`;
+        await runNbaSeasonBacktest(null, (done, total, customMsg) => {
+          if (statusLabel) {
+            statusLabel.textContent = customMsg || `Fetching 1st half data… ${done}/${total} games. Keep this tab open and the screen on.`;
+          }
         });
         renderBacktestPanel();
       } catch (e) {
