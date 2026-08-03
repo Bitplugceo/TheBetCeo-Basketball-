@@ -1,4 +1,4 @@
-M
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -16862,6 +16862,13 @@ function buildBacktestFeatureCache(gameLogs, allGames, splitBoundaries, onProgre
 
     const gameMs = new Date(game.date).getTime();
     features[idx] = {
+      teamName: game.teamName, oppName: game.oppName,
+      gameScored: game.scored, gameAllowed: game.allowed,
+      gameH1Scored: game.h1Scored, gameH1Allowed: game.h1Allowed,
+      gameQ1Scored: game.q1Scored, gameQ1Allowed: game.q1Allowed,
+      gameQ2Scored: game.q2Scored, gameQ2Allowed: game.q2Allowed,
+      gameQ3Scored: game.q3Scored, gameQ3Allowed: game.q3Allowed,
+      gameQ4Scored: game.q4Scored, gameQ4Allowed: game.q4Allowed,
       teamScored: teamWindow.scored, teamAllowed: teamWindow.allowed,
       oppScored: oppWindow.scored, oppAllowed: oppWindow.allowed,
       teamH1Scored: teamH1Window.scored, oppH1Scored: oppH1Window.scored,
@@ -17371,9 +17378,185 @@ function runGroupedParamSearchPhase4(features, allGames, baselineValComposite, o
 }
 
 /**
- * JOINT MULTI-VARIABLE BACKTEST SWEEPER (EXPANDED TO THOUSANDS)
- * Jointly searches across ALL 12 core prediction factors simultaneously.
- * Evaluates candidate parameter vectors against precomputed Phase 3 feature cache.
+ * LIGHTWEIGHT CANDIDATE EVALUATOR
+ * Zero-allocation evaluator for candidate sweeps across precomputed features.
+ * Prevents memory leaks and WebKit Jetsam kills on mobile browsers.
+ */
+function evaluateFeatureCacheLight(features, paramOverrides, options) {
+  options = options || {};
+  const league = options.league || "nba";
+
+  const originalGetParam = window.getParam;
+  window.getParam = function(key, lg) {
+    if (paramOverrides && Object.prototype.hasOwnProperty.call(paramOverrides, key)) {
+      return paramOverrides[key];
+    }
+    return originalGetParam ? originalGetParam(key, lg) : getTunableParam(key, lg);
+  };
+
+  let trainN = 0, valN = 0;
+  let trainTotalErr = 0, valTotalErr = 0;
+  let trainTeamErr = 0, valTeamErr = 0;
+  let trainH1TotalErr = 0, valH1TotalErr = 0;
+  let trainH1TeamErr = 0, valH1TeamErr = 0;
+  let trainQTotalErr = 0, valQTotalErr = 0;
+  let trainQTeamErr = 0, valQTeamErr = 0;
+  let trainQCount = 0, valQCount = 0;
+  let trainQTeamCount = 0, valQTeamCount = 0;
+  let trainH1Count = 0, valH1Count = 0;
+
+  try {
+    for (let i = 0; i < features.length; i++) {
+      const feat = features[i];
+      if (!feat || feat.split === "test") continue;
+
+      const isVal = feat.split === "validation";
+      const teamWindowScored = feat.teamScored;
+      const oppWindowScored  = feat.oppScored;
+      if (!teamWindowScored || teamWindowScored.length < 5 || !oppWindowScored || oppWindowScored.length < 5) continue;
+
+      const parsed = feat.parsed;
+      const _tw = isFinite(window.getParam("teamWeightBase", league)) ? Number(window.getParam("teamWeightBase", league)) : 0.65;
+      const _btBaseConfig = {
+        h2hFactor: window.getParam("h2hFactor", league) ?? 1.0,
+        extremeExpansion: 1.0,
+        restDaysA: feat.restDaysA,
+        restDaysB: feat.restDaysB
+      };
+
+      const _ftSampleTier = getSampleTier(teamWindowScored, oppWindowScored);
+      const _h1SampleTier = getSampleTier(feat.teamH1Scored, feat.oppH1Scored);
+      const _dynWeightsFT = getDynamicWeights(_ftSampleTier, 0.5, league);
+      const _dynWeightsH1 = getDynamicWeights(_h1SampleTier, 0.5, league);
+
+      const _btConfig = {
+        ..._btBaseConfig,
+        teamWeight: isFinite(_dynWeightsFT?.teamWeight) ? _dynWeightsFT.teamWeight : _tw,
+        oppWeight:  isFinite(_dynWeightsFT?.oppWeight)  ? _dynWeightsFT.oppWeight  : 1 - _tw
+      };
+      const _btConfigH1 = {
+        ..._btBaseConfig,
+        teamWeight: isFinite(_dynWeightsH1?.teamWeight) ? _dynWeightsH1.teamWeight : _tw,
+        oppWeight:  isFinite(_dynWeightsH1?.oppWeight)  ? _dynWeightsH1.oppWeight  : 1 - _tw
+      };
+
+      let calc;
+      try {
+        calc = computeFTProjection({ league, parsed, lines: {}, injMultA: 1, injMultB: 1, config: _btConfig });
+      } catch (e) { continue; }
+      if (!calc || !isFinite(calc.projAFT) || !isFinite(calc.projBFT)) continue;
+
+      const gameScored = feat.gameScored;
+      const gameAllowed = feat.gameAllowed;
+
+      if (isVal) {
+        valN++;
+        valTotalErr += Math.abs(calc.ftProj - (gameScored + gameAllowed));
+        valTeamErr += Math.abs(calc.projAFT - gameScored) + Math.abs(calc.projBFT - gameAllowed);
+      } else {
+        trainN++;
+        trainTotalErr += Math.abs(calc.ftProj - (gameScored + gameAllowed));
+        trainTeamErr += Math.abs(calc.projAFT - gameScored) + Math.abs(calc.projBFT - gameAllowed);
+      }
+
+      let calc1H = null;
+      try {
+        calc1H = compute1HProjection({ league, parsed, lines: {}, injMultA: 1, injMultB: 1, config: _btConfigH1 });
+      } catch (e) {}
+
+      if (calc1H && isFinite(calc1H.h1Proj) && isFinite(feat.gameH1Scored) && isFinite(feat.gameH1Allowed)) {
+        const actualH1Tot = feat.gameH1Scored + feat.gameH1Allowed;
+        if (isVal) {
+          valH1Count++;
+          valH1TotalErr += Math.abs(calc1H.h1Proj - actualH1Tot);
+          if (isFinite(calc1H.projA1H) && isFinite(calc1H.projB1H)) {
+            valH1TeamErr += Math.abs(calc1H.projA1H - feat.gameH1Scored) + Math.abs(calc1H.projB1H - feat.gameH1Allowed);
+          }
+        } else {
+          trainH1Count++;
+          trainH1TotalErr += Math.abs(calc1H.h1Proj - actualH1Tot);
+          if (isFinite(calc1H.projA1H) && isFinite(calc1H.projB1H)) {
+            trainH1TeamErr += Math.abs(calc1H.projA1H - feat.gameH1Scored) + Math.abs(calc1H.projB1H - feat.gameH1Allowed);
+          }
+        }
+
+        try {
+          const q1 = computeQuarterProjectionBT("q1", { league, parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: feat.teamName, teamBName: feat.oppName, combinedVolRatio: 0.5, config: _btConfig });
+          const q2 = computeQuarterProjectionBT("q2", { league, parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: feat.teamName, teamBName: feat.oppName, combinedVolRatio: 0.5, config: _btConfig });
+          const q3 = computeQuarterProjectionBT("q3", { league, parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: feat.teamName, teamBName: feat.oppName, combinedVolRatio: 0.5, config: _btConfig });
+          const q4 = computeQuarterProjectionBT("q4", { league, parsed, ftCalc: calc, injA: 1, injB: 1, teamAName: feat.teamName, teamBName: feat.oppName, combinedVolRatio: 0.5, config: _btConfig });
+          applyQuarterAnchorBlendBT(q1, q2, q3, q4, calc1H, calc);
+
+          const qs = [q1, q2, q3, q4];
+          const actualQScored = [feat.gameQ1Scored, feat.gameQ2Scored, feat.gameQ3Scored, feat.gameQ4Scored];
+          const actualQAllowed = [feat.gameQ1Allowed, feat.gameQ2Allowed, feat.gameQ3Allowed, feat.gameQ4Allowed];
+
+          qs.forEach((q, idx) => {
+            if (q && isFinite(q.proj) && isFinite(actualQScored[idx]) && isFinite(actualQAllowed[idx])) {
+              const actQTot = actualQScored[idx] + actualQAllowed[idx];
+              if (isVal) {
+                valQCount++;
+                valQTotalErr += Math.abs(q.proj - actQTot);
+                if (isFinite(q.projA) && isFinite(q.projB)) {
+                  valQTeamCount += 2;
+                  valQTeamErr += Math.abs(q.projA - actualQScored[idx]) + Math.abs(q.projB - actualQAllowed[idx]);
+                }
+              } else {
+                trainQCount++;
+                trainQTotalErr += Math.abs(q.proj - actQTot);
+                if (isFinite(q.projA) && isFinite(q.projB)) {
+                  trainQTeamCount += 2;
+                  trainQTeamErr += Math.abs(q.projA - actualQScored[idx]) + Math.abs(q.projB - actualQAllowed[idx]);
+                }
+              }
+            }
+          });
+        } catch (e) {}
+      }
+    }
+  } finally {
+    window.getParam = originalGetParam;
+  }
+
+  if (!valN || !trainN) return null;
+
+  const bandScore = (mae, target) => {
+    if (!isFinite(mae) || !isFinite(target) || target <= 0) return null;
+    return Math.max(0, Math.min(100, 100 * (1 - mae / (2 * target))));
+  };
+
+  const calcComposite = (totErr, n, teamErr, h1TotErr, h1N, h1TeamErr, qTotErr, qN, qTeamErr, qTeamN) => {
+    const totMAE = totErr / n;
+    const teamMAE = teamErr / (n * 2);
+    const h1TotMAE = h1N ? h1TotErr / h1N : null;
+    const h1TeamMAE = h1N ? h1TeamErr / (h1N * 2) : null;
+    const qTotMAE = qN ? qTotErr / qN : null;
+    const qTeamMAE = qTeamN ? qTeamErr / qTeamN : null;
+
+    const scores = [
+      bandScore(totMAE, BT_ACCURACY_TARGETS.totalMAE),
+      bandScore(teamMAE, BT_ACCURACY_TARGETS.teamScoreMAE),
+      bandScore(h1TotMAE, BT_ACCURACY_TARGETS.h1TotalMAE),
+      bandScore(h1TeamMAE, BT_ACCURACY_TARGETS.h1TeamScoreMAE),
+      bandScore(qTotMAE, BT_ACCURACY_TARGETS.qTotalMAE),
+      bandScore(qTeamMAE, BT_ACCURACY_TARGETS.qTeamMAE)
+    ].filter(v => v !== null && isFinite(v));
+
+    return scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
+  };
+
+  const trainComp = calcComposite(trainTotalErr, trainN, trainTeamErr, trainH1TotalErr, trainH1Count, trainH1TeamErr, trainQTotalErr, trainQCount, trainQTeamErr, trainQTeamCount);
+  const valComp = calcComposite(valTotalErr, valN, valTeamErr, valH1TotalErr, valH1Count, valH1TeamErr, valQTotalErr, valQCount, valQTeamErr, valQTeamCount);
+
+  return {
+    trainAccuracyScore: { composite: trainComp },
+    validationAccuracyScore: { composite: valComp }
+  };
+}
+
+/**
+ * JOINT MULTI-VARIABLE BACKTEST SWEEPER (LIGHTWEIGHT)
+ * Jointly searches across ALL 12 core prediction factors simultaneously using zero-allocation evaluation.
  */
 async function runJointMultiVariableBacktest(features, allGames, options) {
   options = options || {};
@@ -17389,8 +17572,8 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
     if (v !== undefined && v !== null) baselineOverrides[k] = v;
   });
 
-  const baselineEval = evaluateFeatureCacheWithOverrides(features, allGames, baselineOverrides, { league, includeTest: false });
-  const baselineValComp = baselineEval.validationAccuracyScore?.composite || -Infinity;
+  const baselineEval = evaluateFeatureCacheLight(features, baselineOverrides, { league });
+  const baselineValComp = baselineEval?.validationAccuracyScore?.composite || -Infinity;
 
   const jointSearchSpace = {
     teamWeightBase:          [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80],
@@ -17440,14 +17623,14 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
 
       let evalOut;
       try {
-        evalOut = evaluateFeatureCacheWithOverrides(features, allGames, overrides, { league, includeTest: false });
+        evalOut = evaluateFeatureCacheLight(features, overrides, { league });
       } catch (e) {
         continue;
       }
       testedCount++;
 
-      const valComp = evalOut.validationAccuracyScore?.composite;
-      const trainComp = evalOut.trainAccuracyScore?.composite;
+      const valComp = evalOut?.validationAccuracyScore?.composite;
+      const trainComp = evalOut?.trainAccuracyScore?.composite;
       if (!isFinite(valComp)) continue;
 
       const gap = (isFinite(trainComp) ? trainComp : valComp) - valComp;
@@ -18085,6 +18268,8 @@ async function runNbaSeasonBacktest(season, onProgress) {
     if (domB) domB.value = savedB ?? "";
     AppState.context.data = savedContextData;
     window.__seriesDateCache = savedSeriesDateCache;
+    window.__btRunInProgress = false;
+    try { localStorage.removeItem(`BB_H1_PROGRESS_NBA_${season}`); } catch (e) {}
   }
 
   const overall = calculateScoresOnlyCalibration(results);
