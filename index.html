@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4136,6 +4135,12 @@ const TUNABLE_PARAM_REGISTRY = {
     value: 1.30, min: 1.1, max: 1.5, type: "scalar",
     scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
     description: "Upper pace clamp bound for non-NBA/NCAA leagues",
+    lastVerifiedAt: null
+  },
+  advancedBlendWeight: {
+    value: 0.45, min: 0.0, max: 1.0, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Weight given to the ESPN-boxscore-derived pace/ortg/drtg blend vs. the points-path projection (0 = points-only, 1 = advanced-only). Previously hardcoded to 0.45 inside computeFTProjection/compute1HProjection and never swept by the backtest search.",
     lastVerifiedAt: null
   },
   // PHASE 4 CLEANUP: massacreLightThreshold / massacreHeavyThreshold /
@@ -16839,8 +16844,30 @@ async function fetchNbaGameH1(eventId) {
 }
 
 // =============================================================================
-// BATCH 7 PERMANENT DECISION — NO PACE MODEL
+// PACE / ORTG / DRTG — STATUS (updated 2026-08-04, supersedes the note below)
 // -----------------------------------------------------------------------------
+// The BATCH 7 note below (2026-08-01) had already drifted from the code by
+// the time this update was written: FT and 1H were never actually disabled
+// (see the isEspnLeague && hasRealRatings && hasRealPace branch in
+// computeFTProjection/compute1HProjection) — only quarters was dead code
+// (if (false && hasAdvancedQ)). The backtest season cache (v2adv) does carry
+// real per-game ESPN-boxscore-derived ortg/drtg/pace, gated at a 25%
+// minimum-coverage threshold before a cache is trusted — it was partial, not
+// absent.
+//
+// As of this update: quarters gets the same advanced-stats blend as FT/1H,
+// in both the live path and computeQuarterProjectionBT. advancedBlendWeight
+// — previously hardcoded at 0.45 everywhere — is now a registered tunable,
+// swept by both the grouped search and the joint multi-variable search. The
+// evaluator behind the joint search was also found to be missing the
+// per-game advanced-context injection the other two evaluators had, so it
+// was scoring FT/1H/quarters against stale or empty ortg10/drtg10/pace10
+// before this fix — that's corrected too. Read the Phase 6 held-out test
+// result before trusting any specific advancedBlendWeight value: this
+// update makes the knob testable, it does not itself prove the knob helps.
+// =============================================================================
+//
+// Original BATCH 7 note, kept for history (see above for current status):
 // Decision date: 2026-08-01
 // Choice: B — formally exclude pace from projection math (live + backtest).
 //
@@ -16879,6 +16906,16 @@ function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, in
   const sampleSize = Math.min(aS.length, bS.length);
   const leagueBaseQ = (LEAGUE_BASES[league] || 160) / 8;
 
+  const ctxAQ = AppState.context.data?.A || {};
+  const ctxBQ = AppState.context.data?.B || {};
+  const hasAdvancedQ = isFinite(avgOrNaN(ctxAQ.ortg10)) && isFinite(avgOrNaN(ctxAQ.drtg10)) &&
+                       isFinite(avgOrNaN(ctxBQ.ortg10)) && isFinite(avgOrNaN(ctxBQ.drtg10)) &&
+                       isFinite(avgOrNaN(ctxAQ.pace10)) && avgOrNaN(ctxAQ.pace10) > 0 &&
+                       isFinite(avgOrNaN(ctxBQ.pace10)) && avgOrNaN(ctxBQ.pace10) > 0 &&
+                       (ctxAQ.ortg10 || []).length >= 5 && (ctxBQ.ortg10 || []).length >= 5;
+  const leagueRatingBaseQ = LEAGUE_RATING_BASES[league] || 110;
+  const isEspnLeagueQ = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
+
   let projA, projB;
   const _dynWeightsQ = getDynamicWeights(
     getSampleTier(aS, bS),
@@ -16888,8 +16925,39 @@ function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, in
   const _twQ = isFinite(_dynWeightsQ?.teamWeight) ? Number(_dynWeightsQ.teamWeight) : 0.65;
   const _owQ = 1 - _twQ;
 
-  projA = anchorProjection(_dateAwareAvgAQ * _twQ + avgOrNaN(bA) * _owQ, sampleSize, leagueBaseQ);
-  projB = anchorProjection(_dateAwareAvgBQ * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
+  const projA_pts = anchorProjection(_dateAwareAvgAQ * _twQ + avgOrNaN(bA) * _owQ, sampleSize, leagueBaseQ);
+  const projB_pts = anchorProjection(_dateAwareAvgBQ * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
+
+  // AUDIT FIX (pace/ortg/drtg wiring, quarters BT): mirrors the live computeQ
+  // blend — same advancedBlendWeight tunable, same sanity band, so the
+  // backtest search can score this instead of silently skipping quarters'
+  // advanced stats the way it did before.
+  if (hasAdvancedQ && isEspnLeagueQ) {
+    const _qRegMinutes = getLeagueRegulationMinutes(league);
+    const qDivisor = 400 * (48 / _qRegMinutes);
+    const projRatingAQ = avgOrNaN(ctxAQ.ortg10) + avgOrNaN(ctxBQ.drtg10) - leagueRatingBaseQ;
+    const projRatingBQ = avgOrNaN(ctxBQ.ortg10) + avgOrNaN(ctxAQ.drtg10) - leagueRatingBaseQ;
+    const synPaceQ = (avgOrNaN(ctxAQ.pace10) + avgOrNaN(ctxBQ.pace10)) / 2;
+    const projA_adv = (synPaceQ * projRatingAQ) / qDivisor;
+    const projB_adv = (synPaceQ * projRatingBQ) / qDivisor;
+    const advTotalQ = (isFinite(projA_adv) ? projA_adv : 0) + (isFinite(projB_adv) ? projB_adv : 0);
+    const advSaneQ = isFinite(advTotalQ) && advTotalQ >= leagueBaseQ * 0.7 && advTotalQ <= leagueBaseQ * 1.3
+      && isFinite(projA_adv) && isFinite(projB_adv);
+    const _advWQ = isFinite(config?.advancedBlendWeight)
+      ? Number(config.advancedBlendWeight)
+      : (isFinite(getParam("advancedBlendWeight", league)) ? Number(getParam("advancedBlendWeight", league)) : 0.45);
+    if (advSaneQ && _advWQ > 0) {
+      const w = Math.max(0, Math.min(1, _advWQ));
+      projA = projA_pts * (1 - w) + projA_adv * w;
+      projB = projB_pts * (1 - w) + projB_adv * w;
+    } else {
+      projA = projA_pts;
+      projB = projB_pts;
+    }
+  } else {
+    projA = projA_pts;
+    projB = projB_pts;
+  }
 
   const QUARTER_VENUE_PROXY_FACTOR = isFinite(getParam("quarterVenueProxyFactor", league)) ? Number(getParam("quarterVenueProxyFactor", league)) : 1;
   if (ftCalc.aVenueEnabled && isFinite(ftCalc.aVenueAdjustment?.offensiveAdjustment)) {
@@ -17060,10 +17128,14 @@ function _btInjectAdvancedContext(feat) {
 // once per league, so a future multi-config sweep (Phase 4) evaluates each
 // candidate as a pure function over this cache instead of re-deriving the
 // same rolling windows and H2H series from gameLogs on every candidate.
-// Deliberately excludes ortg/drtg "ratings" (BATCH 7 PERMANENT DECISION —
-// NO PACE MODEL, elsewhere in this file, stands — not revisited here) and
-// "line" (the season backtest never uses real market lines — every
-// computeFTProjection/compute1HProjection call below passes lines: {}).
+// UPDATED 2026-08-04: this comment previously claimed ortg/drtg "ratings"
+// were deliberately excluded per the BATCH 7 decision — that was already
+// inaccurate. The cache below computes rolling teamOrtg10/teamDrtg10/
+// teamPace10 (see _btInjectAdvancedContext), which is exactly what feeds
+// the FT/1H/quarters advanced-stats blend during a backtest run. See the
+// status note above computeQuarterProjectionBT for where things stand now.
+// Still excludes "line" (the season backtest never uses real market lines —
+// every computeFTProjection/compute1HProjection call below passes lines: {}).
 function buildBacktestFeatureCache(gameLogs, allGames, splitBoundaries, onProgress) {
   const t0 = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
   const { validationStartMs, testStartMs } = splitBoundaries || {};
@@ -17183,7 +17255,7 @@ const BACKTEST_PARAM_GROUPS = {
   B_FORM_VENUE: {
     id: "B_FORM_VENUE",
     label: "Form/venue",
-    keys: ["teamWeightBase", "venueMinGames", "venueStrongGames", "venueModerateWeight", "venueStrongWeight", "quarterVenueProxyFactor"],
+    keys: ["teamWeightBase", "venueMinGames", "venueStrongGames", "venueModerateWeight", "venueStrongWeight", "quarterVenueProxyFactor", "advancedBlendWeight"],
     // recencyWeights is a vector — handled via the existing TUNING_GRID profiles
     candidates: {
       teamWeightBase:         [0.55, 0.60, 0.65, 0.70, 0.75],
@@ -17191,7 +17263,11 @@ const BACKTEST_PARAM_GROUPS = {
       venueStrongGames:       [8, 10, 12],
       venueModerateWeight:    [0.35, 0.50, 0.60],
       venueStrongWeight:      [0.55, 0.70, 0.80],
-      quarterVenueProxyFactor:[0.5, 1.0, 1.25]
+      quarterVenueProxyFactor:[0.5, 1.0, 1.25],
+      // AUDIT FIX (pace/ortg/drtg wiring): advancedBlendWeight was hardcoded
+      // to 0.45 and never swept — 0.00 is included so the search can prove
+      // "off" beats a nonzero weight if that's what the data says.
+      advancedBlendWeight:    [0.00, 0.25, 0.45, 0.65, 0.85]
     },
     recencyProfiles: true
   },
@@ -17661,6 +17737,15 @@ function evaluateFeatureCacheLight(features, paramOverrides, options) {
       if (!teamWindowScored || teamWindowScored.length < 5 || !oppWindowScored || oppWindowScored.length < 5) continue;
 
       const parsed = feat.parsed;
+      // AUDIT FIX (pace/ortg/drtg wiring): this evaluator backs both the
+      // baseline eval and every candidate in the 2000-sample joint search,
+      // and unlike the other two backtest evaluators it never injected
+      // per-game advanced context — computeFTProjection/compute1HProjection/
+      // computeQuarterProjectionBT below were seeing stale or empty
+      // ortg10/drtg10/pace10 for every single game, so advancedBlendWeight
+      // (and any other advanced-stats behavior) could never be validated by
+      // this search. Matches the injection call the other evaluators make.
+      _btInjectAdvancedContext(feat);
       const _tw = isFinite(window.getParam("teamWeightBase", league)) ? Number(window.getParam("teamWeightBase", league)) : 0.65;
       const _btBaseConfig = {
         h2hFactor: window.getParam("h2hFactor", league) ?? 1.0,
@@ -17846,7 +17931,10 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
     confidenceAThresh:       [0.60, 0.64, 0.68, 0.72],
     confidenceBThresh:       [0.52, 0.56, 0.60],
     confidenceCThresh:       [0.45, 0.50, 0.54],
-    volatilityLimit:        [8, 10, 12, 14, 16]
+    volatilityLimit:        [8, 10, 12, 14, 16],
+    // AUDIT FIX (pace/ortg/drtg wiring): advancedBlendWeight was hardcoded
+    // to 0.45 and never part of this joint sweep — now a real candidate.
+    advancedBlendWeight:     [0.00, 0.20, 0.35, 0.45, 0.60, 0.75, 0.90]
   };
 
   const jointCandidates = _btSampleFromCandidates(jointSearchSpace, sampleCount, rng);
@@ -20153,6 +20241,7 @@ const h1Calc = compute1HProjection({
                            (ctxAQ.ortg10 || []).length >= 5 && (ctxBQ.ortg10 || []).length >= 5;
       const leaguePaceBaseQ = LEAGUE_PACE_BASES[league] || 74;
       const leagueRatingBaseQ = LEAGUE_RATING_BASES[league] || 110;
+      const isEspnLeagueQ = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
 
       let projA, projB;
       const _dynWeightsQ = getDynamicWeights(
@@ -20160,24 +20249,42 @@ const h1Calc = compute1HProjection({
         globalModelState?.volState?.combinedVolRatio ?? 0.5,
         league
       );
-      if (false && hasAdvancedQ) {
-        // AUDIT SIMPLIFICATION: advanced pace/rating branch permanently
-        // disabled for quarters too, same reasoning as FT/H1.
+      const _twQ = isFinite(_dynWeightsQ?.teamWeight) ? Number(_dynWeightsQ.teamWeight) : 0.65;
+      const _owQ = 1 - _twQ;
+      const projA_pts = anchorProjection(_dateAwareAvgAQ * _twQ + avgOrNaN(bA) * _owQ, sampleSize, leagueBaseQ);
+      const projB_pts = anchorProjection(_dateAwareAvgBQ * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
+
+      // AUDIT FIX (pace/ortg/drtg wiring, quarters): re-enabled — was
+      // permanently dead code (if (false && hasAdvancedQ)). Now blends with
+      // the points-path projection (never a pure replace) using the same
+      // advancedBlendWeight tunable and sanity band as FT/1H, so a bad
+      // advanced number can only fall back to the points path, never win.
+      if (hasAdvancedQ && isEspnLeagueQ) {
         const synPaceQ = (avgOrNaN(ctxAQ.pace10) + avgOrNaN(ctxBQ.pace10)) / 2;
         const projRatingAQ = avgOrNaN(ctxAQ.ortg10) + avgOrNaN(ctxBQ.drtg10) - leagueRatingBaseQ;
         const projRatingBQ = avgOrNaN(ctxBQ.ortg10) + avgOrNaN(ctxAQ.drtg10) - leagueRatingBaseQ;
 
         const _qRegMinutes = getLeagueRegulationMinutes(league);
         const qDivisor = 400 * (48 / _qRegMinutes);
-        projA = anchorProjection((synPaceQ * projRatingAQ) / qDivisor, sampleSize, leagueBaseQ);
-        projB = anchorProjection((synPaceQ * projRatingBQ) / qDivisor, sampleSize, leagueBaseQ);
+        const projA_adv = (synPaceQ * projRatingAQ) / qDivisor;
+        const projB_adv = (synPaceQ * projRatingBQ) / qDivisor;
+        const advTotalQ = (isFinite(projA_adv) ? projA_adv : 0) + (isFinite(projB_adv) ? projB_adv : 0);
+        const advSaneQ = isFinite(advTotalQ) && advTotalQ >= leagueBaseQ * 0.7 && advTotalQ <= leagueBaseQ * 1.3
+          && isFinite(projA_adv) && isFinite(projB_adv);
+        const _advWQ = isFinite(config?.advancedBlendWeight)
+          ? Number(config.advancedBlendWeight)
+          : (isFinite(getParam("advancedBlendWeight", league)) ? Number(getParam("advancedBlendWeight", league)) : 0.45);
+        if (advSaneQ && _advWQ > 0) {
+          const w = Math.max(0, Math.min(1, _advWQ));
+          projA = projA_pts * (1 - w) + projA_adv * w;
+          projB = projB_pts * (1 - w) + projB_adv * w;
+        } else {
+          projA = projA_pts;
+          projB = projB_pts;
+        }
       } else {
-
-        const _twQ = isFinite(_dynWeightsQ?.teamWeight) ? Number(_dynWeightsQ.teamWeight) : 0.65;
-        const _owQ = 1 - _twQ;
-
-        projA = anchorProjection(_dateAwareAvgAQ * _twQ + avgOrNaN(bA) * _owQ, sampleSize, leagueBaseQ);
-        projB = anchorProjection(_dateAwareAvgBQ * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
+        projA = projA_pts;
+        projB = projB_pts;
       }
 
       // AUDIT FIX #5: was hardcoded to 1 (always full-strength, no way to dial
