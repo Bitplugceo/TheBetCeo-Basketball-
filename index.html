@@ -1,3 +1,4 @@
+Z
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -18191,15 +18192,48 @@ async function runNbaSeasonBacktest(season, onProgress) {
   engineDebug("Season backtest starting", { league: "nba", season });
 
   if (!window.__bbSeasonDataCache) window.__bbSeasonDataCache = {};
-  const _cacheKey = "nba_" + season;
+  // v2adv: invalidate older caches that lack per-game ortg/drtg/pace on gameLogs
+  const _cacheKey = "nba_v2adv_" + season;
   let gameLogs, allGames, h1ByEvent;
   const _cached = window.__bbSeasonDataCache[_cacheKey];
+
+  function _btApplyH1AndAdvancedToGameLogs(logs, h1mapByEvent) {
+    let advCount = 0, h1Count = 0;
+    Object.keys(logs || {}).forEach(teamId => {
+      (logs[teamId] || []).forEach(g => {
+        const h1map = h1mapByEvent?.[g.eventId];
+        const mine = h1map?.[g.teamId];
+        const opp = h1map?.[g.oppId];
+        if (mine && opp && isFinite(mine.h1) && isFinite(opp.h1)) {
+          g.h1Scored = mine.h1;
+          g.h1Allowed = opp.h1;
+          h1Count++;
+        }
+        if (mine?.quarters && opp?.quarters) {
+          g.q1Scored = mine.quarters[0]; g.q1Allowed = opp.quarters[0];
+          g.q2Scored = mine.quarters[1]; g.q2Allowed = opp.quarters[1];
+          g.q3Scored = mine.quarters[2]; g.q3Allowed = opp.quarters[2];
+          g.q4Scored = mine.quarters[3]; g.q4Allowed = opp.quarters[3];
+        }
+        if (mine && isFinite(mine.ortg) && isFinite(mine.drtg) && isFinite(mine.pace)) {
+          g.ortg = mine.ortg;
+          g.drtg = mine.drtg;
+          g.pace = mine.pace;
+          advCount++;
+        }
+      });
+    });
+    return { h1Count, advCount };
+  }
 
   if (_cached && _cached.gameLogs && _cached.allGames && _cached.h1ByEvent) {
     gameLogs = _cached.gameLogs;
     allGames = _cached.allGames;
     h1ByEvent = _cached.h1ByEvent;
-    engineDebug("Season backtest using in-memory cache", { season, games: allGames.length });
+    const applied = _btApplyH1AndAdvancedToGameLogs(gameLogs, h1ByEvent);
+    engineDebug("Season backtest using in-memory cache", {
+      season, games: allGames.length, h1Applied: applied.h1Count, advancedApplied: applied.advCount
+    });
     if (typeof onProgress === "function") {
       try { onProgress(allGames.length, allGames.length); } catch (e) {}
     }
@@ -18261,33 +18295,15 @@ async function runNbaSeasonBacktest(season, onProgress) {
     await new Promise(r => setTimeout(r, 20));
   }
 
-    for (const teamId of teamIds) {
-      for (const g of (gameLogs[teamId] || [])) {
-        const h1map = h1ByEvent[g.eventId];
-        const mine = h1map?.[g.teamId];
-        const opp = h1map?.[g.oppId];
-        if (mine && opp && isFinite(mine.h1) && isFinite(opp.h1)) {
-          g.h1Scored = mine.h1;
-          g.h1Allowed = opp.h1;
-        }
-        if (mine?.quarters && opp?.quarters) {
-          g.q1Scored = mine.quarters[0]; g.q1Allowed = opp.quarters[0];
-          g.q2Scored = mine.quarters[1]; g.q2Allowed = opp.quarters[1];
-          g.q3Scored = mine.quarters[2]; g.q3Allowed = opp.quarters[2];
-          g.q4Scored = mine.quarters[3]; g.q4Allowed = opp.quarters[3];
-        }
-        if (mine && isFinite(mine.ortg) && isFinite(mine.drtg) && isFinite(mine.pace)) {
-          g.ortg = mine.ortg;
-          g.drtg = mine.drtg;
-          g.pace = mine.pace;
-        }
-      }
-    }
+    const appliedFresh = _btApplyH1AndAdvancedToGameLogs(gameLogs, h1ByEvent);
+    engineDebug("Season backtest H1/advanced applied to gameLogs", appliedFresh);
 
     try { localStorage.removeItem(h1ProgressKey); } catch (e) {}
 
-    window.__bbSeasonDataCache[_cacheKey] = { gameLogs, allGames, h1ByEvent, season, cachedAt: new Date().toISOString() };
-    engineDebug("Season backtest data cached in memory", { season, games: allGames.length });
+    window.__bbSeasonDataCache[_cacheKey] = { gameLogs, allGames, h1ByEvent, season, cacheVersion: "v2adv", cachedAt: new Date().toISOString() };
+    engineDebug("Season backtest data cached in memory", {
+      season, games: allGames.length, advancedApplied: appliedFresh.advCount
+    });
   }
 
   const domA = document.getElementById("aFTScored");
