@@ -4406,7 +4406,13 @@ window.loadRealNbaSeasonFromEspn = loadRealNbaSeasonFromEspn;
  * onProgress(done, total, label) — wire to button text "12/180".
  */
 async function loadRealNbaBothSeasons(onProgress) {
-  const seasons = ["2024/25", "2025/26"];
+  // SAMPLE-SIZE FIX: 2 seasons left MAX-POWER with only 10-20 decisive
+  // plays per market after edge-threshold filtering — nowhere near enough
+  // to trust a win-rate lock. ESPN's scoreboard endpoint works the same way
+  // for older seasons, so pull more of them to give the (now much stricter)
+  // minDecisive/z-test gate in runMaxPowerJointSearch a real chance to pass
+  // on signal instead of always failing for lack of data.
+  const seasons = ["2019/20", "2020/21", "2021/22", "2022/23", "2023/24", "2024/25", "2025/26"];
   const results = [];
   for (let i = 0; i < seasons.length; i++) {
     const r = await loadRealNbaSeasonFromEspn(seasons[i], function (done, total, label) {
@@ -4720,7 +4726,15 @@ async function runMaxPowerJointSearch(opts) {
     // 3. Must not regress on either season
     // 4. Must beat any previously locked set for this market
     let locked = false;
-    const minDecisive = 8;
+    // STATISTICAL RIGOR FIX: minDecisive was 8 and the margin was a flat
+    // +0.5 percentage points — with 1,800 random candidates tried per
+    // market and only a couple seasons of history (real per-market decisive
+    // counts run 10-20), that margin is well inside sampling noise; a coin
+    // that hits 55%+ heads in 15 flips is unremarkable. Raised the floor and
+    // added an approximate one-proportion z-test against the baseline win
+    // rate so a lock requires the improvement to plausibly be signal, not
+    // just a lucky slice of a small sample.
+    const minDecisive = 150;
     const totalDecisive = seasons.reduce(function (a, s) {
       const x = finalBySeason[s];
       return a + ((x && x.decisive) || 0);
@@ -4745,9 +4759,16 @@ async function runMaxPowerJointSearch(opts) {
       }
     } catch (e) {}
 
+    // Approximate one-sample z-test: is finalWinPct/100 significantly above
+    // baselineWinPct/100 given totalDecisive trials? z >= 1.96 ~ p < 0.05.
+    const _p0 = Math.max(0.01, Math.min(0.99, baselineWinPct / 100));
+    const _seZ = totalDecisive > 0 ? Math.sqrt(_p0 * (1 - _p0) / totalDecisive) : Infinity;
+    const _zScore = _seZ > 0 ? ((finalWinPct / 100 - _p0) / _seZ) : 0;
+
     const isStrictlyBetter =
       totalDecisive >= minDecisive &&
-      finalWinPct > baselineWinPct + 0.5 &&
+      finalWinPct > baselineWinPct + 3.0 &&
+      _zScore >= 1.96 &&
       holdsBoth &&
       finalWinPct > prevWinPct + 0.3;
 
@@ -4875,6 +4896,10 @@ async function runMaxPowerBacktestFromButton(onProgress) {
     const MARKETS = ["ft", "h1", "team", "h1_team", "q1", "q2", "q3", "q4"];
     const allReports = [];
     const t0 = Date.now();
+    // SAMPLE-SIZE FIX: matches the loadRealNbaBothSeasons change — more
+    // seasons means more decisive plays per market, which the tightened
+    // minDecisive/z-test gate in runMaxPowerJointSearch now requires.
+    const MAXPOWER_SEASONS = ["2019/20", "2020/21", "2021/22", "2022/23", "2023/24", "2024/25", "2025/26"];
 
     for (let mi = 0; mi < MARKETS.length; mi++) {
       const market = MARKETS[mi];
@@ -4882,7 +4907,7 @@ async function runMaxPowerBacktestFromButton(onProgress) {
         onProgress(mi, MARKETS.length, "market:" + market);
       }
       const report = await runMaxPowerJointSearch({
-        seasons: ["2024/25", "2025/26"],
+        seasons: MAXPOWER_SEASONS,
         league: "nba",
         market: market,
         totalSamples: 1800,
@@ -5042,6 +5067,12 @@ const TUNABLE_PARAM_REGISTRY = {
     value: 1.2, min: 1.0, max: 1.6, type: "scalar",
     scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
     description: "Multiplier making UNDER picks require a larger edge than OVER (UNDER_EDGE_FACTOR)",
+    lastVerifiedAt: null
+  },
+  extremeExpansion: {
+    value: 1.0, min: 1.0, max: 1.3, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Stretches team totals away from league mean when form already implies a slow/fast game (counters mid-total compression bias). 1.0 = no change.",
     lastVerifiedAt: null
   },
   paceClampMinNbaNcaa: {
@@ -17298,7 +17329,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   // when form already implies a slow or fast game. Default 1.0 = no change.
   // Diagnosis showed mid-total MAE ~8.2 vs low/high ~23–25; this targets
   // mean-compression without touching mid-range games as hard.
-  const _extremeExp = isFinite(config?.extremeExpansion) ? Number(config.extremeExpansion) : 1.0;
+  // WIRING FIX: config.extremeExpansion was the only source ever read here,
+  // but the live pick path never set it and every backtest evaluator
+  // hardcoded it to 1.0 — so this stage was dead everywhere. Now falls back
+  // to the tunable param (getParam) instead of a bare 1.0 so a verified/
+  // locked extremeExpansion value actually reaches live predictions.
+  const _extremeExp = isFinite(config?.extremeExpansion) ? Number(config.extremeExpansion) : (getParam("extremeExpansion", league) ?? 1.0);
   if (_extremeExp > 1.0 && isFinite(aS) && isFinite(bS)) {
     const formTotal = aS + bS;
     const leagueTotal = isFinite(eb) ? eb : 220;
@@ -18667,7 +18703,12 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
       const _tw = isFinite(window.getParam("teamWeightBase", league)) ? Number(window.getParam("teamWeightBase", league)) : 0.65;
       const _btBaseConfig = {
         h2hFactor: window.getParam("h2hFactor", league) ?? 1.0,
-        extremeExpansion: 1.0,
+        // WIRING FIX: was hardcoded to 1.0, which silently ignored every
+        // extremeExpansion candidate the joint search generated for this
+        // evaluator. Now reads it the same way h2hFactor does above, so
+        // paramOverrides.extremeExpansion (injected via the monkeypatched
+        // window.getParam) actually reaches computeFTProjection.
+        extremeExpansion: isFinite(window.getParam("extremeExpansion", league)) ? Number(window.getParam("extremeExpansion", league)) : 1.0,
         restDaysA: feat.restDaysA,
         restDaysB: feat.restDaysB
       };
@@ -18777,6 +18818,16 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
   const valCal   = calculateScoresOnlyCalibration(results.filter(r => r.split === "validation"));
   const trainScore = computeBacktestAccuracyScore(trainCal);
   const valScore   = computeBacktestAccuracyScore(valCal);
+  // BUGFIX: this function computed trainCal/valCal only — the "test" split
+  // rows were included in `results` whenever includeTest was true (see the
+  // loop above) but were never actually scored. The caller
+  // (runJointMultiVariableBacktest) was labeling the *validation* composite
+  // as "testComposite", so the untouched Phase 6 test gate was never really
+  // checked — a candidate could be "locked" having only ever been measured
+  // against the same validation set the search already fit to. Compute the
+  // real thing here so callers can gate on it.
+  const testCal   = includeTest ? calculateScoresOnlyCalibration(results.filter(r => r.split === "test")) : null;
+  const testScore = includeTest ? computeBacktestAccuracyScore(testCal) : null;
 
   // Diagnostic: surface why a candidate produced no usable score (first error,
   // how many games actually produced finite projections, result counts).
@@ -18799,8 +18850,10 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
     firstError,
     trainCalibration: trainCal,
     validationCalibration: valCal,
+    testCalibration: testCal,
     trainAccuracyScore: trainScore,
-    validationAccuracyScore: valScore
+    validationAccuracyScore: valScore,
+    testAccuracyScore: testScore
   };
 }
 
@@ -19003,7 +19056,11 @@ function evaluateFeatureCacheLight(features, paramOverrides, options) {
       const _tw = isFinite(window.getParam("teamWeightBase", league)) ? Number(window.getParam("teamWeightBase", league)) : 0.65;
       const _btBaseConfig = {
         h2hFactor: window.getParam("h2hFactor", league) ?? 1.0,
-        extremeExpansion: 1.0,
+        // WIRING FIX: same class of bug as the advancedBlendWeight one
+        // documented above — this was hardcoded to 1.0, so none of the
+        // extremeExpansion candidates (1.05-1.25) in jointSearchSpace were
+        // ever actually evaluated across all 2000 joint-search samples.
+        extremeExpansion: isFinite(window.getParam("extremeExpansion", league)) ? Number(window.getParam("extremeExpansion", league)) : 1.0,
         restDaysA: feat.restDaysA,
         restDaysB: feat.restDaysB
       };
@@ -19250,14 +19307,33 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
     }
   });
 
+  // GATE FIX: testComposite used to silently duplicate the validation
+  // composite (evaluateFeatureCacheWithOverrides never computed a real test
+  // score), so "improved" was decided entirely off the same 25% validation
+  // slice the 2000-candidate search already picked its winner against — a
+  // +0.1 composite margin out of thousands of random trials is well inside
+  // noise. Now requires: (1) a bigger validation margin, (2) the untouched
+  // test split to ALSO beat baseline, and (3) validation and test to stay
+  // close to each other (mirrors the existing 8.0 train/val gap guard above)
+  // so a config that only worked on the slice it was searched against can't
+  // pass as "improved".
+  const _realTestComposite = finalEval.testAccuracyScore?.composite;
+  const _valTestGap = (isFinite(bestValComp) && isFinite(_realTestComposite)) ? (bestValComp - _realTestComposite) : Infinity;
+  const _reallyImproved =
+    bestValComp > baselineValComp + 1.0 &&
+    isFinite(_realTestComposite) &&
+    _realTestComposite > baselineValComp + 0.5 &&
+    Math.abs(_valTestGap) <= 8.0;
+
   const report = {
     league,
     testedCount,
     improvedCount,
     baselineValidationComposite: baselineValComp,
     bestValidationComposite: bestValComp,
-    improved: bestValComp > baselineValComp + 0.1,
-    testComposite: finalEval.validationAccuracyScore?.composite || null,
+    improved: _reallyImproved,
+    testComposite: isFinite(_realTestComposite) ? _realTestComposite : null,
+    valTestGap: isFinite(_valTestGap) ? _valTestGap : null,
     trainComposite: finalEval.trainAccuracyScore?.composite || null,
     proposedDiff,
     bestCandidate,
@@ -19807,7 +19883,11 @@ async function runNbaSeasonBacktest(season, onProgress) {
       const _tw = isFinite(window.getParam("teamWeightBase", "nba")) ? Number(window.getParam("teamWeightBase", "nba")) : 0.65;
       const _btBaseConfig = {
         h2hFactor: window.getParam("h2hFactor", "nba") ?? 1.0,
-        extremeExpansion: 1.0,
+        // WIRING FIX: was hardcoded to 1.0, so the live-baseline "overall/
+        // train/validation/test" numbers this panel shows never reflected
+        // a locked extremeExpansion value even after Lock Optimal Parameters
+        // set one. Now reads the live/tunable value like h2hFactor above.
+        extremeExpansion: isFinite(window.getParam("extremeExpansion", "nba")) ? Number(window.getParam("extremeExpansion", "nba")) : 1.0,
         // FATIGUE LIVE-WIRING follow-through: computeFTProjection now reads
         // config.restDaysA/B (see that comment block). feat.restDaysA/B come
         // from the Phase 3 cache above, derived once per game from gameLogs
@@ -20209,8 +20289,17 @@ function renderBacktestPanel() {
         alert("⚠️ No joint backtest results available to lock yet. Please run the NBA Season Backtest first.");
         return;
       }
+      // GATE FIX: this handler used to lock res.bestCandidate unconditionally
+      // as long as it existed — it never checked res.improved at all, so a
+      // candidate that failed the significance/generalization gate (see
+      // runJointMultiVariableBacktest) could still be locked with a plain OK.
+      if (!res.improved) {
+        alert(`⚠️ This result did not clear the improvement gate (validation margin, untouched test-set check, and validation/test consistency). Locking it would likely be fitting noise, not a real gain.\n\nRun the backtest again or gather more seasons of history before locking.`);
+        return;
+      }
       const count = Object.keys(res.proposedDiff || {}).length;
-      if (confirm(`Lock the optimal parameters found by the joint backtest into the engine for NBA?\n\nThis will apply and persist ${count} optimal parameter override(s) permanently.`)) {
+      const testInfo = isFinite(res.testComposite) ? `\nUntouched test-set score: ${res.testComposite.toFixed(1)}/100` : "";
+      if (confirm(`Lock the optimal parameters found by the joint backtest into the engine for NBA?\n\nThis will apply and persist ${count} optimal parameter override(s) permanently.${testInfo}`)) {
         lockJointBacktestResults("nba");
         alert(`⚡ SUCCESS!\n\n${count} optimal parameter override(s) locked permanently for NBA.`);
         if (typeof renderConfigsPanel === "function") renderConfigsPanel();
