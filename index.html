@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5321,11 +5322,29 @@ function getTunableParam(key, league, market) {
     return null;
   }
 
+  // Registry / league-override candidate — this is what the Joint Backtest
+  // "Lock Optimal Parameters" button and manual Configs panel edits write to.
+  let overrideValue = entry.value;
+  let overrideStamp = entry.lastVerifiedAt || null;
+  if (league && entry.scope === "global") {
+    const leagueKey = String(league).toLowerCase();
+    const leagueEntry = g_tunableParamLeagueOverrides?.[leagueKey]?.[key];
+    if (leagueEntry && "value" in leagueEntry) {
+      overrideValue = leagueEntry.value;
+      overrideStamp = leagueEntry.lastVerifiedAt || null;
+    }
+  }
+
   // ── Maximum-power lock injection (per-market) ───────────────────
-  // Search writes BB_MAXPOWER_LOCKED_LEVERS_<market>. Prefer the
-  // market-specific lock when a market is supplied; otherwise fall
-  // back to the FT lock so existing call sites that don't pass a
-  // market still receive the FT-tuned values.
+  // Search writes BB_MAXPOWER_LOCKED_LEVERS_<market>. CONFIRMED BUG FIX:
+  // this used to return the MAX-POWER value unconditionally, which
+  // permanently shadowed anything the newer Joint Backtest "Lock Optimal
+  // Parameters" button wrote to the registry/override above — Lock
+  // Optimal Parameters would silently do nothing for any key MAX-POWER
+  // had ever locked, with no error shown anywhere. Now compares
+  // timestamps (lockedAt vs lastVerifiedAt, both ISO 8601 so string
+  // comparison is chronological) and only defers to MAX-POWER if its
+  // lock is actually the more recent one.
   try {
     const lk = String(league || "nba").toLowerCase();
     if (lk === "nba") {
@@ -5341,18 +5360,17 @@ function getTunableParam(key, league, market) {
         const locked = JSON.parse(raw);
         if (locked && locked.league === "nba" && locked.leverSet &&
             Object.prototype.hasOwnProperty.call(locked.leverSet, key)) {
-          return locked.leverSet[key];
+          const mpStamp = locked.lockedAt || null;
+          if (!overrideStamp || (mpStamp && mpStamp > overrideStamp)) {
+            return locked.leverSet[key];
+          }
         }
+        break;
       }
     }
   } catch (e) {}
 
-  if (league && entry.scope === "global") {
-    const leagueKey = String(league).toLowerCase();
-    const leagueEntry = g_tunableParamLeagueOverrides?.[leagueKey]?.[key];
-    if (leagueEntry && "value" in leagueEntry) return leagueEntry.value;
-  }
-  return entry.value;
+  return overrideValue;
 }
 
 function setTunableParam(key, newValue, scopeLeague, verifiedAt) {
