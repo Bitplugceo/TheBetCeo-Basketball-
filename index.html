@@ -1,4 +1,3 @@
-F
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2968,6 +2967,7 @@ body.dark-mode .tracker-analytics-section-head {
                        <div class="tracker-head-actions">
 <button type="button" id="trackerMilitaryRaidBtn" class="tracker-insights-btn" title="Single-click: Military Raid · Double-click: Toggle debug view" onclick="triggerTrackerMilitaryRaid()">🚨</button>
 <button type="button" id="trackerHealthBtn" class="tracker-insights-btn" title="Engine health dashboard">❤️</button>
+<button type="button" id="trackerSeasonBacktestBtn" class="tracker-insights-btn" title="Season Backtest panel (Joint search + Lock Optimal Parameters)">📊</button>
 <button type="button" id="trackerBacktestBtn" class="tracker-insights-btn" title="Max-power backtest: run 1 replay test">⚡</button>
 <button type="button" id="trackerConfigBtn" class="tracker-insights-btn" title="View/Edit verified configs">⚙️</button>
 <button type="button" id="trackerCopyDataBtn" class="tracker-insights-btn" title="Copy tracker data to clipboard">📑</button>
@@ -4049,6 +4049,12 @@ const BACKTEST_LEVERS = {
 //   h2hHome, h2hAway, h2hDates, homeRestDays, awayRestDays,
 //   homeInjuries, awayInjuries, line }
 let g_historicalGamesStore = [];
+// PERF AUDIT FIX: version counter + sample cache used by
+// evaluateLeverSetOnStore so the MAX-POWER sweep doesn't re-filter and
+// re-sample the entire store on every single lever-candidate evaluation
+// (see loadHistoricalSeasonGames for the version bump).
+let g_historicalStoreVersion = 0;
+const g_evalSampleCache = new Map();
 
 /**
  * Phase 1 data layer — load (or accept) historical games for a season.
@@ -4067,6 +4073,10 @@ function loadHistoricalSeasonGames(season, league, games) {
     if (typeof engineDebug === "function") engineDebug("loadHistoricalSeasonGames: missing season");
     return 0;
   }
+  // PERF AUDIT FIX: bump the store version so evaluateLeverSetOnStore's
+  // per-(season, league, maxGames) sample cache invalidates whenever the
+  // store actually changes, instead of ever serving a stale sampled subset.
+  g_historicalStoreVersion++;
   // Remove any previous entries for this season+league so reloads are clean
   g_historicalGamesStore = g_historicalGamesStore.filter(g =>
     !(String(g.season) === s && String(g.league || "nba").toLowerCase() === l)
@@ -4396,7 +4406,13 @@ window.loadRealNbaSeasonFromEspn = loadRealNbaSeasonFromEspn;
  * onProgress(done, total, label) — wire to button text "12/180".
  */
 async function loadRealNbaBothSeasons(onProgress) {
-  const seasons = ["2024/25", "2025/26"];
+  // SAMPLE-SIZE FIX: 2 seasons left MAX-POWER with only 10-20 decisive
+  // plays per market after edge-threshold filtering — nowhere near enough
+  // to trust a win-rate lock. ESPN's scoreboard endpoint works the same way
+  // for older seasons, so pull more of them to give the (now much stricter)
+  // minDecisive/z-test gate in runMaxPowerJointSearch a real chance to pass
+  // on signal instead of always failing for lack of data.
+  const seasons = ["2019/20", "2020/21", "2021/22", "2022/23", "2023/24", "2024/25", "2025/26"];
   const results = [];
   for (let i = 0; i < seasons.length; i++) {
     const r = await loadRealNbaSeasonFromEspn(seasons[i], function (done, total, label) {
@@ -4451,16 +4467,28 @@ function evaluateLeverSetOnStore(season, league, leverSet, opts) {
   const s = String(season || "").trim();
   const l = String(league || "nba").toLowerCase();
   const market = String(opts.market || "ft").toLowerCase();
-  let games = g_historicalGamesStore.filter(g =>
-    String(g.season) === s && String(g.league || "nba").toLowerCase() === l
-  );
-  // Stratified sample when maxGames is set (still respects full-game mode when maxGames is huge)
+  // PERF AUDIT FIX: this used to filter the entire g_historicalGamesStore
+  // and rebuild the identical stratified sample on EVERY call — and this
+  // function runs once per lever-candidate per season, i.e. thousands of
+  // times per market during a MAX-POWER sweep, for a result that only
+  // depends on (season, league, maxGames) and never changes unless the
+  // store itself is reloaded. Cache the sampled subset, invalidated only
+  // via g_historicalStoreVersion (bumped in loadHistoricalSeasonGames).
   const maxN = Math.max(30, Number(opts.maxGames) || 100);
-  if (games.length > maxN) {
-    const step = games.length / maxN;
-    const sampled = [];
-    for (let i = 0; i < maxN; i++) sampled.push(games[Math.min(games.length - 1, Math.floor(i * step))]);
-    games = sampled;
+  const cacheKey = g_historicalStoreVersion + "|" + s + "|" + l + "|" + maxN;
+  let games = g_evalSampleCache.get(cacheKey);
+  if (!games) {
+    games = g_historicalGamesStore.filter(g =>
+      String(g.season) === s && String(g.league || "nba").toLowerCase() === l
+    );
+    // Stratified sample when maxGames is set (still respects full-game mode when maxGames is huge)
+    if (games.length > maxN) {
+      const step = games.length / maxN;
+      const sampled = [];
+      for (let i = 0; i < maxN; i++) sampled.push(games[Math.min(games.length - 1, Math.floor(i * step))]);
+      games = sampled;
+    }
+    g_evalSampleCache.set(cacheKey, games);
   }
   let wins = 0, losses = 0, pushes = 0, noplays = 0, absErr = 0, nErr = 0;
   for (let gi = 0; gi < games.length; gi++) {
@@ -4679,10 +4707,72 @@ async function runMaxPowerJointSearch(opts) {
       return a + (finalBySeason[s].composite || 0);
     }, 0) / seasons.length;
 
+    // Primary score = overall win rate % across both seasons
+    function winRateOf(bySeason) {
+      let w = 0, l = 0;
+      seasons.forEach(function (s) {
+        const x = bySeason[s];
+        if (x) { w += (x.wins || 0); l += (x.losses || 0); }
+      });
+      const d = w + l;
+      return d > 0 ? (w / d) * 100 : 0;
+    }
+    const baselineWinPct = winRateOf(baselineBySeason);
+    const finalWinPct = winRateOf(finalBySeason);
+
+    // Strict upgrade-only lock:
+    // 1. Must have real decisive plays
+    // 2. Must be strictly better win % than baseline
+    // 3. Must not regress on either season
+    // 4. Must beat any previously locked set for this market
     let locked = false;
-    if (improved && seasons.every(function (s) {
-      return finalBySeason[s].composite >= baselineBySeason[s].composite - 0.1;
-    })) {
+    // STATISTICAL RIGOR FIX: minDecisive was 8 and the margin was a flat
+    // +0.5 percentage points — with 1,800 random candidates tried per
+    // market and only a couple seasons of history (real per-market decisive
+    // counts run 10-20), that margin is well inside sampling noise; a coin
+    // that hits 55%+ heads in 15 flips is unremarkable. Raised the floor and
+    // added an approximate one-proportion z-test against the baseline win
+    // rate so a lock requires the improvement to plausibly be signal, not
+    // just a lucky slice of a small sample.
+    const minDecisive = 150;
+    const totalDecisive = seasons.reduce(function (a, s) {
+      const x = finalBySeason[s];
+      return a + ((x && x.decisive) || 0);
+    }, 0);
+
+    const holdsBoth = seasons.every(function (s) {
+      const b = baselineBySeason[s];
+      const f = finalBySeason[s];
+      if (!b || !f) return false;
+      // no regression on win rate (allow tiny noise)
+      const bWR = (b.decisive > 0) ? b.wins / b.decisive : 0;
+      const fWR = (f.decisive > 0) ? f.wins / f.decisive : 0;
+      return fWR >= bWR - 0.02;
+    });
+
+    let prevWinPct = -1;
+    try {
+      const prevRaw = localStorage.getItem("BB_MAXPOWER_LOCKED_LEVERS_" + market);
+      if (prevRaw) {
+        const prev = JSON.parse(prevRaw);
+        if (prev && isFinite(prev.finalWinPct)) prevWinPct = Number(prev.finalWinPct);
+      }
+    } catch (e) {}
+
+    // Approximate one-sample z-test: is finalWinPct/100 significantly above
+    // baselineWinPct/100 given totalDecisive trials? z >= 1.96 ~ p < 0.05.
+    const _p0 = Math.max(0.01, Math.min(0.99, baselineWinPct / 100));
+    const _seZ = totalDecisive > 0 ? Math.sqrt(_p0 * (1 - _p0) / totalDecisive) : Infinity;
+    const _zScore = _seZ > 0 ? ((finalWinPct / 100 - _p0) / _seZ) : 0;
+
+    const isStrictlyBetter =
+      totalDecisive >= minDecisive &&
+      finalWinPct > baselineWinPct + 3.0 &&
+      _zScore >= 1.96 &&
+      holdsBoth &&
+      finalWinPct > prevWinPct + 0.3;
+
+    if (isStrictlyBetter) {
       try {
         localStorage.setItem("BB_MAXPOWER_LOCKED_LEVERS_" + market, JSON.stringify({
           league: league,
@@ -4691,10 +4781,13 @@ async function runMaxPowerJointSearch(opts) {
           leverSet: current,
           baselineComposite: baselineComposite,
           finalComposite: finalComposite,
+          baselineWinPct: baselineWinPct,
+          finalWinPct: finalWinPct,
           samplesEvaluated: evaluated,
           lockedAt: new Date().toISOString()
         }));
         locked = true;
+        improved = true;
       } catch (e) {}
     }
 
@@ -4803,6 +4896,10 @@ async function runMaxPowerBacktestFromButton(onProgress) {
     const MARKETS = ["ft", "h1", "team", "h1_team", "q1", "q2", "q3", "q4"];
     const allReports = [];
     const t0 = Date.now();
+    // SAMPLE-SIZE FIX: matches the loadRealNbaBothSeasons change — more
+    // seasons means more decisive plays per market, which the tightened
+    // minDecisive/z-test gate in runMaxPowerJointSearch now requires.
+    const MAXPOWER_SEASONS = ["2019/20", "2020/21", "2021/22", "2022/23", "2023/24", "2024/25", "2025/26"];
 
     for (let mi = 0; mi < MARKETS.length; mi++) {
       const market = MARKETS[mi];
@@ -4810,7 +4907,7 @@ async function runMaxPowerBacktestFromButton(onProgress) {
         onProgress(mi, MARKETS.length, "market:" + market);
       }
       const report = await runMaxPowerJointSearch({
-        seasons: ["2024/25", "2025/26"],
+        seasons: MAXPOWER_SEASONS,
         league: "nba",
         market: market,
         totalSamples: 1800,
@@ -4970,6 +5067,16 @@ const TUNABLE_PARAM_REGISTRY = {
     value: 1.2, min: 1.0, max: 1.6, type: "scalar",
     scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
     description: "Multiplier making UNDER picks require a larger edge than OVER (UNDER_EDGE_FACTOR)",
+    lastVerifiedAt: null
+  },
+  // FINAL NBA LOCK WIDEN: joint search only ever explored up to 1.25 and the
+  // best candidate found (+0.7 composite) didn't clear the +1.0 lock gate.
+  // Raising the ceiling to 1.40 gives the search room to find a real effect
+  // if one exists, instead of being capped below where the signal might be.
+  extremeExpansion: {
+    value: 1.0, min: 1.0, max: 1.4, type: "scalar",
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
+    description: "Stretches team totals away from league mean when form already implies a slow/fast game (counters mid-total compression bias). 1.0 = no change.",
     lastVerifiedAt: null
   },
   paceClampMinNbaNcaa: {
@@ -5243,36 +5350,74 @@ function pruneUnverifiedLeagueOverrideDrift() {
   }
 }
 
-function getTunableParam(key, league) {
+// CONFIRMED BUG FIX: no call site in the engine ever passed a `market`
+// argument to getParam/getTunableParam, so the MAX-POWER per-market lock
+// lookup always defaulted to the "ft" bucket regardless of what was
+// actually being computed — H1 and quarter locks were silently inert.
+// computeFTProjection/compute1HProjection/computeQuarterProjectionBT set
+// this at entry so every getParam(key, league) call underneath them
+// (2-arg, unchanged) picks up the right market automatically. Not reset
+// on exit — cheap tradeoff is a stale value can briefly leak into
+// debug/Configs-panel display reads between games; it never affects
+// which lever set a live pick actually uses.
+let g_currentLiveComputeMarket = null;
+
+function getTunableParam(key, league, market) {
   const entry = TUNABLE_PARAM_REGISTRY[key];
   if (!entry) {
     engineDebug("getTunableParam: unknown key '" + key + "' — check TUNABLE_PARAM_REGISTRY", { key, league });
     return null;
   }
 
-  // ── Maximum-power lock injection ────────────────────────────────
-  // When a dual-season max-power set has been locked for this league,
-  // every live projection must use those exact numbers.
+  // Registry / league-override candidate — this is what the Joint Backtest
+  // "Lock Optimal Parameters" button and manual Configs panel edits write to.
+  let overrideValue = entry.value;
+  let overrideStamp = entry.lastVerifiedAt || null;
+  if (league && entry.scope === "global") {
+    const leagueKey = String(league).toLowerCase();
+    const leagueEntry = g_tunableParamLeagueOverrides?.[leagueKey]?.[key];
+    if (leagueEntry && "value" in leagueEntry) {
+      overrideValue = leagueEntry.value;
+      overrideStamp = leagueEntry.lastVerifiedAt || null;
+    }
+  }
+
+  // ── Maximum-power lock injection (per-market) ───────────────────
+  // Search writes BB_MAXPOWER_LOCKED_LEVERS_<market>. CONFIRMED BUG FIX:
+  // this used to return the MAX-POWER value unconditionally, which
+  // permanently shadowed anything the newer Joint Backtest "Lock Optimal
+  // Parameters" button wrote to the registry/override above — Lock
+  // Optimal Parameters would silently do nothing for any key MAX-POWER
+  // had ever locked, with no error shown anywhere. Now compares
+  // timestamps (lockedAt vs lastVerifiedAt, both ISO 8601 so string
+  // comparison is chronological) and only defers to MAX-POWER if its
+  // lock is actually the more recent one.
   try {
     const lk = String(league || "nba").toLowerCase();
     if (lk === "nba") {
-      const raw = localStorage.getItem("BB_MAXPOWER_LOCKED_LEVERS");
-      if (raw) {
+      const m = String(market || g_currentLiveComputeMarket || "ft").toLowerCase();
+      const keysToTry = [
+        "BB_MAXPOWER_LOCKED_LEVERS_" + m,
+        "BB_MAXPOWER_LOCKED_LEVERS_ft",   // safe fallback
+        "BB_MAXPOWER_LOCKED_LEVERS"       // legacy key
+      ];
+      for (let ki = 0; ki < keysToTry.length; ki++) {
+        const raw = localStorage.getItem(keysToTry[ki]);
+        if (!raw) continue;
         const locked = JSON.parse(raw);
         if (locked && locked.league === "nba" && locked.leverSet &&
             Object.prototype.hasOwnProperty.call(locked.leverSet, key)) {
-          return locked.leverSet[key];
+          const mpStamp = locked.lockedAt || null;
+          if (!overrideStamp || (mpStamp && mpStamp > overrideStamp)) {
+            return locked.leverSet[key];
+          }
         }
+        break;
       }
     }
   } catch (e) {}
 
-  if (league && entry.scope === "global") {
-    const leagueKey = String(league).toLowerCase();
-    const leagueEntry = g_tunableParamLeagueOverrides?.[leagueKey]?.[key];
-    if (leagueEntry && "value" in leagueEntry) return leagueEntry.value;
-  }
-  return entry.value;
+  return overrideValue;
 }
 
 function setTunableParam(key, newValue, scopeLeague, verifiedAt) {
@@ -5286,21 +5431,36 @@ function setTunableParam(key, newValue, scopeLeague, verifiedAt) {
     clampedValue = clampNumber(newValue, entry.min, entry.max);
   }
   const stamp = verifiedAt || new Date().toISOString();
+  // PERF AUDIT FIX: during a MAX-POWER sweep (window.__btRunInProgress),
+  // replayHistoricalGame injects/restores every lever on EVERY replayed
+  // game — hundreds of thousands of calls per market. Each call used to
+  // hit localStorage.setItem (full JSON.stringify of the whole override
+  // object) plus engineDebug (JSON.stringify + array unshift + a debug
+  // panel re-render) unconditionally, which is what made the sweep
+  // unusably slow / appear frozen at 0%. The in-memory registry/override
+  // write below still always happens — getTunableParam keeps reading the
+  // correct injected value during replay — only the disk persistence and
+  // debug logging are skipped while a sweep is running. That's safe
+  // because replayHistoricalGame always restores the pre-sweep values in
+  // its own finally block, so nothing durable is ever lost.
+  const btFast = !!window.__btRunInProgress;
   if (scopeLeague) {
     if (entry.scope !== "global") {
-      engineDebug("setTunableParam: key '" + key + "' does not allow league-level overrides", { key, scopeLeague });
+      if (!btFast) engineDebug("setTunableParam: key '" + key + "' does not allow league-level overrides", { key, scopeLeague });
       return false;
     }
     const leagueKey = String(scopeLeague).toLowerCase();
     if (!g_tunableParamLeagueOverrides[leagueKey]) g_tunableParamLeagueOverrides[leagueKey] = {};
     g_tunableParamLeagueOverrides[leagueKey][key] = { value: clampedValue, lastVerifiedAt: stamp };
-    saveTunableParamLeagueOverrides();
+    if (!btFast) saveTunableParamLeagueOverrides();
   } else {
     entry.value = clampedValue;
     entry.lastVerifiedAt = stamp;
-    saveTunableParamRegistryOverrides();
+    if (!btFast) saveTunableParamRegistryOverrides();
   }
-  engineDebug("setTunableParam promoted", { key, newValue: clampedValue, scopeLeague: scopeLeague || "global", verifiedAt: stamp });
+  if (!btFast) {
+    engineDebug("setTunableParam promoted", { key, newValue: clampedValue, scopeLeague: scopeLeague || "global", verifiedAt: stamp });
+  }
   return true;
 }
 
@@ -5435,8 +5595,8 @@ window.applyPhase2SimulatorProposalFromUI = function(siloKey, league) {
   }
 };
 
-function getParam(key, league) {
-  return getTunableParam(key, league);
+function getParam(key, league, market) {
+  return getTunableParam(key, league, market);
 }
 window.getParam = getParam;
 
@@ -5571,15 +5731,30 @@ function replayHistoricalGame(game, leverSet, market) {
     if (h2hA.length >= 2 && h2hB.length >= 2) {
       const avgH2HA = h2hA.reduce((s,v)=>s+v,0) / h2hA.length;
       const avgH2HB = h2hB.reduce((s,v)=>s+v,0) / h2hB.length;
+      const factor = (typeof getParam === "function") ? (getParam("h2hFactor", league) ?? 1.0) : 1.0;
       let hw = 0.20;
       if (typeof getH2HWeight === "function") {
-        try { hw = getH2HWeight(h2hA.length, league, "ft") || 0.20; } catch (e) {}
+        // CORRECTNESS AUDIT FIX: this call used to be
+        // getH2HWeight(h2hA.length, league, "ft") — passing the league
+        // STRING into the numeric lenB parameter slot. Number("nba") is
+        // NaN, so minLen collapsed to 0 on every single call and the
+        // function always returned 0, silently forcing the "|| 0.20"
+        // fallback below on every backtest replay. That made every
+        // H2H-related lever (h2hFactor, h2hMaxWeight, and the whole
+        // h2hDecay* / h2hLookbackSeasons group) a no-op during the entire
+        // MAX-POWER search — sweeping them never changed a single result.
+        // Fixed to match the real signature and the shape every live call
+        // site already uses (see the getH2HWeight calls in the FT/1H/quarter
+        // projection builders); factor is passed straight in since
+        // getH2HWeight already applies + clamps it internally.
+        try {
+          hw = getH2HWeight(h2hA.length, h2hB.length, "ft", sampleTier, Math.abs(projA - projB), league, null, factor, null) || 0.20;
+        } catch (e) {}
       } else {
         const cap = (typeof getParam === "function") ? (getParam("h2hMaxWeight", league) ?? 0.30) : 0.30;
         hw = Math.min(cap, 0.10 + h2hA.length * 0.04);
+        hw = Math.min(hw * factor, cap);
       }
-      const factor = (typeof getParam === "function") ? (getParam("h2hFactor", league) ?? 1.0) : 1.0;
-      hw = Math.min(hw * factor, (typeof getParam === "function") ? (getParam("h2hMaxWeight", league) ?? 0.30) : 0.30);
       projA = projA * (1 - hw) + avgH2HA * hw;
       projB = projB * (1 - hw) + avgH2HB * hw;
     }
@@ -16991,6 +17166,9 @@ function getMarketKeyFromName(name, marketKeyOverride) {
 }
 
 function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
+  // MARKET CONTEXT FIX: lets getTunableParam resolve the correct
+  // per-market MAX-POWER lock (see g_currentLiveComputeMarket above).
+  g_currentLiveComputeMarket = "ft";
 
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const leagueBase = eb / 2;
@@ -17155,7 +17333,12 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   // when form already implies a slow or fast game. Default 1.0 = no change.
   // Diagnosis showed mid-total MAE ~8.2 vs low/high ~23–25; this targets
   // mean-compression without touching mid-range games as hard.
-  const _extremeExp = isFinite(config?.extremeExpansion) ? Number(config.extremeExpansion) : 1.0;
+  // WIRING FIX: config.extremeExpansion was the only source ever read here,
+  // but the live pick path never set it and every backtest evaluator
+  // hardcoded it to 1.0 — so this stage was dead everywhere. Now falls back
+  // to the tunable param (getParam) instead of a bare 1.0 so a verified/
+  // locked extremeExpansion value actually reaches live predictions.
+  const _extremeExp = isFinite(config?.extremeExpansion) ? Number(config.extremeExpansion) : (getParam("extremeExpansion", league) ?? 1.0);
   if (_extremeExp > 1.0 && isFinite(aS) && isFinite(bS)) {
     const formTotal = aS + bS;
     const leagueTotal = isFinite(eb) ? eb : 220;
@@ -17310,6 +17493,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 }
 
 function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
+  // MARKET CONTEXT FIX: see g_currentLiveComputeMarket above.
+  g_currentLiveComputeMarket = "h1";
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const volLimit = getMarketVolLimit(league, "h1");
 
@@ -17997,6 +18182,9 @@ async function fetchNbaGameH1(eventId) {
 // inputs the live computeQ path just used (from __LAST_AUDIT_STATE) and
 // reports proj deltas. Call from the Backtest panel button or AFDB.
 function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, injB = 1, teamAName = "", teamBName = "", config = {}, combinedVolRatio = 0.5 }) {
+  // MARKET CONTEXT FIX: qKey is already "q1"/"q2"/"q3"/"q4", which matches
+  // MAX-POWER's per-quarter lock keys exactly — see g_currentLiveComputeMarket above.
+  g_currentLiveComputeMarket = qKey;
   const aS = getManualSeries("A", qKey, parsed);
   const bS = getManualSeries("B", qKey, parsed);
 
@@ -18519,7 +18707,12 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
       const _tw = isFinite(window.getParam("teamWeightBase", league)) ? Number(window.getParam("teamWeightBase", league)) : 0.65;
       const _btBaseConfig = {
         h2hFactor: window.getParam("h2hFactor", league) ?? 1.0,
-        extremeExpansion: 1.0,
+        // WIRING FIX: was hardcoded to 1.0, which silently ignored every
+        // extremeExpansion candidate the joint search generated for this
+        // evaluator. Now reads it the same way h2hFactor does above, so
+        // paramOverrides.extremeExpansion (injected via the monkeypatched
+        // window.getParam) actually reaches computeFTProjection.
+        extremeExpansion: isFinite(window.getParam("extremeExpansion", league)) ? Number(window.getParam("extremeExpansion", league)) : 1.0,
         restDaysA: feat.restDaysA,
         restDaysB: feat.restDaysB
       };
@@ -18629,6 +18822,16 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
   const valCal   = calculateScoresOnlyCalibration(results.filter(r => r.split === "validation"));
   const trainScore = computeBacktestAccuracyScore(trainCal);
   const valScore   = computeBacktestAccuracyScore(valCal);
+  // BUGFIX: this function computed trainCal/valCal only — the "test" split
+  // rows were included in `results` whenever includeTest was true (see the
+  // loop above) but were never actually scored. The caller
+  // (runJointMultiVariableBacktest) was labeling the *validation* composite
+  // as "testComposite", so the untouched Phase 6 test gate was never really
+  // checked — a candidate could be "locked" having only ever been measured
+  // against the same validation set the search already fit to. Compute the
+  // real thing here so callers can gate on it.
+  const testCal   = includeTest ? calculateScoresOnlyCalibration(results.filter(r => r.split === "test")) : null;
+  const testScore = includeTest ? computeBacktestAccuracyScore(testCal) : null;
 
   // Diagnostic: surface why a candidate produced no usable score (first error,
   // how many games actually produced finite projections, result counts).
@@ -18651,8 +18854,10 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
     firstError,
     trainCalibration: trainCal,
     validationCalibration: valCal,
+    testCalibration: testCal,
     trainAccuracyScore: trainScore,
-    validationAccuracyScore: valScore
+    validationAccuracyScore: valScore,
+    testAccuracyScore: testScore
   };
 }
 
@@ -18855,7 +19060,11 @@ function evaluateFeatureCacheLight(features, paramOverrides, options) {
       const _tw = isFinite(window.getParam("teamWeightBase", league)) ? Number(window.getParam("teamWeightBase", league)) : 0.65;
       const _btBaseConfig = {
         h2hFactor: window.getParam("h2hFactor", league) ?? 1.0,
-        extremeExpansion: 1.0,
+        // WIRING FIX: same class of bug as the advancedBlendWeight one
+        // documented above — this was hardcoded to 1.0, so none of the
+        // extremeExpansion candidates (1.05-1.25) in jointSearchSpace were
+        // ever actually evaluated across all 2000 joint-search samples.
+        extremeExpansion: isFinite(window.getParam("extremeExpansion", league)) ? Number(window.getParam("extremeExpansion", league)) : 1.0,
         restDaysA: feat.restDaysA,
         restDaysB: feat.restDaysB
       };
@@ -19013,7 +19222,10 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
 
   const jointSearchSpace = {
     teamWeightBase:          [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80],
-    extremeExpansion:        [1.00, 1.05, 1.10, 1.15, 1.20, 1.25],
+    // FINAL NBA LOCK WIDEN: ceiling raised from 1.25 to 1.40 (matches the
+    // TUNABLE_PARAM_REGISTRY max bump above) so the joint search can find a
+    // real compression fix if the previous 1.00-1.25 range was too narrow.
+    extremeExpansion:        [1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40],
     h2hFactor:               [0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
     h2hMaxWeight:            [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45],
     h2hLookbackSeasons:      [2, 3, 4, 5],
@@ -19102,14 +19314,33 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
     }
   });
 
+  // GATE FIX: testComposite used to silently duplicate the validation
+  // composite (evaluateFeatureCacheWithOverrides never computed a real test
+  // score), so "improved" was decided entirely off the same 25% validation
+  // slice the 2000-candidate search already picked its winner against — a
+  // +0.1 composite margin out of thousands of random trials is well inside
+  // noise. Now requires: (1) a bigger validation margin, (2) the untouched
+  // test split to ALSO beat baseline, and (3) validation and test to stay
+  // close to each other (mirrors the existing 8.0 train/val gap guard above)
+  // so a config that only worked on the slice it was searched against can't
+  // pass as "improved".
+  const _realTestComposite = finalEval.testAccuracyScore?.composite;
+  const _valTestGap = (isFinite(bestValComp) && isFinite(_realTestComposite)) ? (bestValComp - _realTestComposite) : Infinity;
+  const _reallyImproved =
+    bestValComp > baselineValComp + 1.0 &&
+    isFinite(_realTestComposite) &&
+    _realTestComposite > baselineValComp + 0.5 &&
+    Math.abs(_valTestGap) <= 8.0;
+
   const report = {
     league,
     testedCount,
     improvedCount,
     baselineValidationComposite: baselineValComp,
     bestValidationComposite: bestValComp,
-    improved: bestValComp > baselineValComp + 0.1,
-    testComposite: finalEval.validationAccuracyScore?.composite || null,
+    improved: _reallyImproved,
+    testComposite: isFinite(_realTestComposite) ? _realTestComposite : null,
+    valTestGap: isFinite(_valTestGap) ? _valTestGap : null,
     trainComposite: finalEval.trainAccuracyScore?.composite || null,
     proposedDiff,
     bestCandidate,
@@ -19659,7 +19890,11 @@ async function runNbaSeasonBacktest(season, onProgress) {
       const _tw = isFinite(window.getParam("teamWeightBase", "nba")) ? Number(window.getParam("teamWeightBase", "nba")) : 0.65;
       const _btBaseConfig = {
         h2hFactor: window.getParam("h2hFactor", "nba") ?? 1.0,
-        extremeExpansion: 1.0,
+        // WIRING FIX: was hardcoded to 1.0, so the live-baseline "overall/
+        // train/validation/test" numbers this panel shows never reflected
+        // a locked extremeExpansion value even after Lock Optimal Parameters
+        // set one. Now reads the live/tunable value like h2hFactor above.
+        extremeExpansion: isFinite(window.getParam("extremeExpansion", "nba")) ? Number(window.getParam("extremeExpansion", "nba")) : 1.0,
         // FATIGUE LIVE-WIRING follow-through: computeFTProjection now reads
         // config.restDaysA/B (see that comment block). feat.restDaysA/B come
         // from the Phase 3 cache above, derived once per game from gameLogs
@@ -20061,8 +20296,17 @@ function renderBacktestPanel() {
         alert("⚠️ No joint backtest results available to lock yet. Please run the NBA Season Backtest first.");
         return;
       }
+      // GATE FIX: this handler used to lock res.bestCandidate unconditionally
+      // as long as it existed — it never checked res.improved at all, so a
+      // candidate that failed the significance/generalization gate (see
+      // runJointMultiVariableBacktest) could still be locked with a plain OK.
+      if (!res.improved) {
+        alert(`⚠️ This result did not clear the improvement gate (validation margin, untouched test-set check, and validation/test consistency). Locking it would likely be fitting noise, not a real gain.\n\nRun the backtest again or gather more seasons of history before locking.`);
+        return;
+      }
       const count = Object.keys(res.proposedDiff || {}).length;
-      if (confirm(`Lock the optimal parameters found by the joint backtest into the engine for NBA?\n\nThis will apply and persist ${count} optimal parameter override(s) permanently.`)) {
+      const testInfo = isFinite(res.testComposite) ? `\nUntouched test-set score: ${res.testComposite.toFixed(1)}/100` : "";
+      if (confirm(`Lock the optimal parameters found by the joint backtest into the engine for NBA?\n\nThis will apply and persist ${count} optimal parameter override(s) permanently.${testInfo}`)) {
         lockJointBacktestResults("nba");
         alert(`⚡ SUCCESS!\n\n${count} optimal parameter override(s) locked permanently for NBA.`);
         if (typeof renderConfigsPanel === "function") renderConfigsPanel();
@@ -23056,6 +23300,9 @@ if (headerErrorBtn) {
       const trackerHealthBtn = document.getElementById("trackerHealthBtn");
       if (trackerHealthBtn) trackerHealthBtn.addEventListener("click", toggleTrackerHealthView);
 
+      const trackerSeasonBacktestBtn = document.getElementById("trackerSeasonBacktestBtn");
+      if (trackerSeasonBacktestBtn) trackerSeasonBacktestBtn.addEventListener("click", toggleTrackerBacktestView);
+
       const trackerBacktestBtn = document.getElementById("trackerBacktestBtn");
       if (trackerBacktestBtn) trackerBacktestBtn.addEventListener("click", async function () {
         if (window.__btRunInProgress) {
@@ -23159,34 +23406,70 @@ if (headerErrorBtn) {
           return;
         }
 
-        // Multi-market summary
+        // Full detailed lock dump — every lever for every market
         if (report && report.multiMarket && Array.isArray(report.reports)) {
           const lines = [
-            "MAX-POWER — ALL MARKETS (NBA)",
-            "-----------------------------",
+            "MAX-POWER — FULL LOCK DETAIL (NBA)",
+            "=================================",
             "store: " + (report.storeTotal || 0) + " games",
             "markets locked: " + (report.lockedCount || 0) + " / " + (report.markets ? report.markets.length : 0),
             "improved: " + (report.improvedCount || 0),
             "ms: " + (report.ms || 0),
             ""
           ];
+
           report.reports.forEach(function (r) {
             if (!r || r.error) {
-              lines.push((r && r.market ? r.market : "?") + ": ERROR");
+              lines.push("—— " + ((r && r.market) || "?").toUpperCase() + " —— ERROR");
+              lines.push("");
               return;
             }
+            const m = (r.market || "?").toUpperCase();
             const f2425 = r.finalBySeason && r.finalBySeason["2024/25"];
             const f2526 = r.finalBySeason && r.finalBySeason["2025/26"];
-            lines.push(
-              (r.market || "?").toUpperCase() +
-              "  " + (r.baselineComposite != null ? r.baselineComposite.toFixed(1) : "—") +
-              " → " + (r.finalComposite != null ? r.finalComposite.toFixed(1) : "—") +
-              "  lock:" + (r.locked ? "YES" : "no") +
-              "  W" + (f2425 ? f2425.wins : "—") + "/" + (f2526 ? f2526.wins : "—")
-            );
+            lines.push("—— " + m + " ——");
+            // Win rate % is the main score
+            let baseW = 0, baseL = 0, finW = 0, finL = 0;
+            if (r.baselineBySeason) {
+              Object.keys(r.baselineBySeason).forEach(function (s) {
+                const x = r.baselineBySeason[s];
+                if (x) { baseW += (x.wins || 0); baseL += (x.losses || 0); }
+              });
+            }
+            if (r.finalBySeason) {
+              Object.keys(r.finalBySeason).forEach(function (s) {
+                const x = r.finalBySeason[s];
+                if (x) { finW += (x.wins || 0); finL += (x.losses || 0); }
+              });
+            }
+            const basePct = (baseW + baseL) > 0 ? ((baseW / (baseW + baseL)) * 100).toFixed(1) : "—";
+            const finPct  = (finW + finL) > 0 ? ((finW / (finW + finL)) * 100).toFixed(1) : "—";
+            lines.push("WIN RATE: " + basePct + "% → " + finPct + "%   lock:" + (r.locked ? "YES" : "no"));
+            lines.push("composite: " +
+              (r.baselineComposite != null ? r.baselineComposite.toFixed(1) : "—") +
+              " → " +
+              (r.finalComposite != null ? r.finalComposite.toFixed(1) : "—"));
+            lines.push("2024/25 W" + (f2425 ? f2425.wins : "—") + "/L" + (f2425 ? f2425.losses : "—") +
+              "   2025/26 W" + (f2526 ? f2526.wins : "—") + "/L" + (f2526 ? f2526.losses : "—"));
+            lines.push("samples: " + (r.samplesEvaluated != null ? r.samplesEvaluated : "—"));
+
+            // Every locked lever in detail
+            const ls = r.bestLeverSet || (r.leverSet) || null;
+            if (ls && typeof ls === "object") {
+              lines.push("LEVERS:");
+              const keys = Object.keys(ls).sort();
+              keys.forEach(function (k) {
+                let v = ls[k];
+                if (typeof v === "number") v = (Math.round(v * 1000) / 1000);
+                lines.push("  " + k + ": " + v);
+              });
+            } else {
+              lines.push("LEVERS: (none — not locked or missing)");
+            }
+            lines.push("");
           });
-          lines.push("");
-          lines.push("Each market has its own permanent lock.");
+
+          lines.push("Each market has its own permanent lock in localStorage.");
           alert(lines.join("\n"));
           return;
         }
