@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4432,14 +4431,24 @@ window.loadRealNbaBothSeasons = loadRealNbaBothSeasons;
  * Score one complete lever set on every store game for a season+league.
  * Returns wins/losses/pushes/noplays + composite (0–100 style).
  */
-function evaluateLeverSetOnStore(season, league, leverSet) {
+function evaluateLeverSetOnStore(season, league, leverSet, opts) {
+  opts = opts || {};
   const s = String(season || "").trim();
   const l = String(league || "nba").toLowerCase();
-  const games = g_historicalGamesStore.filter(g =>
+  let games = g_historicalGamesStore.filter(g =>
     String(g.season) === s && String(g.league || "nba").toLowerCase() === l
   );
+  // ULTRA-FAST: stratified sample so 3000 games never means 3000 replays
+  const maxN = Math.max(30, Number(opts.maxGames) || 100);
+  if (games.length > maxN) {
+    const step = games.length / maxN;
+    const sampled = [];
+    for (let i = 0; i < maxN; i++) sampled.push(games[Math.min(games.length - 1, Math.floor(i * step))]);
+    games = sampled;
+  }
   let wins = 0, losses = 0, pushes = 0, noplays = 0, absErr = 0, nErr = 0;
-  games.forEach(game => {
+  for (let gi = 0; gi < games.length; gi++) {
+    const game = games[gi];
     let r;
     try { r = replayHistoricalGame(game, leverSet); }
     catch (e) { r = { result: "noplay", projectedTotal: NaN, actualTotal: game.actualTotal }; }
@@ -4452,7 +4461,7 @@ function evaluateLeverSetOnStore(season, league, leverSet) {
       absErr += Math.abs(Number(r.projectedTotal) - Number(r.actualTotal));
       nErr++;
     }
-  });
+  }
   const decisive = wins + losses;
   const winRate = decisive > 0 ? wins / decisive : 0;
   const mae = nErr > 0 ? absErr / nErr : 999;
@@ -4513,7 +4522,10 @@ async function runMaxPowerJointSearch(opts) {
     ? opts.seasons.slice()
     : ["2024/25", "2025/26"];
   const league = String(opts.league || "nba").toLowerCase();
-  const maxPerGroup = Math.max(2, Number(opts.maxCandidatesPerGroup) || 3);
+  const maxPerGroup = Math.max(2, Number(opts.maxCandidatesPerGroup) || 2);
+  const maxGames = Math.max(30, Number(opts.maxGames) || 80);
+  const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
+  const evalOpts = { maxGames: maxGames };
 
   if (window.__btRunInProgress) {
     return { error: "Search already running" };
@@ -4525,24 +4537,26 @@ async function runMaxPowerJointSearch(opts) {
     const baseline = getDefaultBacktestLeverSet(league);
     const baselineBySeason = {};
     for (let i = 0; i < seasons.length; i++) {
-      baselineBySeason[seasons[i]] = evaluateLeverSetOnStore(seasons[i], league, baseline);
-      await _btYield();
+      baselineBySeason[seasons[i]] = evaluateLeverSetOnStore(seasons[i], league, baseline, evalOpts);
     }
     const baselineComposite = seasons.reduce(function (a, s) {
       return a + (baselineBySeason[s].composite || 0);
     }, 0) / seasons.length;
 
+    // 3 tight groups only (was 4) — fewer cartesian products
     const GROUPS = [
-      { id: "A_H2H", keys: ["h2hMaxWeight", "h2hFactor", "h2hDecayMinus1"] },
-      { id: "B_FORM_VENUE", keys: ["recencyProfile", "teamWeightBase", "venueModerateWeight"] },
-      { id: "C_FATIGUE_THRESH", keys: ["underEdgeFactor", "edgeThreshold_ft", "paceClampMinNbaNcaa"] },
-      { id: "D_INJURY_CLAMP", keys: ["injuryOppBoostFactor", "paceClampMaxNbaNcaa", "edgeThreshold_h1"] }
+      { id: "A_H2H", keys: ["h2hMaxWeight", "h2hFactor"] },
+      { id: "B_FORM", keys: ["recencyProfile", "teamWeightBase"] },
+      { id: "C_THRESH", keys: ["edgeThreshold_ft", "underEdgeFactor"] }
     ];
 
     let current = Object.assign({}, baseline);
     const groupReports = [];
     let improved = false;
 
+    // Pre-count work for progress
+    let totalWork = seasons.length; // baseline
+    const groupCombos = [];
     for (let gi = 0; gi < GROUPS.length; gi++) {
       const group = GROUPS[gi];
       const axes = group.keys.map(function (k) {
@@ -4556,7 +4570,6 @@ async function runMaxPowerJointSearch(opts) {
         if (cur !== undefined && vals.indexOf(cur) < 0) vals.push(cur);
         return { key: k, vals: vals };
       });
-
       let combos = [{}];
       axes.forEach(function (ax) {
         const next = [];
@@ -4568,17 +4581,31 @@ async function runMaxPowerJointSearch(opts) {
           });
         });
         combos = next;
-        if (combos.length > 8) combos = combos.slice(0, 8);
+        if (combos.length > 6) combos = combos.slice(0, 6);
       });
+      groupCombos.push(combos);
+      totalWork += combos.length * seasons.length;
+    }
+    totalWork += seasons.length; // final pass
+    let workDone = seasons.length;
+    if (onProgress) onProgress(workDone, totalWork, "search");
 
+    for (let gi = 0; gi < GROUPS.length; gi++) {
+      const group = GROUPS[gi];
+      const combos = groupCombos[gi];
       let bestLocal = null;
+
       for (let ci = 0; ci < combos.length; ci++) {
         const candidate = Object.assign({}, current, combos[ci]);
         const scores = [];
         for (let si = 0; si < seasons.length; si++) {
-          scores.push(evaluateLeverSetOnStore(seasons[si], league, candidate));
-          await _btYield();
+          scores.push(evaluateLeverSetOnStore(seasons[si], league, candidate, evalOpts));
+          workDone++;
         }
+        if (onProgress) onProgress(workDone, totalWork, "search");
+        // Yield only every candidate (not every season) — much faster
+        await _btYield();
+
         const mean = scores.reduce(function (a, x) { return a + x.composite; }, 0) / scores.length;
         const beatsAll = scores.every(function (sc, i) {
           return sc.composite >= (baselineBySeason[seasons[i]].composite - 0.25);
@@ -4607,13 +4634,13 @@ async function runMaxPowerJointSearch(opts) {
         adopted: adopted,
         deltaVsBaseline: bestLocal ? (bestLocal.mean - baselineComposite) : 0
       });
-      await _btYield();
     }
 
     const finalBySeason = {};
     for (let i = 0; i < seasons.length; i++) {
-      finalBySeason[seasons[i]] = evaluateLeverSetOnStore(seasons[i], league, current);
-      await _btYield();
+      finalBySeason[seasons[i]] = evaluateLeverSetOnStore(seasons[i], league, current, evalOpts);
+      workDone++;
+      if (onProgress) onProgress(workDone, totalWork, "search");
     }
     const finalComposite = seasons.reduce(function (a, s) {
       return a + (finalBySeason[s].composite || 0);
@@ -4722,7 +4749,7 @@ window.seedMaxPowerHistoricalStore = seedMaxPowerHistoricalStore;
  * 2) run dual-season joint search
  * 3) return a short human summary
  */
-async function runMaxPowerBacktestFromButton() {
+async function runMaxPowerBacktestFromButton(onProgress) {
   try {
     if (!g_historicalGamesStore.length) {
       seedMaxPowerHistoricalStore({ perSeason: 24, seasons: ["2024/25", "2025/26"], league: "nba" });
@@ -4730,7 +4757,9 @@ async function runMaxPowerBacktestFromButton() {
     return await runMaxPowerJointSearch({
       seasons: ["2024/25", "2025/26"],
       league: "nba",
-      maxCandidatesPerGroup: 3
+      maxCandidatesPerGroup: 2,
+      maxGames: 80,
+      onProgress: onProgress || null
     });
   } catch (e) {
     window.__btRunInProgress = false;
@@ -22895,8 +22924,10 @@ if (headerErrorBtn) {
             btn.textContent = "⏳";
           }
           if (typeof runMaxPowerBacktestFromButton === "function") {
-            // Clear synthetic-only if we just loaded real
-            report = await runMaxPowerBacktestFromButton();
+            report = await runMaxPowerBacktestFromButton(function (done, total, label) {
+              const pct = total ? Math.min(99, Math.round((done / total) * 100)) : 0;
+              btn.textContent = (label === "search" ? "S" : "") + pct + "%";
+            });
           } else if (typeof runOneBacktestReplayTest === "function") {
             report = { fallbackReplay: runOneBacktestReplayTest() };
           } else {
