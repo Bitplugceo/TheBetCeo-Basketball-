@@ -1,4 +1,3 @@
-C
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4217,6 +4216,293 @@ window.runOneBacktestReplayTest = runOneBacktestReplayTest;
     }
   }
 })();
+
+// ═══════════════════════════════════════════════════════════════
+// PHASE 2 — evaluate / joint search / dual-season lock / seed
+// Does NOT touch the old season-backtest path.
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Score one complete lever set on every store game for a season+league.
+ * Returns wins/losses/pushes/noplays + composite (0–100 style).
+ */
+function evaluateLeverSetOnStore(season, league, leverSet) {
+  const s = String(season || "").trim();
+  const l = String(league || "nba").toLowerCase();
+  const games = g_historicalGamesStore.filter(g =>
+    String(g.season) === s && String(g.league || "nba").toLowerCase() === l
+  );
+  let wins = 0, losses = 0, pushes = 0, noplays = 0, absErr = 0, nErr = 0;
+  games.forEach(game => {
+    let r;
+    try { r = replayHistoricalGame(game, leverSet); }
+    catch (e) { r = { result: "noplay", projectedTotal: NaN, actualTotal: game.actualTotal }; }
+    const res = String(r && r.result || "noplay").toLowerCase();
+    if (res === "win") wins++;
+    else if (res === "loss") losses++;
+    else if (res === "push") pushes++;
+    else noplays++;
+    if (isFinite(r && r.projectedTotal) && isFinite(r && r.actualTotal)) {
+      absErr += Math.abs(Number(r.projectedTotal) - Number(r.actualTotal));
+      nErr++;
+    }
+  });
+  const decisive = wins + losses;
+  const winRate = decisive > 0 ? wins / decisive : 0;
+  const mae = nErr > 0 ? absErr / nErr : 999;
+  // Composite: reward win rate, penalize MAE, require enough plays
+  const playRate = games.length ? (decisive + pushes) / games.length : 0;
+  const composite = Math.max(0, Math.min(100,
+    (winRate * 55) +
+    (Math.max(0, 20 - mae) * 1.5) +
+    (playRate * 15) +
+    (decisive >= 20 ? 10 : decisive * 0.4)
+  ));
+  return {
+    season: s, league: l, n: games.length,
+    wins, losses, pushes, noplays, decisive,
+    winRate, mae, playRate, composite,
+    leverSet: Object.assign({}, leverSet)
+  };
+}
+window.evaluateLeverSetOnStore = evaluateLeverSetOnStore;
+
+/**
+ * Expand one BACKTEST_LEVERS key into discrete candidate values.
+ */
+function expandLeverCandidates(key, def) {
+  if (!def) return [];
+  if (def.type === "profile" && Array.isArray(def.options)) return def.options.slice();
+  const out = [];
+  const min = Number(def.min), max = Number(def.max), step = Number(def.step) || 1;
+  if (!isFinite(min) || !isFinite(max) || step <= 0) return out;
+  for (let v = min; v <= max + 1e-9; v += step) {
+    out.push(Math.round(v * 1000) / 1000);
+  }
+  return out;
+}
+
+/**
+ * Coordinate-ascent joint search over BACKTEST_LEVERS groups.
+ * Baseline = live defaults. Only adopts a change if validation composite improves.
+ * Dual-season rule: a candidate must beat baseline on BOTH seasons to lock.
+ *
+ * @param {object} opts
+ *   seasons: ["2024/25","2025/26"]
+ *   league: "nba"
+ *   maxCandidatesPerGroup: default 9
+ * @returns {object} report
+ */
+function runMaxPowerJointSearch(opts) {
+  opts = opts || {};
+  const seasons = Array.isArray(opts.seasons) && opts.seasons.length
+    ? opts.seasons.slice()
+    : ["2024/25", "2025/26"];
+  const league = String(opts.league || "nba").toLowerCase();
+  const maxPerGroup = Math.max(3, Number(opts.maxCandidatesPerGroup) || 9);
+
+  window.__btRunInProgress = true;
+  const t0 = Date.now();
+  const baseline = getDefaultBacktestLeverSet(league);
+  const baselineBySeason = {};
+  seasons.forEach(s => {
+    baselineBySeason[s] = evaluateLeverSetOnStore(s, league, baseline);
+  });
+  const baselineComposite = seasons.reduce((a, s) => a + (baselineBySeason[s].composite || 0), 0) / seasons.length;
+
+  // Search groups (joint within group, sequential across groups)
+  const GROUPS = [
+    { id: "A_H2H", keys: ["h2hMaxWeight", "h2hFactor", "h2hDecayMinus1"] },
+    { id: "B_FORM_VENUE", keys: ["recencyProfile", "teamWeightBase", "venueModerateWeight"] },
+    { id: "C_FATIGUE_THRESH", keys: ["underEdgeFactor", "edgeThreshold_ft", "paceClampMinNbaNcaa"] },
+    { id: "D_INJURY_CLAMP", keys: ["injuryOppBoostFactor", "paceClampMaxNbaNcaa", "edgeThreshold_h1"] }
+  ];
+
+  let current = Object.assign({}, baseline);
+  const groupReports = [];
+  let improved = false;
+
+  GROUPS.forEach(group => {
+    // Build a small grid for this group around current values
+    const axes = group.keys.map(k => {
+      const def = BACKTEST_LEVERS[k];
+      let vals = expandLeverCandidates(k, def);
+      if (vals.length > maxPerGroup) {
+        // subsample evenly
+        const step = Math.ceil(vals.length / maxPerGroup);
+        vals = vals.filter((_, i) => i % step === 0).slice(0, maxPerGroup);
+      }
+      // always include current value
+      const cur = current[k];
+      if (cur !== undefined && vals.indexOf(cur) < 0) vals.push(cur);
+      return { key: k, vals };
+    });
+
+    // Cartesian product capped
+    let combos = [{}];
+    axes.forEach(ax => {
+      const next = [];
+      combos.forEach(c => {
+        ax.vals.forEach(v => {
+          const o = Object.assign({}, c);
+          o[ax.key] = v;
+          next.push(o);
+        });
+      });
+      combos = next;
+      if (combos.length > 40) combos = combos.slice(0, 40);
+    });
+
+    let bestLocal = null;
+    combos.forEach(delta => {
+      const candidate = Object.assign({}, current, delta);
+      const scores = seasons.map(s => evaluateLeverSetOnStore(s, league, candidate));
+      const mean = scores.reduce((a, x) => a + x.composite, 0) / scores.length;
+      // Dual-season lock rule: must not lose on ANY season vs baseline
+      const beatsAll = scores.every((sc, i) => sc.composite >= (baselineBySeason[seasons[i]].composite - 0.25));
+      if (!beatsAll) return;
+      if (!bestLocal || mean > bestLocal.mean) {
+        bestLocal = { mean, candidate, scores };
+      }
+    });
+
+    const adopted = !!(bestLocal && bestLocal.mean > baselineComposite + 0.15 &&
+      bestLocal.mean > (groupReports.length
+        ? groupReports[groupReports.length - 1].bestMean
+        : baselineComposite) + 0.05);
+
+    if (adopted) {
+      current = Object.assign({}, bestLocal.candidate);
+      improved = true;
+    }
+
+    groupReports.push({
+      groupId: group.id,
+      evaluated: combos.length,
+      bestMean: bestLocal ? bestLocal.mean : baselineComposite,
+      adopted,
+      deltaVsBaseline: bestLocal ? (bestLocal.mean - baselineComposite) : 0
+    });
+  });
+
+  const finalBySeason = {};
+  seasons.forEach(s => {
+    finalBySeason[s] = evaluateLeverSetOnStore(s, league, current);
+  });
+  const finalComposite = seasons.reduce((a, s) => a + (finalBySeason[s].composite || 0), 0) / seasons.length;
+
+  // Lock only if dual-season rule holds and improved
+  let locked = false;
+  if (improved && seasons.every(s => finalBySeason[s].composite >= baselineBySeason[s].composite - 0.1)) {
+    try {
+      localStorage.setItem("BB_MAXPOWER_LOCKED_LEVERS", JSON.stringify({
+        league, seasons, leverSet: current,
+        baselineComposite, finalComposite,
+        lockedAt: new Date().toISOString()
+      }));
+      locked = true;
+    } catch (e) {}
+  }
+
+  window.__btRunInProgress = false;
+  const report = {
+    seasons, league,
+    baselineComposite, finalComposite, improved, locked,
+    ms: Date.now() - t0,
+    groupReports,
+    baselineBySeason, finalBySeason,
+    bestLeverSet: current,
+    storeTotal: g_historicalGamesStore.length
+  };
+  if (typeof engineDebug === "function") {
+    engineDebug("MAX-POWER joint search complete", report);
+  }
+  return report;
+}
+window.runMaxPowerJointSearch = runMaxPowerJointSearch;
+
+/**
+ * Seed both seasons with realistic synthetic NBA games so the joint
+ * search can run before ESPN bulk history is wired. Replaces only the
+ * seasons it seeds. Point-in-time shape matches loadHistoricalSeasonGames.
+ */
+function seedMaxPowerHistoricalStore(opts) {
+  opts = opts || {};
+  const league = String(opts.league || "nba").toLowerCase();
+  const perSeason = Math.max(20, Math.min(200, Number(opts.perSeason) || 60));
+  const seasons = Array.isArray(opts.seasons) ? opts.seasons : ["2024/25", "2025/26"];
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function series(center, n, noise) {
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(Math.round(center + rand(-noise, noise)));
+    return out;
+  }
+  function makeGame(season, idx) {
+    const homeLevel = rand(108, 118);
+    const awayLevel = rand(106, 116);
+    const homeScored = series(homeLevel, 8, 12);
+    const homeAllowed = series(awayLevel - 2, 8, 12);
+    const awayScored = series(awayLevel, 8, 12);
+    const awayAllowed = series(homeLevel - 2, 8, 12);
+    const finalHome = Math.round(homeLevel + rand(-10, 12));
+    const finalAway = Math.round(awayLevel + rand(-10, 12));
+    const actualTotal = finalHome + finalAway;
+    const line = Math.round((actualTotal + rand(-8, 8)) * 2) / 2; // .0 or .5
+    const month = 10 + Math.floor(idx / 15);
+    const day = 1 + (idx % 28);
+    const year = String(season).startsWith("2025") ? 2025 : 2024;
+    return {
+      season, league,
+      date: year + "-" + String(Math.min(month, 12)).padStart(2, "0") + "-" + String(day).padStart(2, "0"),
+      homeTeamName: "Home_" + idx,
+      awayTeamName: "Away_" + idx,
+      finalHome, finalAway, actualTotal,
+      homeRecentScored: homeScored,
+      homeRecentAllowed: homeAllowed,
+      awayRecentScored: awayScored,
+      awayRecentAllowed: awayAllowed,
+      h2hHome: series((homeLevel + awayLevel) / 2, 3, 8),
+      h2hAway: series((homeLevel + awayLevel) / 2, 3, 8),
+      line
+    };
+  }
+
+  const counts = {};
+  seasons.forEach(season => {
+    const games = [];
+    for (let i = 0; i < perSeason; i++) games.push(makeGame(season, i));
+    counts[season] = loadHistoricalSeasonGames(season, league, games);
+  });
+  if (typeof engineDebug === "function") {
+    engineDebug("seedMaxPowerHistoricalStore", { league, perSeason, counts, storeTotal: g_historicalGamesStore.length });
+  }
+  return { counts, storeTotal: g_historicalGamesStore.length };
+}
+window.seedMaxPowerHistoricalStore = seedMaxPowerHistoricalStore;
+
+/**
+ * One-tap driver used by the ⚡ button:
+ * 1) seed both seasons if store empty
+ * 2) run dual-season joint search
+ * 3) return a short human summary
+ */
+function runMaxPowerBacktestFromButton() {
+  try {
+    if (!g_historicalGamesStore.length) {
+      seedMaxPowerHistoricalStore({ perSeason: 60, seasons: ["2024/25", "2025/26"], league: "nba" });
+    }
+    const report = runMaxPowerJointSearch({
+      seasons: ["2024/25", "2025/26"],
+      league: "nba",
+      maxCandidatesPerGroup: 7
+    });
+    return report;
+  } catch (e) {
+    return { error: String(e && e.message ? e.message : e) };
+  }
+}
+window.runMaxPowerBacktestFromButton = runMaxPowerBacktestFromButton;
 
 // NBA-CORE LOCK FLAG: the retrospective tuner (see NBA_CORE_TUNER_KEYS
 // below) checks this before auto-adjusting certain NBA settings, so it's
@@ -22350,32 +22636,59 @@ if (headerErrorBtn) {
 
       const trackerBacktestBtn = document.getElementById("trackerBacktestBtn");
       if (trackerBacktestBtn) trackerBacktestBtn.addEventListener("click", function () {
-        // Our plan path only — not the old season backtest.
-        let result = null;
+        // Our plan only — dual-season joint search (seeds store if empty).
+        let report = null;
         try {
-          if (typeof runOneBacktestReplayTest === "function") {
-            result = runOneBacktestReplayTest();
+          if (typeof runMaxPowerBacktestFromButton === "function") {
+            report = runMaxPowerBacktestFromButton();
+          } else if (typeof runOneBacktestReplayTest === "function") {
+            report = { fallbackReplay: runOneBacktestReplayTest() };
           } else {
-            result = { error: "runOneBacktestReplayTest missing — Phase 0/1 patch not loaded" };
+            report = { error: "Max-power search not loaded" };
           }
         } catch (e) {
-          result = { error: String(e && e.message ? e.message : e) };
+          report = { error: String(e && e.message ? e.message : e) };
         }
+        if (report && report.error) {
+          alert("MAX-POWER ERROR\n" + report.error);
+          return;
+        }
+        if (report && report.fallbackReplay) {
+          const r = report.fallbackReplay;
+          alert(["1-REPLAY FALLBACK", "pick: " + r.pick, "edge: " + r.edge, "result: " + r.result].join("\n"));
+          return;
+        }
+        const b2425 = report.baselineBySeason && report.baselineBySeason["2024/25"];
+        const b2526 = report.baselineBySeason && report.baselineBySeason["2025/26"];
+        const f2425 = report.finalBySeason && report.finalBySeason["2024/25"];
+        const f2526 = report.finalBySeason && report.finalBySeason["2025/26"];
         const lines = [
-          "MAX-POWER BACKTEST — 1 REPLAY TEST",
-          "--------------------------------",
-          "pick: " + (result && result.pick != null ? result.pick : "—"),
-          "side: " + (result && result.side != null ? result.side : "—"),
-          "edge: " + (result && result.edge != null ? result.edge : "—"),
-          "grade: " + (result && result.grade != null ? result.grade : "—"),
-          "projected: " + (result && result.projectedTotal != null ? result.projectedTotal : "—"),
-          "actual: " + (result && result.actualTotal != null ? result.actualTotal : "—"),
-          "result: " + (result && result.result != null ? result.result : "—"),
-          result && result.error ? ("ERROR: " + result.error) : ""
-        ].filter(Boolean);
+          "MAX-POWER JOINT SEARCH",
+          "----------------------",
+          "store: " + (report.storeTotal || 0) + " games",
+          "baseline avg: " + (report.baselineComposite != null ? report.baselineComposite.toFixed(2) : "—"),
+          "final avg:    " + (report.finalComposite != null ? report.finalComposite.toFixed(2) : "—"),
+          "improved: " + !!report.improved,
+          "locked:   " + !!report.locked,
+          "ms: " + (report.ms || 0),
+          "",
+          "2024/25  base " + (b2425 ? b2425.composite.toFixed(1) : "—") +
+            " → " + (f2425 ? f2425.composite.toFixed(1) : "—") +
+            "  W" + (f2425 ? f2425.wins : "—") + "/L" + (f2425 ? f2425.losses : "—"),
+          "2025/26  base " + (b2526 ? b2526.composite.toFixed(1) : "—") +
+            " → " + (f2526 ? f2526.composite.toFixed(1) : "—") +
+            "  W" + (f2526 ? f2526.wins : "—") + "/L" + (f2526 ? f2526.losses : "—"),
+          "",
+          "Dual-season lock only if BOTH seasons hold."
+        ];
         alert(lines.join("\n"));
         if (typeof engineDebug === "function") {
-          engineDebug("MAX-POWER 1-replay (button)", result || {});
+          engineDebug("MAX-POWER button report", {
+            improved: report.improved, locked: report.locked,
+            baselineComposite: report.baselineComposite,
+            finalComposite: report.finalComposite,
+            storeTotal: report.storeTotal
+          });
         }
       });
 
