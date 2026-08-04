@@ -1,4 +1,3 @@
-D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4442,17 +4441,19 @@ window.loadRealNbaBothSeasons = loadRealNbaBothSeasons;
 // ═══════════════════════════════════════════════════════════════
 
 /**
- * Score one complete lever set on every store game for a season+league.
+ * Score one complete lever set on every store game for a season+league+market.
  * Returns wins/losses/pushes/noplays + composite (0–100 style).
+ * market: "ft" | "h1" | "team" | "h1_team" | "q1" | "q2" | "q3" | "q4"
  */
 function evaluateLeverSetOnStore(season, league, leverSet, opts) {
   opts = opts || {};
   const s = String(season || "").trim();
   const l = String(league || "nba").toLowerCase();
+  const market = String(opts.market || "ft").toLowerCase();
   let games = g_historicalGamesStore.filter(g =>
     String(g.season) === s && String(g.league || "nba").toLowerCase() === l
   );
-  // ULTRA-FAST: stratified sample so 3000 games never means 3000 replays
+  // Stratified sample when maxGames is set (still respects full-game mode when maxGames is huge)
   const maxN = Math.max(30, Number(opts.maxGames) || 100);
   if (games.length > maxN) {
     const step = games.length / maxN;
@@ -4464,8 +4465,8 @@ function evaluateLeverSetOnStore(season, league, leverSet, opts) {
   for (let gi = 0; gi < games.length; gi++) {
     const game = games[gi];
     let r;
-    try { r = replayHistoricalGame(game, leverSet); }
-    catch (e) { r = { result: "noplay", projectedTotal: NaN, actualTotal: game.actualTotal }; }
+    try { r = replayHistoricalGame(game, leverSet, market); }
+    catch (e) { r = { result: "noplay", projectedTotal: NaN, actualTotal: game.actualTotal, market: market }; }
     const res = String(r && r.result || "noplay").toLowerCase();
     if (res === "win") wins++;
     else if (res === "loss") losses++;
@@ -4488,7 +4489,7 @@ function evaluateLeverSetOnStore(season, league, leverSet, opts) {
     (decisive >= 20 ? 10 : decisive * 0.4)
   ));
   return {
-    season: s, league: l, n: games.length,
+    season: s, league: l, market: market, n: games.length,
     wins, losses, pushes, noplays, decisive,
     winRate, mae, playRate, composite,
     leverSet: Object.assign({}, leverSet)
@@ -4539,14 +4540,15 @@ async function runMaxPowerJointSearch(opts) {
     ? opts.seasons.slice()
     : ["2024/25", "2025/26"];
   const league = String(opts.league || "nba").toLowerCase();
+  const market = String(opts.market || "ft").toLowerCase();
   // High-volume defaults — user can override
   const totalSamples = Math.max(400, Number(opts.totalSamples) || 1800);
   const maxGames = Math.max(30, Number(opts.maxGames) || 48);
   const plateauLimit = Math.max(60, Number(opts.plateauLimit) || 120);
   const refineTop = Math.max(20, Number(opts.refineTop) || 40);
   const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
-  const evalOpts = { maxGames: maxGames };
-  const fullEvalOpts = { maxGames: Math.max(maxGames * 2, 90) }; // full accuracy only on survivors
+  const evalOpts = { maxGames: maxGames, market: market };
+  const fullEvalOpts = { maxGames: Math.max(maxGames * 2, 90), market: market };
 
   if (window.__btRunInProgress) {
     return { error: "Search already running" };
@@ -4681,8 +4683,9 @@ async function runMaxPowerJointSearch(opts) {
       return finalBySeason[s].composite >= baselineBySeason[s].composite - 0.1;
     })) {
       try {
-        localStorage.setItem("BB_MAXPOWER_LOCKED_LEVERS", JSON.stringify({
+        localStorage.setItem("BB_MAXPOWER_LOCKED_LEVERS_" + market, JSON.stringify({
           league: league,
+          market: market,
           seasons: seasons,
           leverSet: current,
           baselineComposite: baselineComposite,
@@ -4697,6 +4700,7 @@ async function runMaxPowerJointSearch(opts) {
     const report = {
       seasons: seasons,
       league: league,
+      market: market,
       baselineComposite: baselineComposite,
       finalComposite: finalComposite,
       improved: improved,
@@ -4793,16 +4797,52 @@ async function runMaxPowerBacktestFromButton(onProgress) {
     if (!g_historicalGamesStore.length) {
       seedMaxPowerHistoricalStore({ perSeason: 24, seasons: ["2024/25", "2025/26"], league: "nba" });
     }
-    // Lightning defaults: fast progressive search, full dual-season accuracy on survivors
-    return await runMaxPowerJointSearch({
-      seasons: ["2024/25", "2025/26"],
-      league: "nba",
-      totalSamples: 1800,       // still thousands of full joint configs
-      maxGames: 48,            // fast pre-filter sample
-      plateauLimit: 120,
-      refineTop: 40,           // full dual-season eval only on top survivors
-      onProgress: onProgress || null
-    });
+
+    // Separate max-power lock per market (NBA only)
+    const MARKETS = ["ft", "h1", "team", "h1_team", "q1", "q2", "q3", "q4"];
+    const allReports = [];
+    const t0 = Date.now();
+
+    for (let mi = 0; mi < MARKETS.length; mi++) {
+      const market = MARKETS[mi];
+      if (typeof onProgress === "function") {
+        onProgress(mi, MARKETS.length, "market:" + market);
+      }
+      const report = await runMaxPowerJointSearch({
+        seasons: ["2024/25", "2025/26"],
+        league: "nba",
+        market: market,
+        totalSamples: 1800,
+        maxGames: 48,
+        plateauLimit: 120,
+        refineTop: 40,
+        onProgress: function (done, total, label) {
+          if (typeof onProgress === "function") {
+            // Combine market progress + config progress
+            const marketPct = mi / MARKETS.length;
+            const configPct = total ? (done / total) / MARKETS.length : 0;
+            const overall = Math.min(99, Math.round((marketPct + configPct) * 100));
+            onProgress(overall, 100, market + " " + (label || "search"));
+          }
+        }
+      });
+      allReports.push(report);
+      // Small yield between markets so UI can breathe
+      await new Promise(function (r) { setTimeout(r, 30); });
+    }
+
+    // Summary report across all markets
+    const lockedCount = allReports.filter(function (r) { return r && r.locked; }).length;
+    const improvedCount = allReports.filter(function (r) { return r && r.improved; }).length;
+    return {
+      multiMarket: true,
+      markets: MARKETS,
+      reports: allReports,
+      lockedCount: lockedCount,
+      improvedCount: improvedCount,
+      ms: Date.now() - t0,
+      storeTotal: g_historicalGamesStore.length
+    };
   } catch (e) {
     window.__btRunInProgress = false;
     return { error: String(e && e.message ? e.message : e) };
@@ -5440,17 +5480,19 @@ const TUNING_GRID = {
 };
 
 /**
- * Replay one historical game under a complete joint lever set.
+ * Replay one historical game under a complete joint lever set for a specific market.
  * Snapshot → inject → run pure projection path → restore.
  * No UI, no network. Returns pick vs actual result.
  *
  * @param {object} game     historical game from g_historicalGamesStore
  * @param {object} leverSet full joint values drawn from BACKTEST_LEVERS
+ * @param {string} market   "ft" | "h1" | "team" | "h1_team" | "q1" | "q2" | "q3" | "q4"
  * @returns {object} { pick, side, edge, grade, projectedTotal, actualTotal, result, market }
  */
-function replayHistoricalGame(game, leverSet) {
+function replayHistoricalGame(game, leverSet, market) {
+  market = String(market || "ft").toLowerCase();
   if (!game || !leverSet) {
-    return { pick: "NO PLAY", side: "", edge: 0, grade: "NaN", projectedTotal: NaN, actualTotal: game?.actualTotal ?? NaN, result: "noplay", market: "ft" };
+    return { pick: "NO PLAY", side: "", edge: 0, grade: "NaN", projectedTotal: NaN, actualTotal: game?.actualTotal ?? NaN, result: "noplay", market: market };
   }
   const league = String(game.league || "nba").toLowerCase();
   const snapshot = {};
@@ -5541,13 +5583,71 @@ function replayHistoricalGame(game, leverSet) {
       projB = projB * (1 - hw) + avgH2HB * hw;
     }
 
-    const projectedTotal = projA + projB;
-    const line = isFinite(Number(game.line)) ? Number(game.line) : null;
+    // ── Market-aware projected + actual totals ─────────────────────
+    // FT uses the full projection. Other markets use consistent scaled
+    // versions for now (real live H1/Team/Q projection wiring comes later).
+    const ftProjected = projA + projB;
+    let projectedTotal = ftProjected;
+    let actualTotal = isFinite(Number(game.actualTotal))
+      ? Number(game.actualTotal)
+      : (Number(game.finalHome || 0) + Number(game.finalAway || 0));
+    let marketKey = "ft";
+    let edgeThreshKey = "ft";
+
+    if (market === "h1") {
+      // Typical NBA first-half share ≈ 51–53% of full game
+      projectedTotal = ftProjected * 0.52;
+      actualTotal = isFinite(Number(game.actualH1))
+        ? Number(game.actualH1)
+        : (isFinite(Number(game.h1Home) + Number(game.h1Away))
+            ? Number(game.h1Home) + Number(game.h1Away)
+            : actualTotal * 0.52);
+      marketKey = "h1";
+      edgeThreshKey = "h1";
+    } else if (market === "team") {
+      // Individual team total — use home projection vs a neutral line proxy
+      projectedTotal = projA;
+      actualTotal = isFinite(Number(game.finalHome)) ? Number(game.finalHome) : actualTotal * 0.5;
+      marketKey = "team";
+      edgeThreshKey = "team";
+    } else if (market === "h1_team") {
+      projectedTotal = projA * 0.52;
+      actualTotal = isFinite(Number(game.h1Home))
+        ? Number(game.h1Home)
+        : (isFinite(Number(game.finalHome)) ? Number(game.finalHome) * 0.52 : actualTotal * 0.26);
+      marketKey = "h1_team";
+      edgeThreshKey = "team";
+    } else if (market === "q1" || market === "q2" || market === "q3" || market === "q4") {
+      // Quarters roughly equal share of the game
+      projectedTotal = ftProjected * 0.25;
+      const qKey = "actual" + market.toUpperCase();
+      actualTotal = isFinite(Number(game[qKey]))
+        ? Number(game[qKey])
+        : actualTotal * 0.25;
+      marketKey = market;
+      edgeThreshKey = "q";
+    }
+
+    // Line: prefer market-specific line if present, otherwise scale the FT line
+    let line = null;
+    if (market === "ft" && isFinite(Number(game.line))) {
+      line = Number(game.line);
+    } else if (isFinite(Number(game["line_" + market]))) {
+      line = Number(game["line_" + market]);
+    } else if (isFinite(Number(game.line))) {
+      // Scale FT line as a neutral proxy when no market line exists
+      if (market === "h1") line = Number(game.line) * 0.52;
+      else if (market === "team" || market === "h1_team") line = Number(game.line) * 0.5 * (market === "h1_team" ? 0.52 : 1);
+      else if (market.startsWith("q")) line = Number(game.line) * 0.25;
+      else line = Number(game.line);
+      line = Math.round(line * 2) / 2;
+    }
+
     const edge = (line != null && isFinite(projectedTotal)) ? (projectedTotal - line) : 0;
 
     let pickText = "NO PLAY";
     if (typeof getPick === "function" && line != null) {
-      pickText = getPick(edge, line, league, "ft", {}) || "NO PLAY";
+      pickText = getPick(edge, line, league, marketKey, {}) || "NO PLAY";
     } else if (line != null && Math.abs(edge) >= 1) {
       pickText = edge > 0 ? ("OVER " + line) : ("UNDER " + line);
     }
@@ -5562,20 +5662,17 @@ function replayHistoricalGame(game, leverSet) {
         grade = getConfidenceGrade({
           pick: pickText, line, edge, sampleTier,
           projectionOnly: false, fullModel: true, trap: false,
-          hasH2H: h2hA.length >= 2, volatility: volState.combinedVolRatio * (volLimit || 12),
-          volLimit: volLimit || 12, marketKey: "ft", note: null
+          hasH2H: h2hA.length >= 2,
+          volatility: (typeof volState !== "undefined" ? volState.combinedVolRatio : 1) * (volLimit || 12),
+          volLimit: volLimit || 12, marketKey: marketKey, note: null
         }) || "NaN";
       } catch (e) { grade = "C"; }
     }
 
-    const actualTotal = isFinite(Number(game.actualTotal))
-      ? Number(game.actualTotal)
-      : (Number(game.finalHome || 0) + Number(game.finalAway || 0));
-
     let result = "noplay";
     if (side === "over" || side === "under") {
       if (!isFinite(actualTotal) || line == null) result = "noplay";
-      else if (actualTotal === line) result = "push";
+      else if (Math.abs(actualTotal - line) < 0.01) result = "push";
       else if (side === "over")  result = actualTotal > line ? "win" : "loss";
       else                       result = actualTotal < line ? "win" : "loss";
     }
@@ -5588,7 +5685,7 @@ function replayHistoricalGame(game, leverSet) {
       projectedTotal,
       actualTotal,
       result,
-      market: "ft"
+      market: marketKey
     };
   } finally {
     // 4. Always restore original levers
@@ -23060,6 +23157,40 @@ if (headerErrorBtn) {
           alert(["1-REPLAY FALLBACK", "pick: " + r.pick, "edge: " + r.edge, "result: " + r.result].join("\n"));
           return;
         }
+
+        // Multi-market summary
+        if (report && report.multiMarket && Array.isArray(report.reports)) {
+          const lines = [
+            "MAX-POWER — ALL MARKETS (NBA)",
+            "-----------------------------",
+            "store: " + (report.storeTotal || 0) + " games",
+            "markets locked: " + (report.lockedCount || 0) + " / " + (report.markets ? report.markets.length : 0),
+            "improved: " + (report.improvedCount || 0),
+            "ms: " + (report.ms || 0),
+            ""
+          ];
+          report.reports.forEach(function (r) {
+            if (!r || r.error) {
+              lines.push((r && r.market ? r.market : "?") + ": ERROR");
+              return;
+            }
+            const f2425 = r.finalBySeason && r.finalBySeason["2024/25"];
+            const f2526 = r.finalBySeason && r.finalBySeason["2025/26"];
+            lines.push(
+              (r.market || "?").toUpperCase() +
+              "  " + (r.baselineComposite != null ? r.baselineComposite.toFixed(1) : "—") +
+              " → " + (r.finalComposite != null ? r.finalComposite.toFixed(1) : "—") +
+              "  lock:" + (r.locked ? "YES" : "no") +
+              "  W" + (f2425 ? f2425.wins : "—") + "/" + (f2526 ? f2526.wins : "—")
+            );
+          });
+          lines.push("");
+          lines.push("Each market has its own permanent lock.");
+          alert(lines.join("\n"));
+          return;
+        }
+
+        // Single-market fallback (old path)
         const b2425 = report.baselineBySeason && report.baselineBySeason["2024/25"];
         const b2526 = report.baselineBySeason && report.baselineBySeason["2025/26"];
         const f2425 = report.finalBySeason && report.finalBySeason["2024/25"];
@@ -23067,6 +23198,7 @@ if (headerErrorBtn) {
         alert([
           "MAX-POWER (REAL DATA)",
           "----------------------",
+          "market: " + (report.market || "ft"),
           "store: " + (report.storeTotal || g_historicalGamesStore.length || 0) + " games",
           "samples: " + (report.samplesEvaluated != null ? report.samplesEvaluated : "—"),
           "baseline avg: " + (report.baselineComposite != null ? report.baselineComposite.toFixed(2) : "—"),
@@ -23082,8 +23214,7 @@ if (headerErrorBtn) {
             " → " + (f2526 ? f2526.composite.toFixed(1) : "—") +
             "  W" + (f2526 ? f2526.wins : "—") + "/L" + (f2526 ? f2526.losses : "—"),
           "",
-          "Dual-season lock only if BOTH seasons hold.",
-          "Search continues until plateau (true max power)."
+          "Dual-season lock only if BOTH seasons hold."
         ].join("\n"));
       });
 
