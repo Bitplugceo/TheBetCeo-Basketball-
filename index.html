@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4195,6 +4196,211 @@ function runOneBacktestReplayTest() {
   return result;
 }
 window.runOneBacktestReplayTest = runOneBacktestReplayTest;
+
+// ═══════════════════════════════════════════════════════════════
+// PHASE 3 — Real NBA historical load (ultra-fast, progress 1/N)
+// Batched ESPN scoreboard → in-memory form/H2H (NO per-game form API)
+// ═══════════════════════════════════════════════════════════════
+
+function _btSeasonDateRange(season) {
+  // NBA: Oct → June. season "2024/25" → 20241001..20250630
+  const m = String(season || "").match(/^(\d{4})\s*\/\s*(\d{2,4})$/);
+  if (!m) return null;
+  const y1 = parseInt(m[1], 10);
+  const y2 = m[2].length === 2 ? 2000 + parseInt(m[2], 10) : parseInt(m[2], 10);
+  return { start: y1 + "1001", end: y2 + "0630" };
+}
+
+function _btDateKeysInclusive(startYmd, endYmd) {
+  // YYYYMMDD → list of date keys, daily
+  const keys = [];
+  const s = String(startYmd), e = String(endYmd);
+  let y = parseInt(s.slice(0, 4), 10);
+  let m = parseInt(s.slice(4, 6), 10) - 1;
+  let d = parseInt(s.slice(6, 8), 10);
+  const end = new Date(parseInt(e.slice(0, 4), 10), parseInt(e.slice(4, 6), 10) - 1, parseInt(e.slice(6, 8), 10));
+  const cur = new Date(y, m, d);
+  const pad = n => String(n).padStart(2, "0");
+  while (cur <= end) {
+    keys.push(cur.getFullYear() + pad(cur.getMonth() + 1) + pad(cur.getDate()));
+    cur.setDate(cur.getDate() + 1);
+  }
+  return keys;
+}
+
+/**
+ * Ultra-fast bulk load of final NBA games for one season via scoreboard dates.
+ * Parallel batches (concurrency 8). Progress callback: (done, total, label).
+ * Form + H2H built purely in memory after the scoreboard pass.
+ */
+async function loadRealNbaSeasonFromEspn(season, onProgress) {
+  const league = "nba";
+  const range = _btSeasonDateRange(season);
+  if (!range) return { season: season, loaded: 0, error: "bad season" };
+
+  const base = (typeof getEspnBaseForLeague === "function")
+    ? getEspnBaseForLeague("nba")
+    : "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
+
+  // Cap to today if season end is in the future
+  const today = new Date();
+  const pad = n => String(n).padStart(2, "0");
+  const todayKey = today.getFullYear() + pad(today.getMonth() + 1) + pad(today.getDate());
+  const endKey = range.end > todayKey ? todayKey : range.end;
+  const dateKeys = _btDateKeysInclusive(range.start, endKey);
+  const total = dateKeys.length;
+  const CONCURRENCY = 8;
+  const rawEvents = [];
+
+  for (let i = 0; i < dateKeys.length; i += CONCURRENCY) {
+    const batch = dateKeys.slice(i, i + CONCURRENCY);
+    const jobs = batch.map(function (dk) {
+      if (typeof proxyFetch !== "function") return Promise.resolve(null);
+      return proxyFetch(base + "/scoreboard?dates=" + dk + "&limit=200", 8000).catch(function () { return null; });
+    });
+    const results = await Promise.all(jobs);
+    results.forEach(function (data) {
+      if (!data || !Array.isArray(data.events)) return;
+      data.events.forEach(function (ev) {
+        const comp = ev && ev.competitions && ev.competitions[0];
+        if (!comp) return;
+        const done =
+          (comp.status && comp.status.type && (comp.status.type.completed ||
+            comp.status.type.name === "STATUS_FINAL" ||
+            comp.status.type.state === "post"));
+        if (!done) return;
+        const comps = comp.competitors || [];
+        if (comps.length < 2) return;
+        const home = comps.find(function (c) { return c.homeAway === "home"; }) || comps[0];
+        const away = comps.find(function (c) { return c.homeAway === "away"; }) || comps[1];
+        const ps = function (s) {
+          if (s == null) return NaN;
+          if (typeof s === "object") return parseFloat(s.value != null ? s.value : s.displayValue);
+          return parseFloat(s);
+        };
+        const fh = ps(home && home.score);
+        const fa = ps(away && away.score);
+        if (!isFinite(fh) || !isFinite(fa)) return;
+        rawEvents.push({
+          id: String(ev.id || ""),
+          date: String(ev.date || "").slice(0, 10),
+          homeTeamId: String(home.team && home.team.id || ""),
+          awayTeamId: String(away.team && away.team.id || ""),
+          homeTeamName: String(home.team && (home.team.shortDisplayName || home.team.displayName) || ""),
+          awayTeamName: String(away.team && (away.team.shortDisplayName || away.team.displayName) || ""),
+          finalHome: fh,
+          finalAway: fa,
+          actualTotal: fh + fa
+        });
+      });
+    });
+    if (typeof onProgress === "function") {
+      onProgress(Math.min(i + CONCURRENCY, total), total, "fetch " + season);
+    }
+    // Yield so UI can paint progress
+    await new Promise(function (r) { setTimeout(r, 0); });
+  }
+
+  // Sort chronological
+  rawEvents.sort(function (a, b) {
+    return String(a.date).localeCompare(String(b.date)) || String(a.id).localeCompare(String(b.id));
+  });
+
+  // In-memory team timelines for form + H2H (O(n) — ultra fast)
+  const byTeam = Object.create(null);
+  rawEvents.forEach(function (g, idx) {
+    g._idx = idx;
+    if (!byTeam[g.homeTeamId]) byTeam[g.homeTeamId] = [];
+    if (!byTeam[g.awayTeamId]) byTeam[g.awayTeamId] = [];
+    byTeam[g.homeTeamId].push({ idx: idx, scored: g.finalHome, allowed: g.finalAway, oppId: g.awayTeamId, date: g.date });
+    byTeam[g.awayTeamId].push({ idx: idx, scored: g.finalAway, allowed: g.finalHome, oppId: g.homeTeamId, date: g.date });
+  });
+
+  function priorSeries(teamId, beforeIdx, n) {
+    const arr = byTeam[teamId] || [];
+    const out = [];
+    for (let i = arr.length - 1; i >= 0 && out.length < n; i--) {
+      if (arr[i].idx < beforeIdx) out.push(arr[i]);
+    }
+    // most recent first
+    return out;
+  }
+
+  const games = rawEvents.map(function (g) {
+    const homePrior = priorSeries(g.homeTeamId, g._idx, 10);
+    const awayPrior = priorSeries(g.awayTeamId, g._idx, 10);
+    // H2H: prior meetings between these two teams
+    const h2hHome = [];
+    const h2hAway = [];
+    (byTeam[g.homeTeamId] || []).forEach(function (row) {
+      if (row.idx < g._idx && row.oppId === g.awayTeamId && h2hHome.length < 5) {
+        h2hHome.push(row.scored);
+        h2hAway.push(row.allowed);
+      }
+    });
+    // Market line proxy from pre-game form (no historical odds in free ESPN)
+    let line = null;
+    if (homePrior.length >= 3 && awayPrior.length >= 3) {
+      const hTot = homePrior.slice(0, 5).reduce(function (a, r) { return a + r.scored + r.allowed; }, 0) / Math.min(5, homePrior.length);
+      const aTot = awayPrior.slice(0, 5).reduce(function (a, r) { return a + r.scored + r.allowed; }, 0) / Math.min(5, awayPrior.length);
+      line = Math.round(((hTot + aTot) / 2) * 2) / 2;
+    }
+    return {
+      season: season,
+      league: league,
+      date: g.date,
+      homeTeamId: g.homeTeamId,
+      awayTeamId: g.awayTeamId,
+      homeTeamName: g.homeTeamName,
+      awayTeamName: g.awayTeamName,
+      finalHome: g.finalHome,
+      finalAway: g.finalAway,
+      actualTotal: g.actualTotal,
+      homeRecentScored: homePrior.map(function (r) { return r.scored; }),
+      homeRecentAllowed: homePrior.map(function (r) { return r.allowed; }),
+      awayRecentScored: awayPrior.map(function (r) { return r.scored; }),
+      awayRecentAllowed: awayPrior.map(function (r) { return r.allowed; }),
+      h2hHome: h2hHome,
+      h2hAway: h2hAway,
+      line: line
+    };
+  }).filter(function (g) {
+    // Need enough form to replay
+    return g.homeRecentScored.length >= 3 && g.awayRecentScored.length >= 3 && g.line != null;
+  });
+
+  const count = loadHistoricalSeasonGames(season, league, games);
+  if (typeof onProgress === "function") onProgress(total, total, "done " + season + " (" + count + " games)");
+  if (typeof engineDebug === "function") {
+    engineDebug("loadRealNbaSeasonFromEspn", { season: season, raw: rawEvents.length, usable: count });
+  }
+  return { season: season, raw: rawEvents.length, loaded: count };
+}
+window.loadRealNbaSeasonFromEspn = loadRealNbaSeasonFromEspn;
+
+/**
+ * Load both seasons with live progress. Extremely parallel, yields between batches.
+ * onProgress(done, total, label) — wire to button text "12/180".
+ */
+async function loadRealNbaBothSeasons(onProgress) {
+  const seasons = ["2024/25", "2025/26"];
+  const results = [];
+  for (let i = 0; i < seasons.length; i++) {
+    const r = await loadRealNbaSeasonFromEspn(seasons[i], function (done, total, label) {
+      if (typeof onProgress === "function") {
+        // Global progress across both seasons
+        const base = i * 1000;
+        onProgress(base + done, seasons.length * 1000, label);
+      }
+    });
+    results.push(r);
+  }
+  return {
+    results: results,
+    storeTotal: g_historicalGamesStore.length
+  };
+}
+window.loadRealNbaBothSeasons = loadRealNbaBothSeasons;
 
 // Self-check on load — appears in AFDB / engine log
 (function backtestPhase0SelfCheck() {
@@ -22666,16 +22872,30 @@ if (headerErrorBtn) {
       const trackerBacktestBtn = document.getElementById("trackerBacktestBtn");
       if (trackerBacktestBtn) trackerBacktestBtn.addEventListener("click", async function () {
         if (window.__btRunInProgress) {
-          alert("Max-power search already running…");
+          alert("Max-power already running…");
           return;
         }
         const btn = trackerBacktestBtn;
         const prevLabel = btn.textContent;
-        btn.textContent = "⏳";
         btn.disabled = true;
         let report = null;
         try {
+          // Phase 3: if store is synthetic/empty, load REAL ESPN history first
+          const needsReal = !g_historicalGamesStore.length ||
+            (g_historicalGamesStore.length <= 80 &&
+              String(g_historicalGamesStore[0] && g_historicalGamesStore[0].homeTeamName || "").indexOf("Home_") === 0);
+          if (needsReal && typeof loadRealNbaBothSeasons === "function") {
+            btn.textContent = "0%";
+            await loadRealNbaBothSeasons(function (done, total) {
+              const pct = total ? Math.min(99, Math.round((done / total) * 100)) : 0;
+              btn.textContent = pct + "%";
+            });
+            btn.textContent = "⏳";
+          } else {
+            btn.textContent = "⏳";
+          }
           if (typeof runMaxPowerBacktestFromButton === "function") {
+            // Clear synthetic-only if we just loaded real
             report = await runMaxPowerBacktestFromButton();
           } else if (typeof runOneBacktestReplayTest === "function") {
             report = { fallbackReplay: runOneBacktestReplayTest() };
@@ -22702,9 +22922,9 @@ if (headerErrorBtn) {
         const f2425 = report.finalBySeason && report.finalBySeason["2024/25"];
         const f2526 = report.finalBySeason && report.finalBySeason["2025/26"];
         alert([
-          "MAX-POWER JOINT SEARCH",
+          "MAX-POWER (REAL DATA)",
           "----------------------",
-          "store: " + (report.storeTotal || 0) + " games",
+          "store: " + (report.storeTotal || g_historicalGamesStore.length || 0) + " games",
           "baseline avg: " + (report.baselineComposite != null ? report.baselineComposite.toFixed(2) : "—"),
           "final avg:    " + (report.finalComposite != null ? report.finalComposite.toFixed(2) : "—"),
           "improved: " + !!report.improved,
