@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4701,10 +4700,57 @@ async function runMaxPowerJointSearch(opts) {
       return a + (finalBySeason[s].composite || 0);
     }, 0) / seasons.length;
 
+    // Primary score = overall win rate % across both seasons
+    function winRateOf(bySeason) {
+      let w = 0, l = 0;
+      seasons.forEach(function (s) {
+        const x = bySeason[s];
+        if (x) { w += (x.wins || 0); l += (x.losses || 0); }
+      });
+      const d = w + l;
+      return d > 0 ? (w / d) * 100 : 0;
+    }
+    const baselineWinPct = winRateOf(baselineBySeason);
+    const finalWinPct = winRateOf(finalBySeason);
+
+    // Strict upgrade-only lock:
+    // 1. Must have real decisive plays
+    // 2. Must be strictly better win % than baseline
+    // 3. Must not regress on either season
+    // 4. Must beat any previously locked set for this market
     let locked = false;
-    if (improved && seasons.every(function (s) {
-      return finalBySeason[s].composite >= baselineBySeason[s].composite - 0.1;
-    })) {
+    const minDecisive = 8;
+    const totalDecisive = seasons.reduce(function (a, s) {
+      const x = finalBySeason[s];
+      return a + ((x && x.decisive) || 0);
+    }, 0);
+
+    const holdsBoth = seasons.every(function (s) {
+      const b = baselineBySeason[s];
+      const f = finalBySeason[s];
+      if (!b || !f) return false;
+      // no regression on win rate (allow tiny noise)
+      const bWR = (b.decisive > 0) ? b.wins / b.decisive : 0;
+      const fWR = (f.decisive > 0) ? f.wins / f.decisive : 0;
+      return fWR >= bWR - 0.02;
+    });
+
+    let prevWinPct = -1;
+    try {
+      const prevRaw = localStorage.getItem("BB_MAXPOWER_LOCKED_LEVERS_" + market);
+      if (prevRaw) {
+        const prev = JSON.parse(prevRaw);
+        if (prev && isFinite(prev.finalWinPct)) prevWinPct = Number(prev.finalWinPct);
+      }
+    } catch (e) {}
+
+    const isStrictlyBetter =
+      totalDecisive >= minDecisive &&
+      finalWinPct > baselineWinPct + 0.5 &&
+      holdsBoth &&
+      finalWinPct > prevWinPct + 0.3;
+
+    if (isStrictlyBetter) {
       try {
         localStorage.setItem("BB_MAXPOWER_LOCKED_LEVERS_" + market, JSON.stringify({
           league: league,
@@ -4713,10 +4759,13 @@ async function runMaxPowerJointSearch(opts) {
           leverSet: current,
           baselineComposite: baselineComposite,
           finalComposite: finalComposite,
+          baselineWinPct: baselineWinPct,
+          finalWinPct: finalWinPct,
           samplesEvaluated: evaluated,
           lockedAt: new Date().toISOString()
         }));
         locked = true;
+        improved = true;
       } catch (e) {}
     }
 
@@ -23242,11 +23291,27 @@ if (headerErrorBtn) {
             const f2425 = r.finalBySeason && r.finalBySeason["2024/25"];
             const f2526 = r.finalBySeason && r.finalBySeason["2025/26"];
             lines.push("—— " + m + " ——");
+            // Win rate % is the main score
+            let baseW = 0, baseL = 0, finW = 0, finL = 0;
+            if (r.baselineBySeason) {
+              Object.keys(r.baselineBySeason).forEach(function (s) {
+                const x = r.baselineBySeason[s];
+                if (x) { baseW += (x.wins || 0); baseL += (x.losses || 0); }
+              });
+            }
+            if (r.finalBySeason) {
+              Object.keys(r.finalBySeason).forEach(function (s) {
+                const x = r.finalBySeason[s];
+                if (x) { finW += (x.wins || 0); finL += (x.losses || 0); }
+              });
+            }
+            const basePct = (baseW + baseL) > 0 ? ((baseW / (baseW + baseL)) * 100).toFixed(1) : "—";
+            const finPct  = (finW + finL) > 0 ? ((finW / (finW + finL)) * 100).toFixed(1) : "—";
+            lines.push("WIN RATE: " + basePct + "% → " + finPct + "%   lock:" + (r.locked ? "YES" : "no"));
             lines.push("composite: " +
-              (r.baselineComposite != null ? r.baselineComposite.toFixed(2) : "—") +
+              (r.baselineComposite != null ? r.baselineComposite.toFixed(1) : "—") +
               " → " +
-              (r.finalComposite != null ? r.finalComposite.toFixed(2) : "—") +
-              "  lock:" + (r.locked ? "YES" : "no"));
+              (r.finalComposite != null ? r.finalComposite.toFixed(1) : "—"));
             lines.push("2024/25 W" + (f2425 ? f2425.wins : "—") + "/L" + (f2425 ? f2425.losses : "—") +
               "   2025/26 W" + (f2526 ? f2526.wins : "—") + "/L" + (f2526 ? f2526.losses : "—"));
             lines.push("samples: " + (r.samplesEvaluated != null ? r.samplesEvaluated : "—"));
