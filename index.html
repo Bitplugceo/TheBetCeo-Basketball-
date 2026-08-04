@@ -1,3 +1,4 @@
+Q
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4048,6 +4049,12 @@ const BACKTEST_LEVERS = {
 //   h2hHome, h2hAway, h2hDates, homeRestDays, awayRestDays,
 //   homeInjuries, awayInjuries, line }
 let g_historicalGamesStore = [];
+// PERF AUDIT FIX: version counter + sample cache used by
+// evaluateLeverSetOnStore so the MAX-POWER sweep doesn't re-filter and
+// re-sample the entire store on every single lever-candidate evaluation
+// (see loadHistoricalSeasonGames for the version bump).
+let g_historicalStoreVersion = 0;
+const g_evalSampleCache = new Map();
 
 /**
  * Phase 1 data layer — load (or accept) historical games for a season.
@@ -4066,6 +4073,10 @@ function loadHistoricalSeasonGames(season, league, games) {
     if (typeof engineDebug === "function") engineDebug("loadHistoricalSeasonGames: missing season");
     return 0;
   }
+  // PERF AUDIT FIX: bump the store version so evaluateLeverSetOnStore's
+  // per-(season, league, maxGames) sample cache invalidates whenever the
+  // store actually changes, instead of ever serving a stale sampled subset.
+  g_historicalStoreVersion++;
   // Remove any previous entries for this season+league so reloads are clean
   g_historicalGamesStore = g_historicalGamesStore.filter(g =>
     !(String(g.season) === s && String(g.league || "nba").toLowerCase() === l)
@@ -4450,16 +4461,28 @@ function evaluateLeverSetOnStore(season, league, leverSet, opts) {
   const s = String(season || "").trim();
   const l = String(league || "nba").toLowerCase();
   const market = String(opts.market || "ft").toLowerCase();
-  let games = g_historicalGamesStore.filter(g =>
-    String(g.season) === s && String(g.league || "nba").toLowerCase() === l
-  );
-  // Stratified sample when maxGames is set (still respects full-game mode when maxGames is huge)
+  // PERF AUDIT FIX: this used to filter the entire g_historicalGamesStore
+  // and rebuild the identical stratified sample on EVERY call — and this
+  // function runs once per lever-candidate per season, i.e. thousands of
+  // times per market during a MAX-POWER sweep, for a result that only
+  // depends on (season, league, maxGames) and never changes unless the
+  // store itself is reloaded. Cache the sampled subset, invalidated only
+  // via g_historicalStoreVersion (bumped in loadHistoricalSeasonGames).
   const maxN = Math.max(30, Number(opts.maxGames) || 100);
-  if (games.length > maxN) {
-    const step = games.length / maxN;
-    const sampled = [];
-    for (let i = 0; i < maxN; i++) sampled.push(games[Math.min(games.length - 1, Math.floor(i * step))]);
-    games = sampled;
+  const cacheKey = g_historicalStoreVersion + "|" + s + "|" + l + "|" + maxN;
+  let games = g_evalSampleCache.get(cacheKey);
+  if (!games) {
+    games = g_historicalGamesStore.filter(g =>
+      String(g.season) === s && String(g.league || "nba").toLowerCase() === l
+    );
+    // Stratified sample when maxGames is set (still respects full-game mode when maxGames is huge)
+    if (games.length > maxN) {
+      const step = games.length / maxN;
+      const sampled = [];
+      for (let i = 0; i < maxN; i++) sampled.push(games[Math.min(games.length - 1, Math.floor(i * step))]);
+      games = sampled;
+    }
+    g_evalSampleCache.set(cacheKey, games);
   }
   let wins = 0, losses = 0, pushes = 0, noplays = 0, absErr = 0, nErr = 0;
   for (let gi = 0; gi < games.length; gi++) {
@@ -5285,21 +5308,36 @@ function setTunableParam(key, newValue, scopeLeague, verifiedAt) {
     clampedValue = clampNumber(newValue, entry.min, entry.max);
   }
   const stamp = verifiedAt || new Date().toISOString();
+  // PERF AUDIT FIX: during a MAX-POWER sweep (window.__btRunInProgress),
+  // replayHistoricalGame injects/restores every lever on EVERY replayed
+  // game — hundreds of thousands of calls per market. Each call used to
+  // hit localStorage.setItem (full JSON.stringify of the whole override
+  // object) plus engineDebug (JSON.stringify + array unshift + a debug
+  // panel re-render) unconditionally, which is what made the sweep
+  // unusably slow / appear frozen at 0%. The in-memory registry/override
+  // write below still always happens — getTunableParam keeps reading the
+  // correct injected value during replay — only the disk persistence and
+  // debug logging are skipped while a sweep is running. That's safe
+  // because replayHistoricalGame always restores the pre-sweep values in
+  // its own finally block, so nothing durable is ever lost.
+  const btFast = !!window.__btRunInProgress;
   if (scopeLeague) {
     if (entry.scope !== "global") {
-      engineDebug("setTunableParam: key '" + key + "' does not allow league-level overrides", { key, scopeLeague });
+      if (!btFast) engineDebug("setTunableParam: key '" + key + "' does not allow league-level overrides", { key, scopeLeague });
       return false;
     }
     const leagueKey = String(scopeLeague).toLowerCase();
     if (!g_tunableParamLeagueOverrides[leagueKey]) g_tunableParamLeagueOverrides[leagueKey] = {};
     g_tunableParamLeagueOverrides[leagueKey][key] = { value: clampedValue, lastVerifiedAt: stamp };
-    saveTunableParamLeagueOverrides();
+    if (!btFast) saveTunableParamLeagueOverrides();
   } else {
     entry.value = clampedValue;
     entry.lastVerifiedAt = stamp;
-    saveTunableParamRegistryOverrides();
+    if (!btFast) saveTunableParamRegistryOverrides();
   }
-  engineDebug("setTunableParam promoted", { key, newValue: clampedValue, scopeLeague: scopeLeague || "global", verifiedAt: stamp });
+  if (!btFast) {
+    engineDebug("setTunableParam promoted", { key, newValue: clampedValue, scopeLeague: scopeLeague || "global", verifiedAt: stamp });
+  }
   return true;
 }
 
@@ -5570,15 +5608,30 @@ function replayHistoricalGame(game, leverSet, market) {
     if (h2hA.length >= 2 && h2hB.length >= 2) {
       const avgH2HA = h2hA.reduce((s,v)=>s+v,0) / h2hA.length;
       const avgH2HB = h2hB.reduce((s,v)=>s+v,0) / h2hB.length;
+      const factor = (typeof getParam === "function") ? (getParam("h2hFactor", league) ?? 1.0) : 1.0;
       let hw = 0.20;
       if (typeof getH2HWeight === "function") {
-        try { hw = getH2HWeight(h2hA.length, league, "ft") || 0.20; } catch (e) {}
+        // CORRECTNESS AUDIT FIX: this call used to be
+        // getH2HWeight(h2hA.length, league, "ft") — passing the league
+        // STRING into the numeric lenB parameter slot. Number("nba") is
+        // NaN, so minLen collapsed to 0 on every single call and the
+        // function always returned 0, silently forcing the "|| 0.20"
+        // fallback below on every backtest replay. That made every
+        // H2H-related lever (h2hFactor, h2hMaxWeight, and the whole
+        // h2hDecay* / h2hLookbackSeasons group) a no-op during the entire
+        // MAX-POWER search — sweeping them never changed a single result.
+        // Fixed to match the real signature and the shape every live call
+        // site already uses (see the getH2HWeight calls in the FT/1H/quarter
+        // projection builders); factor is passed straight in since
+        // getH2HWeight already applies + clamps it internally.
+        try {
+          hw = getH2HWeight(h2hA.length, h2hB.length, "ft", sampleTier, Math.abs(projA - projB), league, null, factor, null) || 0.20;
+        } catch (e) {}
       } else {
         const cap = (typeof getParam === "function") ? (getParam("h2hMaxWeight", league) ?? 0.30) : 0.30;
         hw = Math.min(cap, 0.10 + h2hA.length * 0.04);
+        hw = Math.min(hw * factor, cap);
       }
-      const factor = (typeof getParam === "function") ? (getParam("h2hFactor", league) ?? 1.0) : 1.0;
-      hw = Math.min(hw * factor, (typeof getParam === "function") ? (getParam("h2hMaxWeight", league) ?? 0.30) : 0.30);
       projA = projA * (1 - hw) + avgH2HA * hw;
       projB = projB * (1 - hw) + avgH2HB * hw;
     }
