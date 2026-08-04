@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2968,6 +2967,7 @@ body.dark-mode .tracker-analytics-section-head {
                        <div class="tracker-head-actions">
 <button type="button" id="trackerMilitaryRaidBtn" class="tracker-insights-btn" title="Single-click: Military Raid · Double-click: Toggle debug view" onclick="triggerTrackerMilitaryRaid()">🚨</button>
 <button type="button" id="trackerHealthBtn" class="tracker-insights-btn" title="Engine health dashboard">❤️</button>
+<button type="button" id="trackerSeasonBacktestBtn" class="tracker-insights-btn" title="Season Backtest panel (Joint search + Lock Optimal Parameters)">📊</button>
 <button type="button" id="trackerBacktestBtn" class="tracker-insights-btn" title="Max-power backtest: run 1 replay test">⚡</button>
 <button type="button" id="trackerConfigBtn" class="tracker-insights-btn" title="View/Edit verified configs">⚙️</button>
 <button type="button" id="trackerCopyDataBtn" class="tracker-insights-btn" title="Copy tracker data to clipboard">📑</button>
@@ -5315,6 +5315,18 @@ function pruneUnverifiedLeagueOverrideDrift() {
   }
 }
 
+// CONFIRMED BUG FIX: no call site in the engine ever passed a `market`
+// argument to getParam/getTunableParam, so the MAX-POWER per-market lock
+// lookup always defaulted to the "ft" bucket regardless of what was
+// actually being computed — H1 and quarter locks were silently inert.
+// computeFTProjection/compute1HProjection/computeQuarterProjectionBT set
+// this at entry so every getParam(key, league) call underneath them
+// (2-arg, unchanged) picks up the right market automatically. Not reset
+// on exit — cheap tradeoff is a stale value can briefly leak into
+// debug/Configs-panel display reads between games; it never affects
+// which lever set a live pick actually uses.
+let g_currentLiveComputeMarket = null;
+
 function getTunableParam(key, league, market) {
   const entry = TUNABLE_PARAM_REGISTRY[key];
   if (!entry) {
@@ -5348,7 +5360,7 @@ function getTunableParam(key, league, market) {
   try {
     const lk = String(league || "nba").toLowerCase();
     if (lk === "nba") {
-      const m = String(market || "ft").toLowerCase();
+      const m = String(market || g_currentLiveComputeMarket || "ft").toLowerCase();
       const keysToTry = [
         "BB_MAXPOWER_LOCKED_LEVERS_" + m,
         "BB_MAXPOWER_LOCKED_LEVERS_ft",   // safe fallback
@@ -17119,6 +17131,9 @@ function getMarketKeyFromName(name, marketKeyOverride) {
 }
 
 function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
+  // MARKET CONTEXT FIX: lets getTunableParam resolve the correct
+  // per-market MAX-POWER lock (see g_currentLiveComputeMarket above).
+  g_currentLiveComputeMarket = "ft";
 
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const leagueBase = eb / 2;
@@ -17438,6 +17453,8 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 }
 
 function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
+  // MARKET CONTEXT FIX: see g_currentLiveComputeMarket above.
+  g_currentLiveComputeMarket = "h1";
   const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
   const volLimit = getMarketVolLimit(league, "h1");
 
@@ -18125,6 +18142,9 @@ async function fetchNbaGameH1(eventId) {
 // inputs the live computeQ path just used (from __LAST_AUDIT_STATE) and
 // reports proj deltas. Call from the Backtest panel button or AFDB.
 function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, injB = 1, teamAName = "", teamBName = "", config = {}, combinedVolRatio = 0.5 }) {
+  // MARKET CONTEXT FIX: qKey is already "q1"/"q2"/"q3"/"q4", which matches
+  // MAX-POWER's per-quarter lock keys exactly — see g_currentLiveComputeMarket above.
+  g_currentLiveComputeMarket = qKey;
   const aS = getManualSeries("A", qKey, parsed);
   const bS = getManualSeries("B", qKey, parsed);
 
@@ -23183,6 +23203,9 @@ if (headerErrorBtn) {
 
       const trackerHealthBtn = document.getElementById("trackerHealthBtn");
       if (trackerHealthBtn) trackerHealthBtn.addEventListener("click", toggleTrackerHealthView);
+
+      const trackerSeasonBacktestBtn = document.getElementById("trackerSeasonBacktestBtn");
+      if (trackerSeasonBacktestBtn) trackerSeasonBacktestBtn.addEventListener("click", toggleTrackerBacktestView);
 
       const trackerBacktestBtn = document.getElementById("trackerBacktestBtn");
       if (trackerBacktestBtn) trackerBacktestBtn.addEventListener("click", async function () {
