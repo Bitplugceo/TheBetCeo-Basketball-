@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4540,11 +4539,13 @@ async function runMaxPowerJointSearch(opts) {
     : ["2024/25", "2025/26"];
   const league = String(opts.league || "nba").toLowerCase();
   // High-volume defaults — user can override
-  const totalSamples = Math.max(500, Number(opts.totalSamples) || 4000);
-  const maxGames = Math.max(40, Number(opts.maxGames) || 120);
-  const plateauLimit = Math.max(80, Number(opts.plateauLimit) || 200);
+  const totalSamples = Math.max(400, Number(opts.totalSamples) || 1800);
+  const maxGames = Math.max(30, Number(opts.maxGames) || 48);
+  const plateauLimit = Math.max(60, Number(opts.plateauLimit) || 120);
+  const refineTop = Math.max(20, Number(opts.refineTop) || 40);
   const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
   const evalOpts = { maxGames: maxGames };
+  const fullEvalOpts = { maxGames: Math.max(maxGames * 2, 90) }; // full accuracy only on survivors
 
   if (window.__btRunInProgress) {
     return { error: "Search already running" };
@@ -4587,10 +4588,12 @@ async function runMaxPowerJointSearch(opts) {
     let evaluated = 0;
     const sampleReports = [];
 
-    // High-volume joint sampling loop
-    const totalWork = totalSamples + seasons.length;
+    // ── Stage 1: Lightning pre-filter (thousands of full joint configs) ──
+    const totalWork = totalSamples + refineTop + seasons.length;
     let workDone = seasons.length;
     if (onProgress) onProgress(workDone, totalWork, "search");
+
+    const survivors = []; // keep best candidates for Stage 2
 
     for (let i = 0; i < totalSamples; i++) {
       const candidate = sampleFullLeverSet();
@@ -4600,24 +4603,27 @@ async function runMaxPowerJointSearch(opts) {
       }
       evaluated++;
       workDone++;
-      if (onProgress && (i % 25 === 0 || i === totalSamples - 1)) {
+      if (onProgress && (i % 40 === 0 || i === totalSamples - 1)) {
         onProgress(workDone, totalWork, "search");
       }
-      // Yield every 15 samples to keep UI alive
-      if (i % 15 === 0) await _btYield();
+      if (i % 25 === 0) await _btYield();
 
       const mean = scores.reduce(function (a, x) { return a + (x.composite || 0); }, 0) / scores.length;
-
-      // Dual-season hard gate: must not regress on either season
       const holdsBoth = scores.every(function (sc, idx) {
-        return sc.composite >= (baselineBySeason[seasons[idx]].composite - 0.15);
+        return sc.composite >= (baselineBySeason[seasons[idx]].composite - 0.20);
       });
       if (!holdsBoth) {
         samplesSinceImprove++;
         continue;
       }
 
-      if (mean > bestMean + 0.08) {
+      survivors.push({ candidate: candidate, mean: mean });
+      if (survivors.length > refineTop * 3) {
+        survivors.sort(function (a, b) { return b.mean - a.mean; });
+        survivors.length = refineTop * 2;
+      }
+
+      if (mean > bestMean + 0.06) {
         current = Object.assign({}, candidate);
         bestMean = mean;
         improved = true;
@@ -4627,8 +4633,35 @@ async function runMaxPowerJointSearch(opts) {
         samplesSinceImprove++;
       }
 
-      // True maximum-power stop: plateau reached
       if (samplesSinceImprove >= plateauLimit && improved) break;
+    }
+
+    // ── Stage 2: Full dual-season accuracy only on the strongest survivors ──
+    survivors.sort(function (a, b) { return b.mean - a.mean; });
+    const top = survivors.slice(0, refineTop);
+
+    for (let ti = 0; ti < top.length; ti++) {
+      const cand = top[ti].candidate;
+      const scores = [];
+      for (let si = 0; si < seasons.length; si++) {
+        scores.push(evaluateLeverSetOnStore(seasons[si], league, cand, fullEvalOpts));
+      }
+      workDone++;
+      if (onProgress) onProgress(workDone, totalWork, "search");
+      if (ti % 8 === 0) await _btYield();
+
+      const mean = scores.reduce(function (a, x) { return a + (x.composite || 0); }, 0) / scores.length;
+      const holdsBoth = scores.every(function (sc, idx) {
+        return sc.composite >= (baselineBySeason[seasons[idx]].composite - 0.10);
+      });
+      if (!holdsBoth) continue;
+
+      if (mean > bestMean + 0.04) {
+        current = Object.assign({}, cand);
+        bestMean = mean;
+        improved = true;
+        sampleReports.push({ sample: "refine-" + ti, mean: mean, delta: mean - baselineComposite });
+      }
     }
 
     // Final dual-season evaluation of the winner
@@ -4759,12 +4792,14 @@ async function runMaxPowerBacktestFromButton(onProgress) {
     if (!g_historicalGamesStore.length) {
       seedMaxPowerHistoricalStore({ perSeason: 24, seasons: ["2024/25", "2025/26"], league: "nba" });
     }
+    // Lightning defaults: fast progressive search, full dual-season accuracy on survivors
     return await runMaxPowerJointSearch({
       seasons: ["2024/25", "2025/26"],
       league: "nba",
-      totalSamples: 4000,
-      maxGames: 120,
-      plateauLimit: 200,
+      totalSamples: 1800,       // still thousands of full joint configs
+      maxGames: 48,            // fast pre-filter sample
+      plateauLimit: 120,
+      refineTop: 40,           // full dual-season eval only on top survivors
       onProgress: onProgress || null
     });
   } catch (e) {
