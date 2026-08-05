@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7199,6 +7200,40 @@ const LEAGUE_VOL_LIMITS = {
   default: 12
 };
 
+// AUTO-PATCH: single source of truth for "which leagues have a real ESPN
+// site.api.espn.com feed". This used to be copy-pasted (and independently
+// drifting) across getTrackedLeagueApiBase, loadFixtures' gating Set,
+// loadFixturesESPN's slug map, fetchESPNCore's slug map, and
+// computeFTProjection's isEspnLeague array — four separate lists that had
+// gone out of sync with each other. Every one of those now reads from here.
+const ESPN_LEAGUE_SLUGS = {
+  nba: "nba",
+  wnba: "wnba",
+  wnba_pre: "wnba",
+  ncaa: "mens-college-basketball",
+  ncaaw: "womens-college-basketball",
+  nba_gl: "nba-g-league",
+  nba_summer: "nba-summer-las-vegas",
+  euroleague: "euroleague",
+  eurocup: "eurocup",
+  champions_league: "basketball-champions-league",
+  turkey_bsl: "turkish-bsl",
+  acb: "spanish-liga-acb",
+  bbl: "german-bbl",
+  ausnbl: "australian-nbl",
+  lba: "italian-lba",
+  bleague: "japan-b-league",
+  united_league: "vtb-united-league",
+  proa: "french-pro-a",
+  bcl: "greek-basket-league",
+  aba: "adriatic-basketball-association",
+  isl: "israel-super-league",
+  cebl: "cebl"
+};
+function getEspnLeagueSlug(league) {
+  return ESPN_LEAGUE_SLUGS[String(league || "").toLowerCase()] || null;
+}
+
 const VOL_CACHE_KEY = "engineVolCache_v1";
 const VOL_CACHE_MIN_SAMPLES = 25;   
 const VOL_CACHE_MAX_SAMPLES = 2000; 
@@ -9546,14 +9581,20 @@ _proxyFetchCache.delete(cacheKey);
     _proxyFetchCache.set(cacheKey, { data: workerData, timestamp: Date.now() });
     return workerData;
   } catch (workerErr) {
+    // AUTO-PATCH: lastError used to be set once from workerErr and never
+    // updated again, so no matter which fallback actually died last (or
+    // why), the thrown error always reported the Worker's original
+    // failure. Each fallback's real reason is now logged and tracked.
     lastError = workerErr;
+    engineDebug("Worker fetch failed, trying fallback proxies", { request: fetchLabel, error: workerErr?.message || String(workerErr) });
     for (let _fbi = 0; _fbi < _PROXY_FALLBACKS.length; _fbi++) {
       try {
         const _fbData = await fetchJson(_PROXY_FALLBACKS[_fbi](url), `Fallback-${_fbi + 1}`);
         _proxyFetchCache.set(cacheKey, { data: _fbData, timestamp: Date.now() });
         return _fbData;
       } catch (_fbErr) {
-        
+        lastError = _fbErr;
+        engineDebug(`Fallback-${_fbi + 1} failed`, { request: fetchLabel, error: _fbErr?.message || String(_fbErr) });
       }
     }
     engineDebug("fetch failed completely — all proxies exhausted", { request: fetchLabel, error: lastError?.message || workerErr.message });
@@ -13324,28 +13365,13 @@ function applySoftTrackerInfluenceToPicks(picks, fixtureMeta, phase2Activation =
   });
 }
 
+// AUTO-PATCH: now derives from the single ESPN_LEAGUE_SLUGS map (defined
+// near LEAGUE_VOL_LIMITS) instead of keeping its own private, independently
+// drifting copy of the international-league slug list.
 function getTrackedLeagueApiBase(league) {
   const l = String(league || "").toLowerCase();
-  const ESPN_INTL_SLUGS = {
-    euroleague: "euroleague", eurocup: "eurocup",
-    champions_league: "basketball-champions-league",
-    turkey_bsl: "turkish-bsl", acb: "spanish-liga-acb",
-    bbl: "german-bbl", ausnbl: "australian-nbl",
-    lba: "italian-lba", bleague: "japan-b-league",
-    united_league: "vtb-united-league", proa: "french-pro-a",
-    bcl: "greek-basket-league", aba: "adriatic-basketball-association",
-    isl: "israel-super-league", cebl: "cebl"
-  };
-  if (l === "nba") return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
-  if (l === "wnba" || l === "wnba_pre") return "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba";
-  if (l === "ncaa") return "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball";
-  if (l === "ncaaw") return "https://site.api.espn.com/apis/site/v2/sports/basketball/womens-college-basketball";
-  if (l === "nba_gl") return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba-g-league";
-
-  
-  if (l === "nba_summer") return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba-summer-las-vegas";
-  if (ESPN_INTL_SLUGS[l]) return "https://site.api.espn.com/apis/site/v2/sports/basketball/" + ESPN_INTL_SLUGS[l];
-  return "";
+  const slug = getEspnLeagueSlug(l);
+  return slug ? "https://site.api.espn.com/apis/site/v2/sports/basketball/" + slug : "";
 }
 
 window._espnStandingsCache = window._espnStandingsCache || {};
@@ -14493,13 +14519,18 @@ function getEffectivePaceClamp(league) {
   if (cfg && isFinite(cfg.sanityMin) && isFinite(cfg.sanityMax)) {
     return { ft: [cfg.sanityMin, cfg.sanityMax], h1: [cfg.sanityMin * 0.46, cfg.sanityMax * 0.54], team: [cfg.sanityMin * 0.44, cfg.sanityMax * 0.56] };
   }
-  const defaults = {
-    nba: { ft:[160,260], h1:[74,130], team:[70,130] },
-    ncaa: { ft:[120,200], h1:[56,100], team:[54,100] },
-    wnba: { ft:[130,200], h1:[60,100], team:[58,100] },
-    euroleague: { ft:[130,200], h1:[60,100], team:[56,100] }
-  };
-  return defaults[String(league || "").toLowerCase()] || { ft:[100,300], h1:[44,154], team:[40,155] };
+  // AUTO-PATCH: this used to fall back to a 4-league `defaults` object
+  // (itself dead code — nba/ncaa/wnba/euroleague are always caught by the
+  // `cfg` branch above since they're in LEAGUE_CONFIG_MAP) and then, for
+  // every other league, one wide catch-all band (100-300 total) that could
+  // not meaningfully flag a bad line for a real league. Every league now
+  // gets a band proportional to its own known scoring level (LEAGUE_BASES),
+  // using the same 0.72x / 1.28x tolerance computeFTProjection's advSane
+  // check already uses elsewhere in this file — not a new invented ratio.
+  const eb = LEAGUE_BASES[String(league || "").toLowerCase()] || LEAGUE_BASES.unknown;
+  const sanityMin = eb * 0.72;
+  const sanityMax = eb * 1.28;
+  return { ft: [sanityMin, sanityMax], h1: [sanityMin * 0.46, sanityMax * 0.54], team: [sanityMin * 0.44, sanityMax * 0.56] };
 }
 
     function validateLines(league, ftLine, h1Line, aLine, bLine) {
@@ -16281,7 +16312,12 @@ const cls =
       selectedTeamIds = { A: null, B: null };
       validateFetchSection();
 
-        const espnLeagues = new Set(["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","nba_summer"]);
+        // AUTO-PATCH: this used to gate on a private 7-league Set, so the
+        // fixture picker never appeared for EuroLeague/ACB/BBL/LBA/Turkey
+        // BSL/AusNBL/Bleague/United League/PROA/BCL/ABA/ISL/CEBL even though
+        // they have a real ESPN feed elsewhere in the app. Now derived from
+        // the same ESPN_LEAGUE_SLUGS map every other ESPN-aware function uses.
+        const espnLeagues = new Set(Object.keys(ESPN_LEAGUE_SLUGS));
   if (espnLeagues.has(league)) {
     await loadFixturesESPN(league, offset, myToken);
   } else {
@@ -16293,21 +16329,17 @@ const cls =
 
     async function loadFixturesESPN(league, offset, myToken) {
       const sel = document.getElementById("fixtureSelect");
-      const _FIXTURE_SLUG_MAP = {
-        ncaa: "mens-college-basketball", ncaaw: "womens-college-basketball",
-        nba_gl: "nba-g-league", wnba: "wnba", wnba_pre: "wnba",
-        
-        nba_summer: "nba-summer-las-vegas",
-        euroleague: "euroleague", eurocup: "eurocup",
-        champions_league: "basketball-champions-league",
-        turkey_bsl: "turkish-bsl", acb: "spanish-liga-acb",
-        bbl: "german-bbl", ausnbl: "australian-nbl",
-        lba: "italian-lba", bleague: "japan-b-league",
-        united_league: "vtb-united-league", proa: "french-pro-a",
-        bcl: "greek-basket-league", aba: "adriatic-basketball-association",
-        isl: "israel-super-league", cebl: "cebl"
-      };
-      const leagueSlug = _FIXTURE_SLUG_MAP[league] || "nba";
+      // AUTO-PATCH: this used to keep its own private copy of the ESPN slug
+      // map with a silent `|| "nba"` fallback that would have pulled NBA
+      // fixtures for any league it didn't recognize. It now reads the one
+      // shared ESPN_LEAGUE_SLUGS map and bails out instead of guessing if a
+      // league genuinely has no ESPN slug.
+      const leagueSlug = getEspnLeagueSlug(league);
+      if (!leagueSlug) {
+        if (myToken !== _fixtureLoadToken) return;
+        engineDebug("loadFixturesESPN: no ESPN slug for league", { league });
+        return;
+      }
       const base = "https://site.api.espn.com/apis/site/v2/sports/basketball/" + leagueSlug;
       const targetLocalKey = getLocalDateKey(offset);
       const queryDates = offset === 0
@@ -16523,22 +16555,16 @@ async function fetchESPNCore(league, teamAName, teamBName) {
     const isWnba = league === "wnba" || league === "wnba_pre";
     const isNba = league === "nba";
     const isGLeague = league === "nba_gl";
-    const _FETCH_SLUG_MAP = {
-        ncaa: "mens-college-basketball", ncaaw: "womens-college-basketball",
-        nba_gl: "nba-g-league", wnba: "wnba", wnba_pre: "wnba",
-        
-        nba_summer: "nba-summer-las-vegas",
-        euroleague: "euroleague", eurocup: "eurocup",
-        champions_league: "basketball-champions-league",
-        turkey_bsl: "turkish-bsl", acb: "spanish-liga-acb",
-        bbl: "german-bbl", ausnbl: "australian-nbl",
-        lba: "italian-lba", bleague: "japan-b-league",
-        united_league: "vtb-united-league", proa: "french-pro-a",
-        bcl: "greek-basket-league", aba: "adriatic-basketball-association",
-        isl: "israel-super-league", cebl: "cebl"
-      };
-      const leagueSlug = _FETCH_SLUG_MAP[league] || "nba";
-      const espnBase = `https://site.api.espn.com/apis/site/v2/sports/basketball/${leagueSlug}`;
+    // AUTO-PATCH: this used to keep its own private copy of the ESPN slug
+    // map with a silent `|| "nba"` fallback — selecting any unlisted league
+    // and hitting "Fetch" would silently search for the team inside the
+    // NBA's team list instead of failing clearly. It now reads the shared
+    // ESPN_LEAGUE_SLUGS map and throws a specific, honest error instead.
+    const leagueSlug = getEspnLeagueSlug(league);
+    if (!leagueSlug) {
+      throw new Error(`"${league}" has no ESPN auto-fetch source. Enter stats manually for this league.`);
+    }
+    const espnBase = `https://site.api.espn.com/apis/site/v2/sports/basketball/${leagueSlug}`;
 
     let teamAId = selectedTeamIds.A || lookupTeamId(teamAName, league);
     if (!validateTeamId(teamAId, league)) teamAId = await searchTeamFromAPI(espnBase, teamAName, league);
@@ -17211,8 +17237,21 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const aVenueDiag = combineVenueDiag(aScoredBlendFT.diag, aAllowedBlendFT.diag);
   const bVenueDiag = combineVenueDiag(bScoredBlendFT.diag, bAllowedBlendFT.diag);
 
-  const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
-  const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
+  // AUTO-PATCH: this used to be its own 17-league array that had drifted
+  // from ESPN_LEAGUE_SLUGS — it was missing bcl/aba/isl/cebl/nba_summer,
+  // which meant those leagues could fetch a standings table but could never
+  // reach the advanced ortg/drtg/pace blend below even when ESPN had the
+  // data for them. Now derived from the same shared map.
+  const isEspnLeague = Object.prototype.hasOwnProperty.call(ESPN_LEAGUE_SLUGS, league);
+  // AUTO-PATCH: leaguePaceBase used to fall back to one flat constant
+  // (74.0) for every league missing a specific LEAGUE_PACE_BASES entry,
+  // regardless of whether that league actually scores like a 150-point
+  // league or a 220-point one. It now scales that same default
+  // proportionally to the league's own known scoring level (LEAGUE_BASES),
+  // which is populated for essentially every supported league.
+  const leaguePaceBase = LEAGUE_PACE_BASES[league]
+    || (LEAGUE_PACE_BASES.default * ((LEAGUE_BASES[league] || LEAGUE_BASES.unknown) / LEAGUE_BASES.unknown))
+    || 74;
   const leagueRatingBase = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
   // FIX #23: defensiveFloorFlag below compares raw points-allowed (aAllowed/
   // bAllowed) against a per-100-possession rating base, which is only
@@ -22968,6 +23007,13 @@ if (trackedToSave.length) {
   }
 }
 
+  // AUTO-PATCH: this map is currently unused anywhere in the app (confirmed
+  // via full-file search) — it is dead code. The four aus_nbl1_* entries
+  // that used to be here were removed: they incorrectly reused New Zealand
+  // NBL's TheSportsDB ID (4382) via copy-paste. Do not wire this map into a
+  // live fetch until each Australian NBL1 conference (East/North/South/
+  // West/Central) has its own verified TheSportsDB league ID — reusing NZ
+  // NBL's ID would silently pull the wrong league's games.
   const THESPORTSDB_LEAGUE_MAP = {
     "aba":           "4426",
     "isl":           "4428",
@@ -22981,11 +23027,7 @@ if (trackedToSave.length) {
     "brazil_nbb":    "4451",
     "argentina_lnb": "4450",
     "bnxt":          "4438",
-    "china_nbl":     "4440",
-    "aus_nbl1_east": "4382",
-    "aus_nbl1_north":"4382",
-    "aus_nbl1_south":"4382",
-    "aus_nbl1_west": "4382"
+    "china_nbl":     "4440"
   };
 
   
