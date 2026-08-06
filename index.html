@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10455,6 +10454,31 @@ async function fetchTrackerJson(url, options = {}, timeoutMs = TRACKER_NETWORK_T
   }
 }
 
+// ONE-TIME PENDING WIPE (2026-08-06): user asked to permanently delete the
+// pending tracked picks that were stuck (20 local / 29 server, mismatched —
+// see hydrate merge notes). This runs at most once per browser (guarded by
+// the localStorage flag below) — it will NOT keep deleting future pending
+// picks you add going forward. It clears pending picks from local state,
+// records their signatures in deletedSignatures (so a stale server copy
+// can't resurrect them on the next hydrate), and force-pushes the result to
+// the server immediately so the deletion sticks everywhere, not just on
+// this device.
+const ONE_TIME_PENDING_WIPE_KEY = "BB_ONE_TIME_PENDING_WIPE_2026_08_06";
+async function runOneTimePendingWipe() {
+  try {
+    if (localStorage.getItem(ONE_TIME_PENDING_WIPE_KEY)) return;
+    localStorage.setItem(ONE_TIME_PENDING_WIPE_KEY, "1");
+    const result = await clearAllPendingTrackedPicks();
+    if (result && result.removed) {
+      await forceTrackerSaveNow();
+      engineDebug("one-time pending wipe complete", result);
+      renderTrackedPicks();
+    }
+  } catch (e) {
+    engineDebug("one-time pending wipe failed: " + (e?.message || String(e)), { error: e });
+  }
+}
+
 async function primeTrackerStateForRun() {
   const localState = await loadTrackerStateFromLocal();
 
@@ -10468,6 +10492,8 @@ async function primeTrackerStateForRun() {
   renderTrackedPicks();
   
   await hydrateTrackedPicks(true);
+
+  await runOneTimePendingWipe();
   
   g_trackerSaveFailureCount = 0;
 }
@@ -11470,25 +11496,11 @@ function renderTrackedPicks() {
     ? ` • ${stats.engineDivergenceRate}% engine/settled divergence (${stats.engineDivergenceCount})`
     : "";
 
-  summaryEl.innerHTML = `${displayPicks.length} live/recent • ${pendingCount} pending • ${stats.wins} wins • ${stats.losses} losses${_divergenceSuffix}` +
-    (pendingCount > 0
-      ? ` <button type="button" id="clearPendingPicksBtn" style="margin-left:8px;padding:4px 10px;font-size:11px;font-weight:800;background:#c91920;color:#fff;border:none;cursor:pointer;vertical-align:middle;">Clear ${pendingCount} pending</button>`
-      : "");
-
-  const _clearPendingBtn = document.getElementById("clearPendingPicksBtn");
-  if (_clearPendingBtn) {
-    _clearPendingBtn.onclick = async function () {
-      if (!confirm("Delete all " + pendingCount + " pending tracked picks? This cannot be undone.")) return;
-      _clearPendingBtn.disabled = true;
-      try {
-        const res = await clearAllPendingTrackedPicks();
-        alert("Removed " + (res && res.removed != null ? res.removed : pendingCount) + " pending picks.");
-      } catch (e) {
-        alert("Clear failed: " + (e && e.message ? e.message : String(e)));
-      }
-      renderTrackedPicks();
-    };
-  }
+  // PERMANENT REMOVAL (2026-08-06): the "Clear N pending" header button and
+  // its click handler have been deleted at the user's request. The summary
+  // line now only ever renders the stats text — no button is created, so
+  // there is nothing in the header to wire up or click.
+  summaryEl.innerHTML = `${displayPicks.length} live/recent • ${pendingCount} pending • ${stats.wins} wins • ${stats.losses} losses${_divergenceSuffix}`;
 
   const marketLabels = { ft: "FT", h1: "1H", q1: "Q1", q2: "Q2", q3: "Q3", q4: "Q4", team_a: "Team A", team_b: "Team B" };
   const chips = ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"].map(key => {
