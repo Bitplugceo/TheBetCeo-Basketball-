@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7400,6 +7401,35 @@ const LEAGUE_CONFIG_MAP = {
 initLeagueOverridesFromDefaults();
 pruneUnverifiedLeagueOverrideDrift();
 
+// AUDIT FIX (95+ pass): initLeagueOverridesFromDefaults() only seeds a
+// volatilityLimit override for leagues with a curated entry in
+// LEAGUE_CONFIG_MAP (~15 leagues) or LEAGUE_VOL_LIMITS (~18 leagues), and it
+// only runs the very first time g_tunableParamLeagueOverrides is empty.
+// Every other supported league — BCL, ISL, PBA, United League, all 5 Aus
+// NBL1 conferences, Aus Big V, and the rest of the advisory-tier list —
+// never got an override seeded, so getMarketVolLimit() silently fell
+// through to the flat global default (12) for them at prediction time, even
+// though a scaled, league-appropriate fallback (getLeagueVolLimit, which
+// scales off each league's own known scoring level) already existed
+// elsewhere in this file and simply wasn't wired into the seeding step.
+// backfillMissingLeagueVolLimits() closes that gap for every league in
+// LEAGUE_BASES, runs on every load (so it also fixes it for existing
+// installs whose override store is already populated), and only ever fills
+// in a *missing* key — it never touches a curated or manually-tuned value.
+function backfillMissingLeagueVolLimits() {
+  let changed = false;
+  Object.keys(LEAGUE_BASES).forEach(lk => {
+    if (lk === "unknown") return;
+    if (!g_tunableParamLeagueOverrides[lk]) g_tunableParamLeagueOverrides[lk] = {};
+    if (!("volatilityLimit" in g_tunableParamLeagueOverrides[lk])) {
+      g_tunableParamLeagueOverrides[lk]["volatilityLimit"] = { value: getLeagueVolLimit(lk), lastVerifiedAt: null };
+      changed = true;
+    }
+  });
+  if (changed) saveTunableParamLeagueOverrides();
+}
+backfillMissingLeagueVolLimits();
+
 const LEAGUE_TRUST_PROFILES = {
   trusted: [
     "nba", "ncaa", "nba_gl", "ncaaw", "wnba", "euroleague", "eurocup", "champions_league", 
@@ -10468,11 +10498,11 @@ async function runOneTimePendingWipe() {
   try {
     if (localStorage.getItem(ONE_TIME_PENDING_WIPE_KEY)) return;
     localStorage.setItem(ONE_TIME_PENDING_WIPE_KEY, "1");
+    // clearAllPendingTrackedPicks() force-pushes to the server itself now
+    // (see audit fix above), so no extra save call is needed here.
     const result = await clearAllPendingTrackedPicks();
     if (result && result.removed) {
-      await forceTrackerSaveNow();
       engineDebug("one-time pending wipe complete", result);
-      renderTrackedPicks();
     }
   } catch (e) {
     engineDebug("one-time pending wipe failed: " + (e?.message || String(e)), { error: e });
@@ -13716,7 +13746,12 @@ async function clearAllPendingTrackedPicks() {
 
   AppState.tracker.state.updatedAt = new Date().toISOString();
   rebuildTrackerStats();
-  await saveTrackerStateToLocal();
+  // AUDIT FIX (95+ pass): this used to call saveTrackerStateToLocal() only,
+  // so a deletion could be lost if the tab closed before the debounced
+  // background save fired, letting it silently reappear from a stale
+  // server copy on the next hydrate. deleteTrackedPickBySignature already
+  // force-pushes on every deletion — this now matches that pattern.
+  await forceTrackerSaveNow();
   if (typeof renderTrackedPicks === "function") renderTrackedPicks();
   engineDebug("clearAllPendingTrackedPicks", { removed: pending.length });
   return { removed: pending.length };
@@ -17302,7 +17337,16 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const leaguePaceBase = LEAGUE_PACE_BASES[league]
     || (LEAGUE_PACE_BASES.default * ((LEAGUE_BASES[league] || LEAGUE_BASES.unknown) / LEAGUE_BASES.unknown))
     || 74;
-  const leagueRatingBase = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
+  const leagueRatingBase = LEAGUE_RATING_BASES[league]
+    // AUDIT FIX (95+ pass): this used to fall through to one flat constant
+    // (110) for every league missing a curated LEAGUE_RATING_BASES entry
+    // (BCL, ISL, United League among the ESPN-automated leagues), even
+    // though leaguePaceBase right above already scales its own fallback
+    // proportionally to the league's known scoring level (LEAGUE_BASES).
+    // Ratings now get the same treatment for consistency — no new ratio
+    // invented, this mirrors the leaguePaceBase fallback one block up.
+    || (LEAGUE_RATING_BASES.default * ((LEAGUE_BASES[league] || LEAGUE_BASES.unknown) / LEAGUE_BASES.unknown))
+    || 110;
   // FIX #23: defensiveFloorFlag below compares raw points-allowed (aAllowed/
   // bAllowed) against a per-100-possession rating base, which is only
   // roughly the same magnitude for NBA-paced leagues. compute1HProjection
@@ -17642,7 +17686,16 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
   const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
-  const leagueRatingBase = LEAGUE_RATING_BASES[league] || LEAGUE_RATING_BASES.default || 110;
+  const leagueRatingBase = LEAGUE_RATING_BASES[league]
+    // AUDIT FIX (95+ pass): this used to fall through to one flat constant
+    // (110) for every league missing a curated LEAGUE_RATING_BASES entry
+    // (BCL, ISL, United League among the ESPN-automated leagues), even
+    // though leaguePaceBase right above already scales its own fallback
+    // proportionally to the league's known scoring level (LEAGUE_BASES).
+    // Ratings now get the same treatment for consistency — no new ratio
+    // invented, this mirrors the leaguePaceBase fallback one block up.
+    || (LEAGUE_RATING_BASES.default * ((LEAGUE_BASES[league] || LEAGUE_BASES.unknown) / LEAGUE_BASES.unknown))
+    || 110;
 
   const ctxA = AppState.context.data?.A || {};
   const ctxB = AppState.context.data?.B || {};
@@ -20566,13 +20619,24 @@ function checkModelHealth(league) {
   const allPicks = getLearningTrackedPicks().filter(p =>
     p.league === league && (p.resultStatus === "win" || p.resultStatus === "loss")
   );
-  if (allPicks.length < 30) return null; // audit fix: was 10
-  const recentPicks = allPicks.slice(-20); // audit fix: was -10, wider window for a less noisy drift read
+  // AUDIT FIX (95+ pass): a flat n<30 cutoff with a flat n<30 return meant
+  // health monitoring was effectively permanently dark for most of the
+  // ~50-league advisory tier, which rarely accumulates 30 settled picks per
+  // league. Lowered to 12 so those leagues get *some* signal, and the fixed
+  // 0.15 drift threshold — which was only ever sized for a 20-pick window —
+  // is replaced with a standard-error-scaled threshold so a small sample
+  // doesn't get falsely flagged as "degrading"/"improving" from pure noise.
+  const MIN_N = 12;
+  if (allPicks.length < MIN_N) return null;
+  const recentWindow = Math.min(20, Math.max(8, Math.round(allPicks.length * 0.4)));
+  const recentPicks = allPicks.slice(-recentWindow);
   const allWR = allPicks.filter(p => p.resultStatus === "win").length / allPicks.length;
   const recentWR = recentPicks.filter(p => p.resultStatus === "win").length / recentPicks.length;
   const drift = recentWR - allWR;
-  const status = Math.abs(drift) > 0.15 ? (drift < 0 ? "degrading" : "improving") : "stable";
-  return { allWinRate: allWR, recentWinRate: recentWR, drift, status, n: allPicks.length };
+  const se = Math.sqrt(Math.max(allWR * (1 - allWR), 0.01) / recentWindow);
+  const driftThreshold = Math.max(0.15, se * 2.0);
+  const status = Math.abs(drift) > driftThreshold ? (drift < 0 ? "degrading" : "improving") : "stable";
+  return { allWinRate: allWR, recentWinRate: recentWR, drift, status, n: allPicks.length, recentWindow, driftThreshold: Number(driftThreshold.toFixed(3)) };
 }
 
 // PHASE 1 CLEANUP: applyMassacreFrameworkToPicks was already disabled with
