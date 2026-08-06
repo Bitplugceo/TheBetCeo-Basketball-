@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7240,6 +7239,21 @@ const VOL_CACHE_MAX_SAMPLES = 2000;
 const VOL_CACHE_MIN_LIMIT = 6;      
 const VOL_CACHE_MAX_LIMIT = 30;     
 
+// AUTO-PATCH (round 2): LEAGUE_VOL_LIMITS only has explicit, manually
+// curated entries for 17 leagues. Every other call site read it directly
+// and fell back to one flat number (12) for every other league regardless
+// of real scoring level. This is used by those call sites below.
+// LEAGUE_VOL_LIMITS itself is left untouched so initLeagueOverridesFromDefaults()
+// and pruneUnverifiedLeagueOverrideDrift() keep treating "has an explicit
+// curated entry" exactly the way they already do.
+function getLeagueVolLimit(league) {
+  const lk = String(league || "").toLowerCase();
+  if (isFinite(LEAGUE_VOL_LIMITS[lk])) return LEAGUE_VOL_LIMITS[lk];
+  const eb = LEAGUE_BASES[lk] || LEAGUE_BASES.unknown;
+  const scaled = LEAGUE_VOL_LIMITS.default * (eb / LEAGUE_BASES.unknown);
+  return clampNumber(scaled, VOL_CACHE_MIN_LIMIT, VOL_CACHE_MAX_LIMIT);
+}
+
 function loadVolCache() {
   try {
     const raw = localStorage.getItem(VOL_CACHE_KEY);
@@ -14381,8 +14395,11 @@ function addTrackedPicks(newPicks) {
         trap:            p.diagnostics.trap || false,
         paceGapRisk:     p.diagnostics.paceGapRisk || false,
         hasH2H:          p.diagnostics.ftHasH2H || false,
-        volatilityRatio: (isFinite(Number(p.diagnostics.aVol)) && (LEAGUE_VOL_LIMITS[p.league] || 0) > 0)
-                           ? Number(p.diagnostics.aVol) / (LEAGUE_VOL_LIMITS[p.league] || 12)
+        // AUTO-PATCH (round 2): now uses getLeagueVolLimit(), which returns
+        // a league-proportional value instead of a flat 12 for any league
+        // outside the 17 explicitly curated in LEAGUE_VOL_LIMITS.
+        volatilityRatio: isFinite(Number(p.diagnostics.aVol))
+                           ? Number(p.diagnostics.aVol) / getLeagueVolLimit(p.league)
                            : null,
         possProjection:  p.diagnostics.possProjection ?? null,
         anchorPull:      p.diagnostics.anchorPull ?? null,
@@ -17938,9 +17955,14 @@ function calibrateConfidenceModel() {
   
   const buildF = (p) => ({
     edgePct:   clampNumber(Number(p.edgePct || p.godsEyeMemory?.edgePct || 0) / 100 - 0.060, -0.06, 0.15),
+    // AUTO-PATCH (round 2): now uses getLeagueVolLimit(), which (a) is
+    // league-proportional instead of a flat 12 fallback, and (b) fixes a
+    // latent case-sensitivity bug here — this lookup was never lowercased,
+    // so it would have missed the static table even for curated leagues if
+    // p.league ever arrived in mixed case.
     volRatio:  clampNumber(
                  ((Number(p.godsEyeMemory?.aVol || 0) + Number(p.godsEyeMemory?.bVol || 0)) / 2)
-                 / (LEAGUE_VOL_LIMITS[String(p.league || "")] || 12) - 1.0, -1, 2.5),
+                 / getLeagueVolLimit(p.league) - 1.0, -1, 2.5),
     sampleFull: (String(p.godsEyeMemory?.sampleTier || "").toLowerCase() === "full") ? 1 : 0,
     h2h:       (p.godsEyeMemory?.hasH2H) ? 1 : 0,
     trap:      (p.godsEyeMemory?.trap) ? 1 : 0
@@ -23178,7 +23200,15 @@ const isWnba = leagueVal === "wnba" || leagueVal === "wnba_pre";
 
       const league = leagueVal;
 
-      const _isBig5 = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","nba_summer"].includes(league);
+      // AUTO-PATCH (round 2): this was a fifth independent copy of "which
+      // leagues have ESPN support" (7 US leagues only), separate from the
+      // four already unified in round 1. It controlled whether this screen
+      // shows the ESPN fetch/fixture panel or drops the person straight into
+      // the SofaScore manual-lookup panel — so EuroLeague, ACB, BBL, Turkey
+      // BSL, AusNBL, LBA, Bleague, United League, PROA, BCL, ABA, ISL, and
+      // CEBL were being shown the manual-only workflow even though they
+      // have a real, working ESPN feed. Now derived from the same shared map.
+      const _isBig5 = Object.prototype.hasOwnProperty.call(ESPN_LEAGUE_SLUGS, league);
       const isQs = ["nba","wnba","wnba_pre","nba_gl","nba_summer"].includes(league);
 
       setFieldValues(FIELD_GROUPS.periodInputs);
@@ -24080,7 +24110,9 @@ try {
       { label: "moderate_recency",   weights: [1.45, 1.25, 1.00, 0.80, 0.60], paceAdj: "standard",   edgeMult: 1.00 }
     ];
 
-    const volLimit = LEAGUE_VOL_LIMITS[leagueKey] || 12;
+    // AUTO-PATCH (round 2): now uses getLeagueVolLimit() instead of a flat
+    // 12 fallback for any league outside the 17 curated in LEAGUE_VOL_LIMITS.
+    const volLimit = getLeagueVolLimit(leagueKey);
 
     const scores = candidates.map(candidate => {
       let wins = 0, saves = 0, total = 0;
