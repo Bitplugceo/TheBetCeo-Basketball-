@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7435,13 +7436,26 @@ function normalizeLeagueTrustKey(league) {
 
 function getLeagueTrustMeta(league) {
   const key = normalizeLeagueTrustKey(league);
+  // AUTO-PATCH (round 3): "Trusted" used to mean one thing regardless of
+  // whether a league actually has an automated ESPN feed (nba/wnba/
+  // euroleague/etc.) or has to be hand-entered via the SofaScore manual
+  // lookup (nznbl, cba, pba, korea_kbl, aus_big_v, aus_nbl1_east/north/
+  // south/west/central). `mode` is intentionally left untouched — it still
+  // gates behavior (getLeagueActionMeta, the block-mode check, etc.) — this
+  // only adds a separate, purely informational dataMode so the two
+  // different kinds of confidence (model tuning vs. data automation)
+  // aren't collapsed into one label.
+  const dataMode = Object.prototype.hasOwnProperty.call(ESPN_LEAGUE_SLUGS, key) ? "automated" : "manual";
   if (LEAGUE_TRUST_PROFILES.trusted.includes(key)) {
     return {
       key,
       level: "trusted",
       label: "Trusted",
       mode: "full",
-      guidance: "Full plays are allowed. Keep monitoring record and checkpoint review."
+      dataMode,
+      guidance: dataMode === "manual"
+        ? "Full plays are allowed based on model tuning, but this league has no automated data feed — stats must be entered manually (see SofaScore lookup). Double-check inputs before playing."
+        : "Full plays are allowed. Keep monitoring record and checkpoint review."
     };
   }
   if (LEAGUE_TRUST_PROFILES.blocked.includes(key)) {
@@ -7450,6 +7464,7 @@ function getLeagueTrustMeta(league) {
       level: "blocked",
       label: "Do not use",
       mode: "block",
+      dataMode,
       guidance: "No-play only until this league is retuned and revalidated."
     };
   }
@@ -7458,6 +7473,7 @@ function getLeagueTrustMeta(league) {
     level: "advisory",
     label: "Needs retune",
     mode: "advisory",
+    dataMode,
     guidance: "Advisory only for now. Treat any edge as a lean until thresholds are retuned."
   };
 }
@@ -17136,7 +17152,12 @@ function getPickExplanationFactors(p, isLock) {
   // PHASE 1 CLEANUP: massacre-framework explanation factor removed —
   // p.massacre is never set now that the framework has been deleted.
 
-  if (p.leagueTrust && p.leagueTrust.mode !== "full") {
+  // AUTO-PATCH (round 3): this used to only surface a trust note for
+  // non-"full" leagues, so a "Trusted" league with no automated data feed
+  // (dataMode === "manual") got zero indication of that anywhere in the
+  // actual pick display — the manual-entry caveat only existed in code
+  // comments and the debug log. Now shown either way.
+  if (p.leagueTrust && (p.leagueTrust.mode !== "full" || p.leagueTrust.dataMode === "manual")) {
     factors.push(`ℹ League trust: "${p.leagueTrust.label}" — ${p.leagueTrust.guidance}`);
   }
 
@@ -17309,10 +17330,25 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let synNetA = NaN, synNetB = NaN;
   let usedAdvanced = false;
 
+  // AUTO-PATCH: calculateAdvancedMetrics() always reports live-fetched
+  // pace10 values normalized to "per-48-minutes" (standard analytics
+  // convention), but LEAGUE_PACE_BASES stores each league's pace at its OWN
+  // actual game length (e.g. wnba: 81.0 is WNBA's real per-40-minute pace,
+  // not per-48 — WNBA's per-48-equivalent is ~97). Clamping the 48-
+  // normalized rawPace directly against leaguePaceBase*[min,max] compared
+  // two different units for every league that isn't 48 minutes (wnba,
+  // wnba_pre, ncaa, ncaaw, and effectively every 40-minute FIBA-rule
+  // international league). It didn't corrupt the final total — the
+  // /_ftDivisor step further down happens to cancel it out algebraically —
+  // but it silently compressed the effective clamp ceiling for every
+  // 40-minute league, capping genuinely fast games lower than intended.
+  // leaguePaceNorm re-expresses the clamp bounds in the same 48-normalized
+  // space the live pace10 data is already in.
+  const leaguePaceNorm = 48 / (getLeagueRegulationMinutes(league) || 48);
   if (hasRealPace) {
     
     const rawPace = (avgPaceA + avgPaceB) / 2;
-    synPace = clampNumber(rawPace, leaguePaceBase * clamp.min, leaguePaceBase * clamp.max);
+    synPace = clampNumber(rawPace, leaguePaceBase * leaguePaceNorm * clamp.min, leaguePaceBase * leaguePaceNorm * clamp.max);
   } else {
     const totalA = avgOrNaN(aFTS) + avgOrNaN(aFTA);
     const totalB = avgOrNaN(bFTS) + avgOrNaN(bFTA);
@@ -17612,10 +17648,14 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10))
     && (ctxA.ortg10 || []).length >= 5 && (ctxB.ortg10 || []).length >= 5;
 
+  // AUTO-PATCH: same fix as computeFTProjection — see that comment block.
+  // rawPace is 48-normalized live data; the clamp bounds need to be in the
+  // same units, not leaguePaceBase's native (actual-game-length) units.
+  const leaguePaceNorm1H = 48 / (getLeagueRegulationMinutes(league) || 48);
   let synPace = leaguePaceBase;
   if (hasRealPace) {
     const rawPace = (avgPaceA + avgPaceB) / 2;
-    synPace = clampNumber(rawPace, leaguePaceBase * clamp.min, leaguePaceBase * clamp.max);
+    synPace = clampNumber(rawPace, leaguePaceBase * leaguePaceNorm1H * clamp.min, leaguePaceBase * leaguePaceNorm1H * clamp.max);
   }
 
   let projA1H, projB1H;
@@ -18269,7 +18309,12 @@ function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, in
                        isFinite(avgOrNaN(ctxBQ.pace10)) && avgOrNaN(ctxBQ.pace10) > 0 &&
                        (ctxAQ.ortg10 || []).length >= 5 && (ctxBQ.ortg10 || []).length >= 5;
   const leagueRatingBaseQ = LEAGUE_RATING_BASES[league] || 110;
-  const isEspnLeagueQ = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
+  // AUTO-PATCH: this was a 6th independent copy of the ESPN-league list
+  // (missing bcl/aba/isl/cebl/nba_summer, same drift as the FT version
+  // fixed earlier) — quarter-level projections for those leagues could
+  // never use pace/ortg even when real data existed. Now derived from the
+  // same shared ESPN_LEAGUE_SLUGS map.
+  const isEspnLeagueQ = Object.prototype.hasOwnProperty.call(ESPN_LEAGUE_SLUGS, league);
 
   let projA, projB;
   const _dynWeightsQ = getDynamicWeights(
@@ -22817,7 +22862,12 @@ window.__LAST_AUDIT_STATE = {
         leagueRatingBase: _aud_lRatingBase,
         projectedRatingA: isFinite(_aud_ortgA) && isFinite(_aud_drtgB) ? _aud_ortgA + _aud_drtgB - _aud_lRatingBase : null,
         projectedRatingB: isFinite(_aud_ortgB) && isFinite(_aud_drtgA) ? _aud_ortgB + _aud_drtgA - _aud_lRatingBase : null,
-        formulaNote: "projA=(synPace*projectedRatingA)/(100*(48/regMinutes)); projB=(synPace*projectedRatingB)/(100*(48/regMinutes)) — divisor scales with getLeagueRegulationMinutes(league), not a flat 100; only equals /100 when regMinutes=48 (NBA/WNBA)"
+        // AUTO-PATCH: previous note incorrectly listed WNBA alongside NBA as
+        // a regMinutes=48 league. WNBA regulation is 40 minutes
+        // (LEAGUE_REGULATION_MINUTES.wnba = 40), so its real divisor is
+        // 100*(48/40)=120, not 100. Comment-only fix — the formula itself
+        // was already using getLeagueRegulationMinutes() correctly.
+        formulaNote: "projA=(synPace*projectedRatingA)/(100*(48/regMinutes)); projB=(synPace*projectedRatingB)/(100*(48/regMinutes)) — divisor scales with getLeagueRegulationMinutes(league), not a flat 100; only equals /100 when regMinutes=48 (NBA, NBA G-League, NBA Summer League — WNBA, NCAA, NCAAW, and most international FIBA-rule leagues play 40-minute games, so their divisor is 100*1.2=120)"
       },
       STEP6_intelligenceAdjust: {
         signal: _aud_intelSig,
