@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3241,6 +3240,15 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
   engineDebug("ssProcessTeamEvents completed overall count: " + completedAll.length, { label });
 
   const overallGames = completedAll.slice(0, 10);
+  // AUDIT FIX (round 4): completedAll is already sorted most-recent-first,
+  // so overallGames[0] is this team's last completed game. ESPN-automated
+  // leagues have used exactly this (aStats.lastGameDate) to derive
+  // restDays/back-to-back fatigue for a while; manual/SofaScore leagues
+  // never captured the equivalent even though startTimestamp is right
+  // here in the same pasted JSON. Captured now, wired into restDays below.
+  const lastGameDate = overallGames.length && overallGames[0]?.startTimestamp
+    ? new Date(overallGames[0].startTimestamp * 1000).toISOString()
+    : "";
   overallGames.forEach((ev, idx) => {
     const isHome = String(ev.homeTeam?.id) === String(teamId);
     const myScore = isHome ? ev.homeScore : ev.awayScore;
@@ -3328,7 +3336,8 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
            h1ScoredDates,
            q1ScoredList, q2ScoredList, q3ScoredList, q4ScoredList,
            q1AllowedList, q2AllowedList, q3AllowedList, q4AllowedList,
-           q1ScoredDates, q2ScoredDates, q3ScoredDates, q4ScoredDates };
+           q1ScoredDates, q2ScoredDates, q3ScoredDates, q4ScoredDates,
+           lastGameDate };
 }
 
 function clearPasteJSON(side) {
@@ -3511,6 +3520,24 @@ function updateTeamUIFromStats(side, stats) {
   AppState.context.data[side].overall.allowed10 = stats.allowedList;
   AppState.context.data[side].overall.scored = display10S;
   AppState.context.data[side].overall.allowed = display10A;
+
+  // AUDIT FIX (round 4): ESPN-automated leagues derive restDays from
+  // aStats.lastGameDate vs. the selected fixture's kickoff (see
+  // AppState.context.data assembly in the ESPN fetch path). Manual leagues
+  // have no fixture dropdown/kickoff time to compare against, so this is
+  // relative to "now" instead — a reasonable approximation for someone
+  // checking a matchup close to game day, clearly a different basis than
+  // the ESPN path's exact kickoff-relative figure. Only ever sets a value
+  // when there's a real lastGameDate to compute from; otherwise leaves
+  // restDays unset so callers keep falling back to their existing default.
+  AppState.context.data[side].lastGameDate = stats.lastGameDate || "";
+  if (stats.lastGameDate) {
+    const _lastMs = Date.parse(stats.lastGameDate);
+    if (isFinite(_lastMs)) {
+      const _rawDays = Math.max(0, Math.round((Date.now() - _lastMs) / 86400000) - 1);
+      AppState.context.data[side].restDays = _rawDays <= 14 ? _rawDays : null;
+    }
+  }
 
   const _role = getFixtureSideRole(side);
   const _venueScored  = _role === "away" ? stats.awayScoredList  : stats.homeScoredList;
@@ -3962,7 +3989,11 @@ function applyDampedIntelSignal(baseProj, rawSignal, opponentVolRatio) {
 }
 
 function buildGlobalModelState({ league, parsed, lines, injMultA = 1, injMultB = 1 }) {
-  const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
+  // AUDIT FIX (round 4): was a flat LEAGUE_BASES[league] lookup that fell
+  // straight to the generic "unknown" constant for every league without a
+  // curated entry. getLeagueScoreBase() checks the same curated table
+  // first, then the learned vol-cache mean (real data) before giving up.
+  const eb = getLeagueScoreBase(league);
   const volLimit = getMarketVolLimit(league, "ft");
 
   
@@ -5319,7 +5350,18 @@ function saveTunableParamLeagueOverrides() {
 // overrides are left completely alone.
 function pruneUnverifiedLeagueOverrideDrift() {
   const PRUNABLE_STATIC_SOURCES = {
-    volatilityLimit: (lk) => LEAGUE_VOL_LIMITS[lk],
+    // AUDIT FIX (round 4): this used to compare only against the static
+    // curated LEAGUE_VOL_LIMITS table, so for the ~85 leagues with no
+    // curated entry there was nothing to compare against and their
+    // auto-seeded override — computed once, before any real data existed —
+    // was frozen forever. getLeagueVolLimit() now also checks the learned
+    // vol cache (see getLearnedLeagueStats), so comparing against it here
+    // means a stale unverified override gets pruned and re-seeded with the
+    // real learned value the moment enough samples exist. Curated leagues
+    // and manually-verified overrides (lastVerifiedAt set) are unaffected —
+    // getLeagueVolLimit() still returns the curated value for those, and
+    // verified overrides are skipped above before this is ever consulted.
+    volatilityLimit: (lk) => getLeagueVolLimit(lk),
     edgeFTPointThreshold: (lk) => LEAGUE_EDGE_POINT_THRESHOLDS[lk]?.ft,
     edgeH1PointThreshold: (lk) => LEAGUE_EDGE_POINT_THRESHOLDS[lk]?.h1,
     edgeTeamPointThreshold: (lk) => LEAGUE_EDGE_POINT_THRESHOLDS[lk]?.team,
@@ -7253,6 +7295,16 @@ const VOL_CACHE_MAX_LIMIT = 30;
 function getLeagueVolLimit(league) {
   const lk = String(league || "").toLowerCase();
   if (isFinite(LEAGUE_VOL_LIMITS[lk])) return LEAGUE_VOL_LIMITS[lk];
+  // AUDIT FIX (round 4): this used to go straight from "no curated static
+  // entry" to a generic scaled guess for every one of the ~85 leagues that
+  // don't have one. updateLeagueVolCache() has been recording real
+  // per-team scoring variance from both ESPN-fetched and manually-pasted
+  // SofaScore data for every league all along (see ssProcessTeamEvents and
+  // the ESPN schedule-fetch path) and nothing ever read it back. Once a
+  // league has enough real samples, use the real observed standard
+  // deviation instead of a guess derived from its rough scoring level.
+  const learned = getLearnedLeagueStats(lk);
+  if (learned) return clampNumber(learned.stdev, VOL_CACHE_MIN_LIMIT, VOL_CACHE_MAX_LIMIT);
   const eb = LEAGUE_BASES[lk] || LEAGUE_BASES.unknown;
   const scaled = LEAGUE_VOL_LIMITS.default * (eb / LEAGUE_BASES.unknown);
   return clampNumber(scaled, VOL_CACHE_MIN_LIMIT, VOL_CACHE_MAX_LIMIT);
@@ -7299,6 +7351,40 @@ function updateLeagueVolCache(league, values) {
   entry.updatedAt = new Date().toISOString();
   cache[key] = entry;
   saveVolCache(cache);
+}
+
+// AUDIT FIX (round 4): the learned cache above only ever got written to,
+// never read. This is the shared reader — returns real observed
+// {n, mean, stdev} for a league once it has at least VOL_CACHE_MIN_SAMPLES
+// real per-team scoring values on file (from either ESPN or manual paste),
+// or null if there isn't enough real data yet, so callers always have a
+// clean, honest way to fall back to a static/generic default.
+function getLearnedLeagueStats(league) {
+  const lk = String(league || "").toLowerCase();
+  const cache = loadVolCache();
+  const entry = cache[lk];
+  if (!entry || !(entry.n >= VOL_CACHE_MIN_SAMPLES)) return null;
+  const variance = entry.n > 1 ? entry.m2 / (entry.n - 1) : 0;
+  return { n: entry.n, mean: entry.mean, stdev: Math.sqrt(Math.max(0, variance)) };
+}
+
+// AUDIT FIX (round 4): companion to getLeagueVolLimit — same learned cache,
+// same real per-team scoring values, but reading the mean instead of the
+// variance. entry.mean is a real observed average points scored by a
+// single team in this league; doubling it approximates a combined
+// game-total baseline in the same units as LEAGUE_BASES. Curated static
+// entries are still authoritative when present; this only replaces the
+// generic "unknown" fallback once real data exists.
+// Named getLeagueScoreBase (not getLeagueBase) — a same-named function
+// already exists elsewhere in this file that returns an ESPN API base URL
+// for fetchLeagueTeamCatalog and does something completely different;
+// reusing that name here would silently collide with it.
+function getLeagueScoreBase(league) {
+  const lk = String(league || "").toLowerCase();
+  if (isFinite(LEAGUE_BASES[lk])) return LEAGUE_BASES[lk];
+  const learned = getLearnedLeagueStats(lk);
+  if (learned) return learned.mean * 2;
+  return LEAGUE_BASES.unknown;
 }
 
 const QSHAPE_STORAGE_KEY = "BB_TEAM_QSHAPE_V1";
@@ -9594,40 +9680,14 @@ _proxyFetchCache.delete(cacheKey);
     }
   }
 
-  if (String(url).includes("sofascore.com")) {
-    
-    try {
-      const _sofaWorkerData = await fetchJson(WORKER_URL + "?url=" + encodeURIComponent(url), "SofaWorker");
-      if (_sofaWorkerData && typeof _sofaWorkerData === "object") {
-        _proxyFetchCache.set(cacheKey, { data: _sofaWorkerData, timestamp: Date.now() });
-        return _sofaWorkerData;
-      }
-    } catch (_sofaWErr) {
-      
-      engineDebug("SofaWorker failed, trying public proxies", { url: getEngineFetchLabel(url), error: _sofaWErr?.message });
-    }
-
-    const _SOFA_FALLBACKS = [
-      u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
-      u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-      u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
-      u => `https://thingproxy.freeboard.io/fetch/${encodeURIComponent(u)}`
-    ];
-    let sofaError = null;
-    for (let i = 0; i < _SOFA_FALLBACKS.length; i++) {
-      try {
-        const data = await fetchJson(_SOFA_FALLBACKS[i](url), `SofaProxy-${i + 1}`);
-        if (data && typeof data === "object") {
-          _proxyFetchCache.set(cacheKey, { data, timestamp: Date.now() });
-          return data;
-        }
-      } catch (err) {
-        sofaError = err;
-      }
-    }
-    engineDebug("SofaScore fetch failed — all proxies exhausted", { url: getEngineFetchLabel(url), error: sofaError?.message || String(sofaError) });
-    throw sofaError || new Error("All SofaScore proxies failed");
-  }
+  // PATCH (sofascore-manual-only): SofaScore data is intentionally paste-only
+  // (see ssProcessTeamEvents / searchSofascorePlayer) — the app has never
+  // called proxyFetch with a sofascore.com URL from anywhere else, so this
+  // branch was reachable dead code offering a live auto-fetch path we don't
+  // want. Removed outright rather than left dormant. If proxyFetch is ever
+  // called with a sofascore.com URL it now falls through to the same
+  // generic worker/proxy chain every other URL uses below, with no
+  // SofaScore-specific fallback chain propping it up.
 
   const _PROXY_FALLBACKS = [
     u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
@@ -17310,7 +17370,11 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   // per-market MAX-POWER lock (see g_currentLiveComputeMarket above).
   g_currentLiveComputeMarket = "ft";
 
-  const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
+  // AUDIT FIX (round 4): was a flat LEAGUE_BASES[league] lookup that fell
+  // straight to the generic "unknown" constant for every league without a
+  // curated entry. getLeagueScoreBase() checks the same curated table
+  // first, then the learned vol-cache mean (real data) before giving up.
+  const eb = getLeagueScoreBase(league);
   const leagueBase = eb / 2;
   const volLimit = getMarketVolLimit(league, "ft");
 
@@ -17672,7 +17736,11 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1, config = {} }) {
   // MARKET CONTEXT FIX: see g_currentLiveComputeMarket above.
   g_currentLiveComputeMarket = "h1";
-  const eb = LEAGUE_BASES[league] || LEAGUE_BASES.unknown;
+  // AUDIT FIX (round 4): was a flat LEAGUE_BASES[league] lookup that fell
+  // straight to the generic "unknown" constant for every league without a
+  // curated entry. getLeagueScoreBase() checks the same curated table
+  // first, then the learned vol-cache mean (real data) before giving up.
+  const eb = getLeagueScoreBase(league);
   const volLimit = getMarketVolLimit(league, "h1");
 
   let aS1 = getManualSeries("A", "h1", parsed);
@@ -17713,7 +17781,13 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let aAllowed = aAllowedBlend1.value;
   let bAllowed = bAllowedBlend1.value;
 
-  const isEspnLeague = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
+  // AUDIT FIX (round 4): this was a hardcoded 17-league array that had
+  // drifted out of sync with ESPN_LEAGUE_SLUGS (missing bcl, aba, isl,
+  // cebl, nba_summer) even though computeFTProjection's isEspnLeague check
+  // right next to this same market was already reading from the single
+  // source of truth. Those five leagues had working ESPN data on the FT
+  // market and silently lost the advanced pace/rating blend on H1 only.
+  const isEspnLeague = Object.prototype.hasOwnProperty.call(ESPN_LEAGUE_SLUGS, league);
   const leaguePaceBase = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 74;
   const leagueRatingBase = LEAGUE_RATING_BASES[league]
     // AUDIT FIX (95+ pass): this used to fall through to one flat constant
@@ -21800,9 +21874,21 @@ const h1Calc = compute1HProjection({
                            isFinite(avgOrNaN(ctxAQ.pace10)) && avgOrNaN(ctxAQ.pace10) > 0 &&
                            isFinite(avgOrNaN(ctxBQ.pace10)) && avgOrNaN(ctxBQ.pace10) > 0 &&
                            (ctxAQ.ortg10 || []).length >= 5 && (ctxBQ.ortg10 || []).length >= 5;
-      const leaguePaceBaseQ = LEAGUE_PACE_BASES[league] || 74;
-      const leagueRatingBaseQ = LEAGUE_RATING_BASES[league] || 110;
-      const isEspnLeagueQ = ["nba","wnba","wnba_pre","ncaa","ncaaw","nba_gl","euroleague","eurocup","champions_league","turkey_bsl","acb","bbl","ausnbl","lba","bleague","united_league","proa"].includes(league);
+      // AUDIT FIX (round 4): leaguePaceBaseQ/leagueRatingBaseQ used to fall
+      // through to one flat constant (74 / 110) for every league missing a
+      // curated LEAGUE_PACE_BASES/LEAGUE_RATING_BASES entry, even though
+      // computeFTProjection and the H1 market both already scale their
+      // fallback proportionally to the league's known scoring level
+      // (LEAGUE_BASES). Quarter markets now get the same treatment.
+      const leaguePaceBaseQ = LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default
+        || (74 * ((LEAGUE_BASES[league] || LEAGUE_BASES.unknown) / LEAGUE_BASES.unknown));
+      const leagueRatingBaseQ = LEAGUE_RATING_BASES[league]
+        || (LEAGUE_RATING_BASES.default * ((LEAGUE_BASES[league] || LEAGUE_BASES.unknown) / LEAGUE_BASES.unknown))
+        || 110;
+      // AUDIT FIX (round 4): same hardcoded-array drift as the H1 market —
+      // this had fallen out of sync with ESPN_LEAGUE_SLUGS (missing bcl,
+      // aba, isl, cebl, nba_summer). Now reads the single source of truth.
+      const isEspnLeagueQ = Object.prototype.hasOwnProperty.call(ESPN_LEAGUE_SLUGS, league);
 
       let projA, projB;
       const _dynWeightsQ = getDynamicWeights(
