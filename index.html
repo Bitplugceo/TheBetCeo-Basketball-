@@ -6,34 +6,156 @@
     name="viewport"
     content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
   />
-<script>
-    
-  </script>
+<!-- removed empty inline script placeholder -->
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="BB Engine" />
   <meta name="theme-color" content="#c91920" />
 
+  <!-- Basic CSP to restrict origins while leaving inline scripts allowed for the single-file design.
+       NOTE: This keeps inline scripts working (uses 'unsafe-inline') because you requested a single-file approach.
+       For stronger security later, remove inline scripts and tighten this policy. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' https:; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self';">
   <link rel="manifest" href="manifest.json?v=tracker_cleanup_v22_measurement_lab" />
   <link rel="apple-touch-icon" href="0A45F320-A89F-4851-AA4E-CE22138FD52F.jpeg?v=tracker_cleanup_v22_measurement_lab" />
   <link rel="icon" type="image/jpeg" href="0A45F320-A89F-4851-AA4E-CE22138FD52F.jpeg?v=tracker_cleanup_v22_measurement_lab" />
 
   <script>
-    if ("serviceWorker" in navigator) {
-      window.addEventListener("load", function () {
-        navigator.serviceWorker.register("sw.js?v=tracker_cleanup_v22_measurement_lab")
-          .then(function (reg) {
-            if (typeof engineDebug === "function") {
-              engineDebug("Service worker registered", { scope: reg.scope });
+    // Ensure a lightweight engineDebug exists so logging calls are safe.
+    if (typeof engineDebug !== 'function') {
+      window.engineDebug = function () {
+        if (window.console && typeof console.debug === 'function') {
+          try { console.debug.apply(console, arguments); } catch (e) { /* ignore */ }
+        }
+      };
+    }
+
+    // Simple inline HTML sanitizer suitable for a single-file app.
+    // This removes script/style/iframe/object/embed/link nodes and strips on* attributes
+    // and javascript: URIs from href/src attributes. It is not a full replacement for
+    // a robust library (DOMPurify) but improves safety while remaining single-file.
+    function safeSanitizeHTML(inputHtml) {
+      try {
+        var parser = new DOMParser();
+        var doc = parser.parseFromString(String(inputHtml), 'text/html');
+
+        var removeTags = ['script', 'style', 'iframe', 'object', 'embed', 'link'];
+        for (var t = 0; t < removeTags.length; t++) {
+          var nodes = doc.getElementsByTagName(removeTags[t]);
+          for (var i = nodes.length - 1; i >= 0; i--) {
+            if (nodes[i] && nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
+          }
+        }
+
+        var all = doc.getElementsByTagName('*');
+        for (var i = 0; i < all.length; i++) {
+          // Copy attributes because NamedNodeMap is live and modifying while iterating is brittle.
+          var attrs = [];
+          for (var a = 0; a < all[i].attributes.length; a++) {
+            attrs.push({
+              name: all[i].attributes[a].name,
+              value: all[i].attributes[a].value
+            });
+          }
+          for (var j = attrs.length - 1; j >= 0; j--) {
+            var name = attrs[j].name;
+            var value = attrs[j].value;
+            if (/^on/i.test(name)) {
+              all[i].removeAttribute(name);
+            } else if ((name === 'href' || name === 'src') && typeof value === 'string' && value.trim().toLowerCase().indexOf('javascript:') === 0) {
+              all[i].removeAttribute(name);
             }
-          })
-          .catch(function (err) {
-            if (typeof engineDebug === "function") {
-              engineDebug("Service worker registration failed (non-fatal)", { error: err?.message || String(err) });
-            }
-          });
+          }
+        }
+
+        return doc.body ? doc.body.innerHTML : '';
+      } catch (e) {
+        try { engineDebug('sanitize-error', e && e.message); } catch (x) {}
+        return '';
+      }
+    }
+
+    function safeSetInnerHTML(el, html) {
+      if (!el) return;
+      el.innerHTML = safeSanitizeHTML(html);
+    }
+
+    // Lightweight debounced localStorage wrapper to reduce main-thread churn.
+    (function () {
+      var _timers = {};
+      window.BBStorage = {
+        get: function (key) {
+          try {
+            var v = localStorage.getItem(key);
+            return v ? JSON.parse(v) : null;
+          } catch (e) {
+            engineDebug('BBStorage.get.error', e && e.message);
+            return null;
+          }
+        },
+        set: function (key, value) {
+          try {
+            localStorage.setItem(key, JSON.stringify(value));
+          } catch (e) {
+            engineDebug('BBStorage.set.error', e && e.message);
+          }
+        },
+        setDebounced: function (key, value, delay) {
+          delay = (typeof delay === 'number') ? delay : 300;
+          if (_timers[key]) clearTimeout(_timers[key]);
+          _timers[key] = setTimeout(function () {
+            try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { engineDebug('BBStorage.setDebounced.error', e && e.message); }
+            delete _timers[key];
+          }, delay);
+        },
+        remove: function (key) {
+          try { localStorage.removeItem(key); } catch (e) { engineDebug('BBStorage.remove.error', e && e.message); }
+        }
+      };
+    })();
+
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        // Only register in secure contexts (HTTPS or localhost).
+        if (!window.isSecureContext) {
+          engineDebug('Service worker not registered: non-secure context');
+          return;
+        }
+        try {
+          navigator.serviceWorker.register('sw.js?v=tracker_cleanup_v22_measurement_lab')
+            .then(function (reg) {
+              engineDebug('Service worker registered', { scope: reg.scope });
+            })
+            .catch(function (err) {
+              engineDebug('Service worker registration failed (non-fatal)', { error: err && err.message || String(err) });
+            });
+        } catch (e) {
+          engineDebug('Service worker registration exception', e && e.message);
+        }
       });
     }
+
+    // Minimal in-page self-test harness for basic engine/storage sanity checks.
+    // This provides a lightweight safeguard and quick smoke tests without adding CI files.
+    window.runEngineSelfTests = function () {
+      try {
+        engineDebug('Running engine self-tests...');
+        var ok = true;
+        // Storage basic test
+        try {
+          BBStorage.set('__selftest__', { ok: 1 });
+          var got = BBStorage.get('__selftest__');
+          if (!got || got.ok !== 1) { engineDebug('BBStorage selftest failed', got); ok = false; }
+          BBStorage.remove('__selftest__');
+        } catch (e) { engineDebug('BBStorage selftest exception', e && e.message); ok = false; }
+
+        engineDebug('Self-tests complete', { ok: !!ok });
+        return !!ok;
+      } catch (e) {
+        engineDebug('runEngineSelfTests.exception', e && e.message);
+        return false;
+      }
+    };
   </script>
 
   <title>Basketball Prediction Engine</title>
@@ -145,7 +267,9 @@ body::before {
   top: 0;
   left: 0;
   right: 0;
-  height: env(safe-area-inset-top, 0px);
+  /* Provide a sensible fallback height so the strip does not collapse on devices without env() support,
+     while header padding already uses a 20px fallback; this reduces overlap risk on older user agents. */
+  height: env(safe-area-inset-top, 20px);
   background: #c91920;
   z-index: 10000;
   pointer-events: none;
@@ -655,6 +779,13 @@ td {
       background: transparent !important;
       color: var(--muted) !important;
       font-weight: 700 !important;
+    }
+    
+    /* Prefer class-based row targeting for broader browser compatibility.
+       When rendering rows in JS, add `pred-noplay-row` to the <tr> if any td has class "pred-noplay".
+       Keep the :has() rule as progressive enhancement for modern browsers. */
+    tr.pred-noplay-row td {
+      background: transparent !important;
     }
     
     tr:has(td.pred-noplay) td {
