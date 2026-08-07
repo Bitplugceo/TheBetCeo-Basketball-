@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17660,8 +17661,16 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       blowoutGap: Math.abs(aS - bS),
       paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
     });
-    const avgH2HA = avgOrNaN(decayH2HA);
-    const avgH2HB = avgOrNaN(decayH2HB);
+    // AUDIT FIX (1.3): apply season-decay weights only at the average step.
+    // Individual scores in decayH2H* are now raw; weighted mean preserves the
+    // previous numerical result without distorting per-game values.
+    const _ftH2hW = massacreH2H.weights;
+    const avgH2HA = (_ftH2hW && _ftH2hW.length === decayH2HA.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HA.length; i++) { const v = Number(decayH2HA[i]), w = Number(_ftH2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HA); })()
+      : avgOrNaN(decayH2HA);
+    const avgH2HB = (_ftH2hW && _ftH2hW.length === decayH2HB.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HB.length; i++) { const v = Number(decayH2HB[i]), w = Number(_ftH2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HB); })()
+      : avgOrNaN(decayH2HB);
     projAFT = isFinite(projAFT) ? (isFinite(avgH2HA) ? (projAFT * (1 - hw) + avgH2HA * hw) : projAFT) : avgH2HA;
     projBFT = isFinite(projBFT) ? (isFinite(avgH2HB) ? (projBFT * (1 - hw) + avgH2HB * hw) : projBFT) : avgH2HB;
 
@@ -17916,8 +17925,14 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       blowoutGap: Math.abs(projA1H - projB1H),
       paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
     });
-    const avgH2HA = avgOrNaN(decayH2HA);
-    const avgH2HB = avgOrNaN(decayH2HB);
+    // AUDIT FIX (1.3): apply season-decay weights only at the average step.
+    const _h1H2hW = massacreH2H.weights;
+    const avgH2HA = (_h1H2hW && _h1H2hW.length === decayH2HA.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HA.length; i++) { const v = Number(decayH2HA[i]), w = Number(_h1H2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HA); })()
+      : avgOrNaN(decayH2HA);
+    const avgH2HB = (_h1H2hW && _h1H2hW.length === decayH2HB.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HB.length; i++) { const v = Number(decayH2HB[i]), w = Number(_h1H2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HB); })()
+      : avgOrNaN(decayH2HB);
     projA1H = isFinite(projA1H) ? (isFinite(avgH2HA) ? (projA1H * (1 - hw) + avgH2HA * hw) : projA1H) : avgH2HA;
     projB1H = isFinite(projB1H) ? (isFinite(avgH2HB) ? (projB1H * (1 - hw) + avgH2HB * hw) : projB1H) : avgH2HB;
 
@@ -18068,13 +18083,16 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed) {
   if (decayWeights.length >= 2) {
     const _meanW = decayWeights.reduce((s, w) => s + w, 0) / decayWeights.length;
     if (_meanW > 0) {
-      const normalizedA = rawA.map((v, i) => v * decayWeights[i] / _meanW);
-      const normalizedB = rawB.map((v, i) => v * decayWeights[i] / _meanW);
-      return { A: normalizedA, B: normalizedB };
+      // AUDIT FIX (1.3): do NOT scale individual game scores. Mutating each
+      // element (v * w / meanW) makes avg(normalized) equal the correct
+      // weighted mean, but distorts any non-linear downstream use (stdDev,
+      // volatility ratio, min/max). Keep raw scores intact and expose the
+      // decay weights so callers can apply them only at the average step.
+      return { A: rawA, B: rawB, weights: decayWeights };
     }
   }
 
-  return { A: rawA, B: rawB };
+  return { A: rawA, B: rawB, weights: null };
 }
 
 function getMatchupDeltaSignal(side, marketKey, parsed) {
@@ -21880,6 +21898,11 @@ const h1Calc = compute1HProjection({
         }
 
                             const computeQ = (qKey, lineVal, injA = g_injA.scoringMult, injB = g_injB.scoringMult, config = {}) => {
+      // MARKET CONTEXT FIX: qKey is already "q1"/"q2"/"q3"/"q4". Without this,
+      // getParam/getTunableParam still resolve against the leftover "h1" context
+      // set by compute1HProjection, so quarter-specific MAX-POWER locks and
+      // market overrides are silently ignored. Mirrors computeQuarterProjectionBT.
+      g_currentLiveComputeMarket = qKey;
 
       const aS = getManualSeries("A", qKey, parsed);
       const bS = getManualSeries("B", qKey, parsed);
@@ -22027,8 +22050,14 @@ const h1Calc = compute1HProjection({
           blowoutGap: Math.abs(projA - projB),
           paceGapRisk: Math.abs((avgOrNaN(ctxAQ.pace10) || 74) - (avgOrNaN(ctxBQ.pace10) || 74)) > 6
         });
-        const avgH2HA = avgOrNaN(decayH2HA);
-        const avgH2HB = avgOrNaN(decayH2HB);
+        // AUDIT FIX (1.3): apply season-decay weights only at the average step.
+        const _qH2hW = massacreH2HQ.weights;
+        const avgH2HA = (_qH2hW && _qH2hW.length === decayH2HA.length)
+          ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HA.length; i++) { const v = Number(decayH2HA[i]), w = Number(_qH2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HA); })()
+          : avgOrNaN(decayH2HA);
+        const avgH2HB = (_qH2hW && _qH2hW.length === decayH2HB.length)
+          ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HB.length; i++) { const v = Number(decayH2HB[i]), w = Number(_qH2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HB); })()
+          : avgOrNaN(decayH2HB);
         projA = isFinite(avgH2HA) ? ((projA * (1 - hw)) + (avgH2HA * hw)) : projA;
         projB = isFinite(avgH2HB) ? ((projB * (1 - hw)) + (avgH2HB * hw)) : projB;
 
@@ -22082,7 +22111,10 @@ const h1Calc = compute1HProjection({
       // blowoutGap entirely) can restore these discounts instead of grading
       // blind on the common path where H1/FT anchoring fires.
       const qPaceGapRisk = Math.abs((avgOrNaN(ctxAQ.pace10) || 74) - (avgOrNaN(ctxBQ.pace10) || 74)) > 6;
-      return { proj: qProj, edge: qEdge, line: lineVal, pick: qPick, confidence: qConf, tier, projA, projB, hasH2H, volatility: stdDev(aS.concat(bS)), fullModel: qFullModel, projectionOnly: qProjectionOnly, paceGapRisk: qPaceGapRisk };
+      // AUDIT FIX (1.2): stash unmutated pre-anchor projections. The live
+      // quarter-anchor block mutates .proj in place; without these fields the
+      // audit snapshot's preReconcile_total equals postReconcile_total.
+      return { proj: qProj, edge: qEdge, line: lineVal, pick: qPick, confidence: qConf, tier, projA, projB, hasH2H, volatility: stdDev(aS.concat(bS)), fullModel: qFullModel, projectionOnly: qProjectionOnly, paceGapRisk: qPaceGapRisk, preAnchorProjA: projA, preAnchorProjB: projB, preAnchorProjTotal: qProj };
     };
 
     const q1 = computeQ("q1", parseMarketLine(document.getElementById("q1Market")?.value), g_injA.scoringMult, g_injB.scoringMult, { h2hFactor: ftConfigOverride?.h2hFactor });
@@ -23187,10 +23219,10 @@ window.__LAST_AUDIT_STATE = {
     },
 
     QUARTERS: {
-      Q1: q1 ? { preReconcile_projA: q1.projA, preReconcile_projB: q1.projB, preReconcile_total: q1.proj, postReconcile_total: (finalPicksForDisplay.find(x=>x.marketKey==="q1")?.proj ?? q1.proj), line: q1.line, edge: q1.edge, tier: q1.tier, hasH2H: q1.hasH2H, seriesA: safeArr(parsed.aQ1Scored) || [], seriesB: safeArr(parsed.bQ1Scored) || [], allowedA: safeArr(parsed.aQ1Allowed) || [], allowedB: safeArr(parsed.bQ1Allowed) || [] } : null,
-      Q2: q2 ? { preReconcile_projA: q2.projA, preReconcile_projB: q2.projB, preReconcile_total: q2.proj, postReconcile_total: (finalPicksForDisplay.find(x=>x.marketKey==="q2")?.proj ?? q2.proj), line: q2.line, edge: q2.edge, tier: q2.tier, hasH2H: q2.hasH2H, seriesA: safeArr(parsed.aQ2Scored) || [], seriesB: safeArr(parsed.bQ2Scored) || [], allowedA: safeArr(parsed.aQ2Allowed) || [], allowedB: safeArr(parsed.bQ2Allowed) || [] } : null,
-      Q3: q3 ? { preReconcile_projA: q3.projA, preReconcile_projB: q3.projB, preReconcile_total: q3.proj, postReconcile_total: (finalPicksForDisplay.find(x=>x.marketKey==="q3")?.proj ?? q3.proj), line: q3.line, edge: q3.edge, tier: q3.tier, hasH2H: q3.hasH2H, seriesA: safeArr(parsed.aQ3Scored) || [], seriesB: safeArr(parsed.bQ3Scored) || [], allowedA: safeArr(parsed.aQ3Allowed) || [], allowedB: safeArr(parsed.bQ3Allowed) || [] } : null,
-      Q4: q4 ? { preReconcile_projA: q4.projA, preReconcile_projB: q4.projB, preReconcile_total: q4.proj, postReconcile_total: (finalPicksForDisplay.find(x=>x.marketKey==="q4")?.proj ?? q4.proj), line: q4.line, edge: q4.edge, tier: q4.tier, hasH2H: q4.hasH2H, seriesA: safeArr(parsed.aQ4Scored) || [], seriesB: safeArr(parsed.bQ4Scored) || [], allowedA: safeArr(parsed.aQ4Allowed) || [], allowedB: safeArr(parsed.bQ4Allowed) || [] } : null
+      Q1: q1 ? { preReconcile_projA: (q1.preAnchorProjA ?? q1.projA), preReconcile_projB: (q1.preAnchorProjB ?? q1.projB), preReconcile_total: (q1.preAnchorProjTotal ?? q1.proj), postReconcile_total: (finalPicksForDisplay.find(x=>x.marketKey==="q1")?.proj ?? q1.proj), line: q1.line, edge: q1.edge, tier: q1.tier, hasH2H: q1.hasH2H, seriesA: safeArr(parsed.aQ1Scored) || [], seriesB: safeArr(parsed.bQ1Scored) || [], allowedA: safeArr(parsed.aQ1Allowed) || [], allowedB: safeArr(parsed.bQ1Allowed) || [] } : null,
+      Q2: q2 ? { preReconcile_projA: (q2.preAnchorProjA ?? q2.projA), preReconcile_projB: (q2.preAnchorProjB ?? q2.projB), preReconcile_total: (q2.preAnchorProjTotal ?? q2.proj), postReconcile_total: (finalPicksForDisplay.find(x=>x.marketKey==="q2")?.proj ?? q2.proj), line: q2.line, edge: q2.edge, tier: q2.tier, hasH2H: q2.hasH2H, seriesA: safeArr(parsed.aQ2Scored) || [], seriesB: safeArr(parsed.bQ2Scored) || [], allowedA: safeArr(parsed.aQ2Allowed) || [], allowedB: safeArr(parsed.bQ2Allowed) || [] } : null,
+      Q3: q3 ? { preReconcile_projA: (q3.preAnchorProjA ?? q3.projA), preReconcile_projB: (q3.preAnchorProjB ?? q3.projB), preReconcile_total: (q3.preAnchorProjTotal ?? q3.proj), postReconcile_total: (finalPicksForDisplay.find(x=>x.marketKey==="q3")?.proj ?? q3.proj), line: q3.line, edge: q3.edge, tier: q3.tier, hasH2H: q3.hasH2H, seriesA: safeArr(parsed.aQ3Scored) || [], seriesB: safeArr(parsed.bQ3Scored) || [], allowedA: safeArr(parsed.aQ3Allowed) || [], allowedB: safeArr(parsed.bQ3Allowed) || [] } : null,
+      Q4: q4 ? { preReconcile_projA: (q4.preAnchorProjA ?? q4.projA), preReconcile_projB: (q4.preAnchorProjB ?? q4.projB), preReconcile_total: (q4.preAnchorProjTotal ?? q4.proj), postReconcile_total: (finalPicksForDisplay.find(x=>x.marketKey==="q4")?.proj ?? q4.proj), line: q4.line, edge: q4.edge, tier: q4.tier, hasH2H: q4.hasH2H, seriesA: safeArr(parsed.aQ4Scored) || [], seriesB: safeArr(parsed.bQ4Scored) || [], allowedA: safeArr(parsed.aQ4Allowed) || [], allowedB: safeArr(parsed.bQ4Allowed) || [] } : null
     },
 
     reconciliation: {
