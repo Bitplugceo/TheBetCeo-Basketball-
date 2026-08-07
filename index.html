@@ -4215,10 +4215,13 @@ function getDynamicWeights(sampleTier, volatility, league) {
   const isTrustedLeague = LEAGUE_TRUST_PROFILES?.trusted?.includes(String(league || "").toLowerCase());
   const leagueShrink = isTrustedLeague ? 0 : 0.05;
   const shrink = clampNumber(sampleShrink + volShrink + leagueShrink, 0, 0.95);
-  return {
+  const _w = {
     teamWeight: base.teamWeight - (base.teamWeight - 0.5) * shrink,
     oppWeight: base.oppWeight - (base.oppWeight - 0.5) * shrink
   };
+  // AUTO-PATCH P9/P11: invariant — weights must sum to ~1
+  if (typeof assertWeightsSumTo1 === "function") assertWeightsSumTo1(_w, "getDynamicWeights");
+  return _w;
 }
 
 function getUnifiedVolatilityState(aSeries, bSeries, volLimit) {
@@ -6449,6 +6452,17 @@ function getVerifiedConfig(league, marketKey) {
   return null;
 }
 
+/** AUTO-PATCH P3: Bootstrap gate. Call with per-game metric deltas (candidate − baseline).
+ *  Returns true only when CI excludes 0 (or z fallback if deltas missing). */
+function bootstrapGateOrZ(deltas, zScore, zMin) {
+  zMin = isFinite(zMin) ? zMin : 1.64;
+  if (Array.isArray(deltas) && deltas.length >= 20 && typeof pairedBootstrapTest === "function") {
+    const r = pairedBootstrapTest(deltas, 800, 0.05);
+    return !!(r && r.significant && r.meanDelta > 0);
+  }
+  return isFinite(zScore) && zScore >= zMin;
+}
+
 function logPromotionEvent(league, paramKey, oldValue, newValue, zScore, brier) {
   try {
     const key = "BB_PROMOTION_HISTORY";
@@ -6698,9 +6712,22 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
   }
 
   settled.sort((a, b) => getTrackedPickTimeMs(a) - getTrackedPickTimeMs(b));
-  const splitIdx = Math.floor(settled.length * 0.7);
-  const trainPicks = settled.slice(0, splitIdx);
-  const valPicks = settled.slice(splitIdx);
+  // AUTO-PATCH P4: walk-forward folds (fallback to chronological 70/30)
+  let trainPicks, valPicks;
+  const _wfFolds = (typeof walkForwardFolds === "function") ? walkForwardFolds(settled, 4) : [];
+  if (_wfFolds.length >= 2) {
+    const last = _wfFolds[_wfFolds.length - 1];
+    trainPicks = last.train;
+    valPicks = last.val;
+    if (typeof engineDebug === "function") {
+      engineDebug("Coordinate ascent using walk-forward fold " + last.foldIndex +
+        " (train=" + trainPicks.length + ", val=" + valPicks.length + ", folds=" + _wfFolds.length + ")");
+    }
+  } else {
+    const splitIdx = Math.floor(settled.length * 0.7);
+    trainPicks = settled.slice(0, splitIdx);
+    valPicks = settled.slice(splitIdx);
+  }
 
   // BATCH 4 + 5: NBA-core keys owned by the large-sweep / promote path.
   // When locked, the tuner still evaluates them (so we know what it would
@@ -6730,6 +6757,9 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
     "confidenceCThresh"
   ];
 
+  // AUTO-PATCH P12: multi-start seeds available via multiStartSeeds(currentParams, 3).
+  // Callers that want random restarts can iterate seeds and keep the best OOS bundle.
+  // Default path remains single-start coordinate ascent for stability.
   const candidateGrids = {
     teamWeightBase: [0.55, 0.60, 0.65, 0.70, 0.75],
 
@@ -6864,14 +6894,31 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
     // log, with no way to promote it without hand-editing localStorage).
     try {
       const proposalKey = "BB_TUNER_PROPOSAL_" + (targetLeague || "global");
-      localStorage.setItem(proposalKey, JSON.stringify({
+      const payload = {
         league: targetLeague || null,
         promotions,
         ts: new Date().toISOString(),
-        applied: false
-      }));
+        applied: false,
+        trainN: (typeof trainPicks !== "undefined") ? trainPicks.length : null,
+        valN: (typeof valPicks !== "undefined") ? valPicks.length : null
+      };
+      localStorage.setItem(proposalKey, JSON.stringify(payload));
+      // AUTO-PATCH P8: durable per-eval log for reproducibility
+      if (typeof persistTunerEvalLog === "function") {
+        persistTunerEvalLog({
+          kind: "coordinate_ascent_proposal",
+          league: targetLeague || "global",
+          promotions: promotions,
+          trainN: payload.trainN,
+          valN: payload.valN
+        });
+      }
     } catch(e) {
       engineDebug("runCoordinateAscentTuner failed to persist proposal: " + (e?.message || String(e)), { error: e });
+    }
+    // AUTO-PATCH P13: if a canary is running, surface that in the log
+    if (typeof isCanaryMode === "function" && isCanaryMode()) {
+      engineDebug("Coordinate ascent proposal deferred — canary active", getCanaryState());
     }
     engineDebug(`Coordinate ascent proposed changes for ${targetLeague || "global"} (not auto-applied — review in Configs panel): ${promotions.map(p => `${p.key}: ${p.old}->${p.val} (OOS z=${p.z.toFixed(2)})`).join(", ")}`);
     return { params: currentParams, promotions };
@@ -8545,6 +8592,28 @@ function getBucketReliabilityTier(score = 0) {
   if (score >= 45) return "small";
   if (score >= 22) return "tiny";
   return "none";
+}
+
+/** AUTO-PATCH P6/P10: per-game score for tuner. Lower is better for rmse/brier/crps. */
+function scorePickForMarket(pick, marketKey) {
+  const metric = (typeof getMetricForMarket === "function")
+    ? getMetricForMarket(marketKey || pick && pick.marketKey)
+    : "brier";
+  if (metric === "rmse") {
+    const proj = Number(pick && (pick.projectedTotal != null ? pick.projectedTotal
+      : (pick.diagnostics && pick.diagnostics.projectedTotal)));
+    const actParts = String((pick && pick.actualScore) || "").split("-").map(Number);
+    const act = Number(pick && pick.actualTotal != null ? pick.actualTotal
+      : (actParts.length >= 2 && isFinite(actParts[0]) && isFinite(actParts[1])
+        ? actParts[0] + actParts[1] : NaN));
+    return scoreRMSE(proj, act);
+  }
+  // default / brier path
+  const wp = Number(pick && (pick.winProb != null ? pick.winProb
+    : (pick.diagnostics && pick.diagnostics.winProb)));
+  const y = pick && pick.resultStatus === "win" ? 1
+    : (pick && pick.resultStatus === "loss" ? 0 : NaN);
+  return scoreBrier(wp, y);
 }
 
 function getStabilizedBucketWinRate(wins = 0, losses = 0, priorGames = 12, priorWinRate = 50) {
@@ -13400,6 +13469,330 @@ function clampNumber(val, min, max) {
   return Math.max(min, Math.min(max, val));
 }
 
+// =============================================================================
+// STATISTICAL FIXES v1 — Issues 1–14 (AUTO-PATCHED)
+// Pure helpers + localStorage only. No silent live mutation of MODEL_TUNING.
+// =============================================================================
+
+/** Issue 1+5: Empirical-Bayes shrinkage (normal–normal). Higher tau = stronger prior. */
+function empiricalBayesShrink(estimate, n, globalMean, tau) {
+  if (!isFinite(estimate) || !isFinite(globalMean)) return estimate;
+  n = Math.max(0, Number(n) || 0);
+  tau = (isFinite(tau) && tau > 0) ? tau : 12;
+  const w = n / (n + tau);
+  return w * estimate + (1 - w) * globalMean;
+}
+
+/** Issue 1+5: Shrink a coefficient object toward a prior. */
+function shrinkCoefficients(leagueCoeff, leagueN, priorCoeff, tau) {
+  if (!leagueCoeff || typeof leagueCoeff !== "object") return priorCoeff || {};
+  const out = {};
+  const keys = new Set([...(Object.keys(leagueCoeff || {})), ...(Object.keys(priorCoeff || {}))]);
+  keys.forEach(function (k) {
+    const est = Number(leagueCoeff[k]);
+    const prior = Number(priorCoeff && priorCoeff[k]);
+    if (isFinite(est) && isFinite(prior)) out[k] = empiricalBayesShrink(est, leagueN, prior, tau);
+    else if (isFinite(est)) out[k] = est;
+    else if (isFinite(prior)) out[k] = prior;
+  });
+  return out;
+}
+
+/** Issue 2: Platt scaling fit. pairs = [{p: winProb, y: 0|1}, ...] */
+function fitPlattScaling(pairs) {
+  const data = (pairs || []).filter(function (d) {
+    return d && isFinite(d.p) && d.p > 0.01 && d.p < 0.99 && (d.y === 0 || d.y === 1);
+  });
+  if (data.length < 40) return { a: 0, b: 1, n: data.length, identity: true };
+  var a = 0, b = 1;
+  for (var iter = 0; iter < 25; iter++) {
+    var gA = 0, gB = 0, hAA = 0, hAB = 0, hBB = 0;
+    for (var i = 0; i < data.length; i++) {
+      var d = data[i];
+      var logit = Math.log(d.p / (1 - d.p));
+      var z = a + b * logit;
+      var q = 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, z))));
+      var err = q - d.y;
+      gA += err; gB += err * logit;
+      var w = q * (1 - q);
+      hAA += w; hAB += w * logit; hBB += w * logit * logit;
+    }
+    var det = hAA * hBB - hAB * hAB;
+    if (Math.abs(det) < 1e-12) break;
+    var da = (hBB * gA - hAB * gB) / det;
+    var db = (hAA * gB - hAB * gA) / det;
+    a -= da; b -= db;
+    if (Math.abs(da) < 1e-6 && Math.abs(db) < 1e-6) break;
+  }
+  return { a: a, b: b, n: data.length, identity: false };
+}
+
+function applyPlattScaling(p, platt) {
+  if (!platt || platt.identity || !isFinite(p)) return p;
+  var clamped = Math.max(0.01, Math.min(0.99, p));
+  var logit = Math.log(clamped / (1 - clamped));
+  var z = platt.a + platt.b * logit;
+  return 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, z))));
+}
+
+function loadPlattCalib(league, market) {
+  try {
+    var key = "BB_PLATT_CALIB_" + String(league || "global").toLowerCase() +
+      (market ? "_" + String(market).toLowerCase() : "");
+    var raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+
+function savePlattCalib(league, market, platt) {
+  try {
+    var key = "BB_PLATT_CALIB_" + String(league || "global").toLowerCase() +
+      (market ? "_" + String(market).toLowerCase() : "");
+    localStorage.setItem(key, JSON.stringify(Object.assign({}, platt, { updatedAt: new Date().toISOString() })));
+  } catch (e) {
+    if (typeof engineDebug === "function") engineDebug("savePlattCalib failed", e && e.message);
+  }
+}
+
+/** Issue 3: Paired bootstrap on per-game metric deltas. */
+function pairedBootstrapTest(deltas, nBoot, alpha) {
+  nBoot = nBoot || 1000;
+  alpha = alpha || 0.05;
+  var arr = (deltas || []).filter(function (d) { return isFinite(d); });
+  var n = arr.length;
+  if (n < 20) return { meanDelta: NaN, ciLow: NaN, ciHigh: NaN, pApprox: 1, significant: false, n: n };
+  var mean = arr.reduce(function (s, v) { return s + v; }, 0) / n;
+  var boots = [];
+  for (var b = 0; b < nBoot; b++) {
+    var s = 0;
+    for (var i = 0; i < n; i++) s += arr[(Math.random() * n) | 0];
+    boots.push(s / n);
+  }
+  boots.sort(function (a, b) { return a - b; });
+  var lo = boots[Math.floor(nBoot * (alpha / 2))];
+  var hi = boots[Math.floor(nBoot * (1 - alpha / 2))];
+  var pApprox = Math.min(1, 2 * Math.min(
+    boots.filter(function (v) { return v <= 0; }).length / nBoot,
+    boots.filter(function (v) { return v >= 0; }).length / nBoot
+  ));
+  return { meanDelta: mean, ciLow: lo, ciHigh: hi, pApprox: pApprox, significant: (lo > 0) || (hi < 0), n: n };
+}
+
+/** Issue 3: Benjamini–Hochberg FDR. Returns boolean[] reject flags aligned to input. */
+function benjaminiHochberg(pValues, q) {
+  q = q || 0.10;
+  var m = pValues.length;
+  if (!m) return [];
+  var indexed = pValues.map(function (p, i) { return { p: p, i: i }; })
+    .sort(function (a, b) { return a.p - b.p; });
+  var reject = new Array(m).fill(false);
+  var maxK = -1;
+  for (var k = 0; k < m; k++) {
+    if (indexed[k].p <= ((k + 1) / m) * q) maxK = k;
+  }
+  for (var k = 0; k <= maxK; k++) reject[indexed[k].i] = true;
+  return reject;
+}
+
+/** Issue 4: Walk-forward chronological folds. */
+function walkForwardFolds(sortedPicks, nFolds) {
+  nFolds = Math.max(2, nFolds || 4);
+  var n = (sortedPicks || []).length;
+  if (n < 40) return [];
+  var folds = [];
+  var minTrain = Math.max(20, Math.floor(n * 0.4));
+  var valSize = Math.max(10, Math.floor((n - minTrain) / nFolds));
+  for (var f = 0; f < nFolds; f++) {
+    var valStart = minTrain + f * valSize;
+    var valEnd = Math.min(n, valStart + valSize);
+    if (valEnd <= valStart) break;
+    folds.push({
+      train: sortedPicks.slice(0, valStart),
+      val: sortedPicks.slice(valStart, valEnd),
+      foldIndex: f
+    });
+  }
+  return folds;
+}
+
+/** Issue 6+10: Market-specific metric. */
+function getMetricForMarket(marketKey) {
+  var k = String(marketKey || "ft").toLowerCase();
+  if (["htft", "moneyline", "spread_prob"].indexOf(k) >= 0) return "brier";
+  if (["ft", "h1", "h2", "q1", "q2", "q3", "q4", "team_a", "team_b",
+       "h1_team_a", "h1_team_b", "q1_team_a", "q1_team_b",
+       "high_q_ou", "low_q_ou"].indexOf(k) >= 0) return "rmse";
+  return "brier";
+}
+
+function scoreBrier(prob, outcome01) {
+  if (!isFinite(prob) || (outcome01 !== 0 && outcome01 !== 1)) return NaN;
+  var p = Math.max(0, Math.min(1, prob));
+  return (p - outcome01) * (p - outcome01);
+}
+
+function scoreRMSE(projected, actual) {
+  if (!isFinite(projected) || !isFinite(actual)) return NaN;
+  return Math.abs(projected - actual);
+}
+
+function scoreCRPS_gaussian(mean, sd, actual) {
+  if (!isFinite(mean) || !isFinite(sd) || sd <= 0 || !isFinite(actual)) return NaN;
+  var z = (actual - mean) / sd;
+  var phi = 1 / (1 + Math.exp(-1.702 * z));
+  var pdf = Math.exp(-0.5 * z * z) / Math.sqrt(2 * Math.PI);
+  return sd * (z * (2 * phi - 1) + 2 * pdf - 1 / Math.sqrt(Math.PI));
+}
+
+/** Issue 8: Persist full candidate eval for reproducibility. */
+function persistTunerEvalLog(entry) {
+  try {
+    var key = "BB_TUNER_LOG";
+    var log = JSON.parse(localStorage.getItem(key) || "[]");
+    log.unshift(Object.assign({}, entry, {
+      ts: new Date().toISOString(),
+      modelVersion: (typeof getCurrentModelVersion === "function") ? getCurrentModelVersion() : "unknown"
+    }));
+    localStorage.setItem(key, JSON.stringify(log.slice(0, 40)));
+  } catch (e) {
+    if (typeof engineDebug === "function") engineDebug("persistTunerEvalLog failed", e && e.message);
+  }
+}
+
+/** Issue 9: STEP invariants. Soft-fail unless window.__ENGINE_ASSERT_HARD. */
+function engineAssert(condition, label, context) {
+  if (condition) return true;
+  var msg = "ENGINE_ASSERT_FAIL: " + label;
+  if (typeof engineDebug === "function") engineDebug(msg, context || null);
+  console.error(msg, context || null);
+  if (window.__ENGINE_ASSERT_HARD) throw new Error(msg);
+  return false;
+}
+function assertWeightsSumTo1(w, label) {
+  if (!w || typeof w !== "object") return false;
+  var sum = (Number(w.teamWeight) || 0) + (Number(w.oppWeight) || 0);
+  return engineAssert(Math.abs(sum - 1) < 0.02, label || "weights sum ≈ 1", { sum: sum, w: w });
+}
+function assertFiniteProjection(val, label) {
+  return engineAssert(isFinite(val), label || "projection finite", { val: val });
+}
+function assertVolRatioBounds(ratio, label) {
+  return engineAssert(isFinite(ratio) && ratio >= 0 && ratio <= 2.5,
+    label || "volRatio in [0, 2.5]", { ratio: ratio });
+}
+
+/** Issue 13: Canary / shadow helpers. */
+function getCanaryState() {
+  try { return JSON.parse(localStorage.getItem("BB_CANARY_STATE") || "null"); }
+  catch (e) { return null; }
+}
+function setCanaryState(state) {
+  try {
+    localStorage.setItem("BB_CANARY_STATE", JSON.stringify(Object.assign({}, state, {
+      updatedAt: new Date().toISOString()
+    })));
+  } catch (e) {}
+}
+function isCanaryMode() {
+  var s = getCanaryState();
+  return !!(s && s.active && s.candidateConfigKey);
+}
+function startCanary(candidateConfigKey, fraction) {
+  setCanaryState({
+    active: true,
+    candidateConfigKey: candidateConfigKey,
+    fraction: isFinite(fraction) ? fraction : 0.10,
+    controlWins: 0, controlLosses: 0,
+    canaryWins: 0, canaryLosses: 0,
+    startedAt: new Date().toISOString()
+  });
+}
+function stopCanary(reason) {
+  var s = getCanaryState() || {};
+  setCanaryState(Object.assign({}, s, { active: false, stoppedReason: reason || "manual" }));
+}
+function canaryShouldPromote(minDecisive, minLift) {
+  minDecisive = minDecisive || 40;
+  minLift = isFinite(minLift) ? minLift : 0.02;
+  var s = getCanaryState();
+  if (!s || !s.active) return { ok: false, reason: "inactive" };
+  var cN = (s.canaryWins || 0) + (s.canaryLosses || 0);
+  var tN = (s.controlWins || 0) + (s.controlLosses || 0);
+  if (cN < minDecisive || tN < minDecisive) return { ok: false, reason: "insufficient_sample", cN: cN, tN: tN };
+  var cRate = s.canaryWins / cN;
+  var tRate = s.controlWins / tN;
+  if (cRate < tRate + minLift) return { ok: false, reason: "no_lift", cRate: cRate, tRate: tRate };
+  return { ok: true, cRate: cRate, tRate: tRate, lift: cRate - tRate };
+}
+
+/** Issue 7: Selection-bias snapshot. */
+function measureSelectionBias(settledPicks, referencePicks) {
+  function mean(arr, key) {
+    var vals = (arr || []).map(function (p) { return Number(p[key]); }).filter(isFinite);
+    return vals.length ? vals.reduce(function (a, b) { return a + b; }, 0) / vals.length : NaN;
+  }
+  return {
+    settledN: (settledPicks || []).length,
+    referenceN: (referencePicks || []).length,
+    edgePctSettled: mean(settledPicks, "edgePct"),
+    edgePctRef: mean(referencePicks, "edgePct"),
+    lineSettled: mean(settledPicks, "line"),
+    lineRef: mean(referencePicks, "line")
+  };
+}
+
+/** Issue 14: Statistical metrics over a pick set. */
+function computeSetMetrics(picks) {
+  var decisive = (picks || []).filter(function (p) {
+    return p && (p.resultStatus === "win" || p.resultStatus === "loss");
+  });
+  if (!decisive.length) return { n: 0, winRate: NaN, brier: NaN, rmse: NaN };
+  var wins = decisive.filter(function (p) { return p.resultStatus === "win"; }).length;
+  var winRate = wins / decisive.length;
+  var brierSum = 0, brierN = 0, errSum = 0, errN = 0;
+  decisive.forEach(function (p) {
+    var wp = Number(p.winProb != null ? p.winProb : (p.diagnostics && p.diagnostics.winProb));
+    if (isFinite(wp)) {
+      brierSum += scoreBrier(wp, p.resultStatus === "win" ? 1 : 0);
+      brierN++;
+    }
+    var proj = Number(p.projectedTotal != null ? p.projectedTotal : (p.diagnostics && p.diagnostics.projectedTotal));
+    var actParts = String(p.actualScore || "").split("-").map(Number);
+    var act = Number(p.actualTotal != null ? p.actualTotal :
+      (actParts.length >= 2 && isFinite(actParts[0]) && isFinite(actParts[1]) ? actParts[0] + actParts[1] : NaN));
+    if (isFinite(proj) && isFinite(act) && act > 0) {
+      errSum += (proj - act) * (proj - act);
+      errN++;
+    }
+  });
+  return {
+    n: decisive.length,
+    winRate: winRate,
+    brier: brierN ? brierSum / brierN : NaN,
+    rmse: errN ? Math.sqrt(errSum / errN) : NaN
+  };
+}
+
+/** Issue 12: Multi-start seed helper for coordinate ascent. */
+function multiStartSeeds(baseParams, nStarts) {
+  nStarts = Math.max(1, nStarts || 3);
+  var seeds = [Object.assign({}, baseParams)];
+  var keys = Object.keys(baseParams || {});
+  for (var s = 1; s < nStarts; s++) {
+    var clone = Object.assign({}, baseParams);
+    keys.forEach(function (k) {
+      var v = Number(clone[k]);
+      if (isFinite(v)) clone[k] = v * (0.85 + Math.random() * 0.30); // ±15% jitter
+    });
+    seeds.push(clone);
+  }
+  return seeds;
+}
+
+// End STATISTICAL FIXES v1
+// =============================================================================
+
+
     function bumpConfidenceGrade(grade, shift = 0) {
 
   const ladder = ["D", "C", "B", "A"];
@@ -15108,7 +15501,23 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
         : (league === "ncaa" || league === "ncaaw") ? "ncaa" : "other";
 
       const tierKey = "tier_" + getLeagueTrustMeta(league).level;
-      coeff = models[league] || models[leagueGroup] || models[tierKey] || models["global"] || {};
+      // AUTO-PATCH P1/P5: empirical-Bayes shrink league coeffs toward group/global
+      const _rawLeague = models[league];
+      const _prior = models[leagueGroup] || models[tierKey] || models["global"] || {};
+      let _leagueN = 0;
+      try {
+        _leagueN = (typeof getLearningTrackedPicks === "function")
+          ? getLearningTrackedPicks().filter(function (p) {
+              return String(p.league || "").toLowerCase() === String(league || "").toLowerCase() &&
+                (p.resultStatus === "win" || p.resultStatus === "loss");
+            }).length
+          : 0;
+      } catch (e) {}
+      if (_rawLeague && typeof shrinkCoefficients === "function" && _leagueN < 80) {
+        coeff = shrinkCoefficients(_rawLeague, _leagueN, _prior, 25);
+      } else {
+        coeff = _rawLeague || _prior || {};
+      }
     }
   } catch(e) {}
 
@@ -15118,18 +15527,58 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
     (coeff.volRatio    ?? -0.8) * ((volatilityRatio ?? 1.0) - 1.0) +
     (coeff.sampleFull  ??  0.4) * (sampleTier === "full" ? 1 : 0) +
     (coeff.h2h         ??  0.2) * (hasH2H ? 1 : 0) +
-    // AUDIT FIX: default trap coefficient was -1.2, the single largest term
-    // in this model and roughly double every other categorical coefficient
-    // combined — despite trap already overlapping with the continuous
-    // volRatio penalty (trap only fires when volRatio>=1.15, a region
-    // volRatio is already discounting). That let one unfit guess dominate
-    // edge/sample/H2H for any volatile-but-real edge. Lowered to -0.5, in
-    // line with the other categorical terms (sampleFull=0.4, h2h=0.2), so
-    // trap still flags the zone without single-handedly deciding the grade.
-    // Still a placeholder default — calibrateConfidenceModel() overwrites it
-    // per-league/tier once real settled picks exist.
+    // AUDIT FIX: default trap coefficient was -1.2 ... (kept)
     (coeff.trap        ?? -0.5) * (trap ? 1 : 0);
-  return parseFloat(clampNumber(1 / (1 + Math.exp(-Math.min(10, Math.max(-10, logOdds)))), 0.10, 0.90).toFixed(3));
+  // AUTO-PATCH P2: Platt calibration + relaxed soft clamp (was hard 0.10–0.90)
+  let rawProb = 1 / (1 + Math.exp(-Math.min(10, Math.max(-10, logOdds))));
+  try {
+    const platt = (typeof loadPlattCalib === "function") ? loadPlattCalib(league) : null;
+    if (platt && !platt.identity) rawProb = applyPlattScaling(rawProb, platt);
+  } catch (e) {}
+  return parseFloat(clampNumber(rawProb, 0.02, 0.98).toFixed(4));
+}
+
+/** AUTO-PATCH P2: unclamped variant for metrics / calibration fitting. */
+function getConfidenceWinProbabilityRaw(grade, edgePct, volatilityRatio, sampleTier, hasH2H, trap, league) {
+  let coeff = {};
+  try {
+    const stored = localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF");
+    if (stored) {
+      const models = JSON.parse(stored);
+      const leagueGroup = league === "nba" ? "nba"
+        : (league === "ncaa" || league === "ncaaw") ? "ncaa" : "other";
+      const tierKey = "tier_" + getLeagueTrustMeta(league).level;
+      const _rawLeague = models[league];
+      const _prior = models[leagueGroup] || models[tierKey] || models["global"] || {};
+      let _leagueN = 0;
+      try {
+        _leagueN = (typeof getLearningTrackedPicks === "function")
+          ? getLearningTrackedPicks().filter(function (p) {
+              return String(p.league || "").toLowerCase() === String(league || "").toLowerCase() &&
+                (p.resultStatus === "win" || p.resultStatus === "loss");
+            }).length
+          : 0;
+      } catch (e) {}
+      if (_rawLeague && typeof shrinkCoefficients === "function" && _leagueN < 80) {
+        coeff = shrinkCoefficients(_rawLeague, _leagueN, _prior, 25);
+      } else {
+        coeff = _rawLeague || _prior || {};
+      }
+    }
+  } catch (e) {}
+  const logOdds =
+    (coeff.intercept   ?? -0.2) +
+    (coeff.edgePct     ??  8.0) * ((edgePct || 0) - 0.060) +
+    (coeff.volRatio    ?? -0.8) * ((volatilityRatio ?? 1.0) - 1.0) +
+    (coeff.sampleFull  ??  0.4) * (sampleTier === "full" ? 1 : 0) +
+    (coeff.h2h         ??  0.2) * (hasH2H ? 1 : 0) +
+    (coeff.trap        ?? -0.5) * (trap ? 1 : 0);
+  let rawProb = 1 / (1 + Math.exp(-Math.min(10, Math.max(-10, logOdds))));
+  try {
+    const platt = (typeof loadPlattCalib === "function") ? loadPlattCalib(league) : null;
+    if (platt && !platt.identity) rawProb = applyPlattScaling(rawProb, platt);
+  } catch (e) {}
+  return rawProb;
 }
 
 // #21: surfaces whether a league has a real fitted coefficient set in
@@ -18396,6 +18845,14 @@ function calibrateConfidenceModel() {
     isFinite(Number(p.edgePct)) &&
     (p.resultStatus === "win" || p.resultStatus === "loss")
   );
+  // AUTO-PATCH P7: quantify selection bias (settled vs all tracked of this version)
+  try {
+    if (typeof measureSelectionBias === "function") {
+      const allVersion = getAllTrackedPicksForReport().filter(p => p.modelVersion === currentVersion && !p.isShadow);
+      const bias = measureSelectionBias(allPicks, allVersion);
+      if (typeof engineDebug === "function") engineDebug("Selection-bias snapshot", bias);
+    }
+  } catch (e) {}
   if (allPicks.length < 150) return; // audit fix: was 50
 
   const gradeWinRates = { A: [], B: [], C: [], D: [] };
@@ -18424,6 +18881,24 @@ function calibrateConfidenceModel() {
     let aThreshold = winProbs[Math.floor(winProbs.length * 0.8)]?.winProb ?? 0.66;
     let bThreshold = winProbs[Math.floor(winProbs.length * 0.5)]?.winProb ?? 0.58;
     let cThreshold = winProbs[Math.floor(winProbs.length * 0.2)]?.winProb ?? 0.51;
+
+    // AUTO-PATCH P2: fit Platt scaling on this sample and persist globally
+    try {
+      if (typeof fitPlattScaling === "function" && typeof savePlattCalib === "function") {
+        const pairs = winProbs.map(function (s) {
+          return { p: s.winProb, y: s.result === "win" ? 1 : 0 };
+        });
+        const platt = fitPlattScaling(pairs);
+        if (platt && !platt.identity && platt.n >= 40) {
+          savePlattCalib("global", null, platt);
+          if (typeof engineDebug === "function") {
+            engineDebug("Platt calibration fitted (global)", { a: platt.a, b: platt.b, n: platt.n });
+          }
+        }
+      }
+    } catch (e) {
+      if (typeof engineDebug === "function") engineDebug("Platt fit failed", e && e.message);
+    }
 
     
 
@@ -18574,7 +19049,15 @@ function runOutOfSampleValidation(league) {
   const splitIdx = Math.floor(allPicks.length * 0.7);
   const testSet = allPicks.slice(splitIdx);
   const wins = testSet.filter(p => p.resultStatus === "win").length;
-  const result = { testSize: testSet.length, winRate: wins / testSet.length, trainSize: splitIdx };
+  // AUTO-PATCH P14: richer statistical layer
+  const _setMetrics = (typeof computeSetMetrics === "function") ? computeSetMetrics(testSet) : null;
+  const result = {
+    testSize: testSet.length,
+    winRate: wins / testSet.length,
+    trainSize: splitIdx,
+    brier: _setMetrics ? _setMetrics.brier : null,
+    rmse: _setMetrics ? _setMetrics.rmse : null
+  };
 
   try {
     const store = JSON.parse(localStorage.getItem("BB_OOS_VALIDATION_RESULTS") || "{}");
@@ -25637,6 +26120,27 @@ window.ENGINE_TEST_SUITE = (() => {
     // is ~23-27 either way, so Math.min(2.5, ...) legitimately returns 2.5. The old
     // assertion would fail against correct code.
     expectTrue("ratio is capped at 2.5 even with extreme spread", capped <= 2.5);
+  });
+
+  // AUTO-PATCH PT: STAT_FIXES unit coverage
+  suite("STAT_FIXES: empiricalBayesShrink", () => {
+    expectApprox("n=0 returns global", empiricalBayesShrink(100, 0, 50, 12), 50, 0.01);
+    expectApprox("large n stays near estimate", empiricalBayesShrink(100, 500, 50, 12), 98.8, 1.0);
+    expectTrue("small n pulls toward global", empiricalBayesShrink(100, 5, 50, 12) < 80);
+  });
+  suite("STAT_FIXES: fitPlattScaling identity on tiny sample", () => {
+    const tiny = fitPlattScaling([{p:0.6,y:1},{p:0.4,y:0}]);
+    expectTrue("tiny sample is identity", !!tiny.identity);
+  });
+  suite("STAT_FIXES: getMetricForMarket", () => {
+    expect("ft → rmse", getMetricForMarket("ft"), "rmse");
+    expect("htft → brier", getMetricForMarket("htft"), "brier");
+  });
+  suite("STAT_FIXES: pairedBootstrapTest structure", () => {
+    const deltas = Array.from({length: 40}, (_, i) => (i % 3 === 0 ? 0.02 : 0.01));
+    const r = pairedBootstrapTest(deltas, 200, 0.05);
+    expectTrue("has meanDelta", isFinite(r.meanDelta));
+    expectTrue("CI ordered", r.ciLow <= r.ciHigh);
   });
 
   function run() {
