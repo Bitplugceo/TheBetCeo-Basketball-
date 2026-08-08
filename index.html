@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4424,7 +4425,7 @@ window.loadHistoricalSeasonGames = loadHistoricalSeasonGames;
  * starts from a complete, consistent vector.
  */
 function getDefaultBacktestLeverSet(league) {
-  const l = String(league || "nba").toLowerCase();
+  const l = String(league || "wnba").toLowerCase();
   const get = (key, fallback) => {
     try {
       const v = (typeof getParam === "function") ? getParam(key, l) : undefined;
@@ -4516,7 +4517,14 @@ window.runOneBacktestReplayTest = runOneBacktestReplayTest;
 // Batched ESPN scoreboard → in-memory form/H2H (NO per-game form API)
 // ═══════════════════════════════════════════════════════════════
 
-function _btSeasonDateRange(season) {
+function _btSeasonDateRange(season, league) {
+  // WNBA: single calendar year, May → Oct (regular season + playoffs).
+  // season "2026" → 20260501..20261031
+  if (String(league || "").toLowerCase() === "wnba") {
+    const y = String(season || "").match(/^(\d{4})$/);
+    if (!y) return null;
+    return { start: y[1] + "0501", end: y[1] + "1031" };
+  }
   // NBA: Oct → June. season "2024/25" → 20241001..20250630
   const m = String(season || "").match(/^(\d{4})\s*\/\s*(\d{2,4})$/);
   if (!m) return null;
@@ -4547,14 +4555,17 @@ function _btDateKeysInclusive(startYmd, endYmd) {
  * Parallel batches (concurrency 8). Progress callback: (done, total, label).
  * Form + H2H built purely in memory after the scoreboard pass.
  */
-async function loadRealNbaSeasonFromEspn(season, onProgress) {
-  const league = "nba";
-  const range = _btSeasonDateRange(season);
+async function loadRealNbaSeasonFromEspn(season, onProgress, league) {
+  league = String(league || "wnba").toLowerCase();
+  const range = _btSeasonDateRange(season, league);
   if (!range) return { season: season, loaded: 0, error: "bad season" };
 
-  const base = (typeof getEspnBaseForLeague === "function")
-    ? getEspnBaseForLeague("nba")
-    : "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
+  // getEspnBaseForLeague was never defined anywhere in this file, so this
+  // always silently fell through to the hardcoded NBA URL regardless of
+  // league. Use the same shared ESPN_LEAGUE_SLUGS map the rest of the app
+  // reads from (getEspnLeagueSlug) so this actually respects `league`.
+  const _slug = (typeof getEspnLeagueSlug === "function") ? getEspnLeagueSlug(league) : null;
+  const base = "https://site.api.espn.com/apis/site/v2/sports/basketball/" + (_slug || "wnba");
 
   // Cap to today if season end is in the future
   const today = new Date();
@@ -4696,14 +4707,16 @@ window.loadRealNbaSeasonFromEspn = loadRealNbaSeasonFromEspn;
  * Load both seasons with live progress. Extremely parallel, yields between batches.
  * onProgress(done, total, label) — wire to button text "12/180".
  */
-async function loadRealNbaBothSeasons(onProgress) {
+async function loadRealNbaBothSeasons(onProgress, league) {
   // SAMPLE-SIZE FIX: 2 seasons left MAX-POWER with only 10-20 decisive
   // plays per market after edge-threshold filtering — nowhere near enough
   // to trust a win-rate lock. ESPN's scoreboard endpoint works the same way
   // for older seasons, so pull more of them to give the (now much stricter)
   // minDecisive/z-test gate in runMaxPowerJointSearch a real chance to pass
   // on signal instead of always failing for lack of data.
-  const seasons = ["2019/20", "2020/21", "2021/22", "2022/23", "2023/24", "2024/25", "2025/26"];
+  // WNBA seasons are single calendar years (not NBA-style split years).
+  league = String(league || "wnba").toLowerCase();
+  const seasons = ["2019", "2020", "2021", "2022", "2023", "2024", "2025", "2026"];
   const results = [];
   for (let i = 0; i < seasons.length; i++) {
     const r = await loadRealNbaSeasonFromEspn(seasons[i], function (done, total, label) {
@@ -4712,7 +4725,7 @@ async function loadRealNbaBothSeasons(onProgress) {
         const base = i * 1000;
         onProgress(base + done, seasons.length * 1000, label);
       }
-    });
+    }, league);
     results.push(r);
   }
   return {
@@ -5117,10 +5130,10 @@ window.runMaxPowerJointSearch = runMaxPowerJointSearch;
  */
 function seedMaxPowerHistoricalStore(opts) {
   opts = opts || {};
-  const league = String(opts.league || "nba").toLowerCase();
+  const league = String(opts.league || "wnba").toLowerCase();
   // Mobile-safe default: 24 games/season (was 60 — that froze the page)
   const perSeason = Math.max(12, Math.min(80, Number(opts.perSeason) || 24));
-  const seasons = Array.isArray(opts.seasons) ? opts.seasons : ["2024/25", "2025/26"];
+  const seasons = Array.isArray(opts.seasons) ? opts.seasons : ["2025", "2026"];
 
   function rand(a, b) { return a + Math.random() * (b - a); }
   function series(center, n, noise) {
@@ -5139,9 +5152,11 @@ function seedMaxPowerHistoricalStore(opts) {
     const finalAway = Math.round(awayLevel + rand(-10, 12));
     const actualTotal = finalHome + finalAway;
     const line = Math.round((actualTotal + rand(-8, 8)) * 2) / 2; // .0 or .5
-    const month = 10 + Math.floor(idx / 15);
+    // WNBA season runs May→Oct (single calendar year), not the NBA's Oct start.
+    const seasonStartMonth = league === "wnba" ? 5 : 10;
+    const month = seasonStartMonth + Math.floor(idx / 15);
     const day = 1 + (idx % 28);
-    const year = String(season).startsWith("2025") ? 2025 : 2024;
+    const year = parseInt(String(season).slice(0, 4), 10) || 2025;
     return {
       season, league,
       date: year + "-" + String(Math.min(month, 12)).padStart(2, "0") + "-" + String(day).padStart(2, "0"),
@@ -5180,17 +5195,18 @@ window.seedMaxPowerHistoricalStore = seedMaxPowerHistoricalStore;
 async function runMaxPowerBacktestFromButton(onProgress) {
   try {
     if (!g_historicalGamesStore.length) {
-      seedMaxPowerHistoricalStore({ perSeason: 24, seasons: ["2024/25", "2025/26"], league: "nba" });
+      seedMaxPowerHistoricalStore({ perSeason: 24, seasons: ["2025", "2026"], league: "wnba" });
     }
 
-    // Separate max-power lock per market (NBA only)
+    // Separate max-power lock per market (WNBA only)
     const MARKETS = ["ft", "h1", "team", "h1_team", "q1", "q2", "q3", "q4"];
     const allReports = [];
     const t0 = Date.now();
     // SAMPLE-SIZE FIX: matches the loadRealNbaBothSeasons change — more
     // seasons means more decisive plays per market, which the tightened
     // minDecisive/z-test gate in runMaxPowerJointSearch now requires.
-    const MAXPOWER_SEASONS = ["2019/20", "2020/21", "2021/22", "2022/23", "2023/24", "2024/25", "2025/26"];
+    // WNBA seasons are single calendar years (not NBA-style split years).
+    const MAXPOWER_SEASONS = ["2019", "2020", "2021", "2022", "2023", "2024", "2025", "2026"];
 
     for (let mi = 0; mi < MARKETS.length; mi++) {
       const market = MARKETS[mi];
@@ -5199,7 +5215,7 @@ async function runMaxPowerBacktestFromButton(onProgress) {
       }
       const report = await runMaxPowerJointSearch({
         seasons: MAXPOWER_SEASONS,
-        league: "nba",
+        league: "wnba",
         market: market,
         totalSamples: 1800,
         maxGames: 48,
