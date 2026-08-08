@@ -5788,6 +5788,59 @@ window.applyPhase2SimulatorProposalFromUI = function(siloKey, league) {
   }
 };
 
+// AUDIT FIX: calibrateConfidenceModel() (see issues #1, #2, #5, #7) has
+// always computed proposed coefficients and, as of the Platt-scaling fix,
+// a calibration correction alongside them — but unlike every other
+// proposal type in this file (tuner, engine constants, Phase 2 simulator),
+// there was never a function that actually promoted them to the live keys
+// getConfidenceWinProbability() reads. BB_CONFIDENCE_MODEL_COEFF_PROPOSED
+// just accumulated indefinitely with no "Apply" path. The model and its
+// Platt correction are applied together, atomically, so they can never
+// drift out of sync with each other (a stale Platt correction fit against
+// an old model would recalibrate the wrong thing).
+function getStoredConfidenceModelProposal() {
+  try {
+    const coeffRaw = localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_PROPOSED");
+    if (!coeffRaw) return null;
+    const coeff = JSON.parse(coeffRaw);
+    if (!coeff || !Object.keys(coeff).length) return null;
+    let platt = {};
+    try { platt = JSON.parse(localStorage.getItem("BB_PLATT_CALIB_PROPOSED") || "{}"); } catch (e) {}
+    let sampleSizes = {};
+    try { sampleSizes = JSON.parse(localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_N") || "{}"); } catch (e) {}
+    return { coeff, platt, sampleSizes, scopes: Object.keys(coeff) };
+  } catch (e) {
+    return null;
+  }
+}
+
+function applyConfidenceModelProposal() {
+  const proposal = getStoredConfidenceModelProposal();
+  if (!proposal) return false;
+  try {
+    localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF", JSON.stringify(proposal.coeff));
+    localStorage.setItem("BB_PLATT_CALIB", JSON.stringify(proposal.platt));
+    // Proposals here are raw coefficient objects (not wrapped with an
+    // "applied" flag like the tuner/constant proposals), so "no longer
+    // pending" is represented by removing the _PROPOSED keys outright
+    // rather than marking them applied in place.
+    localStorage.removeItem("BB_CONFIDENCE_MODEL_COEFF_PROPOSED");
+    localStorage.removeItem("BB_PLATT_CALIB_PROPOSED");
+  } catch (e) {
+    engineDebug("applyConfidenceModelProposal failed to write live keys: " + (e?.message || String(e)), { error: e });
+    return false;
+  }
+  engineDebug("Confidence model + Platt calibration manually applied via Configs panel", { scopes: proposal.scopes });
+  return true;
+}
+
+window.applyConfidenceModelProposalFromUI = function() {
+  if (!confirm("Apply the pending confidence model + calibration proposal? This will overwrite the live coefficients used for every new pick.")) return;
+  if (applyConfidenceModelProposal()) {
+    if (typeof renderConfigsPanel === "function") renderConfigsPanel();
+  }
+};
+
 function getParam(key, league, market) {
   return getTunableParam(key, league, market);
 }
@@ -6343,20 +6396,30 @@ function getVerifiedConfig(league, marketKey) {
   return null;
 }
 
-function logPromotionEvent(league, paramKey, oldValue, newValue, zScore, brier) {
+// AUDIT FIX (issue #3 follow-up): this used to take a z-score straight from
+// testConfigurationSignificance(). Now that the gate is a paired bootstrap
+// (see runCoordinateAscentTuner), there is no z-score to pass — storing a
+// made-up substitute under a field still called "zScore" would mislabel
+// real evidence in BB_PROMOTION_HISTORY, which the Configs panel displays
+// directly to a human deciding whether to trust a promotion. Store the
+// actual bootstrap p-value and CI instead.
+function logPromotionEvent(league, paramKey, oldValue, newValue, bootstrapStats, brier) {
   try {
     const key = "BB_PROMOTION_HISTORY";
     let history = [];
     const raw = localStorage.getItem(key);
     if (raw) history = JSON.parse(raw) || [];
     
+    const stats = bootstrapStats || {};
     history.push({
       ts: new Date().toISOString(),
       league: league || "global",
       paramKey,
       oldValue,
       newValue,
-      zScore: parseFloat(zScore.toFixed(3)),
+      bootstrapP: isFinite(stats.p) ? parseFloat(stats.p.toFixed(4)) : null,
+      bootstrapCiLow: isFinite(stats.ciLow) ? parseFloat(stats.ciLow.toFixed(4)) : null,
+      bootstrapCiHigh: isFinite(stats.ciHigh) ? parseFloat(stats.ciHigh.toFixed(4)) : null,
       brier: parseFloat(brier.toFixed(5))
     });
     
@@ -7030,7 +7093,10 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
               brier: challengerValCalibration.brier, rmse: challengerRMSE
             };
             promotions.push(promo);
-            logPromotionEvent(targetLeague, key, originalValue, bestValue, boot.meanDelta / ((boot.ciHigh - boot.ciLow) || 1), challengerValCalibration.brier);
+            // AUDIT FIX (issue #3 follow-up): pass the real bootstrap object
+            // through, not a fabricated stand-in for the old z-score — see
+            // logPromotionEvent's own comment for why that mattered.
+            logPromotionEvent(targetLeague, key, originalValue, bestValue, boot, challengerValCalibration.brier);
             // AUDIT FIX (issue #8): persist the full paired per-game record
             // for this candidate, not just the summary line, so the decision
             // can be replayed/audited later.
@@ -12651,7 +12717,7 @@ function renderConfigsPanel() {
             <div class="tracker-review-area">${row.label}</div>
             <div class="tracker-review-status candidate">${row.proposal.promotions.length} PARAM(S) PROPOSED</div>
           </div>
-          <div class="tracker-review-text">${safeText(row.proposal.promotions.map(p => `${p.key}: ${p.old}->${p.val} (z=${p.z.toFixed(2)})`).join(", "))}</div>
+          <div class="tracker-review-text">${safeText(row.proposal.promotions.map(p => `${p.key}: ${p.old}->${p.val} (bootstrap p=${(p.p ?? 1).toFixed(3)})`).join(", "))}</div>
           <div class="tracker-review-action" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
             <span>Proposed ${safeText(new Date(row.proposal.ts).toLocaleString())}</span>
             <button onclick="${row.onclick}" style="background:#3a9c35; color:#fff; border:none; padding:4px 10px; font-weight:800; font-size:10px; cursor:pointer;">✅ Apply</button>
@@ -12698,6 +12764,41 @@ function renderConfigsPanel() {
       });
     }
     html += `
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // AUDIT FIX: calibrateConfidenceModel() has computed proposed coefficients
+  // (and, per issue #2, a Platt-scaling calibration correction) for a
+  // while, but there was never a card in this panel to review or apply
+  // them — every other proposal type here has one. See
+  // getStoredConfidenceModelProposal()'s comment for the full context.
+  const _pendingConfidenceProposal = getStoredConfidenceModelProposal();
+  if (_pendingConfidenceProposal) {
+    const _scopeList = _pendingConfidenceProposal.scopes
+      .map(s => `${safeText(s)} (n=${Number(_pendingConfidenceProposal.sampleSizes?.[s] || 0)})`)
+      .join(", ");
+    html += `
+      <div class="tracker-analytics-card" style="margin-top:12px; border-color:#4ea9ff;">
+        <div class="tracker-analytics-card-head" style="background: linear-gradient(90deg, #1a2f4a 0%, #111 100%);">
+          <div class="tracker-analytics-card-title" style="color:#4ea9ff;">🧠 Pending Confidence Model + Calibration</div>
+          <div class="tracker-analytics-card-meta">${_pendingConfidenceProposal.scopes.length} scope(s) proposed</div>
+        </div>
+        <div class="tracker-analytics-card-body">
+          <div class="tracker-review-list">
+            <div class="tracker-review-row">
+              <div class="tracker-review-top">
+                <div class="tracker-review-area">Win-probability model + Platt calibration</div>
+                <div class="tracker-review-status candidate">REFIT PROPOSED</div>
+              </div>
+              <div class="tracker-review-text">Scopes: ${safeText(_scopeList)}</div>
+              <div class="tracker-review-action" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                <span>Applies both the shrunk coefficients and their calibration correction together</span>
+                <button onclick="applyConfidenceModelProposalFromUI()" style="background:#3a9c35; color:#fff; border:none; padding:4px 10px; font-weight:800; font-size:10px; cursor:pointer;">✅ Apply</button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -12772,6 +12873,17 @@ function renderConfigsPanel() {
           <div class="tracker-review-list">
     `;
     history.slice(-10).reverse().forEach(evt => {
+      // AUDIT FIX (issue #3 follow-up): BB_PROMOTION_HISTORY entries logged
+      // before this patch carry a real evt.zScore; entries logged after it
+      // carry evt.bootstrapP/ciLow/ciHigh instead (there is no z-score once
+      // the gate is a paired bootstrap — see logPromotionEvent). Render
+      // whichever shape a given entry actually has instead of assuming one,
+      // so old history doesn't throw and doesn't get silently mislabeled.
+      const _evidenceText = isFinite(evt.bootstrapP)
+        ? `bootstrap p = ${evt.bootstrapP.toFixed(3)}, 95% CI [${(evt.bootstrapCiLow ?? 0).toFixed(3)}, ${(evt.bootstrapCiHigh ?? 0).toFixed(3)}]`
+        : isFinite(evt.zScore)
+          ? `z-score = ${evt.zScore.toFixed(2)} (legacy)`
+          : "evidence unavailable";
       html += `
         <div class="tracker-review-row" style="font-size:10px;">
           <div class="tracker-review-top">
@@ -12782,7 +12894,7 @@ function renderConfigsPanel() {
             Value updated from <strong>${evt.oldValue}</strong> to <strong>${evt.newValue}</strong> for <strong>${safeText(String(evt.league || "").toUpperCase())}</strong>.
           </div>
           <div style="font-size:8px; color:var(--muted); margin-top:2px;">
-            Evidence: z-score = ${evt.zScore.toFixed(2)} (OOS) | Brier improvement | ${new Date(evt.ts).toLocaleString()}
+            Evidence: ${safeText(_evidenceText)} (OOS) | Brier improvement | ${new Date(evt.ts).toLocaleString()}
           </div>
         </div>
       `;
