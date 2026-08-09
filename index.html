@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10378,22 +10379,35 @@ function applySmartLineToPick(pickRow, rawInput, league) {
     };
   }
 
-  // FIX (smart-line over-blocking): previously required the projection to
-  // clear the FAR end of the ENTIRE entered range (meta.high/meta.low), with
-  // no relation to the market's own edge threshold. A wide range (e.g. a
-  // 26-pt FT spread) could erase a genuinely strong edge (9.0 pts, well past
-  // the 5.5-pt WNBA FT threshold) entirely, forcing NO PLAY on a pick nothing
-  // else in the model was flagging as weak. The conservative cushion is now
-  // capped to the market's own configured edge-point threshold, so thin/
-  // marginal edges are still filtered but edges that already clear the bar
-  // by a wide margin can no longer be wiped out purely by a wide range.
+  // FIX (smart-line rework): cap + real threshold gate + UNDER asymmetry +
+  // hard NO PLAY on absurd ranges. No UI note.
+  const baseThresh = Number(getLeagueEdgePointThreshold(league, pickRow.marketKey)) || 0;
+  const _underFactor = (typeof getParam === "function" ? getParam("underEdgeFactor", league) : null) ?? (typeof UNDER_EDGE_FACTOR !== "undefined" ? UNDER_EDGE_FACTOR : 1.2);
+  const thresh = side === "under" ? baseThresh * _underFactor : baseThresh;
+  const halfWidth = (meta.high - meta.low) / 2;
+  const widthCap = Math.max(thresh * 2, 6);
+
+  if (halfWidth > widthCap) {
+    return {
+      ...pickRow,
+      decisionLine: pickRow.line,
+      trackerLine: pickRow.line,
+      displayLineUsed: pickRow.line,
+      displayEdge: pickRow.edge,
+      displayPick: "NO PLAY",
+      bufferedPickText: pickRow.pick,
+      smartLineMeta: { ...meta, skipped: "range_too_wide", halfWidth, thresh, widthCap }
+    };
+  }
+
   const rawConservativeLine = side === "over" ? meta.high : meta.low;
-  const smartLineCap = Number(getLeagueEdgePointThreshold(league, pickRow.marketKey)) || 0;
   const conservativeLine = side === "over"
-    ? Math.min(rawConservativeLine, meta.mid + smartLineCap)
-    : Math.max(rawConservativeLine, meta.mid - smartLineCap);
+    ? Math.min(rawConservativeLine, meta.mid + thresh)
+    : Math.max(rawConservativeLine, meta.mid - thresh);
   const conservativeEdge = pickRow.proj - conservativeLine;
-  const stillQualifies = side === "over" ? conservativeEdge > 0 : conservativeEdge < 0;
+  const stillQualifies = side === "over"
+    ? conservativeEdge >= thresh
+    : conservativeEdge <= -thresh;
 
   return {
     ...pickRow,
@@ -10403,7 +10417,7 @@ function applySmartLineToPick(pickRow, rawInput, league) {
     displayEdge: conservativeEdge,
     displayPick: stillQualifies ? pickRow.pick : "NO PLAY",
     bufferedPickText: pickRow.pick,
-    smartLineMeta: meta
+    smartLineMeta: { ...meta, conservativeLine, thresh, stillQualifies }
   };
 }
 
@@ -22146,7 +22160,12 @@ async function executeRetrospectiveBacktest(gameId) {
       tdPred.className = "pred-noplay";
       tdPred.style.whiteSpace = "nowrap";
       tdPred.style.fontSize = "11px";
-      tdPred.textContent = "NO PLAY";
+      // FIX: smart-line-forced NO PLAYs now carry a human-readable p.note
+      // explaining why (range too wide, or edge died on the conservative
+      // side of the range). Surface it as a hover tooltip instead of a bare
+      // "NO PLAY" with no explanation.
+      tdPred.textContent = p.note ? "NO PLAY \u24d8" : "NO PLAY";
+      if (p.note) tdPred.title = p.note;
       
       tdPred.style.opacity = "0.55";
     } else {
