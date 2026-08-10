@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5277,19 +5276,19 @@ const TUNABLE_PARAM_REGISTRY = {
   // removing them changes no runtime behavior.
   confidenceAThresh: {
     value: 0.66, min: 0.55, max: 0.80, type: "scalar",
-    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b", "winner", "handicap", "handicap_h1", "handicap_h2"],
     description: "Win-probability cutoff for confidence grade A",
     lastVerifiedAt: null
   },
   confidenceBThresh: {
     value: 0.58, min: 0.50, max: 0.70, type: "scalar",
-    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b", "winner", "handicap", "handicap_h1", "handicap_h2"],
     description: "Win-probability cutoff for confidence grade B",
     lastVerifiedAt: null
   },
   confidenceCThresh: {
     value: 0.51, min: 0.45, max: 0.60, type: "scalar",
-    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b"],
+    scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4", "team_a", "team_b", "winner", "handicap", "handicap_h1", "handicap_h2"],
     description: "Win-probability cutoff for confidence grade C",
     lastVerifiedAt: null
   },
@@ -5345,6 +5344,37 @@ const TUNABLE_PARAM_REGISTRY = {
     value: 3.0, min: 1.0, max: 10.0, type: "scalar",
     scope: "global", appliesTo: ["q1", "q2", "q3", "q4"],
     description: "Point edge threshold required for Quarter picks",
+    lastVerifiedAt: null
+  },
+
+  // MARKET EXPANSION BATCH 1: Winner + Handicap point-threshold registration.
+  // Mirrors the edgeFTPointThreshold/edgeH1PointThreshold pattern exactly.
+  // handicap_h1/handicap_h2 get their own tunable thresholds (not shared
+  // with the full-game handicap) because edgeFTPointThreshold(5.0) vs.
+  // edgeH1PointThreshold(6.0) already prove half-game markets need
+  // independently-tunable thresholds rather than a shared value.
+  edgeWinnerPointThreshold: {
+    value: 5.0, min: 1.0, max: 20.0, type: "scalar",
+    scope: "global", appliesTo: ["winner"],
+    description: "Margin-projection point threshold (vs. combined margin volatility) required before a Winner pick is made",
+    lastVerifiedAt: null
+  },
+  edgeHandicapPointThreshold: {
+    value: 5.0, min: 1.0, max: 15.0, type: "scalar",
+    scope: "global", appliesTo: ["handicap"],
+    description: "Point edge threshold required for full-game Handicap picks (edge = marginProjection + handicapLine)",
+    lastVerifiedAt: null
+  },
+  edgeHandicapH1PointThreshold: {
+    value: 4.0, min: 1.0, max: 12.0, type: "scalar",
+    scope: "global", appliesTo: ["handicap_h1"],
+    description: "Point edge threshold required for 1H Handicap picks (WNBA-only market)",
+    lastVerifiedAt: null
+  },
+  edgeHandicapH2PointThreshold: {
+    value: 4.0, min: 1.0, max: 12.0, type: "scalar",
+    scope: "global", appliesTo: ["handicap_h2"],
+    description: "Point edge threshold required for 2H Handicap picks (WNBA-only market)",
     lastVerifiedAt: null
   },
 
@@ -7586,16 +7616,40 @@ function getLeagueEdgePointThreshold(league, marketKey) {
   else if (marketKey === "q1_team_a" || marketKey === "q1_team_b") key = "q";
   else if (marketKey && marketKey.startsWith("q")) key = "q";
   else if (marketKey === "h1") key = "h1";
+  // MARKET EXPANSION BATCH 1: winner/handicap/handicap_h1/handicap_h2 must
+  // be bucketed explicitly too, for the exact same reason the AUDIT FIX
+  // above exists — without these branches they'd silently fall into the
+  // catch-all "ft" bucket and pull the FT threshold instead of their own.
+  else if (marketKey === "winner") key = "winner";
+  else if (marketKey === "handicap") key = "handicap";
+  else if (marketKey === "handicap_h1") key = "handicap_h1";
+  else if (marketKey === "handicap_h2") key = "handicap_h2";
   else key = "ft";
 
   const paramKey =
     key === "ft"   ? "edgeFTPointThreshold" :
     key === "h1"   ? "edgeH1PointThreshold" :
     key === "team" ? "edgeTeamPointThreshold" :
-    key === "q"    ? "edgeQPointThreshold" : null;
+    key === "q"    ? "edgeQPointThreshold" :
+    key === "winner"      ? "edgeWinnerPointThreshold" :
+    key === "handicap"    ? "edgeHandicapPointThreshold" :
+    key === "handicap_h1" ? "edgeHandicapH1PointThreshold" :
+    key === "handicap_h2" ? "edgeHandicapH2PointThreshold" : null;
   const staticRow = LEAGUE_EDGE_POINT_THRESHOLDS[lk] || LEAGUE_EDGE_POINT_THRESHOLDS.default;
   const staticVal = Number(staticRow?.[key]);
-  const staticDefault = isFinite(staticVal) && staticVal > 0 ? staticVal : 5.0;
+  // MARKET EXPANSION BATCH 1: winner/handicap/handicap_h1/handicap_h2 have no
+  // column in LEAGUE_EDGE_POINT_THRESHOLDS (that 90-row table is deliberately
+  // left untouched), so staticVal is always NaN for them and this fallback
+  // always fires. Changed from a flat hardcoded 5.0 to the new market's own
+  // registered default, so handicap_h1/handicap_h2 (registered at 4.0, not
+  // 5.0) fall back correctly instead of silently borrowing FT's number.
+  // Behavior for ft/h1/team/q is unchanged — every existing row already has
+  // all four keys, so this fallback path was never actually reachable for them.
+  const staticDefault = isFinite(staticVal) && staticVal > 0
+    ? staticVal
+    : (paramKey && TUNABLE_PARAM_REGISTRY[paramKey] && isFinite(TUNABLE_PARAM_REGISTRY[paramKey].value)
+        ? TUNABLE_PARAM_REGISTRY[paramKey].value
+        : 5.0);
 
   const leagueOverride = paramKey ? g_tunableParamLeagueOverrides?.[lk]?.[paramKey] : null;
   if (leagueOverride && isFinite(Number(leagueOverride.value)) && Number(leagueOverride.value) > 0) {
