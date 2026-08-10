@@ -10511,6 +10511,23 @@ function parseMarketRangeMeta(val) {
   return null;
 }
 
+// MARKET EXPANSION BATCH 3: handicap lines are signed (negative = home
+// favored, zero = pick'em) — parseMarketRangeMeta's regex has no minus sign
+// and explicitly rejects x<=0, by design, since every other market here is
+// a positive total. Reusing it for handicap input would silently drop every
+// favored-side line. This is a standalone parser, not a range parser: a
+// handicap line is always one signed number, never a "-4.5 - 4.5" range.
+function parseHandicapLine(val) {
+  if (!val || !String(val).trim()) return null;
+  const raw = normalizeDashes(String(val).trim());
+  const normalizeLine = num => Math.round(num * 2) / 2;
+  const match = raw.match(/^(-?\d{1,3}(?:\.\d+)?)$/);
+  if (!match) return null;
+  const x = parseFloat(match[1]);
+  if (!isFinite(x)) return null;
+  return normalizeLine(x);
+}
+
 function getRawMarketInputMap() {
   return {
     ft: document.getElementById("ftMarket")?.value || "",
@@ -15692,6 +15709,48 @@ function getConfidenceGrade(params) {
   if (!isFinite(winProb)) {
     engineDebug("getConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
       league, marketKey: params?.marketKey, edgePct, volRatio, sampleTier, hasH2H
+    });
+    return "NaN";
+  }
+
+  let learnedThresholds = null;
+  try {
+    const storedThresholds = localStorage.getItem("BB_CONFIDENCE_THRESHOLDS");
+    if (storedThresholds) learnedThresholds = JSON.parse(storedThresholds);
+  } catch(e) {}
+
+  const threshA = learnedThresholds?.aThresh ?? getParam("confidenceAThresh", league) ?? 0.66;
+  const threshB = learnedThresholds?.bThresh ?? getParam("confidenceBThresh", league) ?? 0.58;
+  const threshC = learnedThresholds?.cThresh ?? getParam("confidenceCThresh", league) ?? 0.51;
+
+  if (winProb >= threshA) return "A";
+  if (winProb >= threshB) return "B";
+  if (winProb >= threshC) return "C";
+  return "D";
+}
+
+// MARKET EXPANSION BATCH 3: margin-market twin of getConfidenceGrade above.
+// Same calibrated model, same learned-threshold read path — the only
+// difference is this takes pre-computed marginEdgePct/marginVolRatio
+// (from getMarginConfidenceInputs) instead of recomputing edge/line
+// internally, because getConfidenceGrade's internal `line<=0 => "NaN"`
+// gate would reject every favored-side handicap line.
+function getMarginConfidenceGrade(params) {
+  const {
+    pick, marginEdgePct, marginVolRatio, sampleTier, hasH2H, trap,
+    league = ""
+  } = params || {};
+
+  if (!pick || pick === "NO PLAY" || !isFinite(marginEdgePct)) {
+    return "NaN";
+  }
+
+  const volRatio = isFinite(marginVolRatio) ? marginVolRatio : 0.5;
+  let winProb = getConfidenceWinProbability(null, marginEdgePct, volRatio, sampleTier, hasH2H, !!trap, league);
+
+  if (!isFinite(winProb)) {
+    engineDebug("getMarginConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
+      league, marketKey: params?.marketKey, marginEdgePct, volRatio, sampleTier, hasH2H
     });
     return "NaN";
   }
@@ -22411,6 +22470,13 @@ function extractInputs(league) {
     const v = parseMarketLine((document.getElementById(id)?.value || "").trim());
     return isFinite(v) ? v : null;
   }
+  // MARKET EXPANSION BATCH 3: mirrors readLine() but uses parseHandicapLine
+  // instead of parseMarketLine, since handicap input must accept negative
+  // and zero values that parseMarketLine rejects by design.
+  function readHandicapLine(id) {
+    const v = parseHandicapLine((document.getElementById(id)?.value || "").trim());
+    return isFinite(v) ? v : null;
+  }
   function readSeries(id) {
     return ((document.getElementById(id)?.value || "").trim()) ? parseGames(id) : null;
   }
@@ -22451,6 +22517,10 @@ function extractInputs(league) {
     h1bLine:   readLine("h1TeamBMarket"),
     highQLine: readLine("highQTotalMarket"),
     lowQLine:  readLine("lowQTotalMarket"),
+    // MARKET EXPANSION BATCH 3: no HTML input wired to id="handicapMarket"
+    // yet (that's a later batch) — this reads null gracefully until then,
+    // same as any other market line before its input exists.
+    handicapLine: readHandicapLine("handicapMarket"),
   };
   return { parsed, lines };
 }
@@ -22722,7 +22792,9 @@ const finalLines = Object.freeze({
   h1bLine: lines.h1bLine,
   highQLine: lines.highQLine,
   lowQLine: lines.lowQLine,
-  raceRange: lines.raceRange
+  raceRange: lines.raceRange,
+  // MARKET EXPANSION BATCH 3
+  handicapLine: lines.handicapLine
 });
 
 const memoryFlags = {
@@ -22824,6 +22896,21 @@ const h1Calc = compute1HProjection({
         let h1Pick = getPick(h1Calc.h1Edge, h1Line, league, "h1", { aSc: h1Calc.aS1, bSc: h1Calc.bS1 });
         let aPick = getPick(ftCalc.aEdge, aLine, league, "team_a", { teamSc: ftCalc.aS, blowoutGap: ftCalc.blowoutGap });
         let bPick = getPick(ftCalc.bEdge, bLine, league, "team_b", { teamSc: ftCalc.bS, blowoutGap: ftCalc.blowoutGap });
+        // MARKET EXPANSION BATCH 3: Winner + full-game Handicap, built
+        // directly from ftCalc's own projAFT/projBFT/aVol/bVol — the margin
+        // is already fully computed inside computeFTProjection, so no
+        // separate projection pass is needed. Uses the Batch 2 margin-safe
+        // pick engine (getMarginPick, not getPick) because handicapLine is
+        // routinely negative or zero, which getPick's line<=0 gate would
+        // otherwise silently reject.
+        const marginProjectionFT = computeMarginProjection(ftCalc.projAFT, ftCalc.projBFT);
+        const combinedMarginVolFT = computeCombinedMarginVolatility(ftCalc.aVol, ftCalc.bVol);
+        const winnerEdge = marginProjectionFT;
+        let winnerPick = getMarginPick(winnerEdge, league, "winner");
+        const handicapEdge = (isFinite(marginProjectionFT) && isFinite(finalLines.handicapLine))
+          ? marginProjectionFT + finalLines.handicapLine
+          : NaN;
+        let handicapPick = getMarginPick(handicapEdge, league, "handicap");
         const h1aEdge = (isFinite(h1Calc.projA1H) && isFinite(finalLines.h1aLine) && finalLines.h1aLine > 0) ? h1Calc.projA1H - finalLines.h1aLine : NaN;
         const h1bEdge = (isFinite(h1Calc.projB1H) && isFinite(finalLines.h1bLine) && finalLines.h1bLine > 0) ? h1Calc.projB1H - finalLines.h1bLine : NaN;
         let h1aPick = getPick(h1aEdge, finalLines.h1aLine, league, "h1", { teamSc: h1Calc.aS1 });
