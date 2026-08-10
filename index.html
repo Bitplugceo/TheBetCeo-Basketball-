@@ -15489,6 +15489,75 @@ function getPick(edge, line, league, marketKey, context = {}) {
   return markets.findIndex(m => m === best);
 }
 
+// ===================================================================
+// MARKET EXPANSION BATCH 2: margin-based pick/confidence engine for
+// Winner + Handicap (full/1H/2H). Deliberately built as NEW functions
+// rather than modifying getPick/detectTrap/selectLock — those three all
+// hard-assume `line` is a positive market total (line<=0 => NO PLAY,
+// selectLock requires line>0), which is never true for a signed margin
+// line like -7.5 or a lineless Winner market. Reusing them as-is would
+// have silently killed every favored-side Handicap pick.
+//
+// Calibration note: marginEdgePct below is deliberately |edge| divided
+// by the game's own FT/H1/2H total projection, NOT by combinedMarginStdDev.
+// A z-score-style ratio sits on a completely different numeric scale
+// (roughly 0-3) than what getConfidenceWinProbability's fitted
+// coefficients expect (pivoted at 0.060, the same scale totals edgePct
+// lives on, roughly 0-0.15). Feeding it a z-score would saturate the
+// logistic model to a false ~0.98 confidence for almost any real signal.
+// Dividing by the game's own total-scoring scale keeps marginEdgePct
+// dimensionally identical to totals edgePct, so Winner/Handicap share the
+// exact same per-league coefficient scope as ft/h1/team/q — same tuner,
+// same calibrateConfidenceModel(), same Platt correction — with no risk
+// of corrupting the totals markets' fitted coefficients with an
+// out-of-scale input.
+// ===================================================================
+function computeMarginProjection(teamAProj, teamBProj) {
+  if (!isFinite(teamAProj) || !isFinite(teamBProj)) return NaN;
+  return teamAProj - teamBProj;
+}
+
+function computeCombinedMarginVolatility(stdDevA, stdDevB) {
+  const a = isFinite(stdDevA) ? stdDevA : 0;
+  const b = isFinite(stdDevB) ? stdDevB : 0;
+  return Math.sqrt(a * a + b * b);
+}
+
+function getMarginPick(edge, league, marketKey) {
+  if (isNaN(edge)) return "NO PLAY";
+  if (edge === 0) return "NO PLAY";
+
+  const absEdge = Math.abs(edge);
+  if (absEdge < 0.5) return "NO PLAY";
+
+  const pointThreshold = getLeagueEdgePointThreshold(league, marketKey);
+  // No underEdgeFactor asymmetry here: that factor exists because UNDER
+  // totals picks carry real, documented extra risk (garbage-time/blowout
+  // pace collapse). There's no equivalent directional risk between "home
+  // covers" and "away covers" a spread, so applying it here would be an
+  // unjustified asymmetry rather than a modeled one.
+  if (absEdge < pointThreshold) return "NO PLAY";
+
+  return edge > 0 ? "HOME" : "AWAY";
+}
+
+function getMarginConfidenceInputs(edge, referenceScale, combinedStdDev, marginVolLimit) {
+  const safeScale = (isFinite(referenceScale) && referenceScale > 0) ? referenceScale : NaN;
+  const marginEdgePct = (isFinite(edge) && isFinite(safeScale)) ? Math.abs(edge) / safeScale : NaN;
+  const safeLimit = (isFinite(marginVolLimit) && marginVolLimit > 0) ? marginVolLimit : NaN;
+  const marginVolRatio = (isFinite(combinedStdDev) && isFinite(safeLimit)) ? combinedStdDev / safeLimit : NaN;
+  return { marginEdgePct, marginVolRatio };
+}
+
+function detectMarginTrap(edge, referenceScale, league, marketKey, combinedStdDev, marginVolLimit) {
+  if (isNaN(edge) || edge === 0) return false;
+  const inputs = getMarginConfidenceInputs(edge, referenceScale, combinedStdDev, marginVolLimit);
+  if (!isFinite(inputs.marginEdgePct) || !isFinite(inputs.marginVolRatio)) return false;
+  // Mirrors detectTrap's exact trap-zone bounds (volRatio>=1.15, edgePct in
+  // (0.02,0.06)) — same zone definition, margin-safe inputs.
+  return inputs.marginVolRatio >= 1.15 && inputs.marginEdgePct > 0.02 && inputs.marginEdgePct < 0.06;
+}
+
 function computeLineupQuality(roster, injuryMeta) {
   let score = 1.0;
   const injImpact = isFinite(Number(injuryMeta?.scoringMult)) ? (1 - Number(injuryMeta.scoringMult)) : 0;
