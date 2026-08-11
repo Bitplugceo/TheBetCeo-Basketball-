@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10400,18 +10401,35 @@ function calculateAdvancedMetrics(sMapMine, sMapOpp, ptsMine, ptsOpp, regMinutes
   const orbO = _readBoxStat(sMapOpp, ORB_ALIASES);
   const tovO = _readBoxStat(sMapOpp, TOV_ALIASES);
 
-  if (!(isFinite(fgaM) && fgaM > 0 && isFinite(fgaO) && fgaO > 0)) return null;
   if (!(isFinite(ptsMine) && ptsMine > 0 && isFinite(ptsOpp) && ptsOpp > 0)) return null;
 
-  const possM = fgaM + 0.44 * (isFinite(ftaM) ? ftaM : 0) - (isFinite(orbM) ? orbM : 0) + (isFinite(tovM) ? tovM : 0);
-  const possO = fgaO + 0.44 * (isFinite(ftaO) ? ftaO : 0) - (isFinite(orbO) ? orbO : 0) + (isFinite(tovO) ? tovO : 0);
-  if (!(possM > 40 && possO > 40)) return null;
+  // Prefer real boxscore possessions when FGA is present.
+  let pace, ortg, drtg, poss;
+  if (isFinite(fgaM) && fgaM > 0 && isFinite(fgaO) && fgaO > 0) {
+    const possM = fgaM + 0.44 * (isFinite(ftaM) ? ftaM : 0) - (isFinite(orbM) ? orbM : 0) + (isFinite(tovM) ? tovM : 0);
+    const possO = fgaO + 0.44 * (isFinite(ftaO) ? ftaO : 0) - (isFinite(orbO) ? orbO : 0) + (isFinite(tovO) ? tovO : 0);
+    if (possM > 40 && possO > 40) {
+      poss = (possM + possO) / 2;
+      const mins = isFinite(regMinutes) && regMinutes > 0 ? regMinutes : 48;
+      pace = poss * (48 / mins);
+      ortg = 100 * ptsMine / poss;
+      drtg = 100 * ptsOpp / poss;
+    }
+  }
 
-  const poss = (possM + possO) / 2;
-  const mins = isFinite(regMinutes) && regMinutes > 0 ? regMinutes : 48;
-  const pace = poss * (48 / mins);
-  const ortg = 100 * ptsMine / poss;
-  const drtg = 100 * ptsOpp / poss;
+  // FALLBACK: no usable FGA (common on some ESPN historical summaries).
+  // Estimate pace from total points vs league-average total, then derive
+  // team ortg/drtg from share of points. Better than zeros (mid-collapse).
+  if (!(isFinite(pace) && pace > 0 && isFinite(ortg) && isFinite(drtg))) {
+    const LEAGUE_AVG_TOTAL = 224;
+    const LEAGUE_AVG_PACE = 99.5;
+    const totalPts = ptsMine + ptsOpp;
+    const paceEst = LEAGUE_AVG_PACE * (totalPts / LEAGUE_AVG_TOTAL);
+    poss = paceEst;
+    pace = paceEst;
+    ortg = 100 * ptsMine / Math.max(poss, 1);
+    drtg = 100 * ptsOpp / Math.max(poss, 1);
+  }
 
   if (!(isFinite(pace) && pace > 0 && isFinite(ortg) && ortg > 0 && isFinite(drtg) && drtg > 0)) return null;
   if (pace < 70 || pace > 130) return null;
@@ -10421,7 +10439,7 @@ function calculateAdvancedMetrics(sMapMine, sMapOpp, ptsMine, ptsOpp, regMinutes
     pace: Number(pace.toFixed(2)),
     ortg: Number(ortg.toFixed(2)),
     drtg: Number(drtg.toFixed(2)),
-    possessions: Number(poss.toFixed(2))
+    possessions: Number((poss || pace).toFixed(2))
   };
 }
 
@@ -21151,7 +21169,7 @@ const BT_ACCURACY_TARGETS = {
   qTeamMAE: 4.8
 };
 
-function computeBacktestAccuracyScore(calibration) {
+function computeBacktestAccuracyScore(calibration, marketMetrics) {
   if (!calibration) return null;
   const bandScore = (mae, target) => {
     if (!isFinite(mae) || !isFinite(target) || target <= 0) return null;
@@ -21166,7 +21184,20 @@ function computeBacktestAccuracyScore(calibration) {
     qTeam: bandScore(calibration.qTeamMAE, BT_ACCURACY_TARGETS.qTeamMAE)
   };
   const valid = Object.values(breakdown).filter(v => v !== null && isFinite(v));
-  const composite = valid.length ? valid.reduce((s, v) => s + v, 0) / valid.length : null;
+  let composite = valid.length ? valid.reduce((s, v) => s + v, 0) / valid.length : null;
+
+  // When real Vegas lines are attached, blend ATS + O/U into the score so
+  // joint search optimizes betting edge, not only MAE.
+  if (marketMetrics && isFinite(marketMetrics.atsWinRate) && isFinite(marketMetrics.ouWinRate) && marketMetrics.nWithMarket >= 50) {
+    const atsScore = Math.max(0, Math.min(100, (marketMetrics.atsWinRate - 0.45) / 0.15 * 100));
+    const ouScore  = Math.max(0, Math.min(100, (marketMetrics.ouWinRate  - 0.45) / 0.15 * 100));
+    const marketBlend = 0.55 * atsScore + 0.45 * ouScore;
+    if (isFinite(composite)) composite = 0.55 * composite + 0.45 * marketBlend;
+    else composite = marketBlend;
+    breakdown.marketAts = atsScore;
+    breakdown.marketOu = ouScore;
+  }
+
   return { composite, breakdown, targets: BT_ACCURACY_TARGETS };
 }
 
