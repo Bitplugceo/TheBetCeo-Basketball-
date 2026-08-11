@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17004,7 +17003,13 @@ function getPick(edge, line, league, marketKey, context = {}) {
 
     function selectLock(markets) {
   const valid = markets.filter(m =>
-    m && m.pick !== "NO PLAY" && m.pick !== "—" && !isNaN(m.edge) && m.line > 0
+    m && m.pick !== "NO PLAY" && m.pick !== "—" && !isNaN(m.edge)
+    // MARKET EXPANSION BATCH 4: Winner has no line at all (always null) and
+    // Handicap lines are routinely negative/zero, so `m.line > 0` alone
+    // would permanently exclude both from ever being selected as the lock.
+    // marginEdgePct (set only on Winner/Handicap pick objects) is the
+    // fallback qualifier for those two; every other market is untouched.
+    && (m.line > 0 || isFinite(m.marginEdgePct))
     && !m.lockRestricted
   );
 
@@ -17015,8 +17020,8 @@ function getPick(edge, line, league, marketKey, context = {}) {
     const bGrade = getConfidenceRank(b.confidenceGrade || b.confidence || "");
     if (bGrade !== aGrade) return bGrade - aGrade;
 
-    const aEdgePct = Math.abs(a.edge / a.line) * 100;
-    const bEdgePct = Math.abs(b.edge / b.line) * 100;
+    const aEdgePct = (a.line > 0) ? Math.abs(a.edge / a.line) * 100 : (isFinite(a.marginEdgePct) ? a.marginEdgePct * 100 : 0);
+    const bEdgePct = (b.line > 0) ? Math.abs(b.edge / b.line) * 100 : (isFinite(b.marginEdgePct) ? b.marginEdgePct * 100 : 0);
 
     const aFullModelBonus = a.fullModel ? 0.6 : 0;
     const bFullModelBonus = b.fullModel ? 0.6 : 0;
@@ -25498,6 +25503,37 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     // only the FT object attached this field, and nothing ever displayed it).
     const _coeffFitted = isConfidenceCoeffFitted(league);
 
+    // MARKET EXPANSION BATCH 4: Winner + Handicap confidence grading, using
+    // the Batch 2/3 margin-safe engine. referenceScale = ftCalc.ftProj (see
+    // Batch 2's calibration note for why this, not combinedMarginVolFT, is
+    // what marginEdgePct is measured against — keeps it on the same numeric
+    // scale as totals edgePct so it shares FT/H1's fitted coefficients.
+    const winnerMarginInputs = getMarginConfidenceInputs(winnerEdge, ftCalc.ftProj, combinedMarginVolFT, getMarketVolLimit(league, "ft"));
+    const winnerTrap = detectMarginTrap(winnerEdge, ftCalc.ftProj, league, "winner", combinedMarginVolFT, getMarketVolLimit(league, "ft"));
+    const winnerConfidence = getMarginConfidenceGrade({
+      pick: winnerPick,
+      marginEdgePct: winnerMarginInputs.marginEdgePct,
+      marginVolRatio: winnerMarginInputs.marginVolRatio,
+      sampleTier: ftCalc.ftSampleTier,
+      hasH2H: ftCalc.ftHasH2H,
+      trap: winnerTrap,
+      marketKey: "winner",
+      league
+    });
+
+    const handicapMarginInputs = getMarginConfidenceInputs(handicapEdge, ftCalc.ftProj, combinedMarginVolFT, getMarketVolLimit(league, "ft"));
+    const handicapTrap = detectMarginTrap(handicapEdge, ftCalc.ftProj, league, "handicap", combinedMarginVolFT, getMarketVolLimit(league, "ft"));
+    const handicapConfidence = getMarginConfidenceGrade({
+      pick: handicapPick,
+      marginEdgePct: handicapMarginInputs.marginEdgePct,
+      marginVolRatio: handicapMarginInputs.marginVolRatio,
+      sampleTier: ftCalc.ftSampleTier,
+      hasH2H: ftCalc.ftHasH2H,
+      trap: handicapTrap,
+      marketKey: "handicap",
+      league
+    });
+
     const picks = [
   {
     _idx: 0,
@@ -25611,6 +25647,53 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     bVenueAdjustment: ftCalc.bVenueAdjustment
   },
   {
+    // MARKET EXPANSION BATCH 4: no market line — see Batch 2/3 for why.
+    _idx: 5,
+    name: "Winner",
+    marketKey: "winner",
+    marketType: "winner",
+    league,
+    context: { aSc: ftCalc.aS, bSc: ftCalc.bS },
+    line: null,
+    proj: marginProjectionFT,
+    edge: winnerEdge,
+    pick: winnerPick,
+    confidence: winnerConfidence,
+    note: null,
+    fullModel: ftCalc.ftFullModel,
+    sampleTier: ftCalc.ftSampleTier,
+    hasH2H: ftCalc.ftHasH2H,
+    trap: winnerTrap,
+    volatility: combinedMarginVolFT,
+    volLimit: getMarketVolLimit(league, "ft"),
+    coeffFitted: _coeffFitted,
+    // Feeds selectLock's fallback below — see that patch for why.
+    marginEdgePct: winnerMarginInputs.marginEdgePct
+  },
+  {
+    // MARKET EXPANSION BATCH 4
+    _idx: 6,
+    name: "Handicap",
+    marketKey: "handicap",
+    marketType: "handicap",
+    league,
+    context: { aSc: ftCalc.aS, bSc: ftCalc.bS },
+    line: finalLines.handicapLine,
+    proj: marginProjectionFT,
+    edge: handicapEdge,
+    pick: handicapPick,
+    confidence: handicapConfidence,
+    note: null,
+    fullModel: ftCalc.ftFullModel,
+    sampleTier: ftCalc.ftSampleTier,
+    hasH2H: ftCalc.ftHasH2H,
+    trap: handicapTrap,
+    volatility: combinedMarginVolFT,
+    volLimit: getMarketVolLimit(league, "ft"),
+    coeffFitted: _coeffFitted,
+    marginEdgePct: handicapMarginInputs.marginEdgePct
+  },
+  {
     _idx: 14,
     name: "Team A 1H",
     marketKey: "h1_team_a",
@@ -25675,9 +25758,14 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const isWnbaRun = league === "wnba" || league === "wnba_pre";
     const isManualLeagueRun = !isNbaOrNcaa;
 
-    const wnbaAllowedMarkets   = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4"]);
-    const nbaAllowedMarkets    = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "h1_team_a", "h1_team_b"]);
-    const manualAllowedMarkets = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4"]);
+    // MARKET EXPANSION BATCH 4: "winner" added to all three — no gating,
+    // per spec. "handicap" added to nba/manual only — WNBA gets 1H/2H
+    // Handicap instead of full-game (those markets don't exist yet as
+    // computed picks, so wnbaAllowedMarkets isn't touched further here;
+    // a later batch adds handicap_h1/handicap_h2 to this set once built).
+    const wnbaAllowedMarkets   = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "winner"]);
+    const nbaAllowedMarkets    = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "h1_team_a", "h1_team_b", "winner", "handicap"]);
+    const manualAllowedMarkets = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "winner", "handicap"]);
 
     const finalPicks = picks.filter(p => {
       if (isWnbaRun)       return wnbaAllowedMarkets.has(p.marketKey);
@@ -25690,7 +25778,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       "ft": 1, "h1": 2,
       "team_a": 3, "team_b": 4,
       "q1": 5, "q2": 6, "q3": 7, "q4": 8,
-      "h1_team_a": 9, "h1_team_b": 10
+      "h1_team_a": 9, "h1_team_b": 10,
+      // MARKET EXPANSION BATCH 4: fractional so no existing key needs renumbering
+      "winner": 1.5, "handicap": 4.5
     };
     finalPicks.sort((a, b) => (mktOrderMap[a.marketKey] || 99) - (mktOrderMap[b.marketKey] || 99));
 
@@ -25845,7 +25935,9 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
       fullModel: p.fullModel,
       confidence: p.confidence,
       lockStrength: p.lockStrength,
-      lockRestricted: !!p.lockRestricted
+      lockRestricted: !!p.lockRestricted,
+      // MARKET EXPANSION BATCH 4
+      marginEdgePct: p.marginEdgePct
     })));
 
     const displayablePicks = finalPicksForDisplay;
