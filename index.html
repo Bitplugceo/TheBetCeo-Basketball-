@@ -1,3 +1,4 @@
+H
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -15600,6 +15601,13 @@ function getPickSideFromText(text) {
   const normalized = raw.startsWith("LEAN ") ? raw.slice(5).trim() : raw;
   if (normalized.startsWith("OVER")) return "over";
   if (normalized.startsWith("UNDER")) return "under";
+  // MARKET EXPANSION BATCH 6: Winner/Handicap picks return "HOME"/"AWAY"
+  // (see getMarginPick), not OVER/UNDER. Without these branches this
+  // returns "" for every Winner/Handicap pick, and both call sites inside
+  // buildTrackedPickPayload then mislabel the tracked `side` as
+  // "over"/"under" based on raw edge sign — corrupting settlement grading.
+  if (normalized.startsWith("HOME")) return "home";
+  if (normalized.startsWith("AWAY")) return "away";
   return "";
 }
 
@@ -23826,7 +23834,13 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
   if (!pickRow) return null;
 
   const fixtureMeta = { ...originalFixtureMeta };
-  const exoticNoLineMarkets = ["player", "w_ou", "race", "high_q", "low_q", "htft", "margin_team", "margin_any", "high_q_ou", "low_q_ou", "other"];
+  // MARKET EXPANSION BATCH 6: "winner" belongs here — it genuinely has no
+  // market line, ever, same as player props / race-to markets. "handicap"
+  // deliberately NOT added — it has a real line (once the Batch 5 input is
+  // filled in) and needs the isFinite(line) check below like any other
+  // real market, so a missing/empty handicap line still correctly excludes
+  // it from being tracked as an actual play.
+  const exoticNoLineMarkets = ["player", "w_ou", "race", "high_q", "low_q", "htft", "margin_team", "margin_any", "high_q_ou", "low_q_ou", "other", "winner"];
   const isExoticNoLine = pickRow && exoticNoLineMarkets.includes(pickRow.marketKey);
 
   const isManualLeague = league !== "nba" && league !== "wnba" && league !== "wnba_pre" && league !== "ncaa" && league !== "ncaaw" && league !== "nba_gl";
@@ -23879,7 +23893,10 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
         ftLine: parseMarketLine(document.getElementById("ftMarket")?.value || ""),
         h1Line: parseMarketLine(document.getElementById("h1Market")?.value || ""),
         aLine: parseMarketLine(document.getElementById("teamAMarket")?.value || ""),
-        bLine: parseMarketLine(document.getElementById("teamBMarket")?.value || "")
+        bLine: parseMarketLine(document.getElementById("teamBMarket")?.value || ""),
+        // MARKET EXPANSION BATCH 6: uses parseHandicapLine, not
+        // parseMarketLine — see Batch 3 for why (signed/zero values).
+        handicapLine: parseHandicapLine(document.getElementById("handicapMarket")?.value || "")
       };
       const fixtureMetaSnapshot = getCurrentFixtureMeta();
       
@@ -23942,6 +23959,9 @@ function getSampleTierForMarket(market, dx = {}) {
     if (pickRow?.projectionOnly !== undefined) return !!pickRow.projectionOnly;
     if (market === "ft" || market === "team_a" || market === "team_b") return !!dx.ftProjectionOnly;
     if (market === "h1" || market === "h1_team_a" || market === "h1_team_b") return !!dx.h1ProjectionOnly;
+    // MARKET EXPANSION BATCH 6: winner/handicap both derive their margin
+    // straight from ftCalc, so they share FT's projectionOnly state.
+    if (market === "winner" || market === "handicap") return !!dx.ftProjectionOnly;
     return false;
   }
 
@@ -23952,6 +23972,9 @@ function getSampleTierForMarket(market, dx = {}) {
     if (market === "q2") return !!dx.q2HasH2H;
     if (market === "q3") return !!dx.q3HasH2H;
     if (market === "q4") return !!dx.q4HasH2H;
+    // MARKET EXPANSION BATCH 6: same underlying FT-level H2H data as
+    // ft/team_a/team_b, since both derive from ftCalc directly.
+    if (market === "winner" || market === "handicap") return !!dx.ftHasH2H;
     return false;
   }
 
@@ -23969,6 +23992,13 @@ function getSampleTierForMarket(market, dx = {}) {
     if (market === "h1_team_a") return Number(dx.aVol1 || 0);
     if (market === "h1_team_b") return Number(dx.bVol1 || 0);
     if (market.startsWith("q") && pickRow && isFinite(Number(pickRow.volatility))) return Number(pickRow.volatility);
+    // MARKET EXPANSION BATCH 6: mirrors the quarters branch just above —
+    // pickRow.volatility is combinedMarginVolFT (set in Batch 4), already
+    // on points scale, so divide by the same FT vol limit to normalize it
+    // onto the 0-2.5-ish ratio scale getVolatilityBucket's thresholds expect.
+    if ((market === "winner" || market === "handicap") && pickRow && isFinite(Number(pickRow.volatility))) {
+      return Number(pickRow.volatility) / _ftVolLimitForBucket;
+    }
     return 0;
   }
 
