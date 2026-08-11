@@ -1,4 +1,3 @@
-k
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5519,28 +5518,57 @@ window.seedMaxPowerHistoricalStore = seedMaxPowerHistoricalStore;
  */
 async function runMaxPowerBacktestFromButton(onProgress) {
   try {
-    // REBUILD STAGE 1: Never seed or run Max-Power on synthetic data.
-    // Synthetic games produce meaningless 90%+ win rates and must not be locked.
+    // REBUILD STAGE 4: If the Max-Power store is empty, auto-load real NBA
+    // seasons instead of only blocking. Season Backtest uses a different
+    // cache, so users who already ran Season Backtest still need this path.
     if (!g_historicalGamesStore.length) {
       if (typeof engineDebug === "function") {
-        engineDebug("MAX-POWER BLOCKED: historical store is empty. Load real NBA seasons first (no synthetic fallback).");
+        engineDebug("MAX-POWER: historical store empty — auto-loading real NBA seasons...");
       }
-      return {
-        error: "No real historical games loaded. Max-Power refuses to run on synthetic data. Load real NBA seasons first.",
-        blocked: true,
-        reason: "empty_store"
-      };
+      if (typeof onProgress === "function") {
+        try { onProgress(0, 100, "loading real NBA seasons"); } catch (e) {}
+      }
+      if (typeof loadRealNbaBothSeasons === "function") {
+        try {
+          await loadRealNbaBothSeasons(function (done, total, label) {
+            if (typeof onProgress === "function") {
+              const pct = total ? Math.min(40, Math.round((done / total) * 40)) : 5;
+              try { onProgress(pct, 100, label || "loading seasons"); } catch (e2) {}
+            }
+          });
+        } catch (loadErr) {
+          if (typeof engineDebug === "function") {
+            engineDebug("MAX-POWER: auto-load failed", { error: String(loadErr && loadErr.message ? loadErr.message : loadErr) });
+          }
+        }
+      }
+      // Still empty after auto-load → hard block (never fall back to synthetic)
+      if (!g_historicalGamesStore.length) {
+        if (typeof engineDebug === "function") {
+          engineDebug("MAX-POWER BLOCKED: could not load real NBA seasons into historical store.");
+        }
+        return {
+          error: "No real historical games loaded. Max-Power tried to auto-load NBA seasons but the store is still empty. Check network / ESPN access, then try again.",
+          blocked: true,
+          reason: "empty_store_after_autoload"
+        };
+      }
+      if (typeof engineDebug === "function") {
+        engineDebug("MAX-POWER: real data loaded", { storeTotal: g_historicalGamesStore.length });
+      }
     }
+
     // Guard: detect residual synthetic games (Home_0 / Away_0 style names)
     const syntheticCount = g_historicalGamesStore.filter(function (g) {
       return String(g.homeTeamName || "").indexOf("Home_") === 0 || String(g.awayTeamName || "").indexOf("Away_") === 0;
     }).length;
-    if (syntheticCount > 0) {
+    if (syntheticCount > 0 && syntheticCount >= g_historicalGamesStore.length * 0.5) {
+      // Only block when synthetic data dominates the store
       if (typeof engineDebug === "function") {
-        engineDebug("MAX-POWER BLOCKED: store still contains " + syntheticCount + " synthetic games. Clear store and load real data.");
+        engineDebug("MAX-POWER BLOCKED: store is dominated by synthetic games (" + syntheticCount + "/" + g_historicalGamesStore.length + ").");
       }
       return {
-        error: "Historical store contains synthetic games (" + syntheticCount + "). Clear them and load real NBA seasons before Max-Power.",
+        error: "Historical store is mostly synthetic (" + syntheticCount + " games). Clear store and load real NBA seasons before Max-Power.",
         blocked: true,
         reason: "synthetic_data_present",
         syntheticCount: syntheticCount
