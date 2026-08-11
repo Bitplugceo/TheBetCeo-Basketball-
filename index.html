@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4301,6 +4300,8 @@ function bbAttachMarketToBacktestGames(allGames) {
     g.marketTotal = rec.total;
     g.marketMoneylineTeam = teamIsHome ? rec.moneylineHome : rec.moneylineAway;
     g.marketMoneylineOpp = teamIsHome ? rec.moneylineAway : rec.moneylineHome;
+    g.marketPublicHomePct = rec.publicMoneyHomePct != null ? rec.publicMoneyHomePct : null;
+    g.marketPublicAwayPct = rec.publicMoneyAwayPct != null ? rec.publicMoneyAwayPct : null;
     g.marketSource = rec.source || null;
     attached++;
   });
@@ -4310,6 +4311,119 @@ function bbAttachMarketToBacktestGames(allGames) {
   return { attached: attached, total: allGames.length };
 }
 window.bbAttachMarketToBacktestGames = bbAttachMarketToBacktestGames;
+
+// ============================================================
+// MARKET INDEX PERSISTENCE — IndexedDB so CSVs are imported once
+// Survives full page reloads. localStorage is too small for ~4MB.
+// ============================================================
+const BB_MARKET_IDB_NAME = "BB_MarketIndexDB";
+const BB_MARKET_IDB_STORE = "market";
+const BB_MARKET_IDB_KEY = "index_v1";
+
+function _bbOpenMarketIDB() {
+  return new Promise(function (resolve, reject) {
+    if (!window.indexedDB) { reject(new Error("IndexedDB not available")); return; }
+    const req = indexedDB.open(BB_MARKET_IDB_NAME, 1);
+    req.onupgradeneeded = function (e) {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(BB_MARKET_IDB_STORE)) {
+        db.createObjectStore(BB_MARKET_IDB_STORE);
+      }
+    };
+    req.onsuccess = function (e) { resolve(e.target.result); };
+    req.onerror = function (e) { reject(e.target.error || new Error("IDB open failed")); };
+  });
+}
+
+function bbSaveMarketIndexToIDB(index, stats) {
+  return _bbOpenMarketIDB().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      const tx = db.transaction(BB_MARKET_IDB_STORE, "readwrite");
+      const store = tx.objectStore(BB_MARKET_IDB_STORE);
+      store.put({ index: index, stats: stats, savedAt: new Date().toISOString() }, BB_MARKET_IDB_KEY);
+      tx.oncomplete = function () { resolve(true); };
+      tx.onerror = function () { reject(tx.error || new Error("IDB put failed")); };
+    });
+  });
+}
+window.bbSaveMarketIndexToIDB = bbSaveMarketIndexToIDB;
+
+function bbLoadMarketIndexFromIDB() {
+  return _bbOpenMarketIDB().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      const tx = db.transaction(BB_MARKET_IDB_STORE, "readonly");
+      const store = tx.objectStore(BB_MARKET_IDB_STORE);
+      const req = store.get(BB_MARKET_IDB_KEY);
+      req.onsuccess = function () {
+        const row = req.result;
+        if (row && row.index) resolve(row);
+        else resolve(null);
+      };
+      req.onerror = function () { reject(req.error || new Error("IDB get failed")); };
+    });
+  }).catch(function () { return null; });
+}
+window.bbLoadMarketIndexFromIDB = bbLoadMarketIndexFromIDB;
+
+function bbClearMarketIndexIDB() {
+  return _bbOpenMarketIDB().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      const tx = db.transaction(BB_MARKET_IDB_STORE, "readwrite");
+      tx.objectStore(BB_MARKET_IDB_STORE).delete(BB_MARKET_IDB_KEY);
+      tx.oncomplete = function () { resolve(true); };
+      tx.onerror = function () { reject(tx.error); };
+    });
+  });
+}
+window.bbClearMarketIndexIDB = bbClearMarketIndexIDB;
+
+// Restore market index on boot so user does not re-upload every session
+(function bbRestoreMarketIndexOnBoot() {
+  bbLoadMarketIndexFromIDB().then(function (row) {
+    if (!row || !row.index) return;
+    window.__BB_MARKET_INDEX = row.index;
+    window.__BB_MARKET_INDEX_STATS = row.stats || { totalKeys: Object.keys(row.index).length };
+    if (typeof engineDebug === "function") {
+      engineDebug("Market index restored from IndexedDB", window.__BB_MARKET_INDEX_STATS);
+    }
+  });
+})();
+
+// Grade a single game against real market lines (ATS / total / ML)
+function bbGradeGameVsMarket(g, projectedMargin, projectedTotal) {
+  const out = { ats: null, total: null, ml: null, hasMarket: false };
+  if (!g || g.marketSpreadTeam == null && g.marketTotal == null) return out;
+  out.hasMarket = true;
+  const actualMargin = (Number(g.teamScore) || 0) - (Number(g.oppScore) || 0);
+  // ATS: team covered if actualMargin + marketSpreadTeam > 0 (push = 0)
+  if (g.marketSpreadTeam != null && isFinite(g.marketSpreadTeam)) {
+    const coverMargin = actualMargin + Number(g.marketSpreadTeam);
+    if (Math.abs(coverMargin) < 1e-9) out.ats = "push";
+    else out.ats = coverMargin > 0 ? "win" : "loss";
+    // Model pick vs line: projectedMargin + spread
+    if (projectedMargin != null && isFinite(projectedMargin)) {
+      const modelCover = projectedMargin + Number(g.marketSpreadTeam);
+      out.modelAts = Math.abs(modelCover) < 1e-9 ? "push" : (modelCover > 0 ? "win" : "loss");
+    }
+  }
+  if (g.marketTotal != null && isFinite(g.marketTotal)) {
+    const actualTotal = (Number(g.teamScore) || 0) + (Number(g.oppScore) || 0);
+    const diff = actualTotal - Number(g.marketTotal);
+    if (Math.abs(diff) < 1e-9) out.total = "push";
+    else out.total = diff > 0 ? "over" : "under";
+    if (projectedTotal != null && isFinite(projectedTotal)) {
+      const mDiff = projectedTotal - Number(g.marketTotal);
+      out.modelTotalSide = Math.abs(mDiff) < 1e-9 ? "push" : (mDiff > 0 ? "over" : "under");
+      out.modelTotalHit = (out.modelTotalSide === out.total) ? "win" : (out.total === "push" || out.modelTotalSide === "push" ? "push" : "loss");
+    }
+  }
+  // ML: team won straight up
+  if (actualMargin > 0) out.ml = "win";
+  else if (actualMargin < 0) out.ml = "loss";
+  else out.ml = "push";
+  return out;
+}
+window.bbGradeGameVsMarket = bbGradeGameVsMarket;
 
 // ============================================================
 // MAXIMUM-POWER BACKTEST — Phase 0/1 foundations
@@ -21749,7 +21863,8 @@ function renderBacktestPanel() {
         <label style="display:block; font-size:11px; margin-bottom:4px;">Odds CSV (e.g. all_odds.csv)</label>
         <input type="file" id="bbOddsCsvInput" accept=".csv" style="font-size:11px; margin-bottom:8px; display:block; width:100%;" />
         <button type="button" id="bbImportMarketBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 14px; font-weight:800; font-size:11px; cursor:pointer;">Import & Build Market Index</button>
-        <div id="bbMarketImportStatus" style="font-size:11px; color:var(--muted); margin-top:8px;">${window.__BB_MARKET_INDEX_STATS ? `Loaded: ${window.__BB_MARKET_INDEX_STATS.totalKeys} games indexed (${window.__BB_MARKET_INDEX_STATS.matchedResults} from results CSV, ${window.__BB_MARKET_INDEX_STATS.matchedOdds} from odds CSV).` : "No odds data imported yet — Season Backtest above is using scores only."}</div>
+        <div id="bbMarketImportStatus" style="font-size:11px; color:var(--muted); margin-top:8px;">${window.__BB_MARKET_INDEX_STATS ? `Loaded: ${window.__BB_MARKET_INDEX_STATS.totalKeys} games indexed (${window.__BB_MARKET_INDEX_STATS.matchedResults || "?"} from results CSV, ${window.__BB_MARKET_INDEX_STATS.matchedOdds || "?"} from odds CSV). Persisted in browser — no re-upload needed after reload.` : "No odds data imported yet — Season Backtest uses scores only until you import CSVs once."}</div>
+        <button type="button" id="bbClearMarketBtn" style="background:transparent; color:var(--muted); border:1px solid var(--panel-border); padding:4px 10px; font-size:10px; cursor:pointer; margin-top:6px;">Clear saved market data</button>
       </div>
 
       <div class="tracker-summary-strip">
@@ -21784,6 +21899,16 @@ function renderBacktestPanel() {
 
   panel.innerHTML = html;
 
+  const bbClearBtn = document.getElementById("bbClearMarketBtn");
+  if (bbClearBtn) {
+    bbClearBtn.onclick = function () {
+      if (!confirm("Clear saved market index? You will need to re-import CSVs.")) return;
+      window.__BB_MARKET_INDEX = null;
+      window.__BB_MARKET_INDEX_STATS = null;
+      bbClearMarketIndexIDB().then(function () { renderBacktestPanel(); });
+    };
+  }
+
   const bbImportBtn = document.getElementById("bbImportMarketBtn");
   if (bbImportBtn) {
     bbImportBtn.onclick = function () {
@@ -21810,6 +21935,11 @@ function renderBacktestPanel() {
         window.__BB_MARKET_INDEX = built.index;
         window.__BB_MARKET_INDEX_STATS = built.stats;
         if (typeof engineDebug === "function") engineDebug("Market index built", built.stats);
+        bbSaveMarketIndexToIDB(built.index, built.stats).then(function () {
+          if (statusEl) statusEl.textContent = "Loaded & saved: " + built.stats.totalKeys + " games indexed (persists across reloads).";
+        }).catch(function (e) {
+          if (statusEl) statusEl.textContent = "Loaded: " + built.stats.totalKeys + " games (save failed — will need re-import after reload).";
+        });
         try {
           const seasonCacheKeys = Object.keys(window.__bbSeasonDataCache || {});
           seasonCacheKeys.forEach(function (k) {
