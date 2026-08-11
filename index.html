@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -20399,6 +20400,34 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
       if (!calc || !isFinite(calc.projAFT) || !isFinite(calc.projBFT)) { skipped++; continue; }
       finiteProjCount++;
 
+      // METRIC-CONSISTENCY FIX: runJointMultiVariableBacktest picks its
+      // winning candidate using evaluateFeatureCacheLight's composite, which
+      // already rewards Winner/Handicap win-rate (see that function's
+      // calcComposite). But the Phase 6 significance gate re-scores the
+      // baseline and the winning candidate through THIS function, whose
+      // composite (via computeBacktestAccuracyScore) never included
+      // Winner/Handicap at all — the search could pick a candidate for its
+      // Winner/Handicap gains, then have the gate ignore exactly the gains
+      // it was chosen for. Grade Winner/Handicap here the same way the light
+      // evaluator does, so both composites measure the same thing.
+      let _winnerCorrect = null, _handicapCorrect = null;
+      const _predMargin = calc.projAFT - calc.projBFT;
+      const _actualMargin = game.scored - game.allowed;
+      if (isFinite(_predMargin) && isFinite(_actualMargin)) {
+        const _winnerPick = getMarginPick(_predMargin, league, "winner");
+        if (_winnerPick !== "NO PLAY") {
+          _winnerCorrect = (_winnerPick === "HOME") === (_actualMargin > 0);
+        }
+        if (isFinite(game.marketSpreadTeam)) {
+          const _handicapEdge = _predMargin + game.marketSpreadTeam;
+          const _handicapPick = getMarginPick(_handicapEdge, league, "handicap");
+          const _actualHandicapMargin = _actualMargin + game.marketSpreadTeam;
+          if (_handicapPick !== "NO PLAY" && _actualHandicapMargin !== 0) {
+            _handicapCorrect = (_handicapPick === "HOME") === (_actualHandicapMargin > 0);
+          }
+        }
+      }
+
       let calc1H = null;
       try {
         calc1H = compute1HProjection({ league, parsed, lines: {}, injMultA: 1, injMultB: 1, config: _btConfigH1 });
@@ -20444,6 +20473,8 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
         actualMargin: game.scored - game.allowed,
         predictedTotal: calc.ftProj,
         actualTotal: game.scored + game.allowed,
+        winnerCorrect: _winnerCorrect,
+        handicapCorrect: _handicapCorrect,
         predictedAScore: calc.projAFT,
         actualAScore: game.scored,
         predictedBScore: calc.projBFT,
@@ -21203,6 +21234,18 @@ function calculateScoresOnlyCalibration(evaluationResults) {
   }
   const qGamesCovered = valid.filter(r => (r.quarterTotalPairs || []).length > 0).length;
 
+  // METRIC-CONSISTENCY FIX (see evaluateFeatureCacheWithOverrides): aggregate
+  // the Winner/Handicap grading now captured per-result so the Phase 6 gate's
+  // composite can include these two markets the same way evaluateFeatureCacheLight
+  // already does. r.winnerCorrect/handicapCorrect are true/false when graded,
+  // null when the game had no pick (NO PLAY) or no market spread attached.
+  const winnerGraded = valid.filter(r => r.winnerCorrect === true || r.winnerCorrect === false);
+  const winnerN = winnerGraded.length;
+  const winnerCorrectCount = winnerGraded.filter(r => r.winnerCorrect === true).length;
+  const handicapGraded = valid.filter(r => r.handicapCorrect === true || r.handicapCorrect === false);
+  const handicapN = handicapGraded.length;
+  const handicapCorrectCount = handicapGraded.filter(r => r.handicapCorrect === true).length;
+
   const mae = arr => arr.reduce((s, v) => s + Math.abs(v), 0) / arr.length;
   const bias = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
 
@@ -21224,7 +21267,9 @@ function calculateScoresOnlyCalibration(evaluationResults) {
     qTotalBias: qTotalErrors.length ? bias(qTotalErrors) : null,
     qTeamMAE: qTeamErrors.length ? mae(qTeamErrors) : null,
     qTeamBias: qTeamErrors.length ? bias(qTeamErrors) : null,
-    qN: qGamesCovered
+    qN: qGamesCovered,
+    winnerN, winnerCorrectCount,
+    handicapN, handicapCorrectCount
   };
 }
 
@@ -21259,13 +21304,26 @@ function computeBacktestAccuracyScore(calibration, marketMetrics) {
     if (!isFinite(mae) || !isFinite(target) || target <= 0) return null;
     return Math.max(0, Math.min(100, 100 * (1 - mae / (2 * target))));
   };
+  // METRIC-CONSISTENCY FIX: Winner/Handicap win-rate, scored the same
+  // 0.45-0.60 band and 30-pick minimum evaluateFeatureCacheLight's
+  // calcComposite already uses, so this composite (the one the Phase 6 gate
+  // actually checks against baseline) reflects the same markets the joint
+  // search optimized for, instead of silently dropping the two markets most
+  // recently added.
+  const MIN_MARKET_PICKS = 30;
+  const winRateScore = (correct, n) => {
+    if (!n || n < MIN_MARKET_PICKS) return null;
+    return Math.max(0, Math.min(100, ((correct / n) - 0.45) / 0.15 * 100));
+  };
   const breakdown = {
     ftTotal: bandScore(calibration.totalMAE, BT_ACCURACY_TARGETS.totalMAE),
     ftTeam: bandScore(calibration.teamScoreMAE, BT_ACCURACY_TARGETS.teamScoreMAE),
     h1Total: bandScore(calibration.h1TotalMAE, BT_ACCURACY_TARGETS.h1TotalMAE),
     h1Team: bandScore(calibration.h1TeamScoreMAE, BT_ACCURACY_TARGETS.h1TeamScoreMAE),
     qTotal: bandScore(calibration.qTotalMAE, BT_ACCURACY_TARGETS.qTotalMAE),
-    qTeam: bandScore(calibration.qTeamMAE, BT_ACCURACY_TARGETS.qTeamMAE)
+    qTeam: bandScore(calibration.qTeamMAE, BT_ACCURACY_TARGETS.qTeamMAE),
+    winner: winRateScore(calibration.winnerCorrectCount, calibration.winnerN),
+    handicap: winRateScore(calibration.handicapCorrectCount, calibration.handicapN)
   };
   const valid = Object.values(breakdown).filter(v => v !== null && isFinite(v));
   let composite = valid.length ? valid.reduce((s, v) => s + v, 0) / valid.length : null;
@@ -22042,9 +22100,9 @@ function renderBacktestPanel() {
     <div class="tracker-analytics-shell">
       <div class="tracker-analytics-topbar">
         <div class="tracker-analytics-heading">
-          <div class="tracker-analytics-kicker">Season Backtest + Max-Power</div>
+          <div class="tracker-analytics-kicker">Season Backtest</div>
           <div class="tracker-analytics-title">NBA Unified Backtest</div>
-          <div class="tracker-analytics-subtitle">Scores calibration + real Vegas ATS/O-U/ML when odds are imported. Joint search then Lock Optimal Parameters. Max-Power verification is the last step on this page. ${cached ? `Last run: ${new Date(cached.computedAt).toLocaleString()} (season ${cached.season})` : ""}</div>
+          <div class="tracker-analytics-subtitle">Scores calibration + real Vegas ATS/O-U/ML when odds are imported. Run Season Backtest, then Lock Optimal Parameters — that's the whole workflow. (Max-Power verification below is legacy: its lock is no longer read by the live engine, so running it changes nothing.) ${cached ? `Last run: ${new Date(cached.computedAt).toLocaleString()} (season ${cached.season})` : ""}</div>
         </div>
       </div>
 
