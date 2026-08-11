@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5851,9 +5850,12 @@ const TUNABLE_PARAM_REGISTRY = {
   // Raising the ceiling to 1.40 gives the search room to find a real effect
   // if one exists, instead of being capped below where the signal might be.
   extremeExpansion: {
-    value: 1.0, min: 1.0, max: 1.4, type: "scalar",
+    // REBUILD STAGE 6: default was 1.0 = dead (no expansion). Diagnosis
+    // showed 96–97% of high/low games still predicted mid. Raise live
+    // default so Season Backtest and live picks actually leave the mid band.
+    value: 1.30, min: 1.0, max: 1.4, type: "scalar",
     scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
-    description: "Stretches team totals away from league mean when form already implies a slow/fast game (counters mid-total compression bias). 1.0 = no change.",
+    description: "Stretches team totals away from league mean when form already implies a slow/fast game (counters mid-total compression bias). 1.0 = no change. STAGE 6 default 1.30.",
     lastVerifiedAt: null
   },
   paceClampMinNbaNcaa: {
@@ -17224,7 +17226,10 @@ function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", diverg
   // callers that don't (the majority) keep the exact previous behavior.
   const baseline = isFinite(baselineOverride) ? baselineOverride : avgOrNaN(series);
   if (!isFinite(baseline)) return proj;
-  const dampening = Math.max(0.5, 1.0 - (volRatio - 1) * 0.3);
+  // REBUILD STAGE 6: less aggressive vol damp toward mean (was floor 0.5 /
+  // 0.3 slope). High-vol series were pulled into the mid band and erased
+  // the high/low signal extremeExpansion needs.
+  const dampening = Math.max(0.70, 1.0 - (volRatio - 1) * 0.20);
   return baseline + (proj - baseline) * dampening;
 }
 
@@ -20428,23 +20433,25 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   aS *= injMultA;
   bS *= injMultB;
 
-  // STAGE 3: extreme expansion — stretch team totals away from league mean
-  // when form already implies a slow or fast game. Default 1.0 = no change.
-  // Diagnosis showed mid-total MAE ~8.2 vs low/high ~23–25; this targets
-  // mean-compression without touching mid-range games as hard.
-  // WIRING FIX: config.extremeExpansion was the only source ever read here,
-  // but the live pick path never set it and every backtest evaluator
-  // hardcoded it to 1.0 — so this stage was dead everywhere. Now falls back
-  // to the tunable param (getParam) instead of a bare 1.0 so a verified/
-  // locked extremeExpansion value actually reaches live predictions.
-  const _extremeExp = isFinite(config?.extremeExpansion) ? Number(config.extremeExpansion) : (getParam("extremeExpansion", league) ?? 1.0);
+  // REBUILD STAGE 6: mid-compression fix
+  // Default was 1.0 (no-op). Blended form is already near league mean after
+  // opponent-mix + vol damp, so expand from the STRONGER of blended form vs
+  // raw recent team averages. That is the only way high/low games leave mid.
+  const _extremeExp = isFinite(config?.extremeExpansion) ? Number(config.extremeExpansion) : (getParam("extremeExpansion", league) ?? 1.30);
   if (_extremeExp > 1.0 && isFinite(aS) && isFinite(bS)) {
     const formTotal = aS + bS;
     const leagueTotal = isFinite(eb) ? eb : 220;
-    if (isFinite(formTotal) && formTotal > 0 && isFinite(leagueTotal) && leagueTotal > 0) {
-      const expanded = leagueTotal + (formTotal - leagueTotal) * _extremeExp;
+    const rawA = (typeof avgOrNaN === "function") ? avgOrNaN(aFTS) : NaN;
+    const rawB = (typeof avgOrNaN === "function") ? avgOrNaN(bFTS) : NaN;
+    const rawFormTotal = (isFinite(rawA) && isFinite(rawB)) ? (rawA + rawB) : formTotal;
+    // Prefer the signal farther from league mean (raw recent often is).
+    const gapBlended = isFinite(formTotal) ? Math.abs(formTotal - leagueTotal) : 0;
+    const gapRaw = isFinite(rawFormTotal) ? Math.abs(rawFormTotal - leagueTotal) : 0;
+    const signalTotal = (gapRaw > gapBlended) ? rawFormTotal : formTotal;
+    if (isFinite(signalTotal) && signalTotal > 0 && isFinite(formTotal) && formTotal > 0 && isFinite(leagueTotal) && leagueTotal > 0) {
+      const expanded = leagueTotal + (signalTotal - leagueTotal) * _extremeExp;
       const scale = expanded / formTotal;
-      if (isFinite(scale) && scale > 0) {
+      if (isFinite(scale) && scale > 0.55 && scale < 1.85) {
         aS *= scale;
         bS *= scale;
       }
@@ -23722,11 +23729,9 @@ async function runNbaSeasonBacktest(season, onProgress) {
       const _tw = isFinite(window.getParam("teamWeightBase", "nba")) ? Number(window.getParam("teamWeightBase", "nba")) : 0.65;
       const _btBaseConfig = {
         h2hFactor: window.getParam("h2hFactor", "nba") ?? 1.0,
-        // WIRING FIX: was hardcoded to 1.0, so the live-baseline "overall/
-        // train/validation/test" numbers this panel shows never reflected
-        // a locked extremeExpansion value even after Lock Optimal Parameters
-        // set one. Now reads the live/tunable value like h2hFactor above.
-        extremeExpansion: isFinite(window.getParam("extremeExpansion", "nba")) ? Number(window.getParam("extremeExpansion", "nba")) : 1.0,
+        // REBUILD STAGE 6: fallback 1.30 (was 1.0 = no expansion). Season
+        // Backtest must use the same default so O/U can leave the mid band.
+        extremeExpansion: isFinite(window.getParam("extremeExpansion", "nba")) ? Number(window.getParam("extremeExpansion", "nba")) : 1.30,
         // FATIGUE LIVE-WIRING follow-through: computeFTProjection now reads
         // config.restDaysA/B (see that comment block). feat.restDaysA/B come
         // from the Phase 3 cache above, derived once per game from gameLogs
