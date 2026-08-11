@@ -1,3 +1,4 @@
+i
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7613,6 +7614,220 @@ function getLiveLockBanner(league) {
   return "🔒 LOCKED " + String(league).toUpperCase() + ": " + parts.join(" · ");
 }
 window.getLiveLockBanner = getLiveLockBanner;
+
+// ============================================================
+// PHASE 8 — VALIDATION & FREEZE
+// Re-score a locked config on holdout (or fresh games), then
+// optionally freeze it. A frozen lock cannot be overwritten by
+// promoteConfigToLock / saveLockedConfig unless force:true.
+// ============================================================
+
+/**
+ * Re-evaluate the currently locked config on a game set.
+ * Use this after promote to confirm metrics still hold on the
+ * same or a pure holdout slice.
+ *
+ * @param {string} league
+ * @param {string} market
+ * @param {Array}  [games]  defaults to g_historicalGamesStore for league
+ * @param {object} [opts]   passed to evaluateConfigOnGames
+ * @returns {object} { ok, reason?, eval?, meta?, lockedConfig? }
+ */
+function validateLockedConfig(league, market, games, opts) {
+  opts = opts || {};
+  if (!league || !market) {
+    return { ok: false, reason: "Missing league or market" };
+  }
+  if (typeof hasLockedConfig !== "function" || !hasLockedConfig(league, market)) {
+    return { ok: false, reason: "No lock present for " + league + "/" + market };
+  }
+
+  const store = typeof loadLockedConfigStore === "function" ? loadLockedConfigStore() : {};
+  const lk = String(league).toLowerCase();
+  const mk = String(market).toLowerCase();
+  const entry = store[lk] && store[lk][mk];
+  if (!entry || !entry.params) {
+    return { ok: false, reason: "Lock entry missing params" };
+  }
+
+  let gameList = Array.isArray(games) ? games : null;
+  if (!gameList) {
+    gameList = (Array.isArray(g_historicalGamesStore) ? g_historicalGamesStore : []).filter(function (g) {
+      return String(g.league || "nba").toLowerCase() === lk;
+    });
+  }
+  if (!gameList.length) {
+    return { ok: false, reason: "No games available for validation" };
+  }
+
+  const evalResult = evaluateConfigOnGames(gameList, entry.params, market, opts);
+  const gate = validateLockEvidence(evalResult, opts);
+
+  return {
+    ok: gate.ok,
+    reason: gate.ok ? null : gate.reason,
+    eval: evalResult,
+    meta: entry.meta || {},
+    lockedConfig: entry.params,
+    gamesUsed: gameList.length
+  };
+}
+
+/**
+ * Freeze a locked config. Frozen locks refuse overwrite unless force:true.
+ * Records freeze timestamp and the validation metrics that justified it.
+ *
+ * @param {string} league
+ * @param {string} market
+ * @param {object} [validation]  optional result from validateLockedConfig
+ * @param {object} [opts]        { note }
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+function freezeLockedConfig(league, market, validation, opts) {
+  opts = opts || {};
+  if (!league || !market) return { ok: false, reason: "Missing league or market" };
+  if (typeof hasLockedConfig !== "function" || !hasLockedConfig(league, market)) {
+    return { ok: false, reason: "No lock present — promote first" };
+  }
+
+  // If validation provided, require it to have passed
+  if (validation && validation.ok === false) {
+    return { ok: false, reason: "Cannot freeze: validation failed — " + (validation.reason || "unknown") };
+  }
+
+  const store = loadLockedConfigStore();
+  const lk = String(league).toLowerCase();
+  const mk = String(market).toLowerCase();
+  const entry = store[lk] && store[lk][mk];
+  if (!entry || !entry.params) return { ok: false, reason: "Lock entry missing" };
+
+  entry.meta = entry.meta || {};
+  entry.meta.frozen = true;
+  entry.meta.frozenAt = new Date().toISOString();
+  entry.meta.freezeNote = opts.note || "Frozen after holdout validation";
+  if (validation && validation.eval && validation.eval.holdout) {
+    entry.meta.freezeHoldoutWinRate = validation.eval.holdout.winRate;
+    entry.meta.freezeHoldoutDecisive = validation.eval.holdout.decisive;
+    entry.meta.freezeSearchScore = validation.eval.searchScore;
+    entry.meta.freezeGap = validation.eval.gap;
+  }
+
+  const saved = saveLockedConfigStore(store);
+  if (!saved) return { ok: false, reason: "Failed to persist freeze flag" };
+
+  if (typeof engineDebug === "function") {
+    engineDebug("PHASE 8 FREEZE", {
+      league: lk,
+      market: mk,
+      holdoutWinRate: entry.meta.freezeHoldoutWinRate,
+      decisive: entry.meta.freezeHoldoutDecisive
+    });
+  }
+  return { ok: true, meta: entry.meta };
+}
+
+/**
+ * Unfreeze a lock so it can be replaced by a new search promotion.
+ * Does not delete the lock — only clears the freeze flag.
+ */
+function unfreezeLockedConfig(league, market, opts) {
+  opts = opts || {};
+  if (!league || !market) return { ok: false, reason: "Missing league or market" };
+  if (!hasLockedConfig(league, market)) {
+    return { ok: false, reason: "No lock present" };
+  }
+  const store = loadLockedConfigStore();
+  const lk = String(league).toLowerCase();
+  const mk = String(market).toLowerCase();
+  const entry = store[lk] && store[lk][mk];
+  if (!entry) return { ok: false, reason: "Lock entry missing" };
+
+  entry.meta = entry.meta || {};
+  entry.meta.frozen = false;
+  entry.meta.unfrozenAt = new Date().toISOString();
+  entry.meta.unfreezeNote = opts.note || "Unfrozen for re-search";
+  const saved = saveLockedConfigStore(store);
+  if (!saved) return { ok: false, reason: "Failed to persist unfreeze" };
+  return { ok: true };
+}
+
+/**
+ * True when the lock exists and is frozen.
+ */
+function isLockedConfigFrozen(league, market) {
+  if (!league || !market || typeof getLockedConfigMeta !== "function") return false;
+  const meta = getLockedConfigMeta(league, market);
+  return !!(meta && meta.frozen);
+}
+
+/**
+ * Wrap promoteConfigToLock so frozen locks cannot be overwritten
+ * without an explicit force flag.
+ */
+const _promoteConfigToLockOriginal = promoteConfigToLock;
+function promoteConfigToLockGuarded(league, market, fullConfig, evalResult, opts) {
+  opts = opts || {};
+  if (!opts.force && isLockedConfigFrozen(league, market)) {
+    return {
+      ok: false,
+      reason: "Lock is FROZEN for " + league + "/" + market +
+        ". Unfreeze first or pass force:true after a new full search with better holdout evidence."
+    };
+  }
+  return _promoteConfigToLockOriginal(league, market, fullConfig, evalResult, opts);
+}
+// Replace the public binding
+promoteConfigToLock = promoteConfigToLockGuarded;
+window.promoteConfigToLock = promoteConfigToLockGuarded;
+
+/**
+ * One-shot: validate the current lock on games, then freeze if it passes.
+ */
+function validateAndFreeze(league, market, games, opts) {
+  opts = opts || {};
+  const validation = validateLockedConfig(league, market, games, opts);
+  if (!validation.ok) {
+    return { ok: false, reason: validation.reason, validation: validation };
+  }
+  const frozen = freezeLockedConfig(league, market, validation, {
+    note: opts.note || "Validated and frozen"
+  });
+  return {
+    ok: frozen.ok,
+    reason: frozen.reason || null,
+    validation: validation,
+    meta: frozen.meta || null
+  };
+}
+
+/**
+ * Full status for UI: lock present? frozen? holdout metrics?
+ */
+function getFreezeStatus(league, market) {
+  const base = typeof getLockStatus === "function"
+    ? getLockStatus(league, market)
+    : { locked: false };
+  if (!base.locked) {
+    return Object.assign({}, base, { frozen: false });
+  }
+  const meta = base.meta || {};
+  return {
+    locked: true,
+    frozen: !!meta.frozen,
+    frozenAt: meta.frozenAt || null,
+    holdoutWinRate: meta.holdoutWinRate ?? meta.freezeHoldoutWinRate ?? null,
+    sampleSize: meta.sampleSize ?? meta.freezeHoldoutDecisive ?? null,
+    lockedAt: meta.lockedAt || null,
+    summary: base.summary + (meta.frozen ? " · FROZEN" : " · unfrozen")
+  };
+}
+
+window.validateLockedConfig = validateLockedConfig;
+window.freezeLockedConfig = freezeLockedConfig;
+window.unfreezeLockedConfig = unfreezeLockedConfig;
+window.isLockedConfigFrozen = isLockedConfigFrozen;
+window.validateAndFreeze = validateAndFreeze;
+window.getFreezeStatus = getFreezeStatus;
 
 const TUNABLE_CONSTANTS_GRID = {
   INJURY_OPPONENT_BOOST_FACTOR: [0.1, 0.15, 0.2, 0.25, 0.3],
