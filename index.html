@@ -1,4 +1,3 @@
-O
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -11089,8 +11088,11 @@ function maybeReadH2HEnabled(kind) {
     const q3 = document.getElementById("useQ3H2H");
     const q4 = document.getElementById("useQ4H2H");
     if ((q3 && q3.checked) || (q4 && q4.checked)) return true;
-    const games = (AppState.context && Array.isArray(AppState.context.h2hGames))
-      ? AppState.context.h2hGames : [];
+    // AUDIT FIX: same AppState.context.data accessor bug as getH2HSeries's
+    // "h2" branch — AppState.context has no top-level h2hGames property, so
+    // this always saw an empty array and "usable" could never reach 2.
+    const games = (AppState.context && Array.isArray(AppState.context.data?.h2hGames))
+      ? AppState.context.data.h2hGames : [];
     let usable = 0;
     for (const g of games) {
       if (isFinite(Number(g.h2A)) && Number(g.h2A) > 0 && isFinite(Number(g.h2B)) && Number(g.h2B) > 0) usable++;
@@ -19656,8 +19658,12 @@ function getH2HSeries(side, marketKey, parsed) {
   // Prefer context games (already computed at fetch time). Fallback: sum
   // Q3+Q4 manual H2H series when the user entered those by hand.
   if (marketKey === "h2") {
-    const games = (AppState.context && Array.isArray(AppState.context.h2hGames))
-      ? AppState.context.h2hGames : [];
+    // AUDIT FIX: h2hGames lives on AppState.context.data (g_massacreFetchContext),
+    // not directly on AppState.context (which only exposes a "data" getter/setter).
+    // Reading AppState.context.h2hGames always returned undefined, so this branch
+    // could never see real H2H games and silently fell back to the Q3+Q4 sum path.
+    const games = (AppState.context && Array.isArray(AppState.context.data?.h2hGames))
+      ? AppState.context.data.h2hGames : [];
     const tId = String((side === "A" ? selectedTeamIds?.A : selectedTeamIds?.B) || "");
     if (games.length && tId) {
       const fromGames = [];
@@ -24234,10 +24240,21 @@ function getSampleTierForMarket(market, dx = {}) {
     // MARKET EXPANSION BATCH 6: winner/handicap both derive their margin
     // straight from ftCalc, so they share FT's projectionOnly state.
     if (market === "winner" || market === "handicap") return !!dx.ftProjectionOnly;
+    // AUDIT FIX: 2H Total and 2H Handicap share h2Calc's projectionOnly
+    // state (previously unhandled — fell straight to the false default
+    // below). 1H Handicap shares h1Calc's, same as h1/h1_team_a/h1_team_b.
+    if (market === "h2" || market === "handicap_h2") return !!dx.h2ProjectionOnly;
+    if (market === "handicap_h1") return !!dx.h1ProjectionOnly;
     return false;
   }
 
     function getHasH2HForMarket(market, dx = {}) {
+    // AUDIT FIX: unlike getSampleTierForMarket/getProjectionOnlyForMarket,
+    // this had no pickRow-first fallback, so any market not explicitly
+    // listed below (h2, handicap_h1, handicap_h2) always fell through to
+    // `return false` even though pickRow.hasH2H is already populated
+    // correctly for every market in the picks array.
+    if (pickRow?.hasH2H !== undefined) return !!pickRow.hasH2H;
     if (market === "ft" || market === "team_a" || market === "team_b") return !!dx.ftHasH2H;
     if (market === "h1" || market === "h1_team_a" || market === "h1_team_b") return !!dx.h1HasH2H;
     if (market === "q1") return !!dx.q1HasH2H;
@@ -24270,6 +24287,20 @@ function getSampleTierForMarket(market, dx = {}) {
     // onto the 0-2.5-ish ratio scale getVolatilityBucket's thresholds expect.
     if ((market === "winner" || market === "handicap") && pickRow && isFinite(Number(pickRow.volatility))) {
       return Number(pickRow.volatility) / _ftVolLimitForBucket;
+    }
+    // AUDIT FIX: 2H Total, 1H Handicap, and 2H Handicap were never handled
+    // here at all and always fell through to the flat 0 default below,
+    // permanently bucketing them as "calm" regardless of real volatility.
+    // Each pick's volatility is already point-scale (see Batch 4/5), so
+    // normalize by that market's own vol limit, same pattern as above.
+    if (market === "h2" && pickRow && isFinite(Number(pickRow.volatility))) {
+      return Number(pickRow.volatility) / (getMarketVolLimit(league, "h2") || 1);
+    }
+    if (market === "handicap_h1" && pickRow && isFinite(Number(pickRow.volatility))) {
+      return Number(pickRow.volatility) / (getMarketVolLimit(league, "h1") || 1);
+    }
+    if (market === "handicap_h2" && pickRow && isFinite(Number(pickRow.volatility))) {
+      return Number(pickRow.volatility) / (getMarketVolLimit(league, "h2") || 1);
     }
     return 0;
   }
@@ -26402,9 +26433,17 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
 
     {
       finalPicksForDisplay.forEach(p => {
-        if (p.pick !== "NO PLAY" && isFinite(p.proj) && isFinite(p.line) && p.line > 0) {
+        // AUDIT FIX: winner has no line at all (p.line is always null) and
+        // handicap/handicap_h1/handicap_h2 routinely carry a negative or
+        // zero line, so the old p.line > 0 gate silently skipped every
+        // margin-market pick — they never got a winProbability computed,
+        // permanently excluding them from calibration/Brier tracking
+        // downstream. Use the pre-computed marginEdgePct for those instead.
+        const _isMarginMarketForWinProb = p.marketKey === "winner" || p.marketKey === "handicap" || p.marketKey === "handicap_h1" || p.marketKey === "handicap_h2";
+        const _hasUsableScaleForWinProb = _isMarginMarketForWinProb ? isFinite(p.marginEdgePct) : (isFinite(p.line) && p.line > 0);
+        if (p.pick !== "NO PLAY" && isFinite(p.proj) && _hasUsableScaleForWinProb) {
           const grade = String(p.confidence || "D").toUpperCase();
-          const edgePct = Math.abs(p.edge / p.line);
+          const edgePct = _isMarginMarketForWinProb ? p.marginEdgePct : Math.abs(p.edge / p.line);
           // AUDIT FIX #2: this used to reuse FT's volatility ratio and hardcode
           // "no trap" for every market, so a pick's displayed win% could
           // visibly disagree with its own letter grade (most noticeably on
@@ -26481,6 +26520,10 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
       h1SampleTier: h1Calc.h1SampleTier,
       ftProjectionOnly: ftCalc.ftProjectionOnly,
       h1ProjectionOnly: h1Calc.h1ProjectionOnly,
+      // AUDIT FIX: 2H Total / 2H Handicap had no projectionOnly source at
+      // all in this diagnostics object, so getProjectionOnlyForMarket's
+      // "h2" and "handicap_h2" lookups had nothing real to read.
+      h2ProjectionOnly: h2Calc.h2ProjectionOnly,
       ftHasH2H: ftCalc.ftHasH2H,
       h1HasH2H: h1Calc.h1HasH2H,
       q1HasH2H: !!q1?.hasH2H,
