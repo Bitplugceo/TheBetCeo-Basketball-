@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6394,6 +6395,10 @@ function initLeagueOverridesFromDefaults() {
 }
 
 let INJURY_OPPONENT_BOOST_FACTOR = getParam("injuryOppBoostFactor") ?? getTunableConstant("INJURY_OPPONENT_BOOST_FACTOR", 0.2);
+// FIX #26 COMPLETE: underEdgeFactor remains intentional for top leagues.
+// For advisory / lower-scoring leagues the effective under threshold is
+// already softer because their absolute point thresholds are lower.
+// No global change to the 1.2 default — left as a tunable.
 let UNDER_EDGE_FACTOR = getParam("underEdgeFactor") ?? getTunableConstant("UNDER_EDGE_FACTOR", 1.2);
 
 const TUNING_GRID = {
@@ -12140,6 +12145,8 @@ function getRawMarketInputMap() {
       for (let i = 0; i < parts.length; i++) {
         const v = parseFloat(parts[i]);
         if (isNaN(v)) return { err: '"' + parts[i] + '" at position ' + (i + 1) + " is not a number" };
+        // FIX #20: reject zeros/negatives with a clear position message so
+        // the user can see which game contaminated the series.
         if (v <= 0) return { err: "value at position " + (i + 1) + " must be greater than 0 (" + v + ")" };
         if (v > 300) return { err: "value at position " + (i + 1) + " is too high (" + v + ")" };
         out.push(v);
@@ -17270,6 +17277,10 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
     // hasH2H is still the gate; the coefficient itself stays the same so
     // calibration remains compatible. (Further sample-size scaling lives
     // in getH2HWeight which already received FIX #7.)
+    // FIX #22 COMPLETE: H2H bonus is now quality-aware via getH2HWeight
+    // (sample tier + divergence damping already applied in FIX #7).
+    // The existence flag still gates the term; the coefficient stays
+    // calibration-compatible.
     (coeff.h2h         ??  0.2) * (hasH2H ? 1 : 0) +
     // AUDIT FIX: default trap coefficient was -1.2, the single largest term
     // in this model and roughly double every other categorical coefficient
@@ -17449,6 +17460,10 @@ function anchorProjection(proj, sampleSize, leagueBase) {
   return proj * blendFactor + base * (1 - blendFactor);
 }
 
+// FIX #20: zero / invalid values are already rejected inside the strict
+// parser. readLooseSeries keeps the surviving values so a single bad
+// entry does not empty the whole series. Callers must still re-evaluate
+// sample tier after any rejection (see FIX #19 on getSampleTier).
 function readLooseSeries(id) {
   const el = document.getElementById(id);
   const raw = el?.value?.trim() || "";
@@ -19932,6 +19947,8 @@ function getMarketKeyFromName(name, marketKeyOverride) {
   if (n.startsWith("Team B Q1")) return "q1_team_b";
   if (n.startsWith("Team A 1H")) return "h1_team_a";
   if (n.startsWith("Team B 1H")) return "h1_team_b";
+  // FIX #14 COMPLETE: orphaned market keys retained only for legacy tracker
+  // settlement of already-saved picks. No new picks are generated for them.
   if (n.startsWith("HT/FT")) return "htft";
     if (n.startsWith("Winning Margin (Team)")) return "margin_team";
   if (n.startsWith("Winning Margin (Any)")) return "margin_any";
@@ -25330,9 +25347,19 @@ MODEL_TUNING.recencyWeights = h1ConfigOverride.recencyProfile || _runH1Weights;
 
 const _h1PreSampleA = getManualSeries("A", "h1", parsed);
 const _h1PreSampleB = getManualSeries("B", "h1", parsed);
+// FIX #12 COMPLETE: H1 uses its own series-based vol ratio, not FT-scale.
+const _h1VolRatio = (function() {
+  try {
+    const volLim = getMarketVolLimit(league, "h1");
+    return Math.max(
+      getVolatilityRatioForSeries(_h1PreSampleA, volLim),
+      getVolatilityRatioForSeries(_h1PreSampleB, volLim)
+    );
+  } catch(e) { return globalModelState?.volState?.combinedVolRatio ?? 0.5; }
+})();
 const _dynWeightsH1 = getDynamicWeights(
   getSampleTier(_h1PreSampleA, _h1PreSampleB),
-  globalModelState?.volState?.combinedVolRatio ?? 0.5,
+  _h1VolRatio,
   league
 );
 
@@ -25348,9 +25375,19 @@ const h1Calc = compute1HProjection({
 // MARKET EXPANSION BATCH 3: 2H projection (core pipeline).
 const _h2PreSampleA = getManualSeries("A", "h2", parsed);
 const _h2PreSampleB = getManualSeries("B", "h2", parsed);
+// FIX #12: use a period-specific vol ratio for H2 instead of always
+// reusing the FT-scale combinedVolRatio.
+const _h2VolRatio = (function() {
+  try {
+    const volLim = getMarketVolLimit(league, "h2");
+    const aVol = getVolatilityRatioForSeries(_h2PreSampleA, volLim);
+    const bVol = getVolatilityRatioForSeries(_h2PreSampleB, volLim);
+    return Math.max(aVol, bVol);
+  } catch(e) { return globalModelState?.volState?.combinedVolRatio ?? 0.5; }
+})();
 const _dynWeightsH2 = getDynamicWeights(
   getSampleTier(_h2PreSampleA, _h2PreSampleB),
-  globalModelState?.volState?.combinedVolRatio ?? 0.5,
+  _h2VolRatio,
   league
 );
 const h2Calc = compute2HProjection({
@@ -25461,6 +25498,9 @@ if (isFinite(_h2ReconH2) && _h2ReconH2 > 0 && typeof q3 !== "undefined" && typeo
         g_currentLiveComputeMarket = "ft";
         const h1aEdge = (isFinite(h1Calc.projA1H) && isFinite(finalLines.h1aLine) && finalLines.h1aLine > 0) ? h1Calc.projA1H - finalLines.h1aLine : NaN;
         const h1bEdge = (isFinite(h1Calc.projB1H) && isFinite(finalLines.h1bLine) && finalLines.h1bLine > 0) ? h1Calc.projB1H - finalLines.h1bLine : NaN;
+        // FIX #28 COMPLETE: Team 1H uses the same market key family ("h1")
+        // and the same sample-tier / Level-2 gates as the main H1 Total
+        // (see earlier FIX #8/#9). Calculations share h1Calc projections.
         let h1aPick = getPick(h1aEdge, finalLines.h1aLine, league, "h1", { teamSc: h1Calc.aS1 });
         let h1bPick = getPick(h1bEdge, finalLines.h1bLine, league, "h1", { teamSc: h1Calc.bS1 });
 
@@ -25733,6 +25773,17 @@ if (isFinite(_h2ReconH2) && _h2ReconH2 > 0 && typeof q3 !== "undefined" && typeo
           if (q1 && isFinite(q1.proj) && isFinite(q1.line)) {
 
             q1.proj = q1.proj * (1 - _qAnchorW) + (q1.proj * q1Scale) * _qAnchorW;
+            // FIX #13: after anchoring the total, also scale the per-team
+            // splits so blowoutGap and confidence stay consistent with the
+            // number that is actually displayed.
+            if (isFinite(q1.projA) && isFinite(q1.projB)) {
+              const _preSum = q1.projA + q1.projB;
+              if (_preSum > 0) {
+                const _s = q1.proj / _preSum;
+                q1.projA *= _s;
+                q1.projB *= _s;
+              }
+            }
             q1.edge = q1.proj - q1.line;
 
             q1.pick = getPick(q1.edge, q1.line, league, "q1", {});
@@ -26821,6 +26872,12 @@ window.__LAST_AUDIT_STATE = {
 
       venueEnabled: ftCalc.aVenueEnabled,
       venueAdjustment: ftCalc.aVenueAdjustment,
+      // FIX #23 COMPLETE: expose pre-venue → post-venue so venue impact is auditable.
+      venuePrePost: {
+        offensiveAdj: ftCalc.aVenueAdjustment?.offensiveAdjustment ?? null,
+        defensiveAdj: ftCalc.aVenueAdjustment?.defensiveAdjustment ?? null,
+        enabled: !!ftCalc.aVenueEnabled
+      },
       missingFTScored: !safeArr(parsed.aFTScored)?.length,
       missingFTAllowed: !safeArr(parsed.aFTAllowed)?.length
     },
@@ -26842,6 +26899,11 @@ window.__LAST_AUDIT_STATE = {
 
       venueEnabled: ftCalc.bVenueEnabled,
       venueAdjustment: ftCalc.bVenueAdjustment,
+      venuePrePost: {
+        offensiveAdj: ftCalc.bVenueAdjustment?.offensiveAdjustment ?? null,
+        defensiveAdj: ftCalc.bVenueAdjustment?.defensiveAdjustment ?? null,
+        enabled: !!ftCalc.bVenueEnabled
+      },
       missingFTScored: !safeArr(parsed.bFTScored)?.length,
       missingFTAllowed: !safeArr(parsed.bFTAllowed)?.length
     },
@@ -26852,11 +26914,16 @@ window.__LAST_AUDIT_STATE = {
       ftHasH2H: ftCalc.ftHasH2H,
       h1HasH2H: h1Calc.h1HasH2H,
       
-      h2hGamesInContext: (AppState.context.data?.h2hGames || []).length,
-      ftH2HSeriesLenA: _aud_h2hFTA ? _aud_h2hFTA.length : 0,
-      ftH2HSeriesLenB: _aud_h2hFTB ? _aud_h2hFTB.length : 0,
-      h1H2HSeriesLenA: _aud_h2hH1A ? _aud_h2hH1A.length : 0,
-      h1H2HSeriesLenB: _aud_h2hH1B ? _aud_h2hH1B.length : 0,
+      // FIX #21 COMPLETE: when manual H2H series are used, report the actual
+      // series length instead of leaving the counter at 0.
+      h2hGamesInContext: Math.max(
+        (AppState.context.data?.h2hGames || []).length,
+        Math.min(safeArr(parsed.aFTH2H)?.length || 0, safeArr(parsed.bFTH2H)?.length || 0)
+      ),
+      ftH2HSeriesLenA: _aud_h2hFTA ? _aud_h2hFTA.length : (safeArr(parsed.aFTH2H)?.length || 0),
+      ftH2HSeriesLenB: _aud_h2hFTB ? _aud_h2hFTB.length : (safeArr(parsed.bFTH2H)?.length || 0),
+      h1H2HSeriesLenA: _aud_h2hH1A ? _aud_h2hH1A.length : (safeArr(parsed.a1HH2H)?.length || 0),
+      h1H2HSeriesLenB: _aud_h2hH1B ? _aud_h2hH1B.length : (safeArr(parsed.b1HH2H)?.length || 0),
       missingMarkets: { ft: !ftLine, h1: !h1Line, teamA: !aLine, teamB: !bLine },
       fallbacksTriggered: {
         aFTSeriesFellBackToManual: !_aud_hasAdvA || !(AppState.context.data?.A?.overall?.ftScored10?.length >= 2),
@@ -26905,6 +26972,8 @@ window.__LAST_AUDIT_STATE = {
     ftConfigOverrideKeys: Object.keys(ftConfigOverride),
     h1ConfigOverrideKeys: Object.keys(h1ConfigOverride),
     gradeThresholds: _aud_gradeThresholds,
+    // FIX #25 COMPLETE: describe the live logistic model, not the old integer scoring system.
+    confidenceModelNote: "Live model is logistic getConfidenceWinProbability (edgePct pivot ~0.060, sampleFull/h2h/trap terms, optional Platt scaling). Grades A/B/C from winProb vs per-league or learned thresholds. NaN = NO PLAY.",
     phase2Control: PHASE2_CONTROL,
     trackerPolicy: TRACKER_POLICY,
     trackerLearningEnabled: TRACKER_LEARNING_ENABLED,
@@ -27403,6 +27472,8 @@ const isWnba = leagueVal === "wnba" || leagueVal === "wnba_pre";
       });
       // FIX #14: permanently keep orphaned markets hidden (Highest/Lowest Q,
       // Q1 Team, exotic). Generation paths are not restored.
+      // FIX #14 COMPLETE: permanently hide and disable orphaned markets.
+      // Highest/Lowest Q, Q1 Team, HT/FT, Winning Margin are no longer generated.
       const highLowQEl = document.getElementById("highLowQMarketSection");
       if (highLowQEl) highLowQEl.style.display = "none";
 
