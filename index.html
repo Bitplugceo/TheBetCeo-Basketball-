@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2892,6 +2893,12 @@ body.dark-mode .tracker-analytics-section-head {
        parseHandicapLine (Batch 3), not parseMarketLine. -->
   <div id="handicapMarketSection" style="margin-top: 6px;">
     <div><label id="handicapMarketLabel">Handicap (Home, signed)</label><input id="handicapMarket" placeholder="-4.5" /></div>
+  </div>
+  <!-- MARKET EXPANSION BATCH 5: 1H / 2H Handicap — own inputs (a game can
+       carry different 1H vs 2H lines). Gating to WNBA is Batch 6. -->
+  <div id="handicapH1H2MarketSection" style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px;">
+    <div><label id="handicapH1MarketLabel">1H Handicap (Home, signed)</label><input id="handicapH1Market" placeholder="-2.5" /></div>
+    <div><label id="handicapH2MarketLabel">2H Handicap (Home, signed)</label><input id="handicapH2Market" placeholder="-2.5" /></div>
   </div>
 
       <div id="q1q2MarketSection" style="display: none; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px;">
@@ -12098,13 +12105,19 @@ function getRawMarketInputMap() {
   return {
     ft: document.getElementById("ftMarket")?.value || "",
     h1: document.getElementById("h1Market")?.value || "",
+    // MARKET EXPANSION BATCH 4
+    h2: document.getElementById("h2Market")?.value || "",
 
     team_a: document.getElementById("teamAMarket")?.value || "",
     team_b: document.getElementById("teamBMarket")?.value || "",
     q1: document.getElementById("q1Market")?.value || "",
     q2: document.getElementById("q2Market")?.value || "",
     q3: document.getElementById("q3Market")?.value || "",
-    q4: document.getElementById("q4Market")?.value || ""
+    q4: document.getElementById("q4Market")?.value || "",
+    // MARKET EXPANSION BATCH 5 (margin — raw signed text for smart-line path)
+    handicap: document.getElementById("handicapMarket")?.value || "",
+    handicap_h1: document.getElementById("handicapH1Market")?.value || "",
+    handicap_h2: document.getElementById("handicapH2Market")?.value || ""
   };
 }
 
@@ -19813,7 +19826,7 @@ function getMarketKeyFromName(name, marketKeyOverride) {
   // "Handicap" literally) and land on the "other" catch-all, silently
   // overwriting marketKey right before it's used for tracker attribution.
   // handicap_h1/handicap_h2 included pre-emptively for the batch that adds them.
-  const validKeys = ["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "h1_team_a", "h1_team_b", "player", "winner", "handicap", "handicap_h1", "handicap_h2"];
+  const validKeys = ["ft", "h1", "h2", "team_a", "team_b", "q1", "q2", "q3", "q4", "h1_team_a", "h1_team_b", "player", "winner", "handicap", "handicap_h1", "handicap_h2"];
   if (validKeys.includes(marketKeyOverride)) return marketKeyOverride;
   if (marketKeyOverride === "player") return "player";
   const n = String(name || "");
@@ -19825,6 +19838,12 @@ function getMarketKeyFromName(name, marketKeyOverride) {
   if (n.startsWith("Lowest Scoring Quarter")) return "low_q";
   if (n.startsWith("FT Total")) return "ft";
   if (n.startsWith("1H Total")) return "h1";
+  // MARKET EXPANSION BATCH 4/5 name → key (override already covers when set)
+  if (n.startsWith("2H Total")) return "h2";
+  if (n === "Winner" || n.startsWith("Winner ")) return "winner";
+  if (n === "Handicap" || n.startsWith("Handicap ")) return "handicap";
+  if (n.startsWith("1H Handicap")) return "handicap_h1";
+  if (n.startsWith("2H Handicap")) return "handicap_h2";
   if (n.startsWith("Q1 Total")) return "q1";
   if (n.startsWith("Q2 Total")) return "q2";
   if (n.startsWith("Q3 Total")) return "q3";
@@ -24800,6 +24819,9 @@ function extractInputs(league) {
     // yet (that's a later batch) — this reads null gracefully until then,
     // same as any other market line before its input exists.
     handicapLine: readHandicapLine("handicapMarket"),
+    // MARKET EXPANSION BATCH 5
+    handicapH1Line: readHandicapLine("handicapH1Market"),
+    handicapH2Line: readHandicapLine("handicapH2Market"),
   };
   return { parsed, lines };
 }
@@ -25089,8 +25111,9 @@ const globalModelState = buildGlobalModelState({
 const finalLines = Object.freeze({
   ftLine: baseLines.ftLine,
   h1Line: baseLines.h1Line,
-  // MARKET EXPANSION BATCH 4
-  h2Line: baseLines.h2Line,
+  // MARKET EXPANSION BATCH 4 FIX: baseLines only carries ft/h1/a/b —
+  // h2Line lives on the full extract `lines` object (same pattern as handicapLine).
+  h2Line: lines.h2Line,
   aLine: baseLines.aLine,
   bLine: baseLines.bLine,
   q1aLine: lines.q1aLine,
@@ -25101,7 +25124,10 @@ const finalLines = Object.freeze({
   lowQLine: lines.lowQLine,
   raceRange: lines.raceRange,
   // MARKET EXPANSION BATCH 3
-  handicapLine: lines.handicapLine
+  handicapLine: lines.handicapLine,
+  // MARKET EXPANSION BATCH 5
+  handicapH1Line: lines.handicapH1Line,
+  handicapH2Line: lines.handicapH2Line
 });
 
 const memoryFlags = {
@@ -25268,6 +25294,30 @@ if (isFinite(_h2ReconGap) && typeof engineDebug === "function") {
           : NaN;
         g_currentLiveComputeMarket = "handicap";
         let handicapPick = getMarginPick(handicapEdge, league, "handicap");
+        // MARKET EXPANSION BATCH 5: 1H / 2H Handicap — margin-safe path only.
+        // Uses existing H1 / Batch-3 2H projections; does not alter those engines.
+        const marginProjectionH1 = computeMarginProjection(h1Calc.projA1H, h1Calc.projB1H);
+        const _h1VolLimitForMargin = getMarketVolLimit(league, "h1");
+        const combinedMarginVolH1 = computeCombinedMarginVolatility(
+          (h1Calc.aVol1 || 0) * _h1VolLimitForMargin,
+          (h1Calc.bVol1 || 0) * _h1VolLimitForMargin
+        );
+        const handicapH1Edge = (isFinite(marginProjectionH1) && isFinite(finalLines.handicapH1Line))
+          ? marginProjectionH1 + finalLines.handicapH1Line
+          : NaN;
+        g_currentLiveComputeMarket = "handicap_h1";
+        let handicapH1Pick = getMarginPick(handicapH1Edge, league, "handicap_h1");
+        const marginProjectionH2 = computeMarginProjection(h2Calc.projA2H, h2Calc.projB2H);
+        const _h2VolLimitForMargin = getMarketVolLimit(league, "h2");
+        const combinedMarginVolH2 = computeCombinedMarginVolatility(
+          (h2Calc.aVol2 || 0) * _h2VolLimitForMargin,
+          (h2Calc.bVol2 || 0) * _h2VolLimitForMargin
+        );
+        const handicapH2Edge = (isFinite(marginProjectionH2) && isFinite(finalLines.handicapH2Line))
+          ? marginProjectionH2 + finalLines.handicapH2Line
+          : NaN;
+        g_currentLiveComputeMarket = "handicap_h2";
+        let handicapH2Pick = getMarginPick(handicapH2Edge, league, "handicap_h2");
         g_currentLiveComputeMarket = "ft";
         const h1aEdge = (isFinite(h1Calc.projA1H) && isFinite(finalLines.h1aLine) && finalLines.h1aLine > 0) ? h1Calc.projA1H - finalLines.h1aLine : NaN;
         const h1bEdge = (isFinite(h1Calc.projB1H) && isFinite(finalLines.h1bLine) && finalLines.h1bLine > 0) ? h1Calc.projB1H - finalLines.h1bLine : NaN;
@@ -25896,6 +25946,34 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       league
     });
 
+    // MARKET EXPANSION BATCH 5: 1H / 2H Handicap confidence (margin-safe).
+    // referenceScale = half-game total projection so marginEdgePct stays on
+    // the same numeric scale as totals edgePct (same calibration note as FT).
+    const handicapH1MarginInputs = getMarginConfidenceInputs(handicapH1Edge, h1Calc.h1Proj, combinedMarginVolH1, _h1VolLimitForMargin);
+    const handicapH1Trap = detectMarginTrap(handicapH1Edge, h1Calc.h1Proj, league, "handicap_h1", combinedMarginVolH1, _h1VolLimitForMargin);
+    const handicapH1Confidence = getMarginConfidenceGrade({
+      pick: handicapH1Pick,
+      marginEdgePct: handicapH1MarginInputs.marginEdgePct,
+      marginVolRatio: handicapH1MarginInputs.marginVolRatio,
+      sampleTier: h1Calc.h1SampleTier,
+      hasH2H: h1Calc.h1HasH2H,
+      trap: handicapH1Trap,
+      marketKey: "handicap_h1",
+      league
+    });
+    const handicapH2MarginInputs = getMarginConfidenceInputs(handicapH2Edge, h2Calc.h2Proj, combinedMarginVolH2, _h2VolLimitForMargin);
+    const handicapH2Trap = detectMarginTrap(handicapH2Edge, h2Calc.h2Proj, league, "handicap_h2", combinedMarginVolH2, _h2VolLimitForMargin);
+    const handicapH2Confidence = getMarginConfidenceGrade({
+      pick: handicapH2Pick,
+      marginEdgePct: handicapH2MarginInputs.marginEdgePct,
+      marginVolRatio: handicapH2MarginInputs.marginVolRatio,
+      sampleTier: h2Calc.h2SampleTier,
+      hasH2H: h2Calc.h2HasH2H,
+      trap: handicapH2Trap,
+      marketKey: "handicap_h2",
+      league
+    });
+
     const picks = [
   {
     _idx: 0,
@@ -26077,6 +26155,52 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     coeffFitted: _coeffFitted,
     marginEdgePct: handicapMarginInputs.marginEdgePct
   },
+  // MARKET EXPANSION BATCH 5: 1H Handicap (gated to WNBA in Batch 6)
+  {
+    _idx: 7,
+    name: "1H Handicap",
+    marketKey: "handicap_h1",
+    marketType: "handicap_h1",
+    league,
+    context: { aSc: h1Calc.aS1, bSc: h1Calc.bS1 },
+    line: finalLines.handicapH1Line,
+    proj: marginProjectionH1,
+    edge: handicapH1Edge,
+    pick: handicapH1Pick,
+    confidence: handicapH1Confidence,
+    note: null,
+    fullModel: h1Calc.h1FullModel,
+    sampleTier: h1Calc.h1SampleTier,
+    hasH2H: h1Calc.h1HasH2H,
+    trap: handicapH1Trap,
+    volatility: combinedMarginVolH1,
+    volLimit: _h1VolLimitForMargin,
+    coeffFitted: _coeffFitted,
+    marginEdgePct: handicapH1MarginInputs.marginEdgePct
+  },
+  // MARKET EXPANSION BATCH 5: 2H Handicap (gated to WNBA in Batch 6)
+  {
+    _idx: 8,
+    name: "2H Handicap",
+    marketKey: "handicap_h2",
+    marketType: "handicap_h2",
+    league,
+    context: { aSc: h2Calc.aS2, bSc: h2Calc.bS2 },
+    line: finalLines.handicapH2Line,
+    proj: marginProjectionH2,
+    edge: handicapH2Edge,
+    pick: handicapH2Pick,
+    confidence: handicapH2Confidence,
+    note: null,
+    fullModel: h2Calc.h2FullModel,
+    sampleTier: h2Calc.h2SampleTier,
+    hasH2H: h2Calc.h2HasH2H,
+    trap: handicapH2Trap,
+    volatility: combinedMarginVolH2,
+    volLimit: _h2VolLimitForMargin,
+    coeffFitted: _coeffFitted,
+    marginEdgePct: handicapH2MarginInputs.marginEdgePct
+  },
   {
     _idx: 14,
     name: "Team A 1H",
@@ -26142,14 +26266,15 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const isWnbaRun = league === "wnba" || league === "wnba_pre";
     const isManualLeagueRun = !isNbaOrNcaa;
 
-    // MARKET EXPANSION BATCH 4: "winner" added to all three — no gating,
-    // per spec. "handicap" added to nba/manual only — WNBA gets 1H/2H
-    // Handicap instead of full-game (those markets don't exist yet as
-    // computed picks, so wnbaAllowedMarkets isn't touched further here;
-    // a later batch adds handicap_h1/handicap_h2 to this set once built).
-    const wnbaAllowedMarkets   = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "winner"]);
-    const nbaAllowedMarkets    = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "h1_team_a", "h1_team_b", "winner", "handicap"]);
-    const manualAllowedMarkets = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "winner", "handicap"]);
+    // MARKET EXPANSION BATCH 6: league-conditional market gating (data, not
+    // branching math). Every market still computes above; this only controls
+    // what is displayed / eligible for lock.
+    //   WNBA / WNBA_pre: Winner, 1H Handicap, 2H Handicap — hide full-game
+    //                    Handicap and 2H Total
+    //   All other:       Winner, full-game Handicap, 2H Total — hide 1H/2H Handicap
+    const wnbaAllowedMarkets   = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "winner", "handicap_h1", "handicap_h2"]);
+    const nbaAllowedMarkets    = new Set(["ft", "h1", "h2", "team_a", "team_b", "q1", "q2", "q3", "q4", "h1_team_a", "h1_team_b", "winner", "handicap"]);
+    const manualAllowedMarkets = new Set(["ft", "h1", "h2", "team_a", "team_b", "q1", "q2", "q3", "q4", "winner", "handicap"]);
 
     const finalPicks = picks.filter(p => {
       if (isWnbaRun)       return wnbaAllowedMarkets.has(p.marketKey);
@@ -26159,12 +26284,12 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     });
 
     const mktOrderMap = {
-      "ft": 1, "h1": 2,
+      "ft": 1, "h1": 2, "h2": 2.5,
       "team_a": 3, "team_b": 4,
       "q1": 5, "q2": 6, "q3": 7, "q4": 8,
       "h1_team_a": 9, "h1_team_b": 10,
-      // MARKET EXPANSION BATCH 4: fractional so no existing key needs renumbering
-      "winner": 1.5, "handicap": 4.5
+      // MARKET EXPANSION BATCH 4/5: fractional so no existing key needs renumbering
+      "winner": 1.5, "handicap": 4.5, "handicap_h1": 4.6, "handicap_h2": 4.7
     };
     finalPicks.sort((a, b) => (mktOrderMap[a.marketKey] || 99) - (mktOrderMap[b.marketKey] || 99));
 
