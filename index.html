@@ -1,3 +1,4 @@
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3089,8 +3090,8 @@ body.dark-mode .tracker-analytics-section-head {
                        <div class="tracker-head-actions">
 <button type="button" id="trackerMilitaryRaidBtn" class="tracker-insights-btn" title="Single-click: Military Raid · Double-click: Toggle debug view" onclick="triggerTrackerMilitaryRaid()">🚨</button>
 <button type="button" id="trackerHealthBtn" class="tracker-insights-btn" title="Engine health dashboard">❤️</button>
-<button type="button" id="trackerSeasonBacktestBtn" class="tracker-insights-btn" title="Season Backtest panel (Joint search + Lock Optimal Parameters)">📊</button>
-<button type="button" id="trackerBacktestBtn" class="tracker-insights-btn" title="Max-power backtest: run 1 replay test">⚡</button>
+<button type="button" id="trackerSeasonBacktestBtn" class="tracker-insights-btn" title="Unified Season Backtest + Max-Power (import odds, joint search, lock params)">📊</button>
+<button type="button" id="trackerBacktestBtn" class="tracker-insights-btn" title="Opens the unified backtest panel (Max-Power lives there now)">⚡</button>
 <button type="button" id="trackerConfigBtn" class="tracker-insights-btn" title="View/Edit verified configs">⚙️</button>
 <button type="button" id="trackerCopyDataBtn" class="tracker-insights-btn" title="Copy tracker data to clipboard">📑</button>
 <button type="button" id="trackerCopyDataJsonBtn" class="tracker-insights-btn" title="Copy tracker data as JSON">🧾</button>
@@ -4391,23 +4392,25 @@ window.bbClearMarketIndexIDB = bbClearMarketIndexIDB;
 
 // Grade a single game against real market lines (ATS / total / ML)
 function bbGradeGameVsMarket(g, projectedMargin, projectedTotal) {
-  const out = { ats: null, total: null, ml: null, hasMarket: false };
-  if (!g || g.marketSpreadTeam == null && g.marketTotal == null) return out;
+  const out = { ats: null, total: null, ml: null, hasMarket: false, modelAts: null, modelTotalHit: null, modelMl: null };
+  if (!g || (g.marketSpreadTeam == null && g.marketTotal == null)) return out;
   out.hasMarket = true;
-  const actualMargin = (Number(g.teamScore) || 0) - (Number(g.oppScore) || 0);
+  // Support both teamScore/oppScore and scored/allowed (backtest game objects)
+  const teamPts = Number(g.teamScore != null ? g.teamScore : g.scored) || 0;
+  const oppPts = Number(g.oppScore != null ? g.oppScore : g.allowed) || 0;
+  const actualMargin = teamPts - oppPts;
   // ATS: team covered if actualMargin + marketSpreadTeam > 0 (push = 0)
   if (g.marketSpreadTeam != null && isFinite(g.marketSpreadTeam)) {
     const coverMargin = actualMargin + Number(g.marketSpreadTeam);
     if (Math.abs(coverMargin) < 1e-9) out.ats = "push";
     else out.ats = coverMargin > 0 ? "win" : "loss";
-    // Model pick vs line: projectedMargin + spread
     if (projectedMargin != null && isFinite(projectedMargin)) {
       const modelCover = projectedMargin + Number(g.marketSpreadTeam);
       out.modelAts = Math.abs(modelCover) < 1e-9 ? "push" : (modelCover > 0 ? "win" : "loss");
     }
   }
   if (g.marketTotal != null && isFinite(g.marketTotal)) {
-    const actualTotal = (Number(g.teamScore) || 0) + (Number(g.oppScore) || 0);
+    const actualTotal = teamPts + oppPts;
     const diff = actualTotal - Number(g.marketTotal);
     if (Math.abs(diff) < 1e-9) out.total = "push";
     else out.total = diff > 0 ? "over" : "under";
@@ -4417,13 +4420,53 @@ function bbGradeGameVsMarket(g, projectedMargin, projectedTotal) {
       out.modelTotalHit = (out.modelTotalSide === out.total) ? "win" : (out.total === "push" || out.modelTotalSide === "push" ? "push" : "loss");
     }
   }
-  // ML: team won straight up
   if (actualMargin > 0) out.ml = "win";
   else if (actualMargin < 0) out.ml = "loss";
   else out.ml = "push";
+  if (projectedMargin != null && isFinite(projectedMargin)) {
+    if (Math.abs(projectedMargin) < 1e-9 || actualMargin === 0) out.modelMl = "push";
+    else out.modelMl = ((projectedMargin > 0) === (actualMargin > 0)) ? "win" : "loss";
+  }
   return out;
 }
 window.bbGradeGameVsMarket = bbGradeGameVsMarket;
+
+function bbAggregateMarketMetrics(results) {
+  const tallies = {
+    nWithMarket: 0,
+    ats: { win: 0, loss: 0, push: 0 },
+    ou: { win: 0, loss: 0, push: 0 },
+    ml: { win: 0, loss: 0, push: 0 }
+  };
+  (results || []).forEach(function (r) {
+    const g = r && r.marketGrade;
+    if (!g || !g.hasMarket) return;
+    tallies.nWithMarket++;
+    if (g.modelAts === "win") tallies.ats.win++;
+    else if (g.modelAts === "loss") tallies.ats.loss++;
+    else if (g.modelAts === "push") tallies.ats.push++;
+    if (g.modelTotalHit === "win") tallies.ou.win++;
+    else if (g.modelTotalHit === "loss") tallies.ou.loss++;
+    else if (g.modelTotalHit === "push") tallies.ou.push++;
+    if (g.modelMl === "win") tallies.ml.win++;
+    else if (g.modelMl === "loss") tallies.ml.loss++;
+    else if (g.modelMl === "push") tallies.ml.push++;
+  });
+  function rate(bucket) {
+    const dec = bucket.win + bucket.loss;
+    return dec > 0 ? bucket.win / dec : null;
+  }
+  return {
+    nWithMarket: tallies.nWithMarket,
+    atsWinRate: rate(tallies.ats),
+    ouWinRate: rate(tallies.ou),
+    mlWinRate: rate(tallies.ml),
+    ats: tallies.ats,
+    ou: tallies.ou,
+    ml: tallies.ml
+  };
+}
+window.bbAggregateMarketMetrics = bbAggregateMarketMetrics;
 
 // ============================================================
 // MAXIMUM-POWER BACKTEST — Phase 0/1 foundations
@@ -21573,12 +21616,18 @@ async function runNbaSeasonBacktest(season, onProgress) {
         if (q && isFinite(q.projB)) { qPredTeamScores.push(q.projB); qActualTeamScores.push(quartersActual ? [game.q1Allowed, game.q2Allowed, game.q3Allowed, game.q4Allowed][i] : NaN); }
       });
 
+      const _predMargin = calc.projAFT - calc.projBFT;
+      const _predTotal = calc.ftProj;
+      const _marketGrade = (typeof bbGradeGameVsMarket === "function")
+        ? bbGradeGameVsMarket(game, _predMargin, _predTotal)
+        : null;
+
       results.push({
         date: game.date,
         matchup: `${game.teamName} vs ${game.oppName}`,
-        predictedMargin: calc.projAFT - calc.projBFT,
+        predictedMargin: _predMargin,
         actualMargin: game.scored - game.allowed,
-        predictedTotal: calc.ftProj,
+        predictedTotal: _predTotal,
         actualTotal: game.scored + game.allowed,
         predictedAScore: calc.projAFT,
         actualAScore: game.scored,
@@ -21597,7 +21646,10 @@ async function runNbaSeasonBacktest(season, onProgress) {
         // the Phase 3 feature cache (feat.split), which applies the exact
         // same _btValidationStartMs/_btTestStartMs boundary Phase 2 set up
         // — computed once per game there instead of recomputed here.
-        split: feat.split
+        split: feat.split,
+        marketSpreadTeam: game.marketSpreadTeam != null ? game.marketSpreadTeam : null,
+        marketTotal: game.marketTotal != null ? game.marketTotal : null,
+        marketGrade: _marketGrade
       });
     }
   } finally {
@@ -21629,7 +21681,18 @@ async function runNbaSeasonBacktest(season, onProgress) {
   const validationAccuracyScore = computeBacktestAccuracyScore(validation);
   const testAccuracyScore = computeBacktestAccuracyScore(test);
 
+  // Real-market grading (ATS / O-U / ML) against imported Vegas lines
+  const marketMetrics = (typeof bbAggregateMarketMetrics === "function")
+    ? bbAggregateMarketMetrics(results)
+    : { nWithMarket: 0, atsWinRate: null, ouWinRate: null, mlWinRate: null };
+
   const notes = [];
+  if (marketMetrics && marketMetrics.nWithMarket > 0) {
+    const fmtR = function (v) { return (v == null || !isFinite(v)) ? "—" : (v * 100).toFixed(1) + "%"; };
+    notes.push(`Real market lines attached on ${marketMetrics.nWithMarket} games → Model ATS ${fmtR(marketMetrics.atsWinRate)} · O/U ${fmtR(marketMetrics.ouWinRate)} · ML ${fmtR(marketMetrics.mlWinRate)} (pushes excluded from win rate).`);
+  } else if (!(window.__BB_MARKET_INDEX && Object.keys(window.__BB_MARKET_INDEX).length)) {
+    notes.push("No real odds imported yet — ATS/O-U/ML rates unavailable. Import CSVs above, then re-run.");
+  }
   if (overall) {
     if (isFinite(overall.totalBias) && Math.abs(overall.totalBias) >= 3) {
       notes.push(`Total points are running ${overall.totalBias > 0 ? "high" : "low"} by about ${Math.abs(overall.totalBias).toFixed(1)} pts on average — worth checking pace assumptions.`);
@@ -21710,6 +21773,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
     validationFraction: _btValidationFraction, testFraction: _btTestFraction,
     train, validation, test,
     accuracyScore, trainAccuracyScore, validationAccuracyScore, testAccuracyScore,
+    marketMetrics,
     groupedSearch,
     jointSearch,
     computedAt: new Date().toISOString()
@@ -21789,11 +21853,26 @@ function renderBacktestPanel() {
           <div class="tracker-summary-value">${fmtNum(cached.overall?.qTeamMAE)}</div>
           <div class="tracker-summary-sub">Bias: ${fmtNum(cached.overall?.qTeamBias)}</div>
         </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">Model ATS (vs real spread)</div>
+          <div class="tracker-summary-value">${cached.marketMetrics && isFinite(cached.marketMetrics.atsWinRate) ? (cached.marketMetrics.atsWinRate * 100).toFixed(1) + "%" : "—"}</div>
+          <div class="tracker-summary-sub">${cached.marketMetrics && cached.marketMetrics.nWithMarket ? `n=${cached.marketMetrics.nWithMarket} · ${cached.marketMetrics.ats?.win || 0}W-${cached.marketMetrics.ats?.loss || 0}L-${cached.marketMetrics.ats?.push || 0}P` : "Import odds CSVs to enable"}</div>
+        </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">Model O/U (vs real total)</div>
+          <div class="tracker-summary-value">${cached.marketMetrics && isFinite(cached.marketMetrics.ouWinRate) ? (cached.marketMetrics.ouWinRate * 100).toFixed(1) + "%" : "—"}</div>
+          <div class="tracker-summary-sub">${cached.marketMetrics && cached.marketMetrics.nWithMarket ? `${cached.marketMetrics.ou?.win || 0}W-${cached.marketMetrics.ou?.loss || 0}L-${cached.marketMetrics.ou?.push || 0}P` : "Import odds CSVs to enable"}</div>
+        </div>
+        <div class="tracker-summary-cell">
+          <div class="tracker-summary-label">Model ML (winner pick)</div>
+          <div class="tracker-summary-value">${cached.marketMetrics && isFinite(cached.marketMetrics.mlWinRate) ? (cached.marketMetrics.mlWinRate * 100).toFixed(1) + "%" : "—"}</div>
+          <div class="tracker-summary-sub">${cached.marketMetrics && cached.marketMetrics.nWithMarket ? `${cached.marketMetrics.ml?.win || 0}W-${cached.marketMetrics.ml?.loss || 0}L` : "Import odds CSVs to enable"}</div>
+        </div>
   ` : `
         <div class="tracker-summary-cell primary">
           <div class="tracker-summary-label">No results yet</div>
           <div class="tracker-summary-value">—</div>
-          <div class="tracker-summary-sub">Run a season backtest to see calibration stats here.</div>
+          <div class="tracker-summary-sub">Import odds once, then Run NBA Season Backtest.</div>
         </div>
   `;
 
@@ -21849,9 +21928,9 @@ function renderBacktestPanel() {
     <div class="tracker-analytics-shell">
       <div class="tracker-analytics-topbar">
         <div class="tracker-analytics-heading">
-          <div class="tracker-analytics-kicker">Season Backtest</div>
-          <div class="tracker-analytics-title">Scores-Only Calibration — NBA</div>
-          <div class="tracker-analytics-subtitle">Total points, team points, 1st half, quarters, and margin checked against real final scores, no market line involved. Uses whatever the live engine settings currently are — no separate config. ${cached ? `Last run: ${new Date(cached.computedAt).toLocaleString()} (season ${cached.season})` : ""}</div>
+          <div class="tracker-analytics-kicker">Season Backtest + Max-Power</div>
+          <div class="tracker-analytics-title">NBA Unified Backtest</div>
+          <div class="tracker-analytics-subtitle">Scores calibration + real Vegas ATS/O-U/ML when odds are imported. Joint search then Lock Optimal Parameters. Max-Power verification is the last step on this page. ${cached ? `Last run: ${new Date(cached.computedAt).toLocaleString()} (season ${cached.season})` : ""}</div>
         </div>
       </div>
 
@@ -21875,6 +21954,7 @@ function renderBacktestPanel() {
         <button type="button" id="runSeasonBacktestBtn" style="background:#3a9c35; color:#fff; border:none; padding:8px 16px; font-weight:800; font-size:12px; cursor:pointer;">▶ Run NBA Season Backtest</button>
         <button type="button" id="forceRebuildBacktestBtn" style="background:#d98a00; color:#fff; border:none; padding:8px 12px; font-weight:800; font-size:11px; cursor:pointer; margin-left:8px;">⟳ Force full rebuild</button>
         <button type="button" id="lockJointParamsBtn" style="background:#d4af37; color:#111; border:none; padding:8px 14px; font-weight:900; font-size:12px; cursor:pointer; margin-left:8px; box-shadow: 0 2px 8px rgba(212,175,55,0.4);">⚡ Lock Optimal Parameters</button>
+        <button type="button" id="runMaxPowerVerifyBtn" style="background:#c91920; color:#fff; border:none; padding:8px 12px; font-weight:800; font-size:11px; cursor:pointer; margin-left:8px;">⚡ Max-Power Verify</button>
         <button type="button" id="copySourceCodeDefaultsBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 12px; font-weight:800; font-size:11px; cursor:pointer; margin-left:8px;">📋 Copy Hardcoded Source Defaults</button>
         <button type="button" id="nbaCoreLockBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 12px; font-weight:800; font-size:11px; cursor:pointer; margin-left:8px;">🔒 Lock NBA Core</button>
         <span id="backtestStatusLabel" style="margin-left:10px; font-size:12px; opacity:0.8;"></span>
@@ -22040,6 +22120,41 @@ function renderBacktestPanel() {
         alert("Caches cleared. Tap Run NBA Season Backtest next — it will re-fetch H1 + advanced for all games (takes a while). Keep the screen on.");
       } catch (e) {
         alert("Clear failed: " + (e && e.message ? e.message : String(e)));
+      }
+    };
+  }
+
+  const maxPowerVerifyBtn = document.getElementById("runMaxPowerVerifyBtn");
+  if (maxPowerVerifyBtn) {
+    maxPowerVerifyBtn.onclick = async function () {
+      if (window.__btRunInProgress) {
+        alert("A backtest is already running…");
+        return;
+      }
+      if (typeof runMaxPowerBacktestFromButton !== "function") {
+        alert("Max-Power search is not loaded in this build.");
+        return;
+      }
+      const statusLabel = document.getElementById("backtestStatusLabel");
+      const prev = maxPowerVerifyBtn.textContent;
+      maxPowerVerifyBtn.disabled = true;
+      if (statusLabel) statusLabel.textContent = "Max-Power verification running…";
+      try {
+        const report = await runMaxPowerBacktestFromButton(function (done, total, label) {
+          if (statusLabel) {
+            statusLabel.textContent = (label || "search") + ": " + done + "/" + total;
+          }
+        });
+        window.__lastMaxPowerVerify = report;
+        if (statusLabel) statusLabel.textContent = report && report.error ? ("Error: " + report.error) : "Max-Power verification complete.";
+        if (report && report.error) alert("MAX-POWER ERROR\n" + report.error);
+        else alert("Max-Power verification finished. Check console / debug log for the dual-season gate result. If Season Backtest already found a joint winner, lock it with ⚡ Lock Optimal Parameters.");
+      } catch (e) {
+        if (statusLabel) statusLabel.textContent = "Max-Power failed.";
+        alert("Max-Power failed: " + (e && e.message ? e.message : String(e)));
+      } finally {
+        maxPowerVerifyBtn.disabled = false;
+        maxPowerVerifyBtn.textContent = prev;
       }
     };
   }
@@ -25061,7 +25176,12 @@ if (headerErrorBtn) {
       if (trackerSeasonBacktestBtn) trackerSeasonBacktestBtn.addEventListener("click", toggleTrackerBacktestView);
 
       const trackerBacktestBtn = document.getElementById("trackerBacktestBtn");
-      if (trackerBacktestBtn) trackerBacktestBtn.addEventListener("click", async function () {
+      if (trackerBacktestBtn) trackerBacktestBtn.addEventListener("click", function () {
+        // Max-Power is now inside the unified Season Backtest panel.
+        // Header ⚡ just opens that panel so both flows share one page.
+        if (typeof toggleTrackerBacktestView === "function") toggleTrackerBacktestView();
+        else if (typeof setTrackerModalView === "function") setTrackerModalView("backtest");
+        return;
         if (window.__btRunInProgress) {
           alert("Max-power already running…");
           return;
