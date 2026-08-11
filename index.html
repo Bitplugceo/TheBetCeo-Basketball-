@@ -5881,11 +5881,139 @@ function pruneUnverifiedLeagueOverrideDrift() {
 // which lever set a live pick actually uses.
 let g_currentLiveComputeMarket = null;
 
+// ============================================================
+// PHASE 2 — SINGLE SOURCE OF TRUTH (Lock Store)
+// Permanent home for complete, holdout-validated configs.
+// Once a league+market is locked, live getTunableParam reads ONLY
+// from here. Registry + league overrides remain the schema/defaults
+// and the working set used during a search run.
+// Key: BB_LOCKED_CONFIG_V1
+// Shape: { [league]: { [market]: { params: {...all 39...}, meta: {...} } } }
+// ============================================================
+const BB_LOCKED_CONFIG_KEY = "BB_LOCKED_CONFIG_V1";
+let g_lockedConfigCache = null;
+
+function loadLockedConfigStore() {
+  if (g_lockedConfigCache) return g_lockedConfigCache;
+  try {
+    const raw = localStorage.getItem(BB_LOCKED_CONFIG_KEY);
+    g_lockedConfigCache = raw ? (JSON.parse(raw) || {}) : {};
+  } catch (e) {
+    g_lockedConfigCache = {};
+    if (typeof engineDebug === "function") {
+      engineDebug("loadLockedConfigStore failed: " + (e?.message || String(e)));
+    }
+  }
+  return g_lockedConfigCache;
+}
+
+function saveLockedConfigStore(store) {
+  try {
+    g_lockedConfigCache = store || {};
+    localStorage.setItem(BB_LOCKED_CONFIG_KEY, JSON.stringify(g_lockedConfigCache));
+    return true;
+  } catch (e) {
+    if (typeof engineDebug === "function") {
+      engineDebug("saveLockedConfigStore failed: " + (e?.message || String(e)));
+    }
+    return false;
+  }
+}
+
+function hasLockedConfig(league, market) {
+  if (!league || !market) return false;
+  const store = loadLockedConfigStore();
+  const lk = String(league).toLowerCase();
+  const mk = String(market).toLowerCase();
+  return !!(store[lk] && store[lk][mk] && store[lk][mk].params && typeof store[lk][mk].params === "object");
+}
+
+function getLockedParam(key, league, market) {
+  if (!key || !league || !market) return undefined;
+  const store = loadLockedConfigStore();
+  const lk = String(league).toLowerCase();
+  const mk = String(market).toLowerCase();
+  const entry = store[lk] && store[lk][mk];
+  if (!entry || !entry.params || !(key in entry.params)) return undefined;
+  return entry.params[key];
+}
+
+function getLockedConfigMeta(league, market) {
+  if (!league || !market) return null;
+  const store = loadLockedConfigStore();
+  const lk = String(league).toLowerCase();
+  const mk = String(market).toLowerCase();
+  const entry = store[lk] && store[lk][mk];
+  return entry && entry.meta ? entry.meta : null;
+}
+
+/**
+ * Write a complete locked config for one league+market.
+ * params must be a full snapshot of the 39 tunable keys (or at least
+ * every key the search optimized). meta is free-form discovery evidence.
+ * This is the ONLY write path that makes values permanent for live picks.
+ */
+function saveLockedConfig(league, market, params, meta) {
+  if (!league || !market || !params || typeof params !== "object") {
+    if (typeof engineDebug === "function") {
+      engineDebug("saveLockedConfig: missing league/market/params", { league, market });
+    }
+    return false;
+  }
+  const store = loadLockedConfigStore();
+  const lk = String(league).toLowerCase();
+  const mk = String(market).toLowerCase();
+  if (!store[lk]) store[lk] = {};
+  store[lk][mk] = {
+    params: Object.assign({}, params),
+    meta: Object.assign({
+      lockedAt: new Date().toISOString(),
+      searchVersion: "joint-v1"
+    }, meta || {})
+  };
+  return saveLockedConfigStore(store);
+}
+
+function clearLockedConfig(league, market) {
+  if (!league) return false;
+  const store = loadLockedConfigStore();
+  const lk = String(league).toLowerCase();
+  if (!store[lk]) return false;
+  if (market) {
+    const mk = String(market).toLowerCase();
+    delete store[lk][mk];
+    if (Object.keys(store[lk]).length === 0) delete store[lk];
+  } else {
+    delete store[lk];
+  }
+  return saveLockedConfigStore(store);
+}
+
+window.loadLockedConfigStore = loadLockedConfigStore;
+window.saveLockedConfig = saveLockedConfig;
+window.hasLockedConfig = hasLockedConfig;
+window.getLockedParam = getLockedParam;
+window.getLockedConfigMeta = getLockedConfigMeta;
+window.clearLockedConfig = clearLockedConfig;
+
 function getTunableParam(key, league, market) {
   const entry = TUNABLE_PARAM_REGISTRY[key];
   if (!entry) {
     engineDebug("getTunableParam: unknown key '" + key + "' — check TUNABLE_PARAM_REGISTRY", { key, league });
     return null;
+  }
+
+  // PHASE 2: Locked config is the permanent single source of truth.
+  // When a complete lock exists for this league+market, live picks read
+  // ONLY from it. Registry / league-overrides are ignored for that key.
+  // During a search run (window.__btRunInProgress) we deliberately skip
+  // the lock so the search can freely inject candidate values.
+  const effectiveMarket = market || g_currentLiveComputeMarket || null;
+  if (!window.__btRunInProgress && league && effectiveMarket && hasLockedConfig(league, effectiveMarket)) {
+    const lockedVal = getLockedParam(key, league, effectiveMarket);
+    if (lockedVal !== undefined) {
+      return lockedVal;
+    }
   }
 
   // Registry / league-override candidate — this is what the Joint Backtest
@@ -6214,10 +6342,307 @@ const TUNING_GRID = {
   injuryMults: [1.0]
 };
 
+// ============================================================
+// PHASE 3 — PURE HISTORICAL REPLAY HARNESS
+// Single clean entry point for the joint search.
+// Accepts a complete config (all inventory keys) + one historical
+// game and returns projection + pick + result with no permanent
+// side effects. No UI, no network.
+// ============================================================
+
 /**
- * Replay one historical game under a complete joint lever set for a specific market.
- * Snapshot → inject → run pure projection path → restore.
- * No UI, no network. Returns pick vs actual result.
+ * Build a complete config object (all 39 inventory keys) from live
+ * defaults, then overlay any partial candidate values.
+ * This is what Phase 5 will mutate and pass into pureReplayGame.
+ */
+function buildCompleteConfig(league, partial) {
+  const l = String(league || "nba").toLowerCase();
+  const get = (key, fallback) => {
+    try {
+      if (partial && partial[key] !== undefined && partial[key] !== null) return partial[key];
+      const v = (typeof getParam === "function") ? getParam(key, l) : undefined;
+      return (v !== undefined && v !== null) ? v : fallback;
+    } catch (e) { return fallback; }
+  };
+  const reg = (typeof TUNABLE_PARAM_REGISTRY === "object" && TUNABLE_PARAM_REGISTRY) ? TUNABLE_PARAM_REGISTRY : {};
+  const def = (key, fb) => (reg[key] && reg[key].value !== undefined) ? reg[key].value : fb;
+
+  return {
+    h2hFactor:                get("h2hFactor", def("h2hFactor", 1.0)),
+    h2hMaxWeight:             get("h2hMaxWeight", def("h2hMaxWeight", 0.30)),
+    h2hLookbackSeasons:       get("h2hLookbackSeasons", def("h2hLookbackSeasons", 4)),
+    h2hDecayCurrent:          get("h2hDecayCurrent", def("h2hDecayCurrent", 1.00)),
+    h2hDecayMinus1:           get("h2hDecayMinus1", def("h2hDecayMinus1", 0.75)),
+    h2hDecayMinus2:           get("h2hDecayMinus2", def("h2hDecayMinus2", 0.50)),
+    h2hDecayOlder:            get("h2hDecayOlder", def("h2hDecayOlder", 0.30)),
+    recencyWeights:           get("recencyWeights", def("recencyWeights", [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16])),
+    teamWeightBase:           get("teamWeightBase", def("teamWeightBase", 0.65)),
+    venueMinGames:            get("venueMinGames", def("venueMinGames", 6)),
+    venueStrongGames:         get("venueStrongGames", def("venueStrongGames", 10)),
+    venueModerateWeight:      get("venueModerateWeight", def("venueModerateWeight", 0.50)),
+    venueStrongWeight:        get("venueStrongWeight", def("venueStrongWeight", 0.70)),
+    quarterVenueProxyFactor:  get("quarterVenueProxyFactor", def("quarterVenueProxyFactor", 1.0)),
+    injuryOppBoostFactor:     get("injuryOppBoostFactor", def("injuryOppBoostFactor", 0.2)),
+    underEdgeFactor:          get("underEdgeFactor", def("underEdgeFactor", 1.2)),
+    extremeExpansion:         get("extremeExpansion", def("extremeExpansion", 1.0)),
+    paceClampMinNbaNcaa:      get("paceClampMinNbaNcaa", def("paceClampMinNbaNcaa", 0.65)),
+    paceClampMaxNbaNcaa:      get("paceClampMaxNbaNcaa", def("paceClampMaxNbaNcaa", 1.35)),
+    paceClampMinOther:        get("paceClampMinOther", def("paceClampMinOther", 0.70)),
+    paceClampMaxOther:        get("paceClampMaxOther", def("paceClampMaxOther", 1.30)),
+    advancedBlendWeight:      get("advancedBlendWeight", def("advancedBlendWeight", 0.45)),
+    confidenceAThresh:        get("confidenceAThresh", def("confidenceAThresh", 0.66)),
+    confidenceBThresh:        get("confidenceBThresh", def("confidenceBThresh", 0.58)),
+    confidenceCThresh:        get("confidenceCThresh", def("confidenceCThresh", 0.51)),
+    volatilityLimit:          get("volatilityLimit", def("volatilityLimit", 12)),
+    h1VolScale:               get("h1VolScale", def("h1VolScale", 1.0)),
+    teamVolScale:             get("teamVolScale", def("teamVolScale", 1.0)),
+    quarterVolScale:          get("quarterVolScale", def("quarterVolScale", 1.0)),
+    edgeFTPointThreshold:     get("edgeFTPointThreshold", def("edgeFTPointThreshold", 7.0)),
+    edgeH1PointThreshold:     get("edgeH1PointThreshold", def("edgeH1PointThreshold", 8.0)),
+    edgeTeamPointThreshold:   get("edgeTeamPointThreshold", def("edgeTeamPointThreshold", 10.0)),
+    edgeQPointThreshold:      get("edgeQPointThreshold", def("edgeQPointThreshold", 5.0)),
+    edgeWinnerPointThreshold: get("edgeWinnerPointThreshold", def("edgeWinnerPointThreshold", 5.0)),
+    edgeHandicapPointThreshold: get("edgeHandicapPointThreshold", def("edgeHandicapPointThreshold", 4.0)),
+    edgeHandicapH1PointThreshold: get("edgeHandicapH1PointThreshold", def("edgeHandicapH1PointThreshold", 4.0)),
+    edgeHandicapH2PointThreshold: get("edgeHandicapH2PointThreshold", def("edgeHandicapH2PointThreshold", 4.0)),
+    fatigueB2BPenalty:        get("fatigueB2BPenalty", def("fatigueB2BPenalty", -2.5)),
+    quarterAnchorBlendWeight: get("quarterAnchorBlendWeight", def("quarterAnchorBlendWeight", 0.7))
+  };
+}
+
+/**
+ * Pure replay of one historical game under a complete config.
+ * Does not permanently mutate live state. Uses the same core math
+ * helpers as the live engine (trimmedAvg, getDynamicWeights,
+ * getH2HWeight, getPick, getConfidenceGrade) with config values
+ * applied for the duration of the call only.
+ *
+ * @param {object} game        historical game from g_historicalGamesStore
+ * @param {object} fullConfig  complete config from buildCompleteConfig()
+ * @param {string} market      "ft" | "h1" | "team" | "h1_team" | "q1" | "q2" | "q3" | "q4"
+ * @returns {object} { pick, side, edge, grade, projectedTotal, actualTotal, result, market, projA, projB }
+ */
+function pureReplayGame(game, fullConfig, market) {
+  market = String(market || "ft").toLowerCase();
+  const empty = {
+    pick: "NO PLAY", side: "", edge: 0, grade: "NaN",
+    projectedTotal: NaN, actualTotal: game?.actualTotal ?? NaN,
+    result: "noplay", market: market, projA: NaN, projB: NaN
+  };
+  if (!game || !fullConfig) return empty;
+
+  const league = String(game.league || "nba").toLowerCase();
+  const cfg = fullConfig;
+
+  // Snapshot only the keys we will temporarily inject
+  const injectKeys = [
+    "teamWeightBase", "h2hMaxWeight", "h2hFactor", "h2hLookbackSeasons",
+    "h2hDecayCurrent", "h2hDecayMinus1", "h2hDecayMinus2", "h2hDecayOlder",
+    "recencyWeights", "venueMinGames", "venueStrongGames",
+    "venueModerateWeight", "venueStrongWeight", "quarterVenueProxyFactor",
+    "injuryOppBoostFactor", "underEdgeFactor", "extremeExpansion",
+    "paceClampMinNbaNcaa", "paceClampMaxNbaNcaa", "paceClampMinOther", "paceClampMaxOther",
+    "advancedBlendWeight", "confidenceAThresh", "confidenceBThresh", "confidenceCThresh",
+    "volatilityLimit", "h1VolScale", "teamVolScale", "quarterVolScale",
+    "edgeFTPointThreshold", "edgeH1PointThreshold", "edgeTeamPointThreshold", "edgeQPointThreshold",
+    "edgeWinnerPointThreshold", "edgeHandicapPointThreshold",
+    "edgeHandicapH1PointThreshold", "edgeHandicapH2PointThreshold",
+    "fatigueB2BPenalty", "quarterAnchorBlendWeight"
+  ];
+  const snapshot = {};
+  injectKeys.forEach(key => {
+    try { snapshot[key] = getParam(key, league); } catch (e) { snapshot[key] = undefined; }
+  });
+
+  // Edge-threshold shim used by getLeagueEdgePointThreshold during replay
+  const prevEdgeOverride = window.__BACKTEST_EDGE_OVERRIDE;
+  window.__BACKTEST_EDGE_OVERRIDE = {
+    ft:   cfg.edgeFTPointThreshold,
+    h1:   cfg.edgeH1PointThreshold,
+    team: cfg.edgeTeamPointThreshold,
+    q:    cfg.edgeQPointThreshold
+  };
+
+  const prevBtFlag = window.__btRunInProgress;
+  window.__btRunInProgress = true;
+
+  try {
+    // Inject complete config for the duration of this call only
+    injectKeys.forEach(key => {
+      if (cfg[key] !== undefined && typeof setTunableParam === "function") {
+        setTunableParam(key, cfg[key], league);
+      }
+    });
+
+    const aScored  = Array.isArray(game.homeRecentScored)  ? game.homeRecentScored  : [];
+    const aAllowed = Array.isArray(game.homeRecentAllowed) ? game.homeRecentAllowed : [];
+    const bScored  = Array.isArray(game.awayRecentScored)  ? game.awayRecentScored  : [];
+    const bAllowed = Array.isArray(game.awayRecentAllowed) ? game.awayRecentAllowed : [];
+    const h2hA     = Array.isArray(game.h2hHome)           ? game.h2hHome           : [];
+    const h2hB     = Array.isArray(game.h2hAway)           ? game.h2hAway           : [];
+
+    const sampleTier = (typeof getSampleTier === "function")
+      ? getSampleTier(aScored, bScored)
+      : (aScored.length >= 5 && bScored.length >= 5 ? "full" : (aScored.length >= 3 ? "thin" : "insufficient"));
+
+    if (sampleTier === "insufficient") {
+      return Object.assign({}, empty, { actualTotal: isFinite(Number(game.actualTotal)) ? Number(game.actualTotal) : empty.actualTotal });
+    }
+
+    const aOff = (typeof trimmedAvg === "function") ? trimmedAvg(aScored)  : (aScored.reduce((s, v) => s + v, 0) / (aScored.length || 1));
+    const aDef = (typeof trimmedAvg === "function") ? trimmedAvg(aAllowed) : (aAllowed.reduce((s, v) => s + v, 0) / (aAllowed.length || 1));
+    const bOff = (typeof trimmedAvg === "function") ? trimmedAvg(bScored)  : (bScored.reduce((s, v) => s + v, 0) / (bScored.length || 1));
+    const bDef = (typeof trimmedAvg === "function") ? trimmedAvg(bAllowed) : (bAllowed.reduce((s, v) => s + v, 0) / (bAllowed.length || 1));
+
+    const volLimit = isFinite(cfg.volatilityLimit) ? Number(cfg.volatilityLimit)
+      : ((typeof getMarketVolLimit === "function") ? getMarketVolLimit(league, "ft") : 12);
+    const volState = (typeof getUnifiedVolatilityState === "function")
+      ? getUnifiedVolatilityState(aScored, bScored, volLimit)
+      : { combinedVolRatio: 0.5 };
+
+    // teamWeightBase from config is the base; getDynamicWeights still applies sample/vol shrinkage
+    const dyn = (typeof getDynamicWeights === "function")
+      ? getDynamicWeights(sampleTier, volState.combinedVolRatio, league)
+      : { teamWeight: isFinite(cfg.teamWeightBase) ? Number(cfg.teamWeightBase) : 0.65, oppWeight: 0.35 };
+
+    let projA = aOff * dyn.teamWeight + bDef * dyn.oppWeight;
+    let projB = bOff * dyn.teamWeight + aDef * dyn.oppWeight;
+
+    // H2H blend
+    if (h2hA.length >= 2 && h2hB.length >= 2) {
+      const avgH2HA = h2hA.reduce((s, v) => s + v, 0) / h2hA.length;
+      const avgH2HB = h2hB.reduce((s, v) => s + v, 0) / h2hB.length;
+      const factor = isFinite(cfg.h2hFactor) ? Number(cfg.h2hFactor) : 1.0;
+      let hw = 0.20;
+      if (typeof getH2HWeight === "function") {
+        try {
+          hw = getH2HWeight(h2hA.length, h2hB.length, "ft", sampleTier, Math.abs(projA - projB), league, null, factor, null) || 0.20;
+        } catch (e) {}
+      } else {
+        const cap = isFinite(cfg.h2hMaxWeight) ? Number(cfg.h2hMaxWeight) : 0.30;
+        hw = Math.min(cap, 0.10 + h2hA.length * 0.04);
+        hw = Math.min(hw * factor, cap);
+      }
+      projA = projA * (1 - hw) + avgH2HA * hw;
+      projB = projB * (1 - hw) + avgH2HB * hw;
+    }
+
+    // Fatigue (B2B) — simple rest-day signal using config value
+    const fatigue = isFinite(cfg.fatigueB2BPenalty) ? Number(cfg.fatigueB2BPenalty) : -2.5;
+    if (isFinite(game.homeRestDays) && game.homeRestDays < 1) projA += fatigue;
+    if (isFinite(game.awayRestDays) && game.awayRestDays < 1) projB += fatigue;
+
+    const ftProjected = projA + projB;
+    let projectedTotal = ftProjected;
+    let actualTotal = isFinite(Number(game.actualTotal))
+      ? Number(game.actualTotal)
+      : (Number(game.finalHome || 0) + Number(game.finalAway || 0));
+    let marketKey = "ft";
+
+    if (market === "h1") {
+      projectedTotal = ftProjected * 0.52;
+      actualTotal = isFinite(Number(game.actualH1))
+        ? Number(game.actualH1)
+        : (isFinite(Number(game.h1Home) + Number(game.h1Away))
+            ? Number(game.h1Home) + Number(game.h1Away)
+            : actualTotal * 0.52);
+      marketKey = "h1";
+    } else if (market === "team") {
+      projectedTotal = projA;
+      actualTotal = isFinite(Number(game.finalHome)) ? Number(game.finalHome) : actualTotal * 0.5;
+      marketKey = "team";
+    } else if (market === "h1_team") {
+      projectedTotal = projA * 0.52;
+      actualTotal = isFinite(Number(game.h1Home))
+        ? Number(game.h1Home)
+        : (isFinite(Number(game.finalHome)) ? Number(game.finalHome) * 0.52 : actualTotal * 0.26);
+      marketKey = "h1_team";
+    } else if (market === "q1" || market === "q2" || market === "q3" || market === "q4") {
+      projectedTotal = ftProjected * 0.25;
+      const qKey = "actual" + market.toUpperCase();
+      actualTotal = isFinite(Number(game[qKey])) ? Number(game[qKey]) : actualTotal * 0.25;
+      marketKey = market;
+    }
+
+    // Line
+    let line = null;
+    if (market === "ft" && isFinite(Number(game.line))) {
+      line = Number(game.line);
+    } else if (isFinite(Number(game["line_" + market]))) {
+      line = Number(game["line_" + market]);
+    } else if (isFinite(Number(game.line))) {
+      if (market === "h1") line = Number(game.line) * 0.52;
+      else if (market === "team" || market === "h1_team") line = Number(game.line) * 0.5 * (market === "h1_team" ? 0.52 : 1);
+      else if (market.startsWith("q")) line = Number(game.line) * 0.25;
+      else line = Number(game.line);
+      line = Math.round(line * 2) / 2;
+    }
+
+    const edge = (line != null && isFinite(projectedTotal)) ? (projectedTotal - line) : 0;
+
+    let pickText = "NO PLAY";
+    if (typeof getPick === "function" && line != null) {
+      pickText = getPick(edge, line, league, marketKey, {}) || "NO PLAY";
+    } else if (line != null && Math.abs(edge) >= 1) {
+      pickText = edge > 0 ? ("OVER " + line) : ("UNDER " + line);
+    }
+
+    const side = (typeof getPickSideFromText === "function")
+      ? getPickSideFromText(pickText)
+      : (String(pickText).toUpperCase().includes("OVER") ? "over"
+        : (String(pickText).toUpperCase().includes("UNDER") ? "under" : ""));
+
+    let grade = "NaN";
+    if (typeof getConfidenceGrade === "function" && pickText !== "NO PLAY") {
+      try {
+        grade = getConfidenceGrade({
+          pick: pickText, line, edge, sampleTier,
+          projectionOnly: false, fullModel: true, trap: false,
+          hasH2H: h2hA.length >= 2,
+          volatility: (volState.combinedVolRatio || 1) * (volLimit || 12),
+          volLimit: volLimit || 12, marketKey: marketKey, note: null
+        }) || "NaN";
+      } catch (e) { grade = "C"; }
+    }
+
+    let result = "noplay";
+    if (side === "over" || side === "under") {
+      if (!isFinite(actualTotal) || line == null) result = "noplay";
+      else if (Math.abs(actualTotal - line) < 0.01) result = "push";
+      else if (side === "over") result = actualTotal > line ? "win" : "loss";
+      else result = actualTotal < line ? "win" : "loss";
+    }
+
+    return {
+      pick: pickText,
+      side,
+      edge,
+      grade,
+      projectedTotal,
+      actualTotal,
+      result,
+      market: marketKey,
+      projA,
+      projB
+    };
+  } finally {
+    window.__BACKTEST_EDGE_OVERRIDE = prevEdgeOverride;
+    window.__btRunInProgress = prevBtFlag;
+    injectKeys.forEach(key => {
+      if (snapshot[key] !== undefined && typeof setTunableParam === "function") {
+        setTunableParam(key, snapshot[key], league);
+      }
+    });
+  }
+}
+
+window.buildCompleteConfig = buildCompleteConfig;
+window.pureReplayGame = pureReplayGame;
+
+/**
+ * Legacy adapter — maps old BACKTEST_LEVERS leverSet shape into a complete
+ * config and delegates to pureReplayGame. Kept so existing callers continue
+ * to work while the joint search migrates to the Phase 3 API.
  *
  * @param {object} game     historical game from g_historicalGamesStore
  * @param {object} leverSet full joint values drawn from BACKTEST_LEVERS
@@ -6230,8 +6655,20 @@ function replayHistoricalGame(game, leverSet, market) {
     return { pick: "NO PLAY", side: "", edge: 0, grade: "NaN", projectedTotal: NaN, actualTotal: game?.actualTotal ?? NaN, result: "noplay", market: market };
   }
   const league = String(game.league || "nba").toLowerCase();
-  const snapshot = {};
-  const scalarKeys = Object.keys(leverSet).filter(k => k !== "recencyProfile" && !String(k).startsWith("edgeThreshold_"));
+
+  // Map old leverSet names → inventory keys, then build a complete config
+  const partial = Object.assign({}, leverSet);
+  if (leverSet.edgeThreshold_ft   !== undefined) partial.edgeFTPointThreshold   = leverSet.edgeThreshold_ft;
+  if (leverSet.edgeThreshold_h1   !== undefined) partial.edgeH1PointThreshold   = leverSet.edgeThreshold_h1;
+  if (leverSet.edgeThreshold_team !== undefined) partial.edgeTeamPointThreshold = leverSet.edgeThreshold_team;
+  if (leverSet.edgeThreshold_q    !== undefined) partial.edgeQPointThreshold    = leverSet.edgeThreshold_q;
+  if (leverSet.recencyProfile && typeof RECENCY_PROFILES === "object" && RECENCY_PROFILES[leverSet.recencyProfile]) {
+    partial.recencyWeights = RECENCY_PROFILES[leverSet.recencyProfile].slice();
+  }
+
+  const fullConfig = buildCompleteConfig(league, partial);
+  return pureReplayGame(game, fullConfig, market);
+}
 
   // 1. Snapshot current live values
   scalarKeys.forEach(key => {
@@ -6454,6 +6891,728 @@ function replayHistoricalGame(game, leverSet, market) {
 }
 
 window.replayHistoricalGame = replayHistoricalGame;
+
+// ============================================================
+// PHASE 4 — EVALUATION METRICS
+// Score a complete config from an array of pureReplayGame results.
+// Primary objective for locking: holdout win rate on fired picks,
+// with minimum sample and overfit guards.
+// ============================================================
+
+/**
+ * Score one batch of pureReplayGame results.
+ * Only fired picks (result === "win" | "loss" | "push") count toward
+ * the primary metric. NO PLAY rows are tracked but do not inflate the rate.
+ *
+ * @param {Array} results  array of pureReplayGame return objects
+ * @param {object} [opts]
+ * @param {number} [opts.minFired=30]  minimum decisive (win/loss) picks required
+ * @returns {object} metrics
+ */
+function scoreReplayResults(results, opts) {
+  opts = opts || {};
+  const minFired = isFinite(opts.minFired) ? Number(opts.minFired) : 30;
+
+  const list = Array.isArray(results) ? results : [];
+  let wins = 0, losses = 0, pushes = 0, noplays = 0;
+  let totalEdge = 0, edgeCount = 0;
+  let gradeA = 0, gradeB = 0, gradeC = 0, gradeD = 0, gradeOther = 0;
+  let gradeAWins = 0, gradeALosses = 0;
+  let gradeBWins = 0, gradeBLosses = 0;
+
+  list.forEach(r => {
+    if (!r || typeof r !== "object") return;
+    const res = String(r.result || "").toLowerCase();
+    if (res === "win") wins++;
+    else if (res === "loss") losses++;
+    else if (res === "push") pushes++;
+    else noplays++;
+
+    if (isFinite(r.edge)) {
+      totalEdge += Math.abs(Number(r.edge));
+      edgeCount++;
+    }
+
+    const g = String(r.grade || "").toUpperCase();
+    if (g === "A") {
+      gradeA++;
+      if (res === "win") gradeAWins++;
+      else if (res === "loss") gradeALosses++;
+    } else if (g === "B") {
+      gradeB++;
+      if (res === "win") gradeBWins++;
+      else if (res === "loss") gradeBLosses++;
+    } else if (g === "C") gradeC++;
+    else if (g === "D") gradeD++;
+    else if (g && g !== "NAN") gradeOther++;
+  });
+
+  const decisive = wins + losses;
+  const fired = decisive + pushes;
+  const winRate = decisive > 0 ? (wins / decisive) : 0;
+  const atsRate = fired > 0 ? ((wins + pushes * 0.5) / fired) : 0;
+  const avgAbsEdge = edgeCount > 0 ? (totalEdge / edgeCount) : 0;
+  const fireRate = list.length > 0 ? (fired / list.length) : 0;
+
+  // Simple grade calibration: A should beat B, B should beat overall
+  const gradeAWinRate = (gradeAWins + gradeALosses) > 0 ? (gradeAWins / (gradeAWins + gradeALosses)) : null;
+  const gradeBWinRate = (gradeBWins + gradeBLosses) > 0 ? (gradeBWins / (gradeBWins + gradeBLosses)) : null;
+
+  // Primary score used by the search: win rate, zeroed if sample too small
+  const primaryScore = decisive >= minFired ? winRate : 0;
+  const sampleOk = decisive >= minFired;
+
+  return {
+    games: list.length,
+    fired,
+    decisive,
+    wins,
+    losses,
+    pushes,
+    noplays,
+    winRate,
+    atsRate,
+    avgAbsEdge,
+    fireRate,
+    gradeA,
+    gradeB,
+    gradeC,
+    gradeD,
+    gradeAWinRate,
+    gradeBWinRate,
+    primaryScore,
+    sampleOk,
+    minFired
+  };
+}
+
+/**
+ * Evaluate one complete config on a list of historical games.
+ * Runs pureReplayGame for every game and returns train/holdout metrics.
+ *
+ * @param {Array}  games       historical games (g_historicalGamesStore shape)
+ * @param {object} fullConfig  from buildCompleteConfig()
+ * @param {string} market      "ft" | "h1" | ...
+ * @param {object} [opts]
+ * @param {number} [opts.holdoutFrac=0.25]  last fraction of games held out
+ * @param {number} [opts.minFired=30]
+ * @returns {object} { train, holdout, all, config }
+ */
+function evaluateConfigOnGames(games, fullConfig, market, opts) {
+  opts = opts || {};
+  const holdoutFrac = isFinite(opts.holdoutFrac) ? Math.max(0.1, Math.min(0.4, Number(opts.holdoutFrac))) : 0.25;
+  const minFired = isFinite(opts.minFired) ? Number(opts.minFired) : 30;
+  const list = Array.isArray(games) ? games.slice() : [];
+
+  // Sort by date so holdout is always the most recent slice
+  list.sort((a, b) => {
+    const da = String(a.date || "");
+    const db = String(b.date || "");
+    return da < db ? -1 : (da > db ? 1 : 0);
+  });
+
+  const holdoutN = Math.max(1, Math.floor(list.length * holdoutFrac));
+  const splitAt = Math.max(0, list.length - holdoutN);
+  const trainGames = list.slice(0, splitAt);
+  const holdoutGames = list.slice(splitAt);
+
+  const runBatch = (batch) => {
+    const results = [];
+    for (let i = 0; i < batch.length; i++) {
+      results.push(pureReplayGame(batch[i], fullConfig, market));
+    }
+    return scoreReplayResults(results, { minFired });
+  };
+
+  const train = runBatch(trainGames);
+  const holdout = runBatch(holdoutGames);
+  const all = runBatch(list);
+
+  // Overfit guard: large train/holdout gap is a red flag
+  const gap = (train.sampleOk && holdout.sampleOk)
+    ? (train.winRate - holdout.winRate)
+    : null;
+  const overfitSuspect = gap !== null && gap > 0.12;
+
+  return {
+    train,
+    holdout,
+    all,
+    gap,
+    overfitSuspect,
+    trainGames: trainGames.length,
+    holdoutGames: holdoutGames.length,
+    market: String(market || "ft").toLowerCase(),
+    // The score the search optimizes: holdout primary, zero if sample bad or overfit
+    searchScore: (holdout.sampleOk && !overfitSuspect) ? holdout.primaryScore : 0
+  };
+}
+
+/**
+ * Compare two evaluation objects. Returns true if candidate is strictly
+ * better than baseline on the search objective.
+ */
+function isConfigBetter(candidateEval, baselineEval) {
+  if (!candidateEval || !baselineEval) return false;
+  if (!candidateEval.holdout || !candidateEval.holdout.sampleOk) return false;
+  if (!baselineEval.holdout || !baselineEval.holdout.sampleOk) {
+    return candidateEval.searchScore > 0;
+  }
+  // Prefer higher holdout win rate; break ties with higher fire rate then lower gap
+  if (candidateEval.searchScore > baselineEval.searchScore + 0.005) return true;
+  if (Math.abs(candidateEval.searchScore - baselineEval.searchScore) <= 0.005) {
+    const cFire = candidateEval.holdout.fireRate || 0;
+    const bFire = baselineEval.holdout.fireRate || 0;
+    if (cFire > bFire + 0.02) return true;
+    const cGap = candidateEval.gap == null ? 1 : Math.abs(candidateEval.gap);
+    const bGap = baselineEval.gap == null ? 1 : Math.abs(baselineEval.gap);
+    if (cGap < bGap - 0.02) return true;
+  }
+  return false;
+}
+
+window.scoreReplayResults = scoreReplayResults;
+window.evaluateConfigOnGames = evaluateConfigOnGames;
+window.isConfigBetter = isConfigBetter;
+
+// ============================================================
+// PHASE 5 — JOINT PARAMETER SEARCH
+// Staged coordinate ascent over the full inventory.
+// Every candidate is a COMPLETE config. Score = holdout win rate
+// via evaluateConfigOnGames. Winner can be written to the Lock Store.
+// ============================================================
+
+/** Discrete candidate pools for each searchable inventory key. */
+const JOINT_SEARCH_GRID = {
+  h2hFactor:               { min: 0.50, max: 1.00, step: 0.10 },
+  h2hMaxWeight:            { min: 0.10, max: 0.45, step: 0.05 },
+  h2hLookbackSeasons:      { min: 2,    max: 5,    step: 1 },
+  h2hDecayCurrent:         { min: 0.70, max: 1.00, step: 0.10 },
+  h2hDecayMinus1:          { min: 0.40, max: 0.90, step: 0.10 },
+  h2hDecayMinus2:          { min: 0.20, max: 0.70, step: 0.10 },
+  h2hDecayOlder:           { min: 0.10, max: 0.50, step: 0.10 },
+  teamWeightBase:          { min: 0.45, max: 0.80, step: 0.05 },
+  venueMinGames:           { min: 4,    max: 9,    step: 1 },
+  venueStrongGames:        { min: 7,    max: 12,   step: 1 },
+  venueModerateWeight:     { min: 0.30, max: 0.65, step: 0.10 },
+  venueStrongWeight:       { min: 0.50, max: 0.85, step: 0.10 },
+  quarterVenueProxyFactor: { min: 0.60, max: 1.40, step: 0.20 },
+  injuryOppBoostFactor:    { min: 0.00, max: 0.40, step: 0.10 },
+  underEdgeFactor:         { min: 0.90, max: 1.50, step: 0.10 },
+  extremeExpansion:        { min: 0.80, max: 1.20, step: 0.10 },
+  advancedBlendWeight:     { min: 0.20, max: 0.70, step: 0.10 },
+  volatilityLimit:         { min: 8,    max: 18,   step: 2 },
+  edgeFTPointThreshold:    { min: 4.0,  max: 11.0, step: 1.0 },
+  edgeH1PointThreshold:    { min: 4.0,  max: 12.0, step: 1.0 },
+  edgeTeamPointThreshold:  { min: 5.0,  max: 13.0, step: 1.0 },
+  edgeQPointThreshold:     { min: 2.5,  max: 7.5,  step: 0.5 },
+  fatigueB2BPenalty:       { min: -5.0, max: 0.0,  step: 1.0 },
+  quarterAnchorBlendWeight:{ min: 0.40, max: 1.00, step: 0.15 },
+  confidenceAThresh:       { min: 0.58, max: 0.75, step: 0.04 },
+  confidenceBThresh:       { min: 0.50, max: 0.65, step: 0.04 },
+  confidenceCThresh:       { min: 0.42, max: 0.58, step: 0.04 }
+};
+
+// Stage A focuses on highest-impact dials first
+const JOINT_SEARCH_STAGE_A = [
+  "h2hMaxWeight", "h2hFactor", "teamWeightBase", "advancedBlendWeight",
+  "edgeFTPointThreshold", "underEdgeFactor", "volatilityLimit", "fatigueB2BPenalty"
+];
+
+// Stage B frees the rest
+const JOINT_SEARCH_STAGE_B = Object.keys(JOINT_SEARCH_GRID).filter(function (k) {
+  return JOINT_SEARCH_STAGE_A.indexOf(k) === -1;
+});
+
+function _jointExpandCandidates(def) {
+  if (!def) return [];
+  const out = [];
+  const min = Number(def.min), max = Number(def.max), step = Number(def.step) || 1;
+  if (!isFinite(min) || !isFinite(max) || step <= 0) return out;
+  for (let v = min; v <= max + 1e-9; v += step) {
+    out.push(Math.round(v * 1000) / 1000);
+  }
+  return out;
+}
+
+function _jointYield() {
+  return new Promise(function (resolve) { setTimeout(resolve, 0); });
+}
+
+/**
+ * Staged coordinate-ascent joint search.
+ *
+ * @param {object} opts
+ *   league: "nba"
+ *   market: "ft"
+ *   games: array (defaults to g_historicalGamesStore filtered by league)
+ *   holdoutFrac: 0.25
+ *   minFired: 25
+ *   maxPasses: 3          // full passes over the active dial set
+ *   restarts: 2           // random restarts after stage A
+ *   onProgress: fn({phase, pass, key, evaluated, bestScore, ms})
+ *   autoLock: false       // if true, write winner into BB_LOCKED_CONFIG_V1
+ * @returns {Promise<object>} report with ranked configs
+ */
+async function runJointParamSearch(opts) {
+  opts = opts || {};
+  const league = String(opts.league || "nba").toLowerCase();
+  const market = String(opts.market || "ft").toLowerCase();
+  const holdoutFrac = isFinite(opts.holdoutFrac) ? Number(opts.holdoutFrac) : 0.25;
+  const minFired = isFinite(opts.minFired) ? Number(opts.minFired) : 25;
+  const maxPasses = Math.max(1, Number(opts.maxPasses) || 3);
+  const restarts = Math.max(0, Number(opts.restarts) || 2);
+  const autoLock = !!opts.autoLock;
+  const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
+  const evalOpts = { holdoutFrac: holdoutFrac, minFired: minFired };
+
+  if (window.__btRunInProgress) {
+    return { error: "Search already running" };
+  }
+  window.__btRunInProgress = true;
+  const t0 = Date.now();
+
+  try {
+    // Resolve game set
+    let games = Array.isArray(opts.games) ? opts.games.slice() : null;
+    if (!games) {
+      games = (Array.isArray(g_historicalGamesStore) ? g_historicalGamesStore : []).filter(function (g) {
+        return String(g.league || "nba").toLowerCase() === league;
+      });
+    }
+    if (!games.length) {
+      return { error: "No historical games loaded for league=" + league + ". Call loadHistoricalSeasonGames first." };
+    }
+
+    // Baseline = complete live defaults
+    let current = buildCompleteConfig(league, {});
+    let currentEval = evaluateConfigOnGames(games, current, market, evalOpts);
+    let best = { config: Object.assign({}, current), eval: currentEval };
+    let evaluated = 1;
+    const history = [];
+
+    function reportProgress(phase, pass, key) {
+      if (!onProgress) return;
+      onProgress({
+        phase: phase,
+        pass: pass,
+        key: key || null,
+        evaluated: evaluated,
+        bestScore: best.eval.searchScore,
+        holdoutWinRate: best.eval.holdout ? best.eval.holdout.winRate : null,
+        holdoutDecisive: best.eval.holdout ? best.eval.holdout.decisive : null,
+        ms: Date.now() - t0
+      });
+    }
+
+    async function coordinatePass(keys, phaseLabel, passIdx) {
+      for (let ki = 0; ki < keys.length; ki++) {
+        const key = keys[ki];
+        const def = JOINT_SEARCH_GRID[key];
+        if (!def) continue;
+        const candidates = _jointExpandCandidates(def);
+        let localBestVal = current[key];
+        let localBestEval = currentEval;
+
+        for (let ci = 0; ci < candidates.length; ci++) {
+          const val = candidates[ci];
+          if (val === current[key]) continue;
+          const trial = Object.assign({}, current);
+          trial[key] = val;
+          const trialEval = evaluateConfigOnGames(games, trial, market, evalOpts);
+          evaluated++;
+          if (isConfigBetter(trialEval, localBestEval)) {
+            localBestVal = val;
+            localBestEval = trialEval;
+          }
+          if (evaluated % 8 === 0) await _jointYield();
+        }
+
+        if (localBestVal !== current[key] && isConfigBetter(localBestEval, currentEval)) {
+          current = Object.assign({}, current);
+          current[key] = localBestVal;
+          currentEval = localBestEval;
+          if (isConfigBetter(currentEval, best.eval)) {
+            best = { config: Object.assign({}, current), eval: currentEval };
+            history.push({
+              phase: phaseLabel,
+              pass: passIdx,
+              key: key,
+              value: localBestVal,
+              searchScore: currentEval.searchScore,
+              holdoutWinRate: currentEval.holdout.winRate,
+              holdoutDecisive: currentEval.holdout.decisive
+            });
+          }
+        }
+        reportProgress(phaseLabel, passIdx, key);
+        await _jointYield();
+      }
+    }
+
+    // ── Stage A: high-impact dials ───────────────────────────────
+    for (let p = 1; p <= maxPasses; p++) {
+      await coordinatePass(JOINT_SEARCH_STAGE_A, "A", p);
+    }
+
+    // ── Random restarts from Stage A winner ──────────────────────
+    for (let r = 0; r < restarts; r++) {
+      const restartCfg = Object.assign({}, best.config);
+      // Perturb a few Stage A keys randomly
+      JOINT_SEARCH_STAGE_A.forEach(function (key) {
+        const def = JOINT_SEARCH_GRID[key];
+        if (!def) return;
+        const pool = _jointExpandCandidates(def);
+        if (pool.length) restartCfg[key] = pool[Math.floor(Math.random() * pool.length)];
+      });
+      current = restartCfg;
+      currentEval = evaluateConfigOnGames(games, current, market, evalOpts);
+      evaluated++;
+      if (isConfigBetter(currentEval, best.eval)) {
+        best = { config: Object.assign({}, current), eval: currentEval };
+      }
+      await coordinatePass(JOINT_SEARCH_STAGE_A, "restart-" + (r + 1), 1);
+    }
+
+    // Reset current to global best before Stage B
+    current = Object.assign({}, best.config);
+    currentEval = best.eval;
+
+    // ── Stage B: remaining dials ─────────────────────────────────
+    for (let p = 1; p <= Math.max(1, maxPasses - 1); p++) {
+      await coordinatePass(JOINT_SEARCH_STAGE_B, "B", p);
+    }
+
+    // ── Stage C: local polish around best (±1 step on Stage A keys) ─
+    for (let ki = 0; ki < JOINT_SEARCH_STAGE_A.length; ki++) {
+      const key = JOINT_SEARCH_STAGE_A[ki];
+      const def = JOINT_SEARCH_GRID[key];
+      if (!def) continue;
+      const step = Number(def.step) || 1;
+      const center = Number(best.config[key]);
+      const neighbors = [center - step, center, center + step]
+        .map(function (v) { return Math.round(v * 1000) / 1000; })
+        .filter(function (v) { return v >= def.min - 1e-9 && v <= def.max + 1e-9; });
+      for (let ni = 0; ni < neighbors.length; ni++) {
+        const val = neighbors[ni];
+        if (val === best.config[key]) continue;
+        const trial = Object.assign({}, best.config);
+        trial[key] = val;
+        const trialEval = evaluateConfigOnGames(games, trial, market, evalOpts);
+        evaluated++;
+        if (isConfigBetter(trialEval, best.eval)) {
+          best = { config: trial, eval: trialEval };
+          history.push({
+            phase: "C",
+            pass: 1,
+            key: key,
+            value: val,
+            searchScore: trialEval.searchScore,
+            holdoutWinRate: trialEval.holdout.winRate,
+            holdoutDecisive: trialEval.holdout.decisive
+          });
+        }
+      }
+      reportProgress("C", 1, key);
+      await _jointYield();
+    }
+
+    // Optional auto-lock
+    let locked = false;
+    if (autoLock && best.eval.searchScore > 0 && best.eval.holdout && best.eval.holdout.sampleOk) {
+      locked = !!saveLockedConfig(league, market, best.config, {
+        sampleSize: best.eval.holdout.decisive,
+        holdoutWinRate: best.eval.holdout.winRate,
+        holdoutFired: best.eval.holdout.fired,
+        trainWinRate: best.eval.train ? best.eval.train.winRate : null,
+        trainDecisive: best.eval.train ? best.eval.train.decisive : null,
+        gamesUsed: games.length,
+        evaluated: evaluated,
+        searchVersion: "joint-v1",
+        note: "Auto-locked by runJointParamSearch"
+      });
+    }
+
+    const report = {
+      league: league,
+      market: market,
+      gamesUsed: games.length,
+      evaluated: evaluated,
+      ms: Date.now() - t0,
+      baseline: {
+        searchScore: evaluateConfigOnGames(games, buildCompleteConfig(league, {}), market, evalOpts).searchScore
+      },
+      best: {
+        config: best.config,
+        searchScore: best.eval.searchScore,
+        holdout: best.eval.holdout,
+        train: best.eval.train,
+        gap: best.eval.gap,
+        overfitSuspect: best.eval.overfitSuspect
+      },
+      history: history,
+      locked: locked
+    };
+
+    if (typeof engineDebug === "function") {
+      engineDebug("JOINT PARAM SEARCH complete", {
+        league: league,
+        market: market,
+        evaluated: evaluated,
+        searchScore: report.best.searchScore,
+        holdoutWinRate: report.best.holdout ? report.best.holdout.winRate : null,
+        locked: locked,
+        ms: report.ms
+      });
+    }
+    return report;
+  } catch (e) {
+    return { error: String(e && e.message ? e.message : e) };
+  } finally {
+    window.__btRunInProgress = false;
+  }
+}
+
+window.runJointParamSearch = runJointParamSearch;
+window.JOINT_SEARCH_GRID = JOINT_SEARCH_GRID;
+
+// ============================================================
+// PHASE 6 — LOCKING & PROMOTION
+// Validates holdout evidence, writes complete configs into the
+// Phase 2 Lock Store, keeps a shortlist of near-equals, and
+// exposes review helpers. Nothing is locked without evidence.
+// ============================================================
+
+const BB_LOCK_SHORTLIST_KEY = "BB_LOCK_SHORTLIST_V1";
+const LOCK_MIN_HOLDOUT_DECISIVE = 25;
+const LOCK_MIN_HOLDOUT_WINRATE = 0.52;
+const LOCK_MAX_OVERFIT_GAP = 0.12;
+
+/**
+ * Validate that an evaluation object is strong enough to lock.
+ * Returns { ok: true } or { ok: false, reason: "..." }.
+ */
+function validateLockEvidence(evalResult, opts) {
+  opts = opts || {};
+  const minDecisive = isFinite(opts.minDecisive) ? Number(opts.minDecisive) : LOCK_MIN_HOLDOUT_DECISIVE;
+  const minWinRate = isFinite(opts.minWinRate) ? Number(opts.minWinRate) : LOCK_MIN_HOLDOUT_WINRATE;
+  const maxGap = isFinite(opts.maxGap) ? Number(opts.maxGap) : LOCK_MAX_OVERFIT_GAP;
+
+  if (!evalResult || !evalResult.holdout) {
+    return { ok: false, reason: "Missing holdout evaluation" };
+  }
+  const h = evalResult.holdout;
+  if (!h.sampleOk || h.decisive < minDecisive) {
+    return {
+      ok: false,
+      reason: "Holdout sample too small (" + (h.decisive || 0) + "/" + minDecisive + " decisive)"
+    };
+  }
+  if (h.winRate < minWinRate) {
+    return {
+      ok: false,
+      reason: "Holdout win rate " + (h.winRate * 100).toFixed(1) + "% below minimum " + (minWinRate * 100).toFixed(1) + "%"
+    };
+  }
+  if (evalResult.overfitSuspect || (evalResult.gap != null && evalResult.gap > maxGap)) {
+    return {
+      ok: false,
+      reason: "Overfit suspect (train−holdout gap " + ((evalResult.gap || 0) * 100).toFixed(1) + " pts)"
+    };
+  }
+  if (!(evalResult.searchScore > 0)) {
+    return { ok: false, reason: "searchScore is zero — config rejected by evaluation guards" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Promote a complete config into the permanent Lock Store.
+ * Requires a full config object + its evaluateConfigOnGames result.
+ * Refuses to lock when holdout evidence fails the gates.
+ *
+ * @param {string} league
+ * @param {string} market
+ * @param {object} fullConfig   complete 39-key config
+ * @param {object} evalResult   from evaluateConfigOnGames
+ * @param {object} [opts]       { force: false, note: "", minDecisive, minWinRate, maxGap }
+ * @returns {{ ok: boolean, reason?: string, meta?: object }}
+ */
+function promoteConfigToLock(league, market, fullConfig, evalResult, opts) {
+  opts = opts || {};
+  if (!league || !market || !fullConfig || typeof fullConfig !== "object") {
+    return { ok: false, reason: "Missing league, market, or fullConfig" };
+  }
+
+  if (!opts.force) {
+    const gate = validateLockEvidence(evalResult, opts);
+    if (!gate.ok) return gate;
+  }
+
+  const meta = {
+    lockedAt: new Date().toISOString(),
+    searchVersion: "joint-v1",
+    sampleSize: evalResult && evalResult.holdout ? evalResult.holdout.decisive : null,
+    holdoutWinRate: evalResult && evalResult.holdout ? evalResult.holdout.winRate : null,
+    holdoutFired: evalResult && evalResult.holdout ? evalResult.holdout.fired : null,
+    holdoutAtsRate: evalResult && evalResult.holdout ? evalResult.holdout.atsRate : null,
+    trainWinRate: evalResult && evalResult.train ? evalResult.train.winRate : null,
+    trainDecisive: evalResult && evalResult.train ? evalResult.train.decisive : null,
+    gap: evalResult ? evalResult.gap : null,
+    overfitSuspect: evalResult ? !!evalResult.overfitSuspect : false,
+    gamesUsed: evalResult ? (evalResult.trainGames || 0) + (evalResult.holdoutGames || 0) : null,
+    forced: !!opts.force,
+    note: opts.note || (opts.force ? "Forced lock (gates bypassed)" : "Promoted after holdout validation")
+  };
+
+  const saved = saveLockedConfig(league, market, fullConfig, meta);
+  if (!saved) {
+    return { ok: false, reason: "saveLockedConfig failed (storage error?)" };
+  }
+
+  if (typeof engineDebug === "function") {
+    engineDebug("PHASE 6 LOCK PROMOTED", {
+      league: league,
+      market: market,
+      holdoutWinRate: meta.holdoutWinRate,
+      sampleSize: meta.sampleSize,
+      forced: meta.forced
+    });
+  }
+  return { ok: true, meta: meta };
+}
+
+/**
+ * Promote the winner from a runJointParamSearch report.
+ */
+function promoteSearchReport(report, opts) {
+  opts = opts || {};
+  if (!report || report.error || !report.best || !report.best.config) {
+    return { ok: false, reason: "Invalid search report" };
+  }
+  return promoteConfigToLock(
+    report.league,
+    report.market,
+    report.best.config,
+    report.best,
+    Object.assign({ note: opts.note || "Promoted from joint search report" }, opts)
+  );
+}
+
+/**
+ * Shortlist near-equal configs for later review (does not lock).
+ * Stored separately from the permanent lock.
+ */
+function addToLockShortlist(league, market, fullConfig, evalResult, label) {
+  if (!league || !market || !fullConfig) return false;
+  try {
+    const raw = localStorage.getItem(BB_LOCK_SHORTLIST_KEY);
+    const store = raw ? (JSON.parse(raw) || {}) : {};
+    const lk = String(league).toLowerCase();
+    const mk = String(market).toLowerCase();
+    if (!store[lk]) store[lk] = {};
+    if (!store[lk][mk]) store[lk][mk] = [];
+    store[lk][mk].push({
+      label: label || ("candidate-" + Date.now()),
+      params: Object.assign({}, fullConfig),
+      holdoutWinRate: evalResult && evalResult.holdout ? evalResult.holdout.winRate : null,
+      holdoutDecisive: evalResult && evalResult.holdout ? evalResult.holdout.decisive : null,
+      searchScore: evalResult ? evalResult.searchScore : null,
+      gap: evalResult ? evalResult.gap : null,
+      addedAt: new Date().toISOString()
+    });
+    // Keep last 10 per league+market
+    if (store[lk][mk].length > 10) store[lk][mk] = store[lk][mk].slice(-10);
+    localStorage.setItem(BB_LOCK_SHORTLIST_KEY, JSON.stringify(store));
+    return true;
+  } catch (e) {
+    if (typeof engineDebug === "function") {
+      engineDebug("addToLockShortlist failed: " + (e?.message || String(e)));
+    }
+    return false;
+  }
+}
+
+function getLockShortlist(league, market) {
+  try {
+    const raw = localStorage.getItem(BB_LOCK_SHORTLIST_KEY);
+    const store = raw ? (JSON.parse(raw) || {}) : {};
+    const lk = String(league || "").toLowerCase();
+    const mk = String(market || "").toLowerCase();
+    if (lk && mk) return (store[lk] && store[lk][mk]) ? store[lk][mk].slice() : [];
+    if (lk) return store[lk] || {};
+    return store;
+  } catch (e) {
+    return league && market ? [] : {};
+  }
+}
+
+/**
+ * List every currently locked league+market with summary meta.
+ */
+function listLockedConfigs() {
+  const store = (typeof loadLockedConfigStore === "function") ? loadLockedConfigStore() : {};
+  const out = [];
+  Object.keys(store || {}).forEach(function (lk) {
+    Object.keys(store[lk] || {}).forEach(function (mk) {
+      const entry = store[lk][mk];
+      if (!entry || !entry.params) return;
+      out.push({
+        league: lk,
+        market: mk,
+        meta: entry.meta || {},
+        paramCount: Object.keys(entry.params).length
+      });
+    });
+  });
+  return out;
+}
+
+/**
+ * Human-readable lock status for one league+market.
+ */
+function getLockStatus(league, market) {
+  if (!league || !market) return { locked: false, reason: "missing league/market" };
+  if (typeof hasLockedConfig !== "function" || !hasLockedConfig(league, market)) {
+    return { locked: false, reason: "no lock present" };
+  }
+  const meta = (typeof getLockedConfigMeta === "function") ? getLockedConfigMeta(league, market) : null;
+  return {
+    locked: true,
+    meta: meta,
+    summary: meta
+      ? ("LOCKED " + String(league).toUpperCase() + "/" + String(market).toUpperCase() +
+         " · holdout " + ((meta.holdoutWinRate || 0) * 100).toFixed(1) + "%" +
+         " on " + (meta.sampleSize || "?") + " decisive" +
+         (meta.lockedAt ? (" · " + String(meta.lockedAt).slice(0, 10)) : ""))
+      : ("LOCKED " + String(league).toUpperCase() + "/" + String(market).toUpperCase())
+  };
+}
+
+window.validateLockEvidence = validateLockEvidence;
+window.promoteConfigToLock = promoteConfigToLock;
+window.promoteSearchReport = promoteSearchReport;
+window.addToLockShortlist = addToLockShortlist;
+window.getLockShortlist = getLockShortlist;
+window.listLockedConfigs = listLockedConfigs;
+window.getLockStatus = getLockStatus;
+
+/**
+ * PHASE 7 helper — short banner string for UI / debug when locks are active.
+ */
+function getLiveLockBanner(league) {
+  if (!league || typeof hasLockedConfig !== "function") return "";
+  const markets = ["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4"];
+  const active = markets.filter(function (m) { return hasLockedConfig(league, m); });
+  if (!active.length) return "";
+  const parts = active.map(function (m) {
+    const meta = typeof getLockedConfigMeta === "function" ? getLockedConfigMeta(league, m) : null;
+    const wr = meta && isFinite(meta.holdoutWinRate) ? ((meta.holdoutWinRate * 100).toFixed(0) + "%") : "?";
+    return m.toUpperCase() + " " + wr;
+  });
+  return "🔒 LOCKED " + String(league).toUpperCase() + ": " + parts.join(" · ");
+}
+window.getLiveLockBanner = getLiveLockBanner;
 
 const TUNABLE_CONSTANTS_GRID = {
   INJURY_OPPONENT_BOOST_FACTOR: [0.1, 0.15, 0.2, 0.25, 0.3],
@@ -23207,7 +24366,33 @@ async function runEngine() {
     AppState.context.data = defaultMassacreFetchContext();
     AppState.context.data.league = currentLeagueForRun;
   }
-  try {
+
+  // PHASE 7 — Live engine integration:
+  // If a permanent Lock Store entry exists for this league, it is the sole
+  // source of truth. Skip the legacy BB_VERIFIED_TUNINGS* phase-2 silo path
+  // so it cannot shadow or fight the lock. getTunableParam already prefers
+  // the lock when g_currentLiveComputeMarket is set.
+  const _lockFt = (typeof hasLockedConfig === "function" && currentLeagueForRun)
+    ? hasLockedConfig(currentLeagueForRun, "ft") : false;
+  const _lockH1 = (typeof hasLockedConfig === "function" && currentLeagueForRun)
+    ? hasLockedConfig(currentLeagueForRun, "h1") : false;
+  window.__liveLockActive = { league: currentLeagueForRun, ft: _lockFt, h1: _lockH1 };
+
+  if (_lockFt || _lockH1) {
+    // Locked path: do not apply legacy phase-2 silo overrides
+    window.__phase2FTRecencyWeights = null;
+    window.__phase2PaceAdjustment   = "standard";
+    window.__phase2H1RecencyWeights = null;
+    if (typeof engineDebug === "function") {
+      engineDebug("PHASE 7: using Lock Store", {
+        league: currentLeagueForRun,
+        ftLocked: _lockFt,
+        h1Locked: _lockH1,
+        ftMeta: _lockFt && typeof getLockedConfigMeta === "function" ? getLockedConfigMeta(currentLeagueForRun, "ft") : null,
+        h1Meta: _lockH1 && typeof getLockedConfigMeta === "function" ? getLockedConfigMeta(currentLeagueForRun, "h1") : null
+      });
+    }
+  } else try {
     let ftSiloTunings = {}, h1SiloTunings = {}, allSiloTunings = {};
     try {
       ftSiloTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS_FT")) || {};
@@ -23498,9 +24683,16 @@ const h1Calc = compute1HProjection({
       h1: summarizeCalcForDebug(h1Calc)
     });
 
-                let ftPick = getPick(ftCalc.ftEdge, ftLine, league, "ft", { aSc: ftCalc.aS, bSc: ftCalc.bS, aScScores: ftCalc.aScores, bScScores: ftCalc.bScores, blowoutGap: ftCalc.blowoutGap });
+                // PHASE 7: set g_currentLiveComputeMarket around each market's
+        // pick call so getTunableParam resolves the correct Lock Store
+        // entry (edge thresholds, underEdgeFactor, confidence gates, etc.).
+        g_currentLiveComputeMarket = "ft";
+        let ftPick = getPick(ftCalc.ftEdge, ftLine, league, "ft", { aSc: ftCalc.aS, bSc: ftCalc.bS, aScScores: ftCalc.aScores, bScScores: ftCalc.bScores, blowoutGap: ftCalc.blowoutGap });
+        g_currentLiveComputeMarket = "h1";
         let h1Pick = getPick(h1Calc.h1Edge, h1Line, league, "h1", { aSc: h1Calc.aS1, bSc: h1Calc.bS1 });
+        g_currentLiveComputeMarket = "team_a";
         let aPick = getPick(ftCalc.aEdge, aLine, league, "team_a", { teamSc: ftCalc.aS, blowoutGap: ftCalc.blowoutGap });
+        g_currentLiveComputeMarket = "team_b";
         let bPick = getPick(ftCalc.bEdge, bLine, league, "team_b", { teamSc: ftCalc.bS, blowoutGap: ftCalc.blowoutGap });
         // MARKET EXPANSION BATCH 3: Winner + full-game Handicap, built
         // directly from ftCalc's own projAFT/projBFT/aVol/bVol — the margin
@@ -23512,11 +24704,14 @@ const h1Calc = compute1HProjection({
         const marginProjectionFT = computeMarginProjection(ftCalc.projAFT, ftCalc.projBFT);
         const combinedMarginVolFT = computeCombinedMarginVolatility(ftCalc.aVol, ftCalc.bVol);
         const winnerEdge = marginProjectionFT;
+        g_currentLiveComputeMarket = "winner";
         let winnerPick = getMarginPick(winnerEdge, league, "winner");
         const handicapEdge = (isFinite(marginProjectionFT) && isFinite(finalLines.handicapLine))
           ? marginProjectionFT + finalLines.handicapLine
           : NaN;
+        g_currentLiveComputeMarket = "handicap";
         let handicapPick = getMarginPick(handicapEdge, league, "handicap");
+        g_currentLiveComputeMarket = "ft";
         const h1aEdge = (isFinite(h1Calc.projA1H) && isFinite(finalLines.h1aLine) && finalLines.h1aLine > 0) ? h1Calc.projA1H - finalLines.h1aLine : NaN;
         const h1bEdge = (isFinite(h1Calc.projB1H) && isFinite(finalLines.h1bLine) && finalLines.h1bLine > 0) ? h1Calc.projB1H - finalLines.h1bLine : NaN;
         let h1aPick = getPick(h1aEdge, finalLines.h1aLine, league, "h1", { teamSc: h1Calc.aS1 });
