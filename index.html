@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4371,6 +4372,50 @@ function bbAttachMarketToBacktestGames(allGames) {
 }
 window.bbAttachMarketToBacktestGames = bbAttachMarketToBacktestGames;
 
+// REBUILD STAGE 5: stamp real closing totals from __BB_MARKET_INDEX onto
+// g_historicalGamesStore so Max-Power FT O/U uses the same lines as Season
+// Backtest (not form-proxy lines). Unmatched games lose their proxy line
+// so they score as noplay instead of polluting the real-line win rate.
+function bbAttachRealLinesToHistoricalStore() {
+  const index = window.__BB_MARKET_INDEX;
+  const store = Array.isArray(g_historicalGamesStore) ? g_historicalGamesStore : [];
+  if (!index || !store.length) {
+    return { attached: 0, cleared: 0, total: store.length, hasIndex: !!index };
+  }
+  let attached = 0, cleared = 0;
+  store.forEach(function (g) {
+    if (!g) return;
+    const dateStr = String(g.date || "").slice(0, 10);
+    const homeId = g.homeTeamId;
+    const awayId = g.awayTeamId;
+    let rec = null;
+    if (homeId && awayId && dateStr && typeof bbLookupMarket === "function") {
+      rec = bbLookupMarket(index, dateStr, homeId, awayId);
+    }
+    if (rec && isFinite(Number(rec.total))) {
+      g.marketTotal = Number(rec.total);
+      g.line = Number(rec.total); // overwrite form-proxy line
+      if (rec.spreadHome != null && isFinite(Number(rec.spreadHome))) {
+        g.marketSpreadHome = Number(rec.spreadHome);
+      }
+      g.marketSource = rec.source || "market_index";
+      attached++;
+    } else {
+      // No real line → do not let form-proxy lines fake FT O/U results
+      if (g.line != null) cleared++;
+      g.line = null;
+      g.marketTotal = null;
+    }
+  });
+  if (typeof engineDebug === "function") {
+    engineDebug("MAX-POWER STAGE5: real lines attached to historical store", {
+      attached: attached, cleared: cleared, total: store.length
+    });
+  }
+  return { attached: attached, cleared: cleared, total: store.length, hasIndex: true };
+}
+window.bbAttachRealLinesToHistoricalStore = bbAttachRealLinesToHistoricalStore;
+
 // ============================================================
 // MARKET INDEX PERSISTENCE — IndexedDB so CSVs are imported once
 // Survives full page reloads. localStorage is too small for ~4MB.
@@ -5575,9 +5620,37 @@ async function runMaxPowerBacktestFromButton(onProgress) {
       };
     }
 
+    // REBUILD STAGE 5: require imported real market lines, then stamp them
+    // onto the historical store. Without this, Max-Power optimizes form-proxy
+    // lines (~57%) instead of the real 47.4% O/U problem.
+    if (!window.__BB_MARKET_INDEX || !Object.keys(window.__BB_MARKET_INDEX).length) {
+      if (typeof engineDebug === "function") {
+        engineDebug("MAX-POWER BLOCKED: no real market index loaded. Import odds/results CSV first (same data Season Backtest uses).");
+      }
+      return {
+        error: "No real market lines loaded. Import your odds/results CSV first so Max-Power can attack the real 47.4% O/U, not form-proxy lines.",
+        blocked: true,
+        reason: "missing_market_index"
+      };
+    }
+    const lineAttach = (typeof bbAttachRealLinesToHistoricalStore === "function")
+      ? bbAttachRealLinesToHistoricalStore()
+      : { attached: 0, total: g_historicalGamesStore.length };
+    if (!lineAttach.attached || lineAttach.attached < 50) {
+      if (typeof engineDebug === "function") {
+        engineDebug("MAX-POWER BLOCKED: too few real lines matched on store", lineAttach);
+      }
+      return {
+        error: "Only " + (lineAttach.attached || 0) + " games matched real market lines. Need at least 50. Check that team IDs/dates align with your imported market index.",
+        blocked: true,
+        reason: "insufficient_real_lines",
+        attached: lineAttach.attached || 0
+      };
+    }
+
     // Separate max-power lock per market (NBA only)
-    // REBUILD STAGE 3: FT O/U first (user priority), then halves, team totals, quarters.
-    const MARKETS = ["ft", "h1", "team", "h1_team", "q1", "q2", "q3", "q4"];
+    // REBUILD STAGE 5: FT O/U only — attack the real-line problem first.
+    const MARKETS = ["ft"];
     const allReports = [];
     const t0 = Date.now();
     const MAXPOWER_SEASONS = ["2019/20", "2020/21", "2021/22", "2022/23", "2023/24", "2024/25", "2025/26"];
@@ -6803,8 +6876,11 @@ function pureReplayGame(game, fullConfig, market) {
     }
 
     // Line
+    // REBUILD STAGE 5: prefer real closing total (marketTotal) over form-proxy line.
     let line = null;
-    if (market === "ft" && isFinite(Number(game.line))) {
+    if (market === "ft" && isFinite(Number(game.marketTotal))) {
+      line = Number(game.marketTotal);
+    } else if (market === "ft" && isFinite(Number(game.line))) {
       line = Number(game.line);
     } else if (isFinite(Number(game["line_" + market]))) {
       line = Number(game["line_" + market]);
