@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -19788,11 +19789,21 @@ function getPickExplanationFactors(p, isLock) {
   if (!p) return factors;
 
   const side = getPickSideFromText(p.pick);
-  const edgeVal = isFinite(p.displayEdge) ? p.displayEdge : p.edge;
-  const lineVal = isFinite(p.displayLineUsed) ? p.displayLineUsed : p.line;
+  // Always explain against the decision line the pick was actually made on
+  // (midpoint / p.line), not the smart-line conservative display values.
+  // Smart-line conservatism is noted separately below when it differs.
+  const edgeVal = isFinite(p.edge) ? p.edge : p.displayEdge;
+  const lineVal = isFinite(p.line) ? p.line : p.displayLineUsed;
   if (isFinite(edgeVal) && isFinite(lineVal) && lineVal > 0) {
     const edgePct = Math.abs(edgeVal / lineVal) * 100;
     factors.push(`Edge: ${formatEdge(edgeVal, lineVal)} pts (${edgePct.toFixed(1)}%) vs the ${displayLine(lineVal)} line — this is what makes it ${side ? side.toUpperCase() : "a pick"}.`);
+  }
+  if (
+    isFinite(p.displayLineUsed) && isFinite(p.line) &&
+    p.displayLineUsed !== p.line &&
+    isFinite(p.displayEdge)
+  ) {
+    factors.push(`Smart-line check (range input): conservative edge ${formatEdge(p.displayEdge, p.displayLineUsed)} pts vs ${displayLine(p.displayLineUsed)} (unfavourable end of entered range).`);
   }
 
   const tierLabel = { full: "Full sample (10 games)", thin: "Thin sample (5–9 games)", insufficient: "Insufficient sample" }[p.sampleTier] || null;
@@ -19811,11 +19822,24 @@ function getPickExplanationFactors(p, isLock) {
           factors.push(`📐 Matchup delta: ${teamLabel} averages ${matchupSignal.direction === "elevated" ? "+" : ""}${matchupSignal.deltaPct}% vs season average in this specific matchup (${matchupSignal.sampleSize} H2H games).`);
         }
       });
-      const agreement = getCrossSignalAgreement("A", p.marketKey, _parsedForFactors);
-      if (agreement.signalCount >= 2) {
-        factors.push(agreement.conflictDetected
-          ? `⚠ Signal conflict: recency and matchup history disagree on direction for this market.`
-          : `✓ Signal agreement: ${agreement.agreeCount}/${agreement.signalCount} independent signals point the same direction (${agreement.dominantDirection}).`);
+      // For total markets, aggregate A+B signals so one team's "under"
+      // recency cannot label an OVER total as "signals point under".
+      const agreementA = getCrossSignalAgreement("A", p.marketKey, _parsedForFactors);
+      const agreementB = getCrossSignalAgreement("B", p.marketKey, _parsedForFactors);
+      const mergedSignals = [...(agreementA.signals || []), ...(agreementB.signals || [])];
+      const overCount = mergedSignals.filter(s => s.direction === "over").length;
+      const underCount = mergedSignals.filter(s => s.direction === "under").length;
+      const signalCount = mergedSignals.length;
+      const agreeCount = Math.max(overCount, underCount);
+      const conflictDetected = overCount > 0 && underCount > 0;
+      const dominantDirection = overCount === underCount ? "split" : (overCount > underCount ? "over" : "under");
+      if (signalCount >= 2) {
+        const pickSide = getPickSideFromText(p.pick);
+        if (conflictDetected || (pickSide && dominantDirection !== "split" && dominantDirection !== pickSide)) {
+          factors.push(`⚠ Signal conflict: independent signals do not cleanly agree with this ${pickSide ? pickSide.toUpperCase() : ""} pick (dominant raw signal: ${dominantDirection}).`);
+        } else {
+          factors.push(`✓ Signal agreement: ${agreeCount}/${signalCount} independent signals point the same direction (${dominantDirection}).`);
+        }
       }
     }
     if (p.marketKey && p.marketKey.startsWith("q")) {
@@ -26586,12 +26610,23 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
         ? getMarginPick(p.edge, league, p.marketKey)
         : getPick(p.edge, p.line, league, p.marketKey, context);
 
+      // Smart-line conservatism must NOT silently destroy an A/B-grade pick
+      // that already cleared the midpoint threshold. Killing it to NO PLAY
+      // was preventing tracker save while the table still looked actionable.
+      // Keep the original pick; surface the conservative check as a note.
       if (p.smartLineNoPlay) {
-        p.pick = "NO PLAY";
+        const grade = String(p.confidence || "").toUpperCase();
+        const isStrongGrade = grade === "A" || grade === "B";
+        if (isStrongGrade && p.pick !== "NO PLAY") {
+          p.note = (p.note ? p.note + " · " : "") +
+            "Smart-line: edge fails at unfavourable end of entered range — treat as lean / verify actual line.";
+          // leave p.pick, confidence, displayPick intact so tracker saves it
+        } else {
+          p.pick = "NO PLAY";
+        }
       }
 
       if (p.pick !== "NO PLAY") {
-        
         p.displayPick = p.pick;
         p.bufferedPickText = p.pick;
       } else {
