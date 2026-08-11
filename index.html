@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5902,40 +5901,17 @@ function getTunableParam(key, league, market) {
     }
   }
 
-  // ── Maximum-power lock injection (per-market) ───────────────────
-  // Search writes BB_MAXPOWER_LOCKED_LEVERS_<market>. CONFIRMED BUG FIX:
-  // this used to return the MAX-POWER value unconditionally, which
-  // permanently shadowed anything the newer Joint Backtest "Lock Optimal
-  // Parameters" button wrote to the registry/override above — Lock
-  // Optimal Parameters would silently do nothing for any key MAX-POWER
-  // had ever locked, with no error shown anywhere. Now compares
-  // timestamps (lockedAt vs lastVerifiedAt, both ISO 8601 so string
-  // comparison is chronological) and only defers to MAX-POWER if its
-  // lock is actually the more recent one.
-  try {
-    const lk = String(league || "nba").toLowerCase();
-    if (lk === "nba") {
-      const m = String(market || g_currentLiveComputeMarket || "ft").toLowerCase();
-      const keysToTry = [
-        "BB_MAXPOWER_LOCKED_LEVERS_" + m,
-        "BB_MAXPOWER_LOCKED_LEVERS_ft",   // safe fallback
-        "BB_MAXPOWER_LOCKED_LEVERS"       // legacy key
-      ];
-      for (let ki = 0; ki < keysToTry.length; ki++) {
-        const raw = localStorage.getItem(keysToTry[ki]);
-        if (!raw) continue;
-        const locked = JSON.parse(raw);
-        if (locked && locked.league === "nba" && locked.leverSet &&
-            Object.prototype.hasOwnProperty.call(locked.leverSet, key)) {
-          const mpStamp = locked.lockedAt || null;
-          if (!overrideStamp || (mpStamp && mpStamp > overrideStamp)) {
-            return locked.leverSet[key];
-          }
-        }
-        break;
-      }
-    }
-  } catch (e) {}
+  // ── MAX-POWER RETIRED (backtest roadmap consolidation) ───────────
+  // The old MAX-POWER coordinate-ascent sweep (BACKTEST_LEVERS,
+  // replayHistoricalGame, BB_MAXPOWER_LOCKED_LEVERS_<market>) is retired.
+  // It replayed games through a simplified path that never matched the
+  // live projection pipeline, and its lock here could silently shadow
+  // whatever the properly train/validation/test-gated Joint Backtest
+  // ("Lock Optimal Parameters") had written to the registry/override
+  // above, with no error shown anywhere. getTunableParam now has exactly
+  // one source of truth: the registry/league-override read above. Any
+  // stale BB_MAXPOWER_LOCKED_LEVERS_* keys left in localStorage from a
+  // previous session are simply never read again from here.
 
   return overrideValue;
 }
@@ -7956,6 +7932,22 @@ function getLeagueEdgePointThreshold(league, marketKey) {
     key === "handicap"    ? "edgeHandicapPointThreshold" :
     key === "handicap_h1" ? "edgeHandicapH1PointThreshold" :
     key === "handicap_h2" ? "edgeHandicapH2PointThreshold" : null;
+  // PHASE 6 WIRING FIX: Winner/Handicap have no row in the 90-league
+  // LEAGUE_EDGE_POINT_THRESHOLDS table below (by design — see MARKET
+  // EXPANSION BATCH 1 note a few lines down) and initLeagueOverridesFromDefaults()
+  // never seeds g_tunableParamLeagueOverrides for them either, so both
+  // checks below always skipped straight to the raw TUNABLE_PARAM_REGISTRY
+  // default for these two keys — completely bypassing getParam()/
+  // window.getParam, which is the ONLY mechanism the backtest evaluators
+  // use to inject a joint-search candidate's threshold. Every candidate was
+  // silently graded against the live-locked value no matter what
+  // edgeWinnerPointThreshold/edgeHandicapPointThreshold the search was
+  // actually trying. Scoped to just these two keys (+ H1/H2 siblings) so
+  // FT/H1/Team/Q's existing static-table priority is completely untouched.
+  if (key === "winner" || key === "handicap" || key === "handicap_h1" || key === "handicap_h2") {
+    const _routed = getParam(paramKey, lk);
+    if (isFinite(_routed) && Number(_routed) > 0) return Number(_routed);
+  }
   const staticRow = LEAGUE_EDGE_POINT_THRESHOLDS[lk] || LEAGUE_EDGE_POINT_THRESHOLDS.default;
   const staticVal = Number(staticRow?.[key]);
   // MARKET EXPANSION BATCH 1: winner/handicap/handicap_h1/handicap_h2 have no
@@ -20447,6 +20439,7 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
 
       results.push({
         date: game.date,
+        eventId: game.eventId,
         predictedMargin: calc.projAFT - calc.projBFT,
         actualMargin: game.scored - game.allowed,
         predictedTotal: calc.ftProj,
@@ -20671,7 +20664,7 @@ function runGroupedParamSearchPhase4(features, allGames, baselineValComposite, o
  * Zero-allocation evaluator for candidate sweeps across precomputed features.
  * Prevents memory leaks and WebKit Jetsam kills on mobile browsers.
  */
-function evaluateFeatureCacheLight(features, paramOverrides, options) {
+function evaluateFeatureCacheLight(features, allGames, paramOverrides, options) {
   options = options || {};
   const league = options.league || "nba";
 
@@ -20693,6 +20686,12 @@ function evaluateFeatureCacheLight(features, paramOverrides, options) {
   let trainQCount = 0, valQCount = 0;
   let trainQTeamCount = 0, valQTeamCount = 0;
   let trainH1Count = 0, valH1Count = 0;
+  // MARKET EXPANSION (Phase 6 continuation): Winner (straight-up) and
+  // Handicap (ATS) picks, graded only on games where historical market data
+  // was attached via bbAttachMarketToBacktestGames (optional CSV import) —
+  // games with no market data simply don't vote on these two counters.
+  let trainWinnerN = 0, valWinnerN = 0, trainWinnerCorrect = 0, valWinnerCorrect = 0;
+  let trainHandicapN = 0, valHandicapN = 0, trainHandicapCorrect = 0, valHandicapCorrect = 0;
 
   try {
     for (let i = 0; i < features.length; i++) {
@@ -20761,6 +20760,33 @@ function evaluateFeatureCacheLight(features, paramOverrides, options) {
         trainTeamErr += Math.abs(calc.projAFT - gameScored) + Math.abs(calc.projBFT - gameAllowed);
       }
 
+      // MARKET EXPANSION (Phase 6 continuation): grade Winner + Handicap the
+      // same way the live engine picks them (getMarginPick, league-scoped
+      // edgeWinnerPointThreshold / edgeHandicapPointThreshold), then score
+      // against what actually happened. Handicap skips silently when no
+      // historical market spread is attached to this game.
+      const _gameRec = allGames ? allGames[i] : null;
+      const _predMargin = calc.projAFT - calc.projBFT;
+      const _actualMargin = gameScored - gameAllowed;
+      if (_gameRec && isFinite(_predMargin) && isFinite(_actualMargin)) {
+        const _winnerPick = getMarginPick(_predMargin, league, "winner");
+        if (_winnerPick !== "NO PLAY") {
+          const _winnerCorrect = (_winnerPick === "HOME") === (_actualMargin > 0);
+          if (isVal) { valWinnerN++; if (_winnerCorrect) valWinnerCorrect++; }
+          else { trainWinnerN++; if (_winnerCorrect) trainWinnerCorrect++; }
+        }
+        if (isFinite(_gameRec.marketSpreadTeam)) {
+          const _handicapEdge = _predMargin + _gameRec.marketSpreadTeam;
+          const _handicapPick = getMarginPick(_handicapEdge, league, "handicap");
+          const _actualHandicapMargin = _actualMargin + _gameRec.marketSpreadTeam;
+          if (_handicapPick !== "NO PLAY" && _actualHandicapMargin !== 0) {
+            const _handicapCorrect = (_handicapPick === "HOME") === (_actualHandicapMargin > 0);
+            if (isVal) { valHandicapN++; if (_handicapCorrect) valHandicapCorrect++; }
+            else { trainHandicapN++; if (_handicapCorrect) trainHandicapCorrect++; }
+          }
+        }
+      }
+
       let calc1H = null;
       try {
         calc1H = compute1HProjection({ league, parsed, lines: {}, injMultA: 1, injMultB: 1, config: _btConfigH1 });
@@ -20827,7 +20853,19 @@ function evaluateFeatureCacheLight(features, paramOverrides, options) {
     return Math.max(0, Math.min(100, 100 * (1 - mae / (2 * target))));
   };
 
-  const calcComposite = (totErr, n, teamErr, h1TotErr, h1N, h1TeamErr, qTotErr, qN, qTeamErr, qTeamN) => {
+  // MARKET EXPANSION (Phase 6 continuation): same 0.45-0.60 win-rate band
+  // already used for the season-level ATS/O-U blend in
+  // computeBacktestAccuracyScore, applied here so Winner/Handicap can
+  // actually move which candidate the joint search picks — not just get
+  // reported after the fact. Requires 30+ graded picks in the split before
+  // it counts, so a handful of lucky/unlucky picks can't swing composite.
+  const MIN_MARKET_PICKS = 30;
+  const winRateScore = (correct, n) => {
+    if (!n || n < MIN_MARKET_PICKS) return null;
+    return Math.max(0, Math.min(100, ((correct / n) - 0.45) / 0.15 * 100));
+  };
+
+  const calcComposite = (totErr, n, teamErr, h1TotErr, h1N, h1TeamErr, qTotErr, qN, qTeamErr, qTeamN, winnerCorrect, winnerN, handicapCorrect, handicapN) => {
     const totMAE = totErr / n;
     const teamMAE = teamErr / (n * 2);
     const h1TotMAE = h1N ? h1TotErr / h1N : null;
@@ -20841,14 +20879,16 @@ function evaluateFeatureCacheLight(features, paramOverrides, options) {
       bandScore(h1TotMAE, BT_ACCURACY_TARGETS.h1TotalMAE),
       bandScore(h1TeamMAE, BT_ACCURACY_TARGETS.h1TeamScoreMAE),
       bandScore(qTotMAE, BT_ACCURACY_TARGETS.qTotalMAE),
-      bandScore(qTeamMAE, BT_ACCURACY_TARGETS.qTeamMAE)
+      bandScore(qTeamMAE, BT_ACCURACY_TARGETS.qTeamMAE),
+      winRateScore(winnerCorrect, winnerN),
+      winRateScore(handicapCorrect, handicapN)
     ].filter(v => v !== null && isFinite(v));
 
     return scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
   };
 
-  const trainComp = calcComposite(trainTotalErr, trainN, trainTeamErr, trainH1TotalErr, trainH1Count, trainH1TeamErr, trainQTotalErr, trainQCount, trainQTeamErr, trainQTeamCount);
-  const valComp = calcComposite(valTotalErr, valN, valTeamErr, valH1TotalErr, valH1Count, valH1TeamErr, valQTotalErr, valQCount, valQTeamErr, valQTeamCount);
+  const trainComp = calcComposite(trainTotalErr, trainN, trainTeamErr, trainH1TotalErr, trainH1Count, trainH1TeamErr, trainQTotalErr, trainQCount, trainQTeamErr, trainQTeamCount, trainWinnerCorrect, trainWinnerN, trainHandicapCorrect, trainHandicapN);
+  const valComp = calcComposite(valTotalErr, valN, valTeamErr, valH1TotalErr, valH1Count, valH1TeamErr, valQTotalErr, valQCount, valQTeamErr, valQTeamCount, valWinnerCorrect, valWinnerN, valHandicapCorrect, valHandicapN);
 
   return {
     trainAccuracyScore: { composite: trainComp },
@@ -20874,7 +20914,7 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
     if (v !== undefined && v !== null) baselineOverrides[k] = v;
   });
 
-  const baselineEval = evaluateFeatureCacheLight(features, baselineOverrides, { league });
+  const baselineEval = evaluateFeatureCacheLight(features, allGames, baselineOverrides, { league });
   const baselineValComp = baselineEval?.validationAccuracyScore?.composite || -Infinity;
 
   const jointSearchSpace = {
@@ -20903,6 +20943,13 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
     edgeH1PointThreshold:    [4.0, 5.0, 6.0, 7.0, 8.0],
     edgeTeamPointThreshold:  [5.0, 6.5, 8.0, 10.0, 12.0],
     edgeQPointThreshold:     [2.0, 3.0, 4.0, 5.0],
+    // MARKET EXPANSION (Phase 6 continuation): Winner + Handicap now have
+    // their own graded picks in evaluateFeatureCacheLight (see above) and a
+    // fixed getParam() routing bug (see getLeagueEdgePointThreshold), so
+    // their thresholds can finally be searched instead of sitting frozen at
+    // whatever the registry default was when they were first registered.
+    edgeWinnerPointThreshold:   [2.0, 3.0, 4.0, 5.0, 6.0, 8.0],
+    edgeHandicapPointThreshold: [2.0, 3.0, 4.0, 5.0, 6.0, 8.0],
     confidenceAThresh:       [0.60, 0.64, 0.68, 0.72],
     confidenceBThresh:       [0.52, 0.56, 0.60],
     confidenceCThresh:       [0.45, 0.50, 0.54],
@@ -20932,7 +20979,7 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
 
       let evalOut;
       try {
-        evalOut = evaluateFeatureCacheLight(features, overrides, { league });
+        evalOut = evaluateFeatureCacheLight(features, allGames, overrides, { league });
       } catch (e) {
         continue;
       }
@@ -20983,11 +21030,40 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
   // pass as "improved".
   const _realTestComposite = finalEval.testAccuracyScore?.composite;
   const _valTestGap = (isFinite(bestValComp) && isFinite(_realTestComposite)) ? (bestValComp - _realTestComposite) : Infinity;
+
+  // PHASE 6: paired bootstrap significance, ported from the Coordinate
+  // Ascent Tuner's pairedBootstrapTest — a composite-score margin alone
+  // can't tell a real edge from noise when thousands of random candidates
+  // were tried. Baseline now runs through the SAME real-pipeline evaluator
+  // as the winning candidate, over the SAME untouched test games, paired by
+  // eventId so a skipped game on one side can never misalign the arrays.
+  const _baselineFinalEval = evaluateFeatureCacheWithOverrides(features, allGames, baselineOverrides, { league, includeTest: true });
+  const _btWinFlagsByEventId = (evalResult) => {
+    const map = new Map();
+    (evalResult?.results || []).forEach(r => {
+      if (r.split !== "test" || !r.eventId || !isFinite(r.predictedMargin) || !isFinite(r.actualMargin)) return;
+      map.set(r.eventId, (r.predictedMargin > 0) === (r.actualMargin > 0) ? 1 : 0);
+    });
+    return map;
+  };
+  const _baselineWinMap = _btWinFlagsByEventId(_baselineFinalEval);
+  const _challengerWinMap = _btWinFlagsByEventId(finalEval);
+  const _pairedBaselineWins = [];
+  const _pairedChallengerWins = [];
+  _baselineWinMap.forEach((val, eventId) => {
+    if (_challengerWinMap.has(eventId)) {
+      _pairedBaselineWins.push(val);
+      _pairedChallengerWins.push(_challengerWinMap.get(eventId));
+    }
+  });
+  const _bootstrapResult = pairedBootstrapTest(_pairedBaselineWins, _pairedChallengerWins, 2000, seed + 7);
+
   const _reallyImproved =
     bestValComp > baselineValComp + 1.0 &&
     isFinite(_realTestComposite) &&
     _realTestComposite > baselineValComp + 0.5 &&
-    Math.abs(_valTestGap) <= 8.0;
+    Math.abs(_valTestGap) <= 8.0 &&
+    _bootstrapResult.significant;
 
   const report = {
     league,
@@ -20999,6 +21075,14 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
     testComposite: isFinite(_realTestComposite) ? _realTestComposite : null,
     valTestGap: isFinite(_valTestGap) ? _valTestGap : null,
     trainComposite: finalEval.trainAccuracyScore?.composite || null,
+    bootstrapSignificance: {
+      significant: _bootstrapResult.significant,
+      p: _bootstrapResult.p,
+      ciLow: _bootstrapResult.ciLow,
+      ciHigh: _bootstrapResult.ciHigh,
+      n: _bootstrapResult.n,
+      meanDelta: _bootstrapResult.meanDelta
+    },
     proposedDiff,
     bestCandidate,
     finalCalibration: finalEval.validationCalibration,
