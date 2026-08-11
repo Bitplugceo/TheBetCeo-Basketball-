@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4146,6 +4147,169 @@ const MODEL_TUNING = {
   
   quarterAnchorBlendWeight: 0.7
 };
+
+// ============================================================
+// HISTORICAL MARKET DATA IMPORT — CSV import + join for Season Backtest
+// Lets the backtest attach real spread/total/moneyline to historical
+// games instead of relying on scores only. Two optional CSVs: a
+// results CSV (spread/total/moneyline baked in per game) and an odds
+// CSV (public betting %). Joined by normalized team + date into
+// window.__BB_MARKET_INDEX.
+// ============================================================
+
+function _bbParseCSV(text) {
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { row.push(field); field = ""; }
+      else if (c === '\r') { /* skip, \n handles the break */ }
+      else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ""; }
+      else field += c;
+    }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  if (!rows.length) return [];
+  const header = rows[0].map(h => h.trim());
+  const out = [];
+  for (let r = 1; r < rows.length; r++) {
+    if (rows[r].length === 1 && rows[r][0] === "") continue;
+    const obj = {};
+    for (let c = 0; c < header.length; c++) obj[header[c]] = rows[r][c] !== undefined ? rows[r][c] : "";
+    out.push(obj);
+  }
+  return out;
+}
+window._bbParseCSV = _bbParseCSV;
+
+const BB_RESULTS_ABBR_TO_KEY = {
+  atl: "atlanta", bkn: "brooklyn", bos: "boston", cha: "charlotte", chi: "chicago",
+  cle: "cleveland", dal: "dallas", den: "denver", det: "detroit", gs: "golden state",
+  hou: "houston", ind: "indiana", lac: "la clippers", lal: "la lakers", mem: "memphis",
+  mia: "miami", mil: "milwaukee", min: "minnesota", no: "new orleans", ny: "new york",
+  okc: "oklahoma city", orl: "orlando", phi: "philadelphia", phx: "phoenix",
+  por: "portland", sa: "san antonio", sac: "sacramento", tor: "toronto",
+  utah: "utah", wsh: "washington"
+};
+function bbTeamIdFromResultsAbbr(abbr) {
+  const key = BB_RESULTS_ABBR_TO_KEY[String(abbr || "").toLowerCase().trim()];
+  return key ? NBA_TEAM_MAP[key] : null;
+}
+function bbTeamIdFromOddsName(name) {
+  const key = String(name || "").toLowerCase().trim();
+  return NBA_TEAM_MAP[key] || null;
+}
+window.bbTeamIdFromResultsAbbr = bbTeamIdFromResultsAbbr;
+window.bbTeamIdFromOddsName = bbTeamIdFromOddsName;
+
+function bbBuildMarketIndex(resultsRows, oddsRows) {
+  const index = {};
+  let matchedResults = 0, skippedResults = 0;
+  (resultsRows || []).forEach(function (row) {
+    const homeId = bbTeamIdFromResultsAbbr(row.home);
+    const awayId = bbTeamIdFromResultsAbbr(row.away);
+    const dateStr = String(row.date || "").slice(0, 10);
+    if (!homeId || !awayId || !dateStr) { skippedResults++; return; }
+    const spreadMag = parseFloat(row.spread);
+    const favored = String(row.whos_favored || "").toLowerCase();
+    const spreadHome = isFinite(spreadMag) ? (favored === "home" ? -spreadMag : favored === "away" ? spreadMag : null) : null;
+    const total = parseFloat(row.total);
+    const mlAway = parseFloat(row.moneyline_away);
+    const mlHome = parseFloat(row.moneyline_home);
+    const key = dateStr + "_" + homeId + "_" + awayId;
+    index[key] = {
+      dateStr: dateStr, homeId: homeId, awayId: awayId,
+      spreadHome: spreadHome,
+      total: isFinite(total) ? total : null,
+      moneylineHome: isFinite(mlHome) ? mlHome : null,
+      moneylineAway: isFinite(mlAway) ? mlAway : null,
+      finalHome: parseFloat(row.score_home),
+      finalAway: parseFloat(row.score_away),
+      source: "results_csv"
+    };
+    matchedResults++;
+  });
+
+  let matchedOdds = 0, skippedOdds = 0;
+  (oddsRows || []).forEach(function (row) {
+    const homeId = bbTeamIdFromOddsName(row.home_team);
+    const awayId = bbTeamIdFromOddsName(row.away_team);
+    const dateStr = String(row.game_date || "").slice(0, 10);
+    if (!homeId || !awayId || !dateStr) { skippedOdds++; return; }
+    const key = dateStr + "_" + homeId + "_" + awayId;
+    const existing = index[key] || { dateStr: dateStr, homeId: homeId, awayId: awayId, source: "odds_csv" };
+    const spreadHomePts = parseFloat(row.spread_home_points);
+    const totalPts = parseFloat(row.total_over_points);
+    const mlHomeOdds = parseFloat(row.money_home_odds);
+    const mlAwayOdds = parseFloat(row.money_away_odds);
+    if (existing.spreadHome == null && isFinite(spreadHomePts)) existing.spreadHome = spreadHomePts;
+    if (existing.total == null && isFinite(totalPts)) existing.total = totalPts;
+    if (existing.moneylineHome == null && isFinite(mlHomeOdds)) existing.moneylineHome = mlHomeOdds;
+    if (existing.moneylineAway == null && isFinite(mlAwayOdds)) existing.moneylineAway = mlAwayOdds;
+    existing.publicMoneyHomePct = isFinite(parseFloat(row.money_home_stake_percentage)) ? parseFloat(row.money_home_stake_percentage) : null;
+    existing.publicMoneyAwayPct = isFinite(parseFloat(row.money_away_stake_percentage)) ? parseFloat(row.money_away_stake_percentage) : null;
+    existing.spreadHomeCovered = row.spread_home_won === "True" ? true : (row.spread_home_won === "False" ? false : null);
+    existing.totalOverWon = row.total_over_won === "True" ? true : (row.total_over_won === "False" ? false : null);
+    index[key] = existing;
+    matchedOdds++;
+  });
+
+  return {
+    index: index,
+    stats: {
+      resultsRows: (resultsRows || []).length, matchedResults: matchedResults, skippedResults: skippedResults,
+      oddsRows: (oddsRows || []).length, matchedOdds: matchedOdds, skippedOdds: skippedOdds,
+      totalKeys: Object.keys(index).length
+    }
+  };
+}
+window.bbBuildMarketIndex = bbBuildMarketIndex;
+
+function bbLookupMarket(index, dateStr, homeId, awayId) {
+  if (!index || !dateStr) return null;
+  const base = new Date(dateStr + "T00:00:00Z").getTime();
+  const offsets = [0, -1, 1];
+  for (let i = 0; i < offsets.length; i++) {
+    const d = new Date(base + offsets[i] * 86400000);
+    const ds = d.toISOString().slice(0, 10);
+    const rec = index[ds + "_" + homeId + "_" + awayId];
+    if (rec) return rec;
+  }
+  return null;
+}
+window.bbLookupMarket = bbLookupMarket;
+
+function bbAttachMarketToBacktestGames(allGames) {
+  const index = window.__BB_MARKET_INDEX;
+  if (!index || !allGames) return { attached: 0, total: (allGames || []).length };
+  let attached = 0;
+  allGames.forEach(function (g) {
+    const dateStr = String(g.date || "").slice(0, 10);
+    let rec = bbLookupMarket(index, dateStr, g.teamId, g.oppId);
+    let teamIsHome = true;
+    if (!rec) { rec = bbLookupMarket(index, dateStr, g.oppId, g.teamId); teamIsHome = false; }
+    if (!rec) return;
+    g.marketIsHome = teamIsHome;
+    g.marketSpreadTeam = rec.spreadHome == null ? null : (teamIsHome ? rec.spreadHome : -rec.spreadHome);
+    g.marketTotal = rec.total;
+    g.marketMoneylineTeam = teamIsHome ? rec.moneylineHome : rec.moneylineAway;
+    g.marketMoneylineOpp = teamIsHome ? rec.moneylineAway : rec.moneylineHome;
+    g.marketSource = rec.source || null;
+    attached++;
+  });
+  if (typeof engineDebug === "function") {
+    engineDebug("Market data attached to backtest games", { attached: attached, total: allGames.length });
+  }
+  return { attached: attached, total: allGames.length };
+}
+window.bbAttachMarketToBacktestGames = bbAttachMarketToBacktestGames;
 
 // ============================================================
 // MAXIMUM-POWER BACKTEST — Phase 0/1 foundations
@@ -21057,6 +21221,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
     allGames = _cached.allGames;
     h1ByEvent = _cached.h1ByEvent;
     const applied = _btApplyH1AndAdvancedToGameLogs(gameLogs, h1ByEvent);
+    bbAttachMarketToBacktestGames(allGames);
     engineDebug("Season backtest using in-memory cache", {
       season, games: allGames.length, h1Applied: applied.h1Count, advancedApplied: applied.advCount
     });
@@ -21083,6 +21248,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
       }
     }
     allGames.sort((a, b) => new Date(a.date) - new Date(b.date));
+    bbAttachMarketToBacktestGames(allGames);
 
     const h1ProgressKey = `BB_H1_PROGRESS_NBA_${season}`;
     h1ByEvent = {};
@@ -21575,6 +21741,17 @@ function renderBacktestPanel() {
         </div>
       </div>
 
+      <div style="padding:12px 16px; border-top:1px solid var(--panel-border); border-bottom:1px solid var(--panel-border);">
+        <div style="font-size:12px; font-weight:900; margin-bottom:6px; letter-spacing:0.4px; text-transform:uppercase;">📥 Import Real Odds Data</div>
+        <div style="font-size:11px; color:var(--muted); margin-bottom:8px;">Upload your results CSV (spread/total/moneyline per game) and/or odds CSV (public betting %). Games get matched by team + date and their real market line is attached for grading.</div>
+        <label style="display:block; font-size:11px; margin-bottom:4px;">Results CSV (e.g. nba_2008-2026.csv)</label>
+        <input type="file" id="bbResultsCsvInput" accept=".csv" style="font-size:11px; margin-bottom:8px; display:block; width:100%;" />
+        <label style="display:block; font-size:11px; margin-bottom:4px;">Odds CSV (e.g. all_odds.csv)</label>
+        <input type="file" id="bbOddsCsvInput" accept=".csv" style="font-size:11px; margin-bottom:8px; display:block; width:100%;" />
+        <button type="button" id="bbImportMarketBtn" style="background:#3a404c; color:#fff; border:none; padding:8px 14px; font-weight:800; font-size:11px; cursor:pointer;">Import & Build Market Index</button>
+        <div id="bbMarketImportStatus" style="font-size:11px; color:var(--muted); margin-top:8px;">${window.__BB_MARKET_INDEX_STATS ? `Loaded: ${window.__BB_MARKET_INDEX_STATS.totalKeys} games indexed (${window.__BB_MARKET_INDEX_STATS.matchedResults} from results CSV, ${window.__BB_MARKET_INDEX_STATS.matchedOdds} from odds CSV).` : "No odds data imported yet — Season Backtest above is using scores only."}</div>
+      </div>
+
       <div class="tracker-summary-strip">
         ${summaryHtml}
       </div>
@@ -21606,6 +21783,47 @@ function renderBacktestPanel() {
   `;
 
   panel.innerHTML = html;
+
+  const bbImportBtn = document.getElementById("bbImportMarketBtn");
+  if (bbImportBtn) {
+    bbImportBtn.onclick = function () {
+      const resultsInput = document.getElementById("bbResultsCsvInput");
+      const oddsInput = document.getElementById("bbOddsCsvInput");
+      const statusEl = document.getElementById("bbMarketImportStatus");
+      const resultsFile = resultsInput && resultsInput.files && resultsInput.files[0];
+      const oddsFile = oddsInput && oddsInput.files && oddsInput.files[0];
+      if (!resultsFile && !oddsFile) {
+        alert("Choose at least one CSV file (results and/or odds) first.");
+        return;
+      }
+      if (statusEl) statusEl.textContent = "Reading files…";
+      const readFile = f => f ? new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsText(f);
+      }) : Promise.resolve(null);
+      Promise.all([readFile(resultsFile), readFile(oddsFile)]).then(function (texts) {
+        const resultsRows = texts[0] ? _bbParseCSV(texts[0]) : [];
+        const oddsRows = texts[1] ? _bbParseCSV(texts[1]) : [];
+        const built = bbBuildMarketIndex(resultsRows, oddsRows);
+        window.__BB_MARKET_INDEX = built.index;
+        window.__BB_MARKET_INDEX_STATS = built.stats;
+        if (typeof engineDebug === "function") engineDebug("Market index built", built.stats);
+        try {
+          const seasonCacheKeys = Object.keys(window.__bbSeasonDataCache || {});
+          seasonCacheKeys.forEach(function (k) {
+            const c = window.__bbSeasonDataCache[k];
+            if (c && c.allGames) bbAttachMarketToBacktestGames(c.allGames);
+          });
+        } catch (e) {}
+        renderBacktestPanel();
+      }).catch(function (err) {
+        if (statusEl) statusEl.textContent = "Import failed: " + (err && err.message ? err.message : String(err));
+        if (typeof engineDebug === "function") engineDebug("Market import failed", { error: err && err.message ? err.message : String(err) });
+      });
+    };
+  }
 
   const lockJointBtn = document.getElementById("lockJointParamsBtn");
   if (lockJointBtn) {
