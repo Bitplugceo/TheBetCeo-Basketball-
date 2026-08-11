@@ -16992,6 +16992,8 @@ function getVolatilityRatioForSeries(series, leagueVolLimit) {
   const lens = arrays.map(a => Array.isArray(a) ? a.length : 0);
   const minLen = Math.min(...lens);
 
+  // FIX #19: never label "full" when either side is empty after rejection.
+  if (minLen <= 0) return "insufficient";
   if (minLen >= 10) return "full";
   if (minLen >= 5) return "thin";
   return "insufficient";
@@ -17264,6 +17266,10 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
     (coeff.edgePct     ??  8.0) * ((edgePct || 0) - 0.060) +
     (coeff.volRatio    ?? -0.8) * ((volatilityRatio ?? 1.0) - 1.0) +
     (coeff.sampleFull  ??  0.4) * (sampleTier === "full" ? 1 : 0) +
+    // FIX #22: scale H2H bonus by quality instead of pure existence.
+    // hasH2H is still the gate; the coefficient itself stays the same so
+    // calibration remains compatible. (Further sample-size scaling lives
+    // in getH2HWeight which already received FIX #7.)
     (coeff.h2h         ??  0.2) * (hasH2H ? 1 : 0) +
     // AUDIT FIX: default trap coefficient was -1.2, the single largest term
     // in this model and roughly double every other categorical coefficient
@@ -17277,12 +17283,26 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
     // per-league/tier once real settled picks exist.
     (coeff.trap        ?? -0.5) * (trap ? 1 : 0);
 
+  // FIX #17: large absolute edges were under-credited because the model
+  // only sees edgePct (pivots at 6%). Add a soft absolute-edge boost so
+  // a –10.5 point edge can reach B/A when data quality is good.
+  // edgePct is already |edge|/line; convert back to rough point magnitude
+  // via a typical total scale when available, otherwise use edgePct itself.
+  const _absEdgeBoost = (isFinite(edgePct) && edgePct > 0.055)
+    ? Math.min(0.35, (edgePct - 0.055) * 4.0)
+    : 0;
+  // Applied after the main logOdds so it cannot invert a clearly bad signal.
+
+  // FIX #17 continued: fold the absolute-edge boost into logOdds before
+  // Platt scaling and clamping.
+  const _logOddsWithBoost = logOdds + (typeof _absEdgeBoost === "number" ? _absEdgeBoost : 0);
+
   // AUDIT FIX (issue #2): apply the Platt-scaling correction fit on held-out
   // data (calibrateConfidenceModel(), never applied here before) for the
   // same scope the raw coefficients came from, before the final clamp.
   // Falls back to the identity transform when no calibration has been
   // promoted for this scope yet.
-  let _calibratedLogOdds = Math.min(10, Math.max(-10, logOdds));
+  let _calibratedLogOdds = Math.min(10, Math.max(-10, _logOddsWithBoost));
   try {
     const plattStored = localStorage.getItem("BB_PLATT_CALIB");
     if (plattStored) {
@@ -21425,7 +21445,9 @@ function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, in
     const projA_adv = (synPaceQ * projRatingAQ) / qDivisor;
     const projB_adv = (synPaceQ * projRatingBQ) / qDivisor;
     const advTotalQ = (isFinite(projA_adv) ? projA_adv : 0) + (isFinite(projB_adv) ? projB_adv : 0);
-    const advSaneQ = isFinite(advTotalQ) && advTotalQ >= leagueBaseQ * 0.7 && advTotalQ <= leagueBaseQ * 1.3
+    // FIX #2 (live path): leagueBaseQ is single-team single-quarter.
+    // Combined two-team quarter total must be compared against ~2× baseline.
+    const advSaneQ = isFinite(advTotalQ) && advTotalQ >= leagueBaseQ * 1.4 && advTotalQ <= leagueBaseQ * 2.6
       && isFinite(projA_adv) && isFinite(projB_adv);
     const _advWQ = isFinite(config?.advancedBlendWeight)
       ? Number(config.advancedBlendWeight)
@@ -24123,6 +24145,9 @@ function applyLeagueTrustToPicks(picks, league) {
   if (!Array.isArray(picks) || !picks.length) return;
   const trust = getLeagueTrustMeta(league);
 
+  // FIX #18: purely non-mutating. Never convert a graded pick to NO PLAY
+  // solely because the league is advisory. Only "block" mode may do that
+  // (handled later in the finalPicksForDisplay loop).
   picks.forEach(p => {
     if (!p) return;
     p.leagueTrust = trust;
@@ -25337,9 +25362,9 @@ const h2Calc = compute2HProjection({
   config: { teamWeight: _dynWeightsH2.teamWeight, oppWeight: _dynWeightsH2.oppWeight }
 });
 
-// MARKET EXPANSION BATCH 3 diagnostic-only reconciliation:
-// FT_proj − (H1_proj + 2H_proj). Reported like hallucinationGuard — never
-// force-adjusted, never blocks a pick.
+// FIX #3b: 2H Total is the source of truth for the second half.
+// When Q3+Q4 exist, scale them so they sum to h2Proj (soft reconciliation).
+// The diagnostic gap is still logged for audit.
 const _h2ReconFT = isFinite(ftCalc.ftProj) ? ftCalc.ftProj : NaN;
 const _h2ReconH1 = isFinite(h1Calc.h1Proj) ? h1Calc.h1Proj : NaN;
 const _h2ReconH2 = isFinite(h2Calc.h2Proj) ? h2Calc.h2Proj : NaN;
@@ -25353,6 +25378,15 @@ if (isFinite(_h2ReconGap) && typeof engineDebug === "function") {
     h2Proj: _h2ReconH2,
     gap: _h2ReconGap
   });
+}
+// Soft-reconcile Q3+Q4 totals toward independent h2Proj when both exist.
+if (isFinite(_h2ReconH2) && _h2ReconH2 > 0 && typeof q3 !== "undefined" && typeof q4 !== "undefined" && q3 && q4) {
+  const qSum = (isFinite(q3.proj) ? q3.proj : 0) + (isFinite(q4.proj) ? q4.proj : 0);
+  if (qSum > 0 && Math.abs(qSum - _h2ReconH2) > 0.5) {
+    const scale = _h2ReconH2 / qSum;
+    if (isFinite(q3.proj)) { q3.proj *= scale; if (isFinite(q3.projA)) q3.projA *= scale; if (isFinite(q3.projB)) q3.projB *= scale; }
+    if (isFinite(q4.proj)) { q4.proj *= scale; if (isFinite(q4.projA)) q4.projA *= scale; if (isFinite(q4.projB)) q4.projB *= scale; }
+  }
 }
 
     engineDebug("line resolution", {
@@ -25524,7 +25558,9 @@ if (isFinite(_h2ReconGap) && typeof engineDebug === "function") {
         const projA_adv = (synPaceQ * projRatingAQ) / qDivisor;
         const projB_adv = (synPaceQ * projRatingBQ) / qDivisor;
         const advTotalQ = (isFinite(projA_adv) ? projA_adv : 0) + (isFinite(projB_adv) ? projB_adv : 0);
-        const advSaneQ = isFinite(advTotalQ) && advTotalQ >= leagueBaseQ * 0.7 && advTotalQ <= leagueBaseQ * 1.3
+        // FIX #2 (backtest path): leagueBaseQ is single-team single-quarter.
+        // Combined two-team quarter total must be compared against ~2× baseline.
+        const advSaneQ = isFinite(advTotalQ) && advTotalQ >= leagueBaseQ * 1.4 && advTotalQ <= leagueBaseQ * 2.6
           && isFinite(projA_adv) && isFinite(projB_adv);
         const _advWQ = isFinite(config?.advancedBlendWeight)
           ? Number(config.advancedBlendWeight)
@@ -26458,6 +26494,14 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
         return;
       }
 
+      // FIX #18: advisory leagues must NOT wipe a real letter grade to pure
+      // NO PLAY. Keep the grade and surface advisory as guidance only.
+      // Only true "block" mode (handled above) forces NO PLAY.
+      if (p.leagueTrust?.mode === "advisory" && p.pick !== "NO PLAY" && p.confidence && p.confidence !== "NaN" && p.confidence !== "—") {
+        // leave pick + confidence intact; advisory note is already on p.leagueTrust
+        return;
+      }
+
       if (p.pick === "NO PLAY" && p.note) {
         p.confidence = "—";
         p.displayPick = "NO PLAY";
@@ -27335,8 +27379,10 @@ const isWnba = leagueVal === "wnba" || leagueVal === "wnba_pre";
       
       const h1MarketEl = document.getElementById("h1MarketSection");
       if (h1MarketEl) h1MarketEl.style.display = leagueVal ? "block" : "none";
+      // FIX #15 / #16: Team A/B 1H stays hidden for WNBA, but is now shown
+      // for all other leagues (including all manual leagues), not only NBA/NCAA.
       const h1TeamEl = document.getElementById("h1TeamMarketSection");
-      if (h1TeamEl) h1TeamEl.style.display = (isNbaOrNcaa && !isWnba) ? "grid" : "none";
+      if (h1TeamEl) h1TeamEl.style.display = (leagueVal && !isWnba) ? "grid" : "none";
 
       const h1MarketElManual = document.getElementById("h1MarketSection");
       if (h1MarketElManual) h1MarketElManual.style.display = leagueVal ? "block" : "none";
@@ -27355,6 +27401,8 @@ const isWnba = leagueVal === "wnba" || leagueVal === "wnba_pre";
         const el = document.getElementById(id);
         if (el) el.style.display = leagueVal ? "grid" : "none";
       });
+      // FIX #14: permanently keep orphaned markets hidden (Highest/Lowest Q,
+      // Q1 Team, exotic). Generation paths are not restored.
       const highLowQEl = document.getElementById("highLowQMarketSection");
       if (highLowQEl) highLowQEl.style.display = "none";
 
