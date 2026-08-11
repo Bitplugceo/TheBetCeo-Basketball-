@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -22128,6 +22129,60 @@ function evaluateFeatureCacheLight(features, allGames, paramOverrides, options) 
  * JOINT MULTI-VARIABLE BACKTEST SWEEPER (LIGHTWEIGHT)
  * Jointly searches across ALL 12 core prediction factors simultaneously using zero-allocation evaluation.
  */
+// ============================================================
+// PERSISTENT "BEST EVER" LOCK STORE
+// Purpose: a single run's winner should never be treated as the final
+// answer on its own — it only earns a permanent place here once it beats
+// whatever is already recorded AND clears the same significance bar the
+// report already computes (bootstrap-significant, real test-split gain,
+// train/val/test all close together). Re-running the backtest later can
+// only ever replace this record with something that beats it; it can
+// never regress it. This is the "lock it in unless we find something
+// even better" behavior — enforced in code, not just by habit.
+// ============================================================
+function _btLockedBestKey(league) {
+  return "BB_LOCKED_BEST_EVER_V1_" + String(league || "nba").toUpperCase();
+}
+
+function loadLockedBestEver(league) {
+  try {
+    const raw = localStorage.getItem(_btLockedBestKey(league));
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function _btMaybeSaveLockedBest(league, candidate, meta) {
+  const existing = loadLockedBestEver(league);
+  const newScore = meta && isFinite(meta.testComposite) ? meta.testComposite : -Infinity;
+  const oldScore = existing && isFinite(existing.testComposite) ? existing.testComposite : -Infinity;
+  if (newScore <= oldScore + 1e-9) {
+    return { saved: false, reason: existing ? "Existing locked-best record is still at least as good." : "No existing record, but this candidate didn't clear the significance bar.", existing };
+  }
+  const record = {
+    league: String(league || "nba"),
+    candidate: { ...candidate },
+    validationComposite: meta.validationComposite,
+    testComposite: meta.testComposite,
+    trainComposite: meta.trainComposite,
+    bootstrapP: meta.bootstrapP,
+    bootstrapSignificant: meta.bootstrapSignificant,
+    gamesUsed: meta.gamesUsed || null,
+    supersedes: existing ? { testComposite: existing.testComposite, lockedAt: existing.lockedAt } : null,
+    lockedAt: new Date().toISOString()
+  };
+  try {
+    localStorage.setItem(_btLockedBestKey(league), JSON.stringify(record));
+  } catch (e) {
+    return { saved: false, reason: "localStorage write failed: " + (e?.message || String(e)), existing };
+  }
+  engineDebug("Locked-best-ever record updated", {
+    league, oldScore: isFinite(oldScore) ? oldScore : null, newScore, lockedAt: record.lockedAt
+  });
+  return { saved: true, record };
+}
+
 async function runJointMultiVariableBacktest(features, allGames, options) {
   options = options || {};
   const sampleCount = Math.max(100, Math.min(5000, options.sampleCount || 2000));
@@ -22142,7 +22197,19 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
     if (v !== undefined && v !== null) baselineOverrides[k] = v;
   });
 
-  const baselineEval = evaluateFeatureCacheLight(features, allGames, baselineOverrides, { league });
+  // EVALUATOR FIX: evaluateFeatureCacheLight never resets AppState.context.data
+  // or primes the aFTScored/bFTScored DOM inputs before calling
+  // computeFTProjection (unlike evaluateFeatureCacheWithOverrides, which does
+  // both — see that function's own BUGFIX comment). computeFTProjection's
+  // venue-blend step reads AppState.context.data via getFetchedSeries(), so
+  // every game silently threw inside evaluateFeatureCacheLight's try/catch
+  // and got skipped — trainN/valN stayed 0 for the baseline AND for all 2000
+  // candidates, so this function returned null every single time and the
+  // joint search never actually tested anything (testedCount incremented,
+  // improvedCount never did). Using the same evaluator everywhere — the one
+  // Phase 4's grouped search already proved works — removes that whole class
+  // of "two scorers silently disagree" bug instead of patching the copy.
+  const baselineEval = evaluateFeatureCacheWithOverrides(features, allGames, baselineOverrides, { league, includeTest: false });
   const baselineValComp = baselineEval?.validationAccuracyScore?.composite || -Infinity;
 
   const jointSearchSpace = {
@@ -22184,53 +22251,124 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
     volatilityLimit:        [8, 10, 12, 14, 16],
     // AUDIT FIX (pace/ortg/drtg wiring): advancedBlendWeight was hardcoded
     // to 0.45 and never part of this joint sweep — now a real candidate.
-    advancedBlendWeight:     [0.00, 0.20, 0.35, 0.45, 0.60, 0.75, 0.90]
+    advancedBlendWeight:     [0.00, 0.20, 0.35, 0.45, 0.60, 0.75, 0.90],
+    // COVERAGE FIX: these 9 registry params were never in this search space
+    // (or in Phase 4's groups) at all — they've been sitting frozen at their
+    // hardcoded registry default since the app was built. Ranges pulled from
+    // each param's own min/max in TUNABLE_PARAM_REGISTRY.
+    paceClampMinNbaNcaa:     [0.50, 0.60, 0.65, 0.70, 0.80, 0.90],
+    paceClampMaxNbaNcaa:     [1.15, 1.25, 1.35, 1.40, 1.45, 1.50],
+    paceClampMinOther:       [0.50, 0.60, 0.70, 0.80, 0.90],
+    paceClampMaxOther:       [1.15, 1.25, 1.30, 1.40, 1.50],
+    h1VolScale:              [0.40, 0.55, 0.70, 0.7071, 0.85, 1.00],
+    teamVolScale:            [0.30, 0.40, 0.50, 0.65, 0.80, 1.00],
+    quarterVolScale:         [0.25, 0.35, 0.50, 0.65, 0.80, 1.00],
+    edgeHandicapH1PointThreshold: [1.5, 2.5, 4.0, 5.5, 7.0, 9.0],
+    edgeHandicapH2PointThreshold: [1.5, 2.5, 4.0, 5.5, 7.0, 9.0]
   };
-
-  const jointCandidates = _btSampleFromCandidates(jointSearchSpace, sampleCount, rng);
-  jointCandidates.unshift({ ...baselineOverrides });
 
   let bestValComp = baselineValComp;
   let bestCandidate = { ...baselineOverrides };
   let testedCount = 0;
   let improvedCount = 0;
 
-  const BATCH_SIZE = 100;
-  for (let i = 0; i < jointCandidates.length; i += BATCH_SIZE) {
-    const chunk = jointCandidates.slice(i, i + BATCH_SIZE);
+  // Shared scorer for both stages below — one evaluator, one gap rule,
+  // used identically everywhere so a candidate can never look different
+  // depending on which stage found it.
+  function scoreCandidate(overrides) {
+    let evalOut;
+    try {
+      evalOut = evaluateFeatureCacheWithOverrides(features, allGames, overrides, { league, includeTest: false });
+    } catch (e) {
+      return null;
+    }
+    testedCount++;
+    const valComp = evalOut?.validationAccuracyScore?.composite;
+    const trainComp = evalOut?.trainAccuracyScore?.composite;
+    if (!isFinite(valComp)) return null;
+    const gap = (isFinite(trainComp) ? trainComp : valComp) - valComp;
+    if (gap > 8.0) return null;
+    return valComp;
+  }
+
+  // ── Stage 1: broad random sweep across all 38 dials at once ──────────
+  // Purpose: find a decent neighborhood in a huge joint space. Kept
+  // deliberately smaller than the old 2000 now that every candidate does
+  // real work through the full evaluator (the old count was only cheap
+  // because the light evaluator was silently failing on every row).
+  const stage1Count = Math.max(80, Math.min(600, sampleCount));
+  const stage1Candidates = _btSampleFromCandidates(jointSearchSpace, stage1Count, rng);
+  // Seed with anything the caller already knows is good (e.g. Phase 4's
+  // grouped-search winner, which ran first) — worst case it's ignored
+  // because stage 2 finds something better anyway; best case it saves
+  // stage 1 from having to randomly rediscover it.
+  if (Array.isArray(options.extraSeeds)) {
+    options.extraSeeds.forEach(seed => { if (seed && typeof seed === "object") stage1Candidates.unshift({ ...seed }); });
+  }
+  stage1Candidates.unshift({ ...baselineOverrides });
+
+  const BATCH_SIZE = 40;
+  for (let i = 0; i < stage1Candidates.length; i += BATCH_SIZE) {
+    const chunk = stage1Candidates.slice(i, i + BATCH_SIZE);
     for (const cand of chunk) {
       const overrides = { ...baselineOverrides, ...cand };
       if (typeof TUNING_GRID !== "undefined" && Array.isArray(TUNING_GRID.recencyProfiles)) {
         const profiles = TUNING_GRID.recencyProfiles;
         overrides.recencyWeights = profiles[Math.floor(rng() * profiles.length)];
       }
-
-      let evalOut;
-      try {
-        evalOut = evaluateFeatureCacheLight(features, allGames, overrides, { league });
-      } catch (e) {
-        continue;
-      }
-      testedCount++;
-
-      const valComp = evalOut?.validationAccuracyScore?.composite;
-      const trainComp = evalOut?.trainAccuracyScore?.composite;
-      if (!isFinite(valComp)) continue;
-
-      const gap = (isFinite(trainComp) ? trainComp : valComp) - valComp;
-      if (gap > 8.0) continue;
-
-      if (valComp > bestValComp + 1e-6) {
+      const valComp = scoreCandidate(overrides);
+      if (valComp != null && valComp > bestValComp + 1e-6) {
         bestValComp = valComp;
         bestCandidate = { ...overrides };
         improvedCount++;
       }
     }
-
     if (typeof onProgress === "function") {
-      try { onProgress(testedCount, jointCandidates.length, bestValComp); } catch (e) {}
+      try { onProgress(testedCount, "stage1", bestValComp); } catch (e) {}
     }
     await new Promise(r => setTimeout(r, 0));
+  }
+
+  // ── Stage 2: coordinate-ascent refinement around the stage-1 winner ──
+  // Purpose: this is the part pure random joint sampling can't do well —
+  // hold every dial fixed at the current best except one, sweep that one
+  // dial's full candidate list, keep it only if it genuinely helps, move
+  // to the next dial. Two full passes, plus one pass over the recency
+  // profiles (a vector, not a scalar, so it's swept on its own). This is
+  // the same "keep only if it helps" rule Phase 4 already proved works —
+  // just applied across all 38 dials together instead of 4 fixed groups.
+  const refinementKeys = Object.keys(jointSearchSpace);
+  const REFINEMENT_PASSES = 2;
+  for (let pass = 1; pass <= REFINEMENT_PASSES; pass++) {
+    for (const key of refinementKeys) {
+      const candidates = jointSearchSpace[key];
+      for (const val of candidates) {
+        if (val === bestCandidate[key]) continue;
+        const trial = { ...bestCandidate, [key]: val };
+        const valComp = scoreCandidate(trial);
+        if (valComp != null && valComp > bestValComp + 1e-6) {
+          bestValComp = valComp;
+          bestCandidate = trial;
+          improvedCount++;
+        }
+      }
+      if (typeof onProgress === "function") {
+        try { onProgress(testedCount, "stage2-pass" + pass + ":" + key, bestValComp); } catch (e) {}
+      }
+      await new Promise(r => setTimeout(r, 0));
+    }
+    if (typeof TUNING_GRID !== "undefined" && Array.isArray(TUNING_GRID.recencyProfiles)) {
+      for (const profile of TUNING_GRID.recencyProfiles) {
+        const trial = { ...bestCandidate, recencyWeights: profile };
+        const valComp = scoreCandidate(trial);
+        if (valComp != null && valComp > bestValComp + 1e-6) {
+          bestValComp = valComp;
+          bestCandidate = trial;
+          improvedCount++;
+        }
+      }
+      await new Promise(r => setTimeout(r, 0));
+    }
   }
 
   const finalEval = evaluateFeatureCacheWithOverrides(features, allGames, bestCandidate, { league, includeTest: true });
@@ -22293,6 +22431,21 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
     Math.abs(_valTestGap) <= 8.0 &&
     _bootstrapResult.significant;
 
+  // Only a run that clears every one of the gates above ever gets a shot at
+  // the persistent record — and even then it only overwrites it if it's
+  // actually better than what's already locked (see _btMaybeSaveLockedBest).
+  let lockAttempt = { saved: false, reason: "Not statistically significant this run — locked-best record (if any) is unchanged." };
+  if (_reallyImproved) {
+    lockAttempt = _btMaybeSaveLockedBest(league, bestCandidate, {
+      validationComposite: bestValComp,
+      testComposite: _realTestComposite,
+      trainComposite: finalEval.trainAccuracyScore?.composite,
+      bootstrapP: _bootstrapResult.p,
+      bootstrapSignificant: _bootstrapResult.significant,
+      gamesUsed: allGames.length
+    });
+  }
+
   const report = {
     league,
     testedCount,
@@ -22314,6 +22467,7 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
     proposedDiff,
     bestCandidate,
     finalCalibration: finalEval.validationCalibration,
+    lockAttempt,
     computedAt: new Date().toISOString()
   };
 
@@ -22328,44 +22482,45 @@ async function runJointMultiVariableBacktest(features, allGames, options) {
   return report;
 }
 
+// GATE FIX: both of the functions below used to read window.__lastJointBacktestResult
+// directly and act on res.bestCandidate unconditionally — with no check on
+// res.improved at all. That means even a run that legitimately found
+// nothing better than baseline (bestCandidate === baselineOverrides) would
+// still export/lock it as if it were a validated discovery, and a run that
+// *did* find something but was worse than an earlier run's find could
+// overwrite that earlier, better result. Both now read the persistent
+// locked-best-ever record instead (see loadLockedBestEver /
+// _btMaybeSaveLockedBest above), which only ever moves forward.
 function exportHardcodedSourceDefaults(league) {
-  const res = window.__lastJointBacktestResult;
-  if (!res || !res.bestCandidate) return null;
-  const c = res.bestCandidate;
-  const targetLeague = (league || res.league || "nba").toLowerCase();
+  const targetLeague = (league || "nba").toLowerCase();
+  const rec = loadLockedBestEver(targetLeague);
+  if (!rec || !rec.candidate) {
+    return "// No locked-best-ever record for " + targetLeague.toUpperCase() + " yet.\n" +
+           "// Run the Season Backtest (which runs the joint search automatically)\n" +
+           "// until a run clears the significance bar — only then is there anything\n" +
+           "// safe to hardcode. Nothing has cleared it yet, so nothing is generated.";
+  }
+  const c = rec.candidate;
+  const fmt = v => Array.isArray(v) ? JSON.stringify(v) : v;
+
+  const registryLines = Object.keys(TUNABLE_PARAM_REGISTRY)
+    .filter(k => c[k] !== undefined && c[k] !== null)
+    .map(k => `TUNABLE_PARAM_REGISTRY.${k}.value = ${fmt(c[k])};`)
+    .join("\n");
 
   const code = `// =====================================================================
-// OPTIMAL HARDCODED DEFAULTS FOR ${targetLeague.toUpperCase()}
-// Generated by Joint Backtest on ${new Date().toLocaleDateString()}
-// Validation Accuracy Score: ${res.bestValidationComposite.toFixed(1)}/100
+// LOCKED-BEST-EVER DEFAULTS FOR ${targetLeague.toUpperCase()}
+// Locked at: ${rec.lockedAt}
+// Validation Accuracy Score: ${isFinite(rec.validationComposite) ? rec.validationComposite.toFixed(1) : "n/a"}/100
+// Held-out Test Accuracy Score: ${isFinite(rec.testComposite) ? rec.testComposite.toFixed(1) : "n/a"}/100
+// Bootstrap significance p-value: ${isFinite(rec.bootstrapP) ? rec.bootstrapP.toFixed(4) : "n/a"}
+// Games used: ${rec.gamesUsed || "n/a"}
+// This record only updates when a run beats it AND clears the joint
+// search's significance gate — see runJointMultiVariableBacktest.
 // =====================================================================
 
 // 1. Update TUNABLE_PARAM_REGISTRY defaults:
-TUNABLE_PARAM_REGISTRY.teamWeightBase.value = ${c.teamWeightBase};
-TUNABLE_PARAM_REGISTRY.h2hFactor.value = ${c.h2hFactor};
-TUNABLE_PARAM_REGISTRY.h2hMaxWeight.value = ${c.h2hMaxWeight};
-TUNABLE_PARAM_REGISTRY.h2hLookbackSeasons.value = ${c.h2hLookbackSeasons};
-TUNABLE_PARAM_REGISTRY.h2hDecayCurrent.value = ${c.h2hDecayCurrent};
-TUNABLE_PARAM_REGISTRY.h2hDecayMinus1.value = ${c.h2hDecayMinus1};
-TUNABLE_PARAM_REGISTRY.h2hDecayMinus2.value = ${c.h2hDecayMinus2};
-TUNABLE_PARAM_REGISTRY.h2hDecayOlder.value = ${c.h2hDecayOlder};
-TUNABLE_PARAM_REGISTRY.venueMinGames.value = ${c.venueMinGames};
-TUNABLE_PARAM_REGISTRY.venueStrongGames.value = ${c.venueStrongGames};
-TUNABLE_PARAM_REGISTRY.venueModerateWeight.value = ${c.venueModerateWeight};
-TUNABLE_PARAM_REGISTRY.venueStrongWeight.value = ${c.venueStrongWeight};
-TUNABLE_PARAM_REGISTRY.quarterVenueProxyFactor.value = ${c.quarterVenueProxyFactor};
-TUNABLE_PARAM_REGISTRY.fatigueB2BPenalty.value = ${c.fatigueB2BPenalty};
-TUNABLE_PARAM_REGISTRY.quarterAnchorBlendWeight.value = ${c.quarterAnchorBlendWeight};
-TUNABLE_PARAM_REGISTRY.underEdgeFactor.value = ${c.underEdgeFactor};
-TUNABLE_PARAM_REGISTRY.injuryOppBoostFactor.value = ${c.injuryOppBoostFactor};
-TUNABLE_PARAM_REGISTRY.edgeFTPointThreshold.value = ${c.edgeFTPointThreshold};
-TUNABLE_PARAM_REGISTRY.edgeH1PointThreshold.value = ${c.edgeH1PointThreshold};
-TUNABLE_PARAM_REGISTRY.edgeTeamPointThreshold.value = ${c.edgeTeamPointThreshold};
-TUNABLE_PARAM_REGISTRY.edgeQPointThreshold.value = ${c.edgeQPointThreshold};
-TUNABLE_PARAM_REGISTRY.confidenceAThresh.value = ${c.confidenceAThresh};
-TUNABLE_PARAM_REGISTRY.confidenceBThresh.value = ${c.confidenceBThresh};
-TUNABLE_PARAM_REGISTRY.confidenceCThresh.value = ${c.confidenceCThresh};
-TUNABLE_PARAM_REGISTRY.volatilityLimit.value = ${c.volatilityLimit};
+${registryLines}
 
 // 2. Update LEAGUE_EDGE_POINT_THRESHOLDS["${targetLeague}"]:
 LEAGUE_EDGE_POINT_THRESHOLDS["${targetLeague}"] = {
@@ -22379,21 +22534,27 @@ LEAGUE_EDGE_POINT_THRESHOLDS["${targetLeague}"] = {
 }
 
 function lockJointBacktestResults(league) {
-  const res = window.__lastJointBacktestResult;
-  if (!res || !res.bestCandidate) return false;
-  const targetLeague = league || res.league || "nba";
+  const targetLeague = league || "nba";
+  const rec = loadLockedBestEver(targetLeague);
+  if (!rec || !rec.candidate) {
+    engineDebug("Lock requested but no locked-best-ever record exists yet", { league: targetLeague });
+    return false;
+  }
   const stamp = new Date().toISOString();
 
   let lockedCount = 0;
-  Object.keys(res.bestCandidate).forEach(key => {
-    const val = res.bestCandidate[key];
+  Object.keys(rec.candidate).forEach(key => {
+    const val = rec.candidate[key];
     if (val !== undefined && val !== null) {
       setTunableParam(key, val, targetLeague, stamp);
       lockedCount++;
     }
   });
 
-  engineDebug("Joint backtest results PERMANENTLY LOCKED", { league: targetLeague, lockedCount, stamp });
+  engineDebug("Joint backtest results PERMANENTLY LOCKED", {
+    league: targetLeague, lockedCount, stamp,
+    validationComposite: rec.validationComposite, testComposite: rec.testComposite
+  });
   return true;
 }
 
@@ -23112,22 +23273,28 @@ async function runNbaSeasonBacktest(season, onProgress) {
         _btFeatures,
         allGames,
         {
-          sampleCount: 2000,
+          sampleCount: 600,
           seed: 101,
           league: "nba",
-          onProgress: (tested, total, bestVal) => {
+          // Give the joint search a head start from whatever Phase 4 (which
+          // just ran) already found — see the extraSeeds handling above.
+          extraSeeds: groupedSearch?.bestBundle ? [groupedSearch.bestBundle] : [],
+          onProgress: (tested, stageLabel, bestVal) => {
             if (typeof onProgress === "function") {
-              try { onProgress(allGames.length, allGames.length, `Sweeping joint configs: ${tested}/${total} (Best: ${isFinite(bestVal) ? bestVal.toFixed(1) : "—"}/100)`); } catch (e) {}
+              try { onProgress(allGames.length, allGames.length, `Joint search [${stageLabel}]: ${tested} tested (Best: ${isFinite(bestVal) ? bestVal.toFixed(1) : "—"}/100)`); } catch (e) {}
             }
           }
         }
       );
       if (jointSearch?.improved) {
-        notes.push(`⚡ JOINT BACKTEST OPTIMAL FOUND: Validation Accuracy Score boosted to ${jointSearch.bestValidationComposite.toFixed(1)}/100 across ${Object.keys(jointSearch.proposedDiff).length} tuned variables (${jointSearch.testedCount} tested). Tap '⚡ Lock Optimal Parameters' below to make it permanent!`);
+        const savedNote = jointSearch.lockAttempt?.saved
+          ? " This is now the new locked-best-ever record for NBA."
+          : " (Beat this run's baseline, but did not beat the existing locked-best-ever record — see Lock panel.)";
+        notes.push(`⚡ JOINT BACKTEST OPTIMAL FOUND: Validation Accuracy Score boosted to ${jointSearch.bestValidationComposite.toFixed(1)}/100 across ${Object.keys(jointSearch.proposedDiff).length} tuned variables (${jointSearch.testedCount} tested).${savedNote}`);
       } else if (groupedSearch?.improved) {
-        notes.push(`Phase 4 grouped search found a validation improvement (${(validationAccuracyScore?.composite ?? 0).toFixed(1)} → ${groupedSearch.bestValidationComposite.toFixed(1)}).`);
+        notes.push(`Phase 4 grouped search found a validation improvement (${(validationAccuracyScore?.composite ?? 0).toFixed(1)} → ${groupedSearch.bestValidationComposite.toFixed(1)}), but it did not clear the joint search's stricter significance bar (real test-split gain + bootstrap significance). Treat it as a lead, not a lock.`);
       } else {
-        notes.push("Joint backtest ran across all variables; current live baseline is already globally optimal for this dataset!");
+        notes.push("Joint backtest ran across all 38 variables; current live baseline is already the best validated config found for this dataset.");
       }
     }
   } catch (e) {
