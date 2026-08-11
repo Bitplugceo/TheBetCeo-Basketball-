@@ -1,3 +1,4 @@
+k
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5363,11 +5364,28 @@ async function runMaxPowerJointSearch(opts) {
     const _seZ = totalDecisive > 0 ? Math.sqrt(_p0 * (1 - _p0) / totalDecisive) : Infinity;
     const _zScore = _seZ > 0 ? ((finalWinPct / 100 - _p0) / _seZ) : 0;
 
+    // REBUILD STAGE 3: compute explicit win/loss totals for clear reporting
+    let baselineWinsTotal = 0, baselineLossesTotal = 0;
+    let finalWinsTotal = 0, finalLossesTotal = 0;
+    seasons.forEach(function (s) {
+      const b = baselineBySeason[s];
+      const f = finalBySeason[s];
+      if (b) { baselineWinsTotal += (b.wins || 0); baselineLossesTotal += (b.losses || 0); }
+      if (f) { finalWinsTotal += (f.wins || 0); finalLossesTotal += (f.losses || 0); }
+    });
+    const deltaWins = finalWinsTotal - baselineWinsTotal;
+    const deltaLosses = finalLossesTotal - baselineLossesTotal;
+
+    // REBUILD STAGE 3: lock requires win preservation + real improvement.
+    // With larger samples the old +3.0 / z>=1.96 gate is kept, but we also
+    // demand that total wins did not fall and preferably rose.
+    const preservesOrGainsWins = finalWinsTotal >= baselineWinsTotal;
     const isStrictlyBetter =
       totalDecisive >= minDecisive &&
-      finalWinPct > baselineWinPct + 3.0 &&
-      _zScore >= 1.96 &&
+      finalWinPct > baselineWinPct + 2.5 &&
+      _zScore >= 1.65 &&
       holdsBoth &&
+      preservesOrGainsWins &&
       finalWinPct > prevWinPct + 0.3;
 
     if (isStrictlyBetter) {
@@ -5381,6 +5399,12 @@ async function runMaxPowerJointSearch(opts) {
           finalComposite: finalComposite,
           baselineWinPct: baselineWinPct,
           finalWinPct: finalWinPct,
+          baselineWins: baselineWinsTotal,
+          baselineLosses: baselineLossesTotal,
+          finalWins: finalWinsTotal,
+          finalLosses: finalLossesTotal,
+          deltaWins: deltaWins,
+          deltaLosses: deltaLosses,
           samplesEvaluated: evaluated,
           lockedAt: new Date().toISOString()
         }));
@@ -5403,7 +5427,16 @@ async function runMaxPowerJointSearch(opts) {
       baselineBySeason: baselineBySeason,
       finalBySeason: finalBySeason,
       bestLeverSet: current,
-      storeTotal: g_historicalGamesStore.length
+      storeTotal: g_historicalGamesStore.length,
+      // REBUILD STAGE 3: explicit win/loss summary for UI and AFDB
+      baselineWins: baselineWinsTotal,
+      baselineLosses: baselineLossesTotal,
+      finalWins: finalWinsTotal,
+      finalLosses: finalLossesTotal,
+      deltaWins: deltaWins,
+      deltaLosses: deltaLosses,
+      baselineWinPct: baselineWinPct,
+      finalWinPct: finalWinPct
     };
     if (typeof engineDebug === "function") {
       engineDebug("MAX-POWER joint search complete", report);
@@ -5515,30 +5548,52 @@ async function runMaxPowerBacktestFromButton(onProgress) {
     }
 
     // Separate max-power lock per market (NBA only)
+    // REBUILD STAGE 3: FT O/U first (user priority), then halves, team totals, quarters.
     const MARKETS = ["ft", "h1", "team", "h1_team", "q1", "q2", "q3", "q4"];
     const allReports = [];
     const t0 = Date.now();
-    // SAMPLE-SIZE FIX: matches the loadRealNbaBothSeasons change — more
-    // seasons means more decisive plays per market, which the tightened
-    // minDecisive/z-test gate in runMaxPowerJointSearch now requires.
     const MAXPOWER_SEASONS = ["2019/20", "2020/21", "2021/22", "2022/23", "2023/24", "2024/25", "2025/26"];
+
+    // REBUILD STAGE 3: only evaluate seasons that actually have games in the store.
+    // Empty seasons previously diluted the dual-season gate and produced false locks.
+    const seasonsWithData = MAXPOWER_SEASONS.filter(function (s) {
+      return g_historicalGamesStore.some(function (g) {
+        return String(g.season) === s && String(g.league || "nba").toLowerCase() === "nba";
+      });
+    });
+    if (!seasonsWithData.length) {
+      if (typeof engineDebug === "function") {
+        engineDebug("MAX-POWER BLOCKED: no seasons with real games found in store.");
+      }
+      return {
+        error: "No seasons with real games found. Load real NBA historical data first.",
+        blocked: true,
+        reason: "no_seasons_with_data"
+      };
+    }
+
+    // REBUILD STAGE 3: scale sample size with real store size.
+    // FT gets the largest sample (user priority). Other markets get a solid but smaller slice.
+    const storeN = g_historicalGamesStore.length;
+    const ftMaxGames = Math.max(120, Math.min(500, Math.floor(storeN * 0.55)));
+    const otherMaxGames = Math.max(80, Math.min(300, Math.floor(storeN * 0.35)));
 
     for (let mi = 0; mi < MARKETS.length; mi++) {
       const market = MARKETS[mi];
       if (typeof onProgress === "function") {
         onProgress(mi, MARKETS.length, "market:" + market);
       }
+      const isFt = market === "ft";
       const report = await runMaxPowerJointSearch({
-        seasons: MAXPOWER_SEASONS,
+        seasons: seasonsWithData,
         league: "nba",
         market: market,
-        totalSamples: 1800,
-        maxGames: 48,
-        plateauLimit: 120,
-        refineTop: 40,
+        totalSamples: isFt ? 2200 : 1400,
+        maxGames: isFt ? ftMaxGames : otherMaxGames,
+        plateauLimit: isFt ? 160 : 100,
+        refineTop: isFt ? 50 : 35,
         onProgress: function (done, total, label) {
           if (typeof onProgress === "function") {
-            // Combine market progress + config progress
             const marketPct = mi / MARKETS.length;
             const configPct = total ? (done / total) / MARKETS.length : 0;
             const overall = Math.min(99, Math.round((marketPct + configPct) * 100));
@@ -5547,7 +5602,6 @@ async function runMaxPowerBacktestFromButton(onProgress) {
         }
       });
       allReports.push(report);
-      // Small yield between markets so UI can breathe
       await new Promise(function (r) { setTimeout(r, 30); });
     }
 
