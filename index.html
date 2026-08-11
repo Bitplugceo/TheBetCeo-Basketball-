@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5046,18 +5045,30 @@ function evaluateLeverSetOnStore(season, league, leverSet, opts) {
   const decisive = wins + losses;
   const winRate = decisive > 0 ? wins / decisive : 0;
   const mae = nErr > 0 ? absErr / nErr : 999;
-  // Composite: reward win rate, penalize MAE, require enough plays
   const playRate = games.length ? (decisive + pushes) / games.length : 0;
+
+  // REBUILD STAGE 2: Win-preserving primary score.
+  // 1. Win rate dominates (0-70 points)
+  // 2. Raw win count bonus (more wins = better, even at same rate)
+  // 3. Loss penalty (fewer losses is strongly preferred)
+  // 4. MAE only as a weak secondary (max ~10 points)
+  // 5. Play-rate only as a tiny floor so pure no-play configs cannot win
+  const winRatePts = winRate * 70;
+  const winCountPts = Math.min(15, wins * 0.08);
+  const lossPenalty = Math.min(12, losses * 0.06);
+  const maePts = Math.max(0, 10 - mae * 0.4);
+  const playFloor = Math.min(5, playRate * 8);
   const composite = Math.max(0, Math.min(100,
-    (winRate * 55) +
-    (Math.max(0, 20 - mae) * 1.5) +
-    (playRate * 15) +
-    (decisive >= 20 ? 10 : decisive * 0.4)
+    winRatePts + winCountPts - lossPenalty + maePts + playFloor
   ));
+
+  // Explicit net edge used by the search ranker
+  const netWins = wins - losses;
+
   return {
     season: s, league: l, market: market, n: games.length,
     wins, losses, pushes, noplays, decisive,
-    winRate, mae, playRate, composite,
+    winRate, mae, playRate, composite, netWins,
     leverSet: Object.assign({}, leverSet)
   };
 }
@@ -5177,27 +5188,55 @@ async function runMaxPowerJointSearch(opts) {
       }
       if (i % 25 === 0) await _btYield();
 
+      // REBUILD STAGE 2: rank primarily by total wins / win-rate, not old composite.
+      // A candidate is rejected if it reduces total wins on any season vs baseline.
       const mean = scores.reduce(function (a, x) { return a + (x.composite || 0); }, 0) / scores.length;
+      const totalWins = scores.reduce(function (a, x) { return a + (x.wins || 0); }, 0);
+      const totalLosses = scores.reduce(function (a, x) { return a + (x.losses || 0); }, 0);
+      const baselineWins = seasons.reduce(function (a, s) {
+        return a + ((baselineBySeason[s] && baselineBySeason[s].wins) || 0);
+      }, 0);
+      const baselineLosses = seasons.reduce(function (a, s) {
+        return a + ((baselineBySeason[s] && baselineBySeason[s].losses) || 0);
+      }, 0);
+
+      // Hard win-preservation gate: never accept a config that has fewer wins
+      // than baseline across the evaluated seasons.
+      const preservesWins = totalWins >= baselineWins;
       const holdsBoth = scores.every(function (sc, idx) {
-        return sc.composite >= (baselineBySeason[seasons[idx]].composite - 0.20);
+        const base = baselineBySeason[seasons[idx]];
+        if (!base) return false;
+        // Allow tiny composite noise, but never fewer wins on a season
+        return (sc.wins || 0) >= (base.wins || 0) &&
+               sc.composite >= (base.composite - 0.35);
       });
-      if (!holdsBoth) {
+      if (!preservesWins || !holdsBoth) {
         samplesSinceImprove++;
         continue;
       }
 
-      survivors.push({ candidate: candidate, mean: mean });
+      // Rank key: higher wins first, then lower losses, then composite
+      const rankScore = (totalWins * 1000) - (totalLosses * 10) + mean;
+
+      survivors.push({ candidate: candidate, mean: mean, rankScore: rankScore, totalWins: totalWins, totalLosses: totalLosses });
       if (survivors.length > refineTop * 3) {
-        survivors.sort(function (a, b) { return b.mean - a.mean; });
+        survivors.sort(function (a, b) { return (b.rankScore || 0) - (a.rankScore || 0); });
         survivors.length = refineTop * 2;
       }
 
-      if (mean > bestMean + 0.06) {
+      if (rankScore > (bestMean * 1000) + 0.5 || (totalWins > baselineWins && totalLosses <= baselineLosses)) {
         current = Object.assign({}, candidate);
         bestMean = mean;
         improved = true;
         samplesSinceImprove = 0;
-        sampleReports.push({ sample: evaluated, mean: mean, delta: mean - baselineComposite });
+        sampleReports.push({
+          sample: evaluated,
+          mean: mean,
+          wins: totalWins,
+          losses: totalLosses,
+          deltaWins: totalWins - baselineWins,
+          delta: mean - baselineComposite
+        });
       } else {
         samplesSinceImprove++;
       }
@@ -5206,7 +5245,8 @@ async function runMaxPowerJointSearch(opts) {
     }
 
     // ── Stage 2: Full dual-season accuracy only on the strongest survivors ──
-    survivors.sort(function (a, b) { return b.mean - a.mean; });
+    // REBUILD STAGE 2: sort by win-preserving rankScore, not old composite mean
+    survivors.sort(function (a, b) { return (b.rankScore || 0) - (a.rankScore || 0); });
     const top = survivors.slice(0, refineTop);
 
     for (let ti = 0; ti < top.length; ti++) {
@@ -5220,16 +5260,37 @@ async function runMaxPowerJointSearch(opts) {
       if (ti % 8 === 0) await _btYield();
 
       const mean = scores.reduce(function (a, x) { return a + (x.composite || 0); }, 0) / scores.length;
-      const holdsBoth = scores.every(function (sc, idx) {
-        return sc.composite >= (baselineBySeason[seasons[idx]].composite - 0.10);
-      });
-      if (!holdsBoth) continue;
+      const totalWins = scores.reduce(function (a, x) { return a + (x.wins || 0); }, 0);
+      const totalLosses = scores.reduce(function (a, x) { return a + (x.losses || 0); }, 0);
+      const baselineWins = seasons.reduce(function (a, s) {
+        return a + ((baselineBySeason[s] && baselineBySeason[s].wins) || 0);
+      }, 0);
+      const baselineLosses = seasons.reduce(function (a, s) {
+        return a + ((baselineBySeason[s] && baselineBySeason[s].losses) || 0);
+      }, 0);
 
-      if (mean > bestMean + 0.04) {
+      const preservesWins = totalWins >= baselineWins;
+      const holdsBoth = scores.every(function (sc, idx) {
+        const base = baselineBySeason[seasons[idx]];
+        if (!base) return false;
+        return (sc.wins || 0) >= (base.wins || 0) &&
+               sc.composite >= (base.composite - 0.25);
+      });
+      if (!preservesWins || !holdsBoth) continue;
+
+      const rankScore = (totalWins * 1000) - (totalLosses * 10) + mean;
+      if (rankScore > (bestMean * 1000) || (totalWins > baselineWins && totalLosses <= baselineLosses)) {
         current = Object.assign({}, cand);
         bestMean = mean;
         improved = true;
-        sampleReports.push({ sample: "refine-" + ti, mean: mean, delta: mean - baselineComposite });
+        sampleReports.push({
+          sample: "refine-" + ti,
+          mean: mean,
+          wins: totalWins,
+          losses: totalLosses,
+          deltaWins: totalWins - baselineWins,
+          delta: mean - baselineComposite
+        });
       }
     }
 
@@ -5425,8 +5486,32 @@ window.seedMaxPowerHistoricalStore = seedMaxPowerHistoricalStore;
  */
 async function runMaxPowerBacktestFromButton(onProgress) {
   try {
+    // REBUILD STAGE 1: Never seed or run Max-Power on synthetic data.
+    // Synthetic games produce meaningless 90%+ win rates and must not be locked.
     if (!g_historicalGamesStore.length) {
-      seedMaxPowerHistoricalStore({ perSeason: 24, seasons: ["2024/25", "2025/26"], league: "nba" });
+      if (typeof engineDebug === "function") {
+        engineDebug("MAX-POWER BLOCKED: historical store is empty. Load real NBA seasons first (no synthetic fallback).");
+      }
+      return {
+        error: "No real historical games loaded. Max-Power refuses to run on synthetic data. Load real NBA seasons first.",
+        blocked: true,
+        reason: "empty_store"
+      };
+    }
+    // Guard: detect residual synthetic games (Home_0 / Away_0 style names)
+    const syntheticCount = g_historicalGamesStore.filter(function (g) {
+      return String(g.homeTeamName || "").indexOf("Home_") === 0 || String(g.awayTeamName || "").indexOf("Away_") === 0;
+    }).length;
+    if (syntheticCount > 0) {
+      if (typeof engineDebug === "function") {
+        engineDebug("MAX-POWER BLOCKED: store still contains " + syntheticCount + " synthetic games. Clear store and load real data.");
+      }
+      return {
+        error: "Historical store contains synthetic games (" + syntheticCount + "). Clear them and load real NBA seasons before Max-Power.",
+        blocked: true,
+        reason: "synthetic_data_present",
+        syntheticCount: syntheticCount
+      };
     }
 
     // Separate max-power lock per market (NBA only)
@@ -28746,7 +28831,15 @@ window.engineDebug = function(msg, extra) {
     try { _aDetail = JSON.stringify(extra); } catch(e) { _aDetail = String(extra); }
   }
   const _aFullLine = _aDetail ? (msgStr + " | " + _aDetail.toLowerCase()) : msgStr;
-  const isErr = (_aFullLine.includes("error") || _aFullLine.includes("fail") ||
+  // REBUILD STAGE 1: never treat successful backtest completion messages as errors
+  // even when the giant JSON payload contains the words "fail" / "error" inside diagnosis.
+  const isBacktestSuccess =
+    msgStr.includes("season backtest complete") ||
+    msgStr.includes("max-power joint search complete") ||
+    msgStr.includes("joint multi-variable backtest complete") ||
+    msgStr.includes("max-power blocked");
+  const isErr = !isBacktestSuccess &&
+                (_aFullLine.includes("error") || _aFullLine.includes("fail") ||
                  _aFullLine.includes("critical") || _aFullLine.includes("crash") ||
                  _aFullLine.includes("blocked") || _aFullLine.includes("exception")) &&
                 !_aFullLine.includes("nan") &&
