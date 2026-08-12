@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7252,6 +7253,16 @@ function bbBtMetricCard(label,m){
 async function bbBtResumeOptimizationIfAvailable() {
   const l = window.__BB_BACKTEST_LAB;
   if (l.running) return;
+
+  // A completed optimization is authoritative. Never let an old/in-flight
+  // optimizer checkpoint resurrect itself after the page is reopened, because
+  // that can steal the UI/run state from Phase 5 and make it look as though
+  // Phase 5 requires another optimization.
+  if (l.results?.champion?.config) {
+    try { await bbBtDeleteOptimizationCheckpoint(); } catch (_) {}
+    return;
+  }
+
   const checkpoint = await bbBtGetOptimizationCheckpoint();
   if (!checkpoint || checkpoint.status === "completed") return;
   if (Number(checkpoint.jobVersion || 1) !== 2) {
@@ -7446,9 +7457,19 @@ function renderBacktestPanel(){
     if(btn)btn.disabled=true;
     try{
       if(l.running) return;
-      if(l.games?.length && l.odds?.length) bbBtValidate();
-      if(!l.validation?.ready) throw new Error("Persisted games/odds are not valid yet. Run Validate Data once.");
-      if(!l.results?.champion) throw new Error("Run Optimization to completion before Phase 5.");
+
+      // Do not re-run validation here when the current validation is already
+      // READY. Revalidating on every Phase 5 click was able to replace the
+      // in-memory matched dataset/state and made the completed optimization
+      // appear unavailable on mobile Safari.
+      if(!l.validation?.ready){
+        if(l.games?.length && l.odds?.length) bbBtValidate();
+        if(!l.validation?.ready) throw new Error("Persisted games/odds are not valid yet. Run Validate Data once.");
+      }
+
+      // Phase 5 consumes the persisted Phase 4 champion. It must never start
+      // or request another optimization.
+      if(!l.results?.champion?.config) throw new Error("Run Optimization to completion before Phase 5.");
       renderBacktestPanel();
       const report=await bbBtRunPhase5Verification({parityFixtures:30,chunkSize:20});
       console.info("[Backtest Lab] Phase 5 complete", report);
