@@ -1,4 +1,3 @@
-Z
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5648,6 +5647,13 @@ function bbBtTeamKey(v) {
   const compact = bbBtNorm(v).replace(/[^a-z0-9]/g, "");
   return BB_BACKTEST_TEAM_ALIASES[compact] || compact;
 }
+function bbBtGameKey(date, home, away) {
+  const d = bbBtDate(date);
+  const h = bbBtTeamKey(home);
+  const a = bbBtTeamKey(away);
+  if (!d || !h || !a) return "";
+  return `${d}|${h}|${a}`;
+}
 function bbBtNum(v) {
   if (v === null || v === undefined || v === "") return null;
   const n = Number(String(v).replace(/,/g, "").replace(/[−–—]/g, "-"));
@@ -5664,14 +5670,14 @@ function bbBtDate(v) {
 function bbBtCanonicalSeasonLabel(v) {
   const s = bbBtText(v)
     .replace(/[–—−]/g, "-")
-    .replace(/[\\u2010-\\u2015]/g, "-")
-    .replace(/\\s+/g, "")
+    .replace(/[\u2010-\u2015]/g, "-")
+    .replace(/\s+/g, "")
     .replace(/_/g, "-");
-  let m = s.match(/^(20\\d{2})[-\\/](20\\d{2})$/);
+  let m = s.match(/^(20\d{2})[-\/](20\d{2})$/);
   if (m) return Number(m[2]) === Number(m[1]) + 1 ? `${m[1]}/${m[2].slice(-2)}` : null;
-  m = s.match(/^(20\\d{2})[-\\/](\\d{2})$/);
+  m = s.match(/^(20\d{2})[-\/](\d{2})$/);
   if (m) return `${m[1]}/${m[2]}`;
-  m = s.match(/^(20\\d{2})$/);
+  m = s.match(/^(20\d{2})$/);
   if (m) return m[1];
   return null;
 }
@@ -5679,31 +5685,41 @@ function bbBtSeason(v, date) {
   const canonical = bbBtCanonicalSeasonLabel(v);
   const d = bbBtDate(date);
   const y = d ? Number(d.slice(0, 4)) : null;
-  const m = d ? Number(d.slice(5, 7)) : null;
 
-  // The supplied games file uses numeric season IDs:
+  // The supplied games file uses numeric season IDs equal to the season
+  // ending year:
   //   2025 => NBA 2024/25
   //   2026 + calendar year 2025 => NBA 2025/26
   //   2026 + calendar year 2026 => protected 2026 holdout.
-  // Date is therefore authoritative for the split when the source season
-  // is numeric. Explicit slash-form season labels remain authoritative.
+  //
+  // Older numeric season IDs must remain identifiable so validation can
+  // classify them as EXCLUDED OLDER rather than INVALID.
   if (canonical === "2024/25" || canonical === "2025/26") return canonical;
-  if (canonical === "2026") {
-    if (y === 2025) return "2025/26";
-    if (y === 2026) return "2026";
-  }
-  if (canonical === "2025") return "2024/25";
-  if (canonical === "2026") {
-    if (y === 2025) return "2025/26";
-    if (y === 2026) return "2026";
+
+  if (/^\d{4}$/.test(canonical || "")) {
+    const seasonYear = Number(canonical);
+
+    if (seasonYear === 2026) {
+      if (y === 2025) return "2025/26";
+      if (y === 2026) return "2026";
+    }
+
+    if (seasonYear === 2025) return "2024/25";
+
+    if (seasonYear >= 2000 && seasonYear <= 2024) {
+      return `${seasonYear - 1}/${String(seasonYear).slice(-2)}`;
+    }
   }
 
-  if (y === 2024 && m >= 10) return "2024/25";
-  if (y === 2025 && m <= 6) return "2024/25";
-  if (y === 2025 && m >= 10) return "2025/26";
+  // Fallback for files that omit a usable season column.
+  if (y === 2024 && Number(d.slice(5, 7)) >= 10) return "2024/25";
+  if (y === 2025 && Number(d.slice(5, 7)) <= 6) return "2024/25";
+  if (y === 2025 && Number(d.slice(5, 7)) >= 10) return "2025/26";
   if (y === 2026) return "2026";
+
   return null;
 }
+
 function bbBtSeasonYear(s) {
   const m = String(s || "").match(/^(\d{4})/);
   return m ? Number(m[1]) : null;
@@ -6036,7 +6052,8 @@ function bbBtOddsExactSignature(o) {
   return Object.keys(raw).sort().map(k => `${k}=${String(raw[k] ?? "")}`).join("\u001f");
 }
 function bbBtDedupeOdds(odds) {
-  const exact = new Set(), byGame = new Map(), out = [], duplicateRows = 0, conflictingGameIds = [];
+  const exact = new Set(), byGame = new Map(), out = [], conflictingGameIds = [];
+  let duplicateRows = 0;
   for (const o of odds) {
     const sig = bbBtOddsExactSignature(o);
     if (exact.has(sig)) { duplicateRows++; continue; }
@@ -6405,7 +6422,19 @@ function bbBtValidate(){
     warnings.push(`Non-identical duplicate odds game IDs retained first deterministically: ${deduped.conflictingGameIds.length}`);
   }
 
-  normalizedOdds.forEach((o,i)=>{
+  // Apply the same hard season boundary to odds before structural validation.
+  // Older supplied odds are excluded from the experiment, not treated as
+  // malformed data. This prevents pre-2024/25 rows from generating errors.
+  const eligibleOdds = normalizedOdds.filter(o =>
+    BB_BACKTEST_ALLOWED_SEASONS.includes(bbBtSeason(o.season,o.date))
+  );
+  const excludedOlderOdds = normalizedOdds.length - eligibleOdds.length;
+
+  if (excludedOlderOdds) {
+    warnings.push(`Older odds rows excluded from experiment: ${excludedOlderOdds}`);
+  }
+
+  eligibleOdds.forEach((o,i)=>{
     if(!o.date) errors.push(`Odds ${i+1}: missing/invalid game_date`);
     if(!o.home||!o.away) errors.push(`Odds ${i+1}: missing home_team/away_team`);
 
@@ -6423,10 +6452,10 @@ function bbBtValidate(){
       errors.push(`Odds ${i+1}: Handicap decimal odds invalid`);
   });
 
-  const matched=bbBtMatchOdds(eligible,normalizedOdds);
+  const matched=bbBtMatchOdds(eligible,eligibleOdds);
   const gameKeys=new Set(eligible.map(g=>bbBtGameKey(g.date,g.homeName,g.awayName)));
   const reverseKeys=new Set(eligible.map(g=>bbBtGameKey(g.date,g.awayName,g.homeName)));
-  const unmatchedOdds=normalizedOdds.filter(o=>
+  const unmatchedOdds=eligibleOdds.filter(o=>
     !gameKeys.has(bbBtGameKey(o.date,o.home,o.away)) &&
     !reverseKeys.has(bbBtGameKey(o.date,o.home,o.away))
   ).length;
@@ -6439,7 +6468,7 @@ function bbBtValidate(){
   });
 
   const seasonOdds={}; BB_BACKTEST_ALLOWED_SEASONS.forEach(s=>seasonOdds[s]=0);
-  normalizedOdds.forEach(o=>{
+  eligibleOdds.forEach(o=>{
     const season=bbBtSeason(o.season,o.date);
     if(BB_BACKTEST_ALLOWED_SEASONS.includes(season)) seasonOdds[season]++;
   });
@@ -6462,7 +6491,8 @@ function bbBtValidate(){
     uniqueOddsGames:normalizedOdds.length,
     oddsDuplicateRows:deduped.duplicateRows,
     oddsConflictingGameIds:deduped.conflictingGameIds.length,
-    oddsRecords:normalizedOdds.length,
+    excludedOlderOdds,
+    oddsRecords:eligibleOdds.length,
     unmatchedOddsRecords:unmatchedOdds,
     matchedGames:matched.length,
     marketCounts,
@@ -6476,7 +6506,7 @@ function bbBtValidate(){
       return [s,{matched:hit,total,coverage:total?hit/total:0}];
     })),
     sourceSeasonCounts: games.reduce((acc,g)=>{const k=bbBtText(g.raw?.season||g.raw?.season_label||g.raw?.seasonLabel)||"(missing)";acc[k]=(acc[k]||0)+1;return acc;},{}),
-    oddsSourceSeasonCounts: normalizedOdds.reduce((acc,o)=>{const k=bbBtText(o.raw?.season||o.raw?.season_label||o.raw?.seasonLabel)||"(date-derived)";acc[k]=(acc[k]||0)+1;return acc;},{}),
+    oddsSourceSeasonCounts: eligibleOdds.reduce((acc,o)=>{const k=bbBtText(o.raw?.season||o.raw?.season_label||o.raw?.seasonLabel)||"(date-derived)";acc[k]=(acc[k]||0)+1;return acc;},{}),
     duplicateGameKeys:[...gameKeyCounts.entries()].filter(([,n])=>n>1).map(([key,n])=>({key,count:n})),
     errors:errors.slice(0,200),
     warnings:warnings.slice(0,100),
@@ -6484,6 +6514,8 @@ function bbBtValidate(){
   };
 
   // Missing odds are a coverage condition, not a structural validation error.
+  // The experiment evaluates only games for which the requested market odds
+  // are actually supplied.
   v.ready=eligible.length>0 &&
     BB_BACKTEST_ALLOWED_SEASONS.every(s=>counts[s]>0) &&
     BB_BACKTEST_MARKETS.every(m=>marketCounts[m]>0) &&
