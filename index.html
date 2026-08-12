@@ -1,3 +1,4 @@
+Z
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4521,6 +4522,31 @@ let g_historicalGamesStore = [];
 let g_historicalStoreVersion = 0;
 const g_evalSampleCache = new Map();
 
+const FRESH_BT_SEASONS = ["2024/25", "2025/26"];
+const FRESH_BT_MARKETS = ["ft", "ml", "h1", "team_a", "team_b", "handicap", "q1", "q2", "q3", "q4", "h1_team_a", "h1_team_b"];
+
+function evaluateMarketOnFreshSeasons(market, leverSet, opts) {
+  opts = opts || {};
+  const results = [];
+  for (let i = 0; i < FRESH_BT_SEASONS.length; i++) {
+    const seasonResult = evaluateLeverSetOnStore(FRESH_BT_SEASONS[i], "nba", leverSet, Object.assign({}, opts, { market: market }));
+    results.push(seasonResult);
+  }
+  const totalWins = results.reduce(function (a, r) { return a + (r.wins || 0); }, 0);
+  const totalLosses = results.reduce(function (a, r) { return a + (r.losses || 0); }, 0);
+  const decisive = totalWins + totalLosses;
+  return {
+    market: market,
+    seasons: FRESH_BT_SEASONS.slice(),
+    wins: totalWins,
+    losses: totalLosses,
+    decisive: decisive,
+    winRate: decisive > 0 ? totalWins / decisive : 0,
+    bySeason: results
+  };
+}
+window.evaluateMarketOnFreshSeasons = evaluateMarketOnFreshSeasons;
+
 function loadHistoricalSeasonGames(season, league, games) {
   const s = String(season || "").trim();
   const l = String(league || "nba").toLowerCase();
@@ -4833,7 +4859,7 @@ window.loadRealNbaSeasonFromEspn = loadRealNbaSeasonFromEspn;
 
 async function loadRealNbaBothSeasons(onProgress) {
 
-  const seasons = ["2019/20", "2020/21", "2021/22", "2022/23", "2023/24", "2024/25", "2025/26"];
+  const seasons = ["2024/25", "2025/26"];
   const results = [];
   for (let i = 0; i < seasons.length; i++) {
     const r = await loadRealNbaSeasonFromEspn(seasons[i], function (done, total, label) {
@@ -4950,6 +4976,49 @@ function expandLeverCandidates(key, def) {
 function _btYield() {
   return new Promise(function (resolve) { setTimeout(resolve, 0); });
 }
+
+async function runFreshMarketByMarketSearch(opts) {
+  opts = opts || {};
+  const markets = Array.isArray(opts.markets) && opts.markets.length
+    ? opts.markets.slice()
+    : (typeof FRESH_BT_MARKETS !== "undefined" ? FRESH_BT_MARKETS.slice() : ["ft", "ml", "h1", "team_a", "team_b", "handicap", "q1", "q2", "q3", "q4"]);
+  const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
+  const results = {};
+  const t0 = Date.now();
+
+  for (let i = 0; i < markets.length; i++) {
+    const market = markets[i];
+    if (onProgress) onProgress(i, markets.length, "searching " + market);
+
+    const report = await runMaxPowerJointSearch({
+      seasons: ["2024/25", "2025/26"],
+      league: "nba",
+      market: market,
+      totalSamples: opts.totalSamples || 1200,
+      maxGames: opts.maxGames || 60,
+      onProgress: function (done, total, label) {
+        if (onProgress) onProgress(i + (done / Math.max(total, 1)), markets.length, market + " · " + label);
+      }
+    });
+
+    results[market] = report;
+    if (typeof engineDebug === "function") {
+      engineDebug("FRESH_BT market done: " + market, {
+        improved: !!report.improved,
+        finalComposite: report.finalComposite,
+        locked: !!report.locked
+      });
+    }
+    await _btYield();
+  }
+
+  window.__FRESH_BT_RESULTS = results;
+  if (typeof engineDebug === "function") {
+    engineDebug("FRESH_BT market-by-market complete", { ms: Date.now() - t0, markets: Object.keys(results) });
+  }
+  return results;
+}
+window.runFreshMarketByMarketSearch = runFreshMarketByMarketSearch;
 
 async function runMaxPowerJointSearch(opts) {
   opts = opts || {};
