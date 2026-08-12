@@ -1,4 +1,3 @@
-Q
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5851,12 +5850,12 @@ const TUNABLE_PARAM_REGISTRY = {
   // Raising the ceiling to 1.40 gives the search room to find a real effect
   // if one exists, instead of being capped below where the signal might be.
   extremeExpansion: {
-    // REBUILD STAGE 6.1: after Stage 6 (1.30) O/U 47.4→48.7 and extreme
-    // hit-rate ~20%. Push default to ceiling 1.40 to cut remaining ~76% mid
-    // predictions on true high/low games without a second search pass.
-    value: 1.40, min: 1.0, max: 1.55, type: "scalar",
+    // REBUILD STAGE 6.2: 6.1 (1.40 + regime boost) opened extremes (27%/31%)
+    // but O/U fell 48.7→47.7 and MAE blew to 18. Soften to 1.33 — keep
+    // last-5 signal, drop regime boost, protect Stage 6's 561 wins.
+    value: 1.33, min: 1.0, max: 1.45, type: "scalar",
     scope: "global", appliesTo: ["ft", "h1", "q1", "q2", "q3", "q4"],
-    description: "Stretches team totals away from league mean when form already implies a slow/fast game (counters mid-total compression bias). 1.0 = no change. STAGE 6.1 default 1.40.",
+    description: "Stretches team totals away from league mean when form already implies a slow/fast game (counters mid-total compression bias). 1.0 = no change. STAGE 6.2 default 1.33.",
     lastVerifiedAt: null
   },
   paceClampMinNbaNcaa: {
@@ -6698,7 +6697,7 @@ function buildCompleteConfig(league, partial) {
     quarterVenueProxyFactor:  get("quarterVenueProxyFactor", def("quarterVenueProxyFactor", 1.0)),
     injuryOppBoostFactor:     get("injuryOppBoostFactor", def("injuryOppBoostFactor", 0.2)),
     underEdgeFactor:          get("underEdgeFactor", def("underEdgeFactor", 1.2)),
-    extremeExpansion:         get("extremeExpansion", def("extremeExpansion", 1.40)),
+    extremeExpansion:         get("extremeExpansion", def("extremeExpansion", 1.33)),
     paceClampMinNbaNcaa:      get("paceClampMinNbaNcaa", def("paceClampMinNbaNcaa", 0.65)),
     paceClampMaxNbaNcaa:      get("paceClampMaxNbaNcaa", def("paceClampMaxNbaNcaa", 1.35)),
     paceClampMinOther:        get("paceClampMinOther", def("paceClampMinOther", 0.70)),
@@ -17227,9 +17226,9 @@ function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", diverg
   // callers that don't (the majority) keep the exact previous behavior.
   const baseline = isFinite(baselineOverride) ? baselineOverride : avgOrNaN(series);
   if (!isFinite(baseline)) return proj;
-  // REBUILD STAGE 6.1: softer still — keep more of the extreme signal that
-  // Stage 6 unlocked (was floor 0.70 / 0.20 slope after Stage 6).
-  const dampening = Math.max(0.78, 1.0 - (volRatio - 1) * 0.15);
+  // REBUILD STAGE 6.2: restore Stage 6 vol damp (0.70 / 0.20). 6.1's
+  // softer damp + strong expansion overshot and hurt O/U + MAE.
+  const dampening = Math.max(0.70, 1.0 - (volRatio - 1) * 0.20);
   return baseline + (proj - baseline) * dampening;
 }
 
@@ -20433,11 +20432,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   aS *= injMultA;
   bS *= injMultB;
 
-  // REBUILD STAGE 6.1: stronger mid-compression break
-  // Stage 6 got O/U 48.7% and ~20% correct extreme calls. Remaining failure
-  // mode: ~76% of true high/low still mid. Use last-5 form (more extreme),
-  // default 1.40, and a regime boost when |gap| is already large.
-  const _extremeExp = isFinite(config?.extremeExpansion) ? Number(config.extremeExpansion) : (getParam("extremeExpansion", league) ?? 1.40);
+  // REBUILD STAGE 6.2: keep last-5 signal (helped extreme hit rate), drop
+  // regime boost, default 1.33. Goal: hold ≥561 O/U wins, MAE ≤15.5, keep
+  // as much of the 27%/31% extreme hit rate as the softer power allows.
+  const _extremeExp = isFinite(config?.extremeExpansion) ? Number(config.extremeExpansion) : (getParam("extremeExpansion", league) ?? 1.33);
   if (_extremeExp > 1.0 && isFinite(aS) && isFinite(bS)) {
     const formTotal = aS + bS;
     const leagueTotal = isFinite(eb) ? eb : 220;
@@ -20456,13 +20454,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     if (gapLast5 >= gapRaw && gapLast5 >= gapBlended && isFinite(last5Total)) signalTotal = last5Total;
     else if (gapRaw > gapBlended && isFinite(rawFormTotal)) signalTotal = rawFormTotal;
     if (isFinite(signalTotal) && signalTotal > 0 && isFinite(formTotal) && formTotal > 0 && isFinite(leagueTotal) && leagueTotal > 0) {
-      const gap = Math.abs(signalTotal - leagueTotal);
-      // Extra boost when form is already clearly high/low (>12 pts from mean).
-      const regimeBoost = gap >= 18 ? 1.12 : (gap >= 12 ? 1.06 : 1.0);
-      const expEff = _extremeExp * regimeBoost;
-      const expanded = leagueTotal + (signalTotal - leagueTotal) * expEff;
+      // No regime boost — 6.1's extra 6–12% overshot.
+      const expanded = leagueTotal + (signalTotal - leagueTotal) * _extremeExp;
       const scale = expanded / formTotal;
-      if (isFinite(scale) && scale > 0.50 && scale < 2.00) {
+      if (isFinite(scale) && scale > 0.55 && scale < 1.85) {
         aS *= scale;
         bS *= scale;
       }
@@ -23740,8 +23735,8 @@ async function runNbaSeasonBacktest(season, onProgress) {
       const _tw = isFinite(window.getParam("teamWeightBase", "nba")) ? Number(window.getParam("teamWeightBase", "nba")) : 0.65;
       const _btBaseConfig = {
         h2hFactor: window.getParam("h2hFactor", "nba") ?? 1.0,
-        // REBUILD STAGE 6.1: fallback 1.40 to match live default.
-        extremeExpansion: isFinite(window.getParam("extremeExpansion", "nba")) ? Number(window.getParam("extremeExpansion", "nba")) : 1.40,
+        // REBUILD STAGE 6.2: fallback 1.33 to match live default.
+        extremeExpansion: isFinite(window.getParam("extremeExpansion", "nba")) ? Number(window.getParam("extremeExpansion", "nba")) : 1.33,
         // FATIGUE LIVE-WIRING follow-through: computeFTProjection now reads
         // config.restDaysA/B (see that comment block). feat.restDaysA/B come
         // from the Phase 3 cache above, derived once per game from gameLogs
