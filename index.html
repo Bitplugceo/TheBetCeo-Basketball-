@@ -10596,6 +10596,35 @@ function getCurrentModelVersion() {
   return normalizeModelVersion(ENGINE_MODEL_VERSION);
 }
 
+// LOCK STABILITY FIX: cheap fingerprint of the tunables that actually move
+// picks, so two runs against the same fixture under materially different
+// settings are distinguishable in the tracked-pick record and debug log —
+// without touching ENGINE_MODEL_VERSION or the calibration grouping that
+// keys off it, which is a much larger and riskier change.
+function getLiveConfigFingerprint(league) {
+  try {
+    const keys = [
+      "teamWeightBase", "h2hFactor", "h2hMaxWeight", "underEdgeFactor",
+      "injuryOppBoostFactor", "extremeExpansion", "advancedBlendWeight",
+      "quarterAnchorBlendWeight", "fatigueB2BPenalty", "volatilityLimit",
+      "edgeFTPointThreshold", "edgeH1PointThreshold", "edgeTeamPointThreshold", "edgeQPointThreshold",
+      "confidenceAThresh", "confidenceBThresh", "confidenceCThresh"
+    ];
+    const parts = keys.map(k => {
+      const v = getParam(k, league);
+      return k + ":" + (Array.isArray(v) ? v.join(",") : v);
+    });
+    const str = parts.join("|");
+    let hash = 5381;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) + hash + str.charCodeAt(i)) >>> 0;
+    }
+    return hash.toString(16);
+  } catch (e) {
+    return "unknown";
+  }
+}
+
 function isPickEligibleForLearning(pick) {
   if (!TRACKER_LEARNING_ENABLED) return false;
   return true; 
@@ -24866,6 +24895,7 @@ function getSampleTierForMarket(market, dx = {}) {
     confidenceGrade: grade,
     originalConfidenceGrade: String(pickRow.shadowTrackerFeedback?.originalConfidence || grade || "").toUpperCase(),
     modelVersion: getCurrentModelVersion(),
+    configFingerprint: getLiveConfigFingerprint(league),
     isLock,
     isABQualified,
     trackerBucket: "raw",
@@ -26972,6 +27002,68 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
       // MARKET EXPANSION BATCH 4
       marginEdgePct: p.marginEdgePct
     })));
+
+    // LOCK STABILITY FIX: selectLock() is a stateless argmax — every rerun of the
+    // same fixture (e.g. after tweaking a tunable) recomputes it from scratch with
+    // no memory of what was previously locked, so a probability nudging across a
+    // grade-letter boundary can silently flip which market is "the lock" even when
+    // nothing meaningfully changed. Only allow a flip when the new candidate is a
+    // clear, decisive improvement over whatever was already locked for this exact
+    // fixture; otherwise keep the standing lock and log why.
+    const _existingLockedPick = (AppState.tracker.state.activePicks || []).find(p =>
+      p && p.eventId && fixtureMeta?.eventId && String(p.eventId) === String(fixtureMeta.eventId) &&
+      p.isLock && String(p.resultStatus || "pending").toLowerCase() === "pending"
+    );
+    if (_existingLockedPick) {
+      const _stillValidIdx = finalPicksForDisplay.findIndex(p =>
+        p && p.marketKey === _existingLockedPick.marketKey && p.pick !== "NO PLAY" && !p.lockRestricted
+      );
+      const _newLockPick = lockIdx >= 0 ? finalPicksForDisplay[lockIdx] : null;
+      if (_stillValidIdx === -1) {
+        engineDebug("lock hysteresis: previous lock market no longer valid, allowing flip", {
+          eventId: fixtureMeta.eventId,
+          previousLockMarket: _existingLockedPick.marketKey,
+          newLockMarket: _newLockPick?.marketKey || null,
+          previousConfigFingerprint: _existingLockedPick.configFingerprint || "unknown",
+          newConfigFingerprint: getLiveConfigFingerprint(league)
+        });
+      } else if (!_newLockPick) {
+        engineDebug("lock hysteresis: no fresh candidate this run, keeping standing lock", {
+          eventId: fixtureMeta.eventId,
+          keptLockMarket: _existingLockedPick.marketKey
+        });
+        lockIdx = _stillValidIdx;
+      } else if (_newLockPick.marketKey !== _existingLockedPick.marketKey) {
+        const _oldRank = getConfidenceRank(_existingLockedPick.confidenceGrade);
+        const _newRank = getConfidenceRank(_newLockPick.confidence);
+        const _oldEdgePct = isFinite(Number(_existingLockedPick.edgePct)) ? Math.abs(Number(_existingLockedPick.edgePct)) : 0;
+        const _newEdgePctRaw = isFinite(_newLockPick.marginEdgePct)
+          ? _newLockPick.marginEdgePct * 100
+          : ((isFinite(_newLockPick.displayLineUsed ?? _newLockPick.line) && (_newLockPick.displayLineUsed ?? _newLockPick.line) > 0)
+              ? Math.abs((_newLockPick.displayEdge ?? _newLockPick.edge) / (_newLockPick.displayLineUsed ?? _newLockPick.line)) * 100
+              : 0);
+        const LOCK_FLIP_EDGE_MARGIN = 2.0;
+        const _decisiveFlip = _newRank > _oldRank || (_newRank === _oldRank && _newEdgePctRaw >= _oldEdgePct + LOCK_FLIP_EDGE_MARGIN);
+        if (_decisiveFlip) {
+          engineDebug("lock hysteresis: new candidate decisively beats standing lock, flipping", {
+            eventId: fixtureMeta.eventId,
+            previousLockMarket: _existingLockedPick.marketKey, previousGrade: _existingLockedPick.confidenceGrade, previousEdgePct: _oldEdgePct,
+            newLockMarket: _newLockPick.marketKey, newGrade: _newLockPick.confidence, newEdgePct: _newEdgePctRaw,
+            previousConfigFingerprint: _existingLockedPick.configFingerprint || "unknown",
+            newConfigFingerprint: getLiveConfigFingerprint(league)
+          });
+        } else {
+          engineDebug("lock hysteresis: standing lock retained, new candidate not a decisive improvement", {
+            eventId: fixtureMeta.eventId,
+            keptLockMarket: _existingLockedPick.marketKey, keptGrade: _existingLockedPick.confidenceGrade, keptEdgePct: _oldEdgePct,
+            candidateMarket: _newLockPick.marketKey, candidateGrade: _newLockPick.confidence, candidateEdgePct: _newEdgePctRaw,
+            previousConfigFingerprint: _existingLockedPick.configFingerprint || "unknown",
+            newConfigFingerprint: getLiveConfigFingerprint(league)
+          });
+          lockIdx = _stillValidIdx;
+        }
+      }
+    }
 
     const displayablePicks = finalPicksForDisplay;
     
