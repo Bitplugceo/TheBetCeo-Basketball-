@@ -1,3 +1,4 @@
+D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6083,6 +6084,37 @@ function bbBtDeleteOptimizationCheckpoint() {
   })).catch(() => false);
 }
 
+// A completed optimization is a durable artifact, not a transient checkpoint.
+// Keep it separately from the resumable "current" job so finishing the search
+// can never delete the result that Phase 5 needs later.
+function bbBtPutCompletedOptimization(payload) {
+  return bbBtOpenDataIDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(BB_BACKTEST_OPTIMIZATION_IDB_STORE, "readwrite");
+    tx.objectStore(BB_BACKTEST_OPTIMIZATION_IDB_STORE).put(payload, "completed");
+    tx.oncomplete = () => { db.close(); resolve(true); };
+    tx.onerror = () => { db.close(); reject(tx.error || new Error("Completed optimization could not be saved.")); };
+  })).catch(e => {
+    console.warn("[Backtest Lab] Completed optimization save failed:", e);
+    return false;
+  });
+}
+function bbBtGetCompletedOptimization() {
+  return bbBtOpenDataIDB().then(db => new Promise((resolve, reject) => {
+    const req = db.transaction(BB_BACKTEST_OPTIMIZATION_IDB_STORE, "readonly")
+      .objectStore(BB_BACKTEST_OPTIMIZATION_IDB_STORE).get("completed");
+    req.onsuccess = () => { db.close(); resolve(req.result || null); };
+    req.onerror = () => { db.close(); reject(req.error || new Error("Completed optimization could not be restored.")); };
+  })).catch(() => null);
+}
+function bbBtDeleteCompletedOptimization() {
+  return bbBtOpenDataIDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(BB_BACKTEST_OPTIMIZATION_IDB_STORE, "readwrite");
+    tx.objectStore(BB_BACKTEST_OPTIMIZATION_IDB_STORE).delete("completed");
+    tx.oncomplete = () => { db.close(); resolve(true); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  })).catch(() => false);
+}
+
 // Phase 5 uses a separate durable checkpoint so completed optimization state
 // is never overwritten or forced to rerun.
 function bbBtPutPhase5Checkpoint(payload) {
@@ -7010,6 +7042,19 @@ async function bbBtOptimize(features,options={}){
     lab.champion=best;
     lab.history=history;
     lab.testedConfigurations=tested;
+    // Persist the completed result separately before deleting the resumable
+    // checkpoint. Phase 5 and future page loads must be able to recover the
+    // champion without rerunning the 5,000-configuration search.
+    await bbBtPutCompletedOptimization({
+      version: BB_BACKTEST_LAB_VERSION,
+      jobVersion: 3,
+      status: "completed",
+      dataHash,
+      results: result,
+      champion: best,
+      savedAt: Date.now()
+    });
+    bbBtSaveState();
     lab.progress=Object.assign({},lab.progress,{
       status:"completed",
       phase:"complete",
@@ -7253,10 +7298,39 @@ async function bbBtResumeOptimizationIfAvailable() {
   const l = window.__BB_BACKTEST_LAB;
   if (l.running) return;
 
-  // A completed optimization is authoritative. Never let an old/in-flight
-  // optimizer checkpoint resurrect itself after the page is reopened, because
-  // that can steal the UI/run state from Phase 5 and make it look as though
-  // Phase 5 requires another optimization.
+  // Completed optimization is permanent. Recover it from IndexedDB if the
+  // in-memory/localStorage state was lost during a mobile page lifecycle.
+  if (!l.results?.champion?.config && l.games?.length && l.odds?.length) {
+    try {
+      bbBtValidate();
+      if (l.validation?.ready) {
+        const dataHash = bbBtDataHash(l.matched);
+        const completed = await bbBtGetCompletedOptimization();
+        if (completed?.status === "completed" && completed.dataHash === dataHash && completed.results?.champion?.config) {
+          l.results = completed.results;
+          l.champion = completed.champion || completed.results.champion;
+          l.history = completed.results.history || [];
+          l.testedConfigurations = completed.results.testedConfigurations || [];
+          l.progress = Object.assign({}, l.progress || {}, {
+            status:"completed", phase:"complete", restored:true,
+            evaluated:l.results.testedConfigurations?.length || l.results.samples || 0,
+            total:l.results.testedConfigurations?.length || l.results.samples || 0,
+            best:l.results.champion.hash || null,
+            bestValidationScore:l.results.champion.validationScore ?? null,
+            resumeAvailable:false, lastSavedAt:completed.savedAt || Date.now()
+          });
+          bbBtSaveState();
+          bbBtSetOptimizationProgress(l.progress);
+          renderBacktestPanel();
+        }
+      }
+    } catch (e) {
+      console.warn("[Backtest Lab] Completed optimization restore failed:", e);
+    }
+  }
+
+  // A completed optimization is authoritative. Never resurrect an old/in-flight
+  // checkpoint after completion. The resumable checkpoint is only for unfinished work.
   if (l.results?.champion?.config) {
     try { await bbBtDeleteOptimizationCheckpoint(); } catch (_) {}
     return;
@@ -7512,6 +7586,32 @@ window.addEventListener("pagehide", () => {
 bbBtLoadState();
 bbBtRestoreUploads().then(async () => {
   const l = window.__BB_BACKTEST_LAB;
+  // Recover the permanent Phase 4 result before deciding whether Phase 5 may run.
+  if (!l?.results?.champion?.config && l?.validation?.ready) {
+    try {
+      const completed = await bbBtGetCompletedOptimization();
+      const dataHash = bbBtDataHash(l.matched);
+      if (completed?.status === "completed" && completed.dataHash === dataHash && completed.results?.champion?.config) {
+        l.results = completed.results;
+        l.champion = completed.champion || completed.results.champion;
+        l.history = completed.results.history || [];
+        l.testedConfigurations = completed.results.testedConfigurations || [];
+        l.progress = Object.assign({}, l.progress || {}, {
+          status:"completed", phase:"complete", restored:true,
+          evaluated:l.results.testedConfigurations?.length || l.results.samples || 0,
+          total:l.results.testedConfigurations?.length || l.results.samples || 0,
+          best:l.results.champion.hash || null,
+          bestValidationScore:l.results.champion.validationScore ?? null,
+          resumeAvailable:false, lastSavedAt:completed.savedAt || Date.now()
+        });
+        bbBtSaveState();
+        bbBtSetOptimizationProgress(l.progress);
+        renderBacktestPanel();
+      }
+    } catch (e) {
+      console.warn("[Backtest Lab] Permanent optimization restore failed:", e);
+    }
+  }
   // Resume Phase 5 from its durable checkpoint after Safari/page suspension.
   // A completed optimization is never rerun.
   if (l?.validation?.ready && l?.results?.champion) {
