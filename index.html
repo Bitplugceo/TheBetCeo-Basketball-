@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5553,6 +5552,12 @@ function buildCompleteConfig(league, partial) {
 
 
 /* ============================================================================
+ * PHASE 3.1 — DATA PERSISTENCE / SEASON CANONICALIZATION REPAIR
+ * Uploaded datasets are persisted in IndexedDB; mobile file-input resets no longer
+ * discard the dataset. Season labels are canonicalized before eligibility checks.
+ * Older valid seasons are excluded before row-level validation.
+ * ========================================================================== */
+/* ============================================================================
  * NBA BACKTEST LAB v1
  * Replaces all legacy backtest/search code.
  * Data boundary: user uploads only; eligible seasons are 2024/25, 2025/26, 2026.
@@ -5589,8 +5594,10 @@ const BB_BACKTEST_DEFAULT_CONFIG = Object.freeze({
 
 window.__BB_BACKTEST_LAB = window.__BB_BACKTEST_LAB || {
   games: [], odds: [], matched: [], validation: null, results: null,
-  running: false, progress: null, champion: null, history: [], testedConfigurations: []
+  running: false, progress: null, champion: null, history: [], testedConfigurations: [],
+  fileMeta: { games: null, odds: null }
 };
+window.__BB_BACKTEST_LAB.fileMeta = window.__BB_BACKTEST_LAB.fileMeta || { games: null, odds: null };
 
 function bbBtText(v) { return String(v == null ? "" : v).trim(); }
 function bbBtNorm(v) {
@@ -5607,17 +5614,34 @@ function bbBtDate(v) {
   const d = new Date(v);
   return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
 }
+function bbBtCanonicalSeasonLabel(v) {
+  const s = bbBtText(v)
+    .replace(/[–—−]/g, "-")
+    .replace(/[\\u2010-\\u2015]/g, "-")
+    .replace(/\\s+/g, "")
+    .replace(/_/g, "-");
+  let m = s.match(/^(20\\d{2})[-\\/](20\\d{2})$/);
+  if (m) return Number(m[2]) === Number(m[1]) + 1 ? `${m[1]}/${m[2].slice(-2)}` : null;
+  m = s.match(/^(20\\d{2})[-\\/](\\d{2})$/);
+  if (m) return `${m[1]}/${m[2]}`;
+  m = s.match(/^(20\\d{2})$/);
+  if (m) return m[1];
+  return null;
+}
 function bbBtSeason(v, date) {
-  const s = bbBtText(v);
-  if (BB_BACKTEST_ALLOWED_SEASONS.includes(s)) return s;
+  const canonical = bbBtCanonicalSeasonLabel(v);
+  if (canonical === "2024/25" || canonical === "2025/26" || canonical === "2026") return canonical;
+
   const d = bbBtDate(date);
   if (!d) return null;
   const y = Number(d.slice(0, 4)), m = Number(d.slice(5, 7));
+
+  // The explicit 2026 holdout remains calendar-year 2026. An explicit
+  // 2025/26 season label always takes precedence over date inference.
   if (y === 2024 && m >= 10) return "2024/25";
   if (y === 2025 && m <= 6) return "2024/25";
   if (y === 2025 && m >= 10) return "2025/26";
-  if (y === 2026 && m <= 6) return "2025/26";
-  if (y === 2026 && m >= 7) return "2026";
+  if (y === 2026) return "2026";
   return null;
 }
 function bbBtSeasonYear(s) {
@@ -5674,14 +5698,114 @@ function bbBtCsv(text) {
     return o;
   });
 }
-async function bbBtReadFile(file) {
-  const text = await file.text();
-  if (file.name.toLowerCase().endsWith(".json")) {
-    const parsed = JSON.parse(text);
+const BB_BACKTEST_DATA_IDB_NAME = "BB_BacktestDataDB";
+const BB_BACKTEST_DATA_IDB_STORE = "uploads";
+const BB_BACKTEST_DATA_IDB_VERSION = 1;
+
+function bbBtOpenDataIDB() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) {
+      reject(new Error("IndexedDB is not available in this browser."));
+      return;
+    }
+    const req = indexedDB.open(BB_BACKTEST_DATA_IDB_NAME, BB_BACKTEST_DATA_IDB_VERSION);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(BB_BACKTEST_DATA_IDB_STORE)) {
+        db.createObjectStore(BB_BACKTEST_DATA_IDB_STORE);
+      }
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = e => reject(e.target.error || new Error("Backtest data database could not be opened."));
+  });
+}
+function bbBtPutPersistedUpload(kind, payload) {
+  return bbBtOpenDataIDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(BB_BACKTEST_DATA_IDB_STORE, "readwrite");
+    tx.objectStore(BB_BACKTEST_DATA_IDB_STORE).put(payload, kind);
+    tx.oncomplete = () => { db.close(); resolve(true); };
+    tx.onerror = () => { db.close(); reject(tx.error || new Error("Backtest upload could not be persisted.")); };
+  }));
+}
+function bbBtGetPersistedUpload(kind) {
+  return bbBtOpenDataIDB().then(db => new Promise((resolve, reject) => {
+    const req = db.transaction(BB_BACKTEST_DATA_IDB_STORE, "readonly")
+      .objectStore(BB_BACKTEST_DATA_IDB_STORE).get(kind);
+    req.onsuccess = () => { db.close(); resolve(req.result || null); };
+    req.onerror = () => { db.close(); reject(req.error || new Error("Backtest upload could not be restored.")); };
+  })).catch(() => null);
+}
+function bbBtDeletePersistedUploads() {
+  return bbBtOpenDataIDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(BB_BACKTEST_DATA_IDB_STORE, "readwrite");
+    const store = tx.objectStore(BB_BACKTEST_DATA_IDB_STORE);
+    store.delete("games"); store.delete("odds");
+    tx.oncomplete = () => { db.close(); resolve(true); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  })).catch(() => false);
+}
+async function bbBtParseRawFile(fileName, rawText) {
+  if (String(fileName || "").toLowerCase().endsWith(".json")) {
+    const parsed = JSON.parse(rawText);
     return Array.isArray(parsed) ? parsed : (Array.isArray(parsed.data) ? parsed.data : []);
   }
-  return bbBtCsv(text);
+  return bbBtCsv(rawText);
 }
+async function bbBtReadFile(file) {
+  return bbBtParseRawFile(file.name, await file.text());
+}
+async function bbBtLoadUploadIntoLab(kind, file) {
+  if (!file) return;
+  const rawText = await file.text();
+  const rows = await bbBtParseRawFile(file.name, rawText);
+  const lab = window.__BB_BACKTEST_LAB;
+  const canonical = kind === "games"
+    ? rows.map(bbBtCanonicalGame)
+    : rows.map(bbBtCanonicalOdds);
+  lab[kind] = canonical;
+  lab.fileMeta[kind] = {
+    name: file.name,
+    size: file.size,
+    type: file.type || "",
+    rows: canonical.length,
+    loadedAt: new Date().toISOString()
+  };
+  await bbBtPutPersistedUpload(kind, {
+    name: file.name,
+    size: file.size,
+    type: file.type || "",
+    rawText,
+    rows: canonical.length,
+    savedAt: new Date().toISOString()
+  });
+}
+async function bbBtRestoreUploads() {
+  const lab = window.__BB_BACKTEST_LAB;
+  for (const kind of ["games", "odds"]) {
+    const saved = await bbBtGetPersistedUpload(kind);
+    if (!saved || typeof saved.rawText !== "string") continue;
+    try {
+      const rows = await bbBtParseRawFile(saved.name, saved.rawText);
+      lab[kind] = kind === "games"
+        ? rows.map(bbBtCanonicalGame)
+        : rows.map(bbBtCanonicalOdds);
+      lab.fileMeta[kind] = {
+        name: saved.name,
+        size: saved.size || saved.rawText.length,
+        type: saved.type || "",
+        rows: lab[kind].length,
+        loadedAt: saved.savedAt || null,
+        restored: true
+      };
+    } catch (e) {
+      lab.fileMeta[kind] = Object.assign({}, lab.fileMeta[kind] || {}, {
+        name: saved.name, rows: 0, restoreError: String(e.message || e)
+      });
+    }
+  }
+  if (typeof renderBacktestPanel === "function") renderBacktestPanel();
+}
+
 function bbBtCanonicalGame(row, index) {
   const date = bbBtDate(bbBtFirst(row, ["date","game_date","gameDate","event_date","eventDate","start_date"]));
   const homeName = bbBtTeamName(row, "home"), awayName = bbBtTeamName(row, "away");
@@ -6040,13 +6164,31 @@ function bbBtValidate(){
   const eligible=[];
   const gameKeyCounts=new Map();
   games.forEach((g,i)=>{
-    if(!g.date) errors.push(`Game ${i+1}: missing/invalid date`);
-    if(!g.homeName||!g.awayName) errors.push(`Game ${i+1}: missing home/away team`);
-    if(g.homeName&&g.awayName&&bbBtNorm(g.homeName)===bbBtNorm(g.awayName)) errors.push(`Game ${i+1}: home and away teams are identical`);
-    if(g.homeScore==null||g.awayScore==null) errors.push(`Game ${i+1}: missing final score`);
-    if(!g.season){ errors.push(`Game ${i+1}: season missing/ambiguous`); excludedInvalid++; return; }
-    if(!BB_BACKTEST_ALLOWED_SEASONS.includes(g.season)){ excludedOlder++; return; }
-    if(!g.date||!g.homeId||!g.awayId||g.homeScore==null||g.awayScore==null){ excludedInvalid++; return; }
+    // Classify season before validating the rest of the row. Valid older
+    // records are EXCLUDED, not incorrectly counted as INVALID.
+    if(!g.season){
+      excludedInvalid++;
+      errors.push(`Game ${i+1}: season missing/ambiguous`);
+      return;
+    }
+    if(!BB_BACKTEST_ALLOWED_SEASONS.includes(g.season)){
+      excludedOlder++;
+      return;
+    }
+
+    let rowInvalid = false;
+    if(!g.date){ errors.push(`Game ${i+1}: missing/invalid date`); rowInvalid = true; }
+    if(!g.homeName||!g.awayName){ errors.push(`Game ${i+1}: missing home/away team`); rowInvalid = true; }
+    if(g.homeName&&g.awayName&&bbBtNorm(g.homeName)===bbBtNorm(g.awayName)){
+      errors.push(`Game ${i+1}: home and away teams are identical`); rowInvalid = true;
+    }
+    if(g.homeScore==null||g.awayScore==null){ errors.push(`Game ${i+1}: missing final score`); rowInvalid = true; }
+
+    if(rowInvalid || !g.homeId || !g.awayId){
+      excludedInvalid++;
+      return;
+    }
+
     counts[g.season]++;
     const key=bbBtGameKey(g.date,g.homeName,g.awayName);
     gameKeyCounts.set(key,(gameKeyCounts.get(key)||0)+1);
@@ -6117,6 +6259,8 @@ function bbBtValidate(){
     marketRecords,
     gamesMissingMarket,
     seasonOdds,
+    sourceSeasonCounts: games.reduce((acc,g)=>{const k=bbBtText(g.raw?.season||g.raw?.season_label||g.raw?.seasonLabel)||"(missing)";acc[k]=(acc[k]||0)+1;return acc;},{}),
+    oddsSourceSeasonCounts: normalizedOdds.reduce((acc,o)=>{const k=bbBtText(o.raw?.season||o.raw?.season_label||o.raw?.seasonLabel)||"(missing)";acc[k]=(acc[k]||0)+1;return acc;},{}),
     duplicateGameKeys:[...gameKeyCounts.entries()].filter(([,n])=>n>1).map(([key,n])=>({key,count:n})),
     errors:errors.slice(0,200),
     warnings:warnings.slice(0,100),
@@ -6134,12 +6278,28 @@ function bbBtValidate(){
   return v;
 }
 function bbBtSaveState(){
-  try{const l=window.__BB_BACKTEST_LAB;localStorage.setItem(BB_BACKTEST_STORAGE_KEY,JSON.stringify({
-    version:BB_BACKTEST_LAB_VERSION,validation:l.validation,results:l.results,champion:l.champion,history:l.history,testedConfigurations:l.testedConfigurations
-  }));}catch(_){}
+  try{
+    const l=window.__BB_BACKTEST_LAB;
+    localStorage.setItem(BB_BACKTEST_STORAGE_KEY,JSON.stringify({
+      version:BB_BACKTEST_LAB_VERSION,
+      validation:l.validation,results:l.results,champion:l.champion,
+      history:l.history,testedConfigurations:l.testedConfigurations,
+      fileMeta:l.fileMeta
+    }));
+  }catch(_){}
 }
 function bbBtLoadState(){
-  try{const x=JSON.parse(localStorage.getItem(BB_BACKTEST_STORAGE_KEY)||"null");if(x&&x.version===BB_BACKTEST_LAB_VERSION){Object.assign(window.__BB_BACKTEST_LAB,{validation:x.validation,results:x.results,champion:x.champion,history:x.history||[],testedConfigurations:x.testedConfigurations||x.results?.testedConfigurations||[]});}}catch(_){}
+  try{
+    const x=JSON.parse(localStorage.getItem(BB_BACKTEST_STORAGE_KEY)||"null");
+    if(x&&x.version===BB_BACKTEST_LAB_VERSION){
+      Object.assign(window.__BB_BACKTEST_LAB,{
+        validation:x.validation,results:x.results,champion:x.champion,
+        history:x.history||[],
+        testedConfigurations:x.testedConfigurations||x.results?.testedConfigurations||[],
+        fileMeta:x.fileMeta||{games:null,odds:null}
+      });
+    }
+  }catch(_){}
 }
 function bbBtRenderSummary(v){
   if(!v)return `<div class="tracker-report-card"><b>DATA STATUS</b><div>Upload both files, then validate.</div></div>`;
@@ -6150,6 +6310,11 @@ function bbBtRenderSummary(v){
   <div class="tracker-report-card"><div class="tracker-report-label">Odds coverage</div>${markets}<div style="margin-top:6px">Unmatched supported odds: <b>${v.unmatchedOddsRecords??"—"}</b></div></div>
   <div class="tracker-report-card"><div class="tracker-report-label">Required-market gaps</div>${missing}</div>
   <div class="tracker-report-card"><div class="tracker-report-label">Readiness</div><b>${v.ready?"READY":"NOT READY"}</b><div>${v.errors?.length||0} errors · ${v.warnings?.length||0} warnings</div></div>
+  <div class="tracker-report-card"><div class="tracker-report-label">Uploaded datasets</div>
+    <div>Games rows: <b>${v.uploadedGames||0}</b> · Odds rows: <b>${v.uploadedOdds||0}</b></div>
+    <div>Supported odds rows: <b>${v.oddsRecords||0}</b></div>
+    <div>Stored uploads survive page rerenders/device suspension when IndexedDB is available.</div>
+  </div>
   <div class="tracker-report-card"><div class="tracker-report-label">Data boundary</div><div>USER UPLOADS ONLY</div><div>No external historical supplementation.</div></div></div>`;
 }
 function bbBtMetricCard(label,m){
@@ -6163,8 +6328,14 @@ function renderBacktestPanel(){
     <div class="tracker-analytics-topbar"><div class="tracker-analytics-kicker">NBA ENGINE</div><h3 class="tracker-analytics-title">Backtest Lab v1</h3>
     <p class="tracker-analytics-subtitle">User-supplied games + odds only · 2024/25 train · 2025/26 validation · 2026 protected holdout</p></div>
     <div style="display:grid;gap:8px">
-      <div><label>Historical Games <input id="bbBtGamesFile" type="file" accept=".csv,.json"></label>
-      <label style="margin-left:8px">Historical Odds <input id="bbBtOddsFile" type="file" accept=".csv,.json"></label></div>
+      <div>
+        <label>Historical Games <input id="bbBtGamesFile" type="file" accept=".csv,.json"></label>
+        <div id="bbBtGamesLoaded" style="font-size:11px;margin-top:3px">${l.fileMeta?.games?.name ? `Loaded: <b>${l.fileMeta.games.name}</b> · ${l.games?.length||0} rows${l.fileMeta.games.restored?" · restored from device storage":""}` : "No games dataset stored."}</div>
+      </div>
+      <div>
+        <label>Historical Odds <input id="bbBtOddsFile" type="file" accept=".csv,.json"></label>
+        <div id="bbBtOddsLoaded" style="font-size:11px;margin-top:3px">${l.fileMeta?.odds?.name ? `Loaded: <b>${l.fileMeta.odds.name}</b> · ${l.odds?.length||0} rows${l.fileMeta.odds.restored?" · restored from device storage":""}` : "No odds dataset stored."}</div>
+      </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button id="bbBtValidateBtn" type="button">Validate Data</button><button id="bbBtBaselineBtn" type="button">Run Baseline</button>
         <button id="bbBtOptimizeBtn" type="button">Run Optimization</button><button id="bbBtExportBtn" type="button">Finalize + Lock v1</button>
@@ -6179,15 +6350,53 @@ function renderBacktestPanel(){
     <div id="bbBtProgress" style="font-size:11px">${l.progress?`${l.progress.phase}: ${l.progress.evaluated}/${l.progress.total}`:"Idle"}</div>
     </div>`;
   const bind=(id,fn)=>{const e=document.getElementById(id);if(e)e.onclick=fn;};
-  bind("bbBtValidateBtn",async()=>{try{const gf=document.getElementById("bbBtGamesFile")?.files?.[0],of=document.getElementById("bbBtOddsFile")?.files?.[0];
-    if(gf)l.games=(await bbBtReadFile(gf)).map(bbBtCanonicalGame); if(of)l.odds=(await bbBtReadFile(of)).map(bbBtCanonicalOdds);
-    bbBtValidate();renderBacktestPanel();}catch(e){alert("Backtest data error: "+e.message);}});
+
+  const gamesInput=document.getElementById("bbBtGamesFile");
+  const oddsInput=document.getElementById("bbBtOddsFile");
+  if(gamesInput) gamesInput.onchange=async()=>{
+    try{
+      const file=gamesInput.files?.[0];
+      if(!file)return;
+      await bbBtLoadUploadIntoLab("games",file);
+      bbBtSaveState();
+      const status=document.getElementById("bbBtGamesLoaded");
+      if(status)status.innerHTML=`Loaded: <b>${file.name}</b> · ${l.games.length} rows · saved to device storage`;
+    }catch(e){alert("Historical Games upload error: "+e.message);}
+  };
+  if(oddsInput) oddsInput.onchange=async()=>{
+    try{
+      const file=oddsInput.files?.[0];
+      if(!file)return;
+      await bbBtLoadUploadIntoLab("odds",file);
+      bbBtSaveState();
+      const status=document.getElementById("bbBtOddsLoaded");
+      if(status)status.innerHTML=`Loaded: <b>${file.name}</b> · ${l.odds.length} rows · saved to device storage`;
+    }catch(e){alert("Historical Odds upload error: "+e.message);}
+  };
+
+  bind("bbBtValidateBtn",async()=>{
+    try{
+      // Prefer the persisted in-memory datasets. The native file inputs may
+      // legitimately reset after a mobile Safari page lifecycle event.
+      const gf=document.getElementById("bbBtGamesFile")?.files?.[0];
+      const of=document.getElementById("bbBtOddsFile")?.files?.[0];
+      if(gf) await bbBtLoadUploadIntoLab("games",gf);
+      if(of) await bbBtLoadUploadIntoLab("odds",of);
+      if(!l.games.length || !l.odds.length) throw new Error("Both persisted datasets must be loaded before validation.");
+      bbBtValidate();
+      bbBtSaveState();
+      renderBacktestPanel();
+    }catch(e){alert("Backtest data error: "+e.message);}
+  });
   bind("bbBtBaselineBtn",()=>{if(!l.validation?.ready){alert("Validate both datasets first.");return;}const c=bbBtConfigFromRegistry(),s=bbBtSplit(l.matched);const tr=bbBtEvaluateConfig(s.train,c),va=bbBtEvaluateConfig(s.validation,c),ho=bbBtEvaluateConfig(s.holdout,c);l.results={baseline:{hash:bbBtConfigHash(c),config:c,train:tr,validation:va,holdout:ho,trainScore:bbBtJointScore(tr),validationScore:bbBtJointScore(va),holdoutScore:bbBtJointScore(ho)},baselineHoldout:ho,holdout:ho,holdoutScore:bbBtJointScore(ho),samples:1,champion:null,holdoutAcceptable:false,generatedAt:new Date().toISOString(),dataHash:bbBtDataHash(l.matched)};l.champion=null;bbBtSaveState();renderBacktestPanel();});
   bind("bbBtOptimizeBtn",async()=>{if(!l.validation?.ready){alert("Validate both datasets first.");return;}if(l.running)return;l.running=true;try{await bbBtOptimize(l.matched,{samples:5000,seed:20260812});bbBtSaveState();}catch(e){console.error(e);alert("Optimization failed: "+e.message);}finally{l.running=false;renderBacktestPanel();}});
   bind("bbBtExportBtn",()=>{const out=bbBtExportVerifiedConfigV1();if(!out.ok)alert("NBA VERIFIED CONFIG v1 not activated: "+out.reason);else{bbBtSaveState();renderBacktestPanel();}});
 }
 window.renderBacktestPanel=renderBacktestPanel;
 bbBtLoadState();
+bbBtRestoreUploads().catch(e => {
+  console.warn("Backtest dataset restore failed:", e);
+});
 
 
 const BB_LOCK_SHORTLIST_KEY = "BB_LOCK_SHORTLIST_V1";
