@@ -16498,6 +16498,10 @@ function anchorProjection(proj, sampleSize, leagueBase) {
 }
 
 function readLooseSeries(id) {
+  // ---- fast path: backtest in-memory override (skips DOM read + string round-trip) ----
+  if (window.__btSeriesOverride && Object.prototype.hasOwnProperty.call(window.__btSeriesOverride, id)) {
+    return window.__btSeriesOverride[id];
+  }
   const el = document.getElementById(id);
   const raw = el?.value?.trim() || "";
   if (!raw) return [];
@@ -20172,8 +20176,14 @@ function computeQuarterProjectionBT(qKey, { league, parsed, ftCalc, injA = 1, in
     });
 
     assertInvariant(isFinite(hw) && hw >= 0 && hw <= 1, qKey + ".h2hWeight out of [0,1]", { hw, league, qKey, decayHA: decayH2HA.length, decayHB: decayH2HB.length });
-    const avgH2HA = avgOrNaN(decayH2HA);
-    const avgH2HB = avgOrNaN(decayH2HB);
+    // ---- parity fix: match live's decay-weighted H2H average instead of a plain average ----
+    const _qH2hWBT = massacreH2HQ.weights;
+    const avgH2HA = (_qH2hWBT && _qH2hWBT.length === decayH2HA.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HA.length; i++) { const v = Number(decayH2HA[i]), w = Number(_qH2hWBT[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HA); })()
+      : avgOrNaN(decayH2HA);
+    const avgH2HB = (_qH2hWBT && _qH2hWBT.length === decayH2HB.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HB.length; i++) { const v = Number(decayH2HB[i]), w = Number(_qH2hWBT[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HB); })()
+      : avgOrNaN(decayH2HB);
     projA = isFinite(avgH2HA) ? ((projA * (1 - hw)) + (avgH2HA * hw)) : projA;
     projB = isFinite(avgH2HB) ? ((projB * (1 - hw)) + (avgH2HB * hw)) : projB;
 
@@ -20522,8 +20532,8 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
         skipped++; continue;
       }
 
-      if (domA) domA.value = (teamWindow.scored || []).join(",");
-      if (domB) domB.value = (oppWindow.scored || []).join(",");
+      // ---- fast path: in-memory override instead of DOM write + later re-parse ----
+      window.__btSeriesOverride = { aFTScored: (teamWindow.scored || []).slice(0, 10), bFTScored: (oppWindow.scored || []).slice(0, 10) };
 
       const teamH1Window = { scored: feat.teamH1Scored, allowed: feat.parsed.a1HAllowed };
       const oppH1Window  = { scored: feat.oppH1Scored,  allowed: feat.parsed.b1HAllowed };
@@ -20652,6 +20662,7 @@ function evaluateFeatureCacheWithOverrides(features, allGames, paramOverrides, o
     if (domB) domB.value = savedB ?? "";
     if (typeof AppState !== "undefined" && AppState.context) AppState.context.data = savedContextData;
     window.__seriesDateCache = savedSeriesDateCache;
+    window.__btSeriesOverride = null;
   }
 
   const trainCal = calculateScoresOnlyCalibration(results.filter(r => r.split === "train"));
@@ -21621,8 +21632,8 @@ async function runNbaSeasonBacktest(season, onProgress) {
 
       if (teamWindow.scored.length < 5 || oppWindow.scored.length < 5) { skipped++; continue; }
 
-      if (domA) domA.value = teamWindow.scored.join(",");
-      if (domB) domB.value = oppWindow.scored.join(",");
+      // ---- fast path: in-memory override instead of DOM write + later re-parse ----
+      window.__btSeriesOverride = { aFTScored: teamWindow.scored.slice(0, 10), bFTScored: oppWindow.scored.slice(0, 10) };
 
       const teamH1Window = { scored: feat.teamH1Scored, allowed: feat.parsed.a1HAllowed };
       const oppH1Window = { scored: feat.oppH1Scored, allowed: feat.parsed.b1HAllowed };
@@ -21742,6 +21753,7 @@ async function runNbaSeasonBacktest(season, onProgress) {
     AppState.context.data = savedContextData;
     window.__seriesDateCache = savedSeriesDateCache;
     window.__btRunInProgress = false;
+    window.__btSeriesOverride = null;
     try { localStorage.removeItem(`BB_H1_PROGRESS_NBA_${season}`); } catch (e) {}
   }
 
