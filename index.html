@@ -1,3 +1,4 @@
+G
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2755,64 +2756,279 @@ function bbBtPlateauAnalysis(result, minWindow) {
   };
 }
 
-function bbBtRunPhase5Verification(options={}) {
+function bbBtYield() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+function bbBtPhase5NewAccumulator() {
+  return {wins:0,losses:0,pushes:0,selections:0,decisive:0,profit:0,betOdds:0,coverage:0};
+}
+
+function bbBtPhase5Accumulate(acc, row) {
+  if (!row) return;
+  acc.coverage++;
+  if (row.status !== "settled") return;
+  acc.selections++;
+  if (row.result === "win") { acc.wins++; acc.decisive++; }
+  else if (row.result === "loss") { acc.losses++; acc.decisive++; }
+  else if (row.result === "push") { acc.pushes++; }
+  if (row.odds != null && row.result !== "push") {
+    acc.betOdds++;
+    acc.profit += row.result === "win" ? Number(row.odds) - 1 : -1;
+  }
+}
+
+function bbBtPhase5Metric(acc) {
+  acc = acc || bbBtPhase5NewAccumulator();
+  return {
+    wins:acc.wins, losses:acc.losses, pushes:acc.pushes,
+    selections:acc.selections, decisive:acc.decisive,
+    winRate:acc.decisive ? acc.wins / acc.decisive : null,
+    roi:acc.betOdds ? acc.profit / acc.betOdds : null,
+    coverage:acc.coverage
+  };
+}
+
+function bbBtPhase5MetricsEmpty() {
+  return {
+    ft_total:bbBtPhase5NewAccumulator(),
+    winner:bbBtPhase5NewAccumulator(),
+    handicap:bbBtPhase5NewAccumulator()
+  };
+}
+
+function bbBtPhase5ProcessFeature(features, index, config, metrics) {
+  const f=features[index];
+  if (!f || f.homeScore==null || f.awayScore==null || f.priorA.length<3 || f.priorB.length<3) return;
+  if (!BB_BACKTEST_ALLOWED_SEASONS.includes(f.season)) return;
+  try {
+    bbBtSetEngineContext(f);
+    selectedTeamIds.A=f.homeId; selectedTeamIds.B=f.awayId;
+    window.__BB_BACKTEST_REFERENCE_DATE=f.date;
+    window.__BB_BACKTEST_FIXTURE_META={
+      homeId:f.homeId,awayId:f.awayId,eventDate:f.date,eventId:"phase5_"+f.sourceIndex
+    };
+    const parsed={
+      aFTScored:f.priorA.map(x=>x.scored), bFTScored:f.priorB.map(x=>x.scored),
+      aFTAllowed:f.priorA.map(x=>x.allowed), bFTAllowed:f.priorB.map(x=>x.allowed),
+      aFTH2H:f.h2h.map(x=>x.scoreA), bFTH2H:f.h2h.map(x=>x.scoreB)
+    };
+    const lines={ftLine:f.totalLine,aLine:f.homeLine,bLine:f.awayLine};
+    const ep=computeFTProjection({
+      league:"nba",parsed,lines,injMultA:1,injMultB:1,
+      config:{restDaysA:f.derivedRestA,restDaysB:f.derivedRestB}
+    });
+    if(!ep || !isFinite(ep.ftProj) || !isFinite(ep.projAFT) || !isFinite(ep.projBFT)) return;
+    BB_BACKTEST_MARKETS.forEach(m => bbBtPhase5Accumulate(metrics[m], bbBtGrade(null,m,f,ep,config)));
+  } catch (_) {
+    // Match the existing verifier: one bad fixture cannot abort verification.
+  }
+}
+
+async function bbBtPhase5EvaluateChunk(features, config, startIndex, metrics, chunkSize) {
+  const snapshot={
+    context:AppState.context.data,
+    teams:{A:selectedTeamIds.A,B:selectedTeamIds.B},
+    series:window.__btSeriesOverride,
+    ref:window.__BB_BACKTEST_REFERENCE_DATE,
+    fixture:window.__BB_BACKTEST_FIXTURE_META,
+    config:window.__BB_BACKTEST_CONFIG_OVERRIDE
+  };
+  try {
+    bbBtOverrideConfig(config);
+    AppState.context.data={};
+    const end=Math.min(features.length,startIndex+chunkSize);
+    for(let i=startIndex;i<end;i++) bbBtPhase5ProcessFeature(features,i,config,metrics);
+    return end;
+  } finally {
+    AppState.context.data=snapshot.context;
+    selectedTeamIds.A=snapshot.teams.A; selectedTeamIds.B=snapshot.teams.B;
+    window.__btSeriesOverride=snapshot.series;
+    window.__BB_BACKTEST_REFERENCE_DATE=snapshot.ref;
+    window.__BB_BACKTEST_FIXTURE_META=snapshot.fixture;
+    bbBtOverrideConfig(snapshot.config || null);
+  }
+}
+
+function bbBtPhase5BuildEvaluation(config, splitMetrics) {
+  const train=splitMetrics.train, validation=splitMetrics.validation, holdout=splitMetrics.holdout;
+  const t={
+    ft_total:bbBtPhase5Metric(train.ft_total),winner:bbBtPhase5Metric(train.winner),handicap:bbBtPhase5Metric(train.handicap)
+  };
+  const v={
+    ft_total:bbBtPhase5Metric(validation.ft_total),winner:bbBtPhase5Metric(validation.winner),handicap:bbBtPhase5Metric(validation.handicap)
+  };
+  const h={
+    ft_total:bbBtPhase5Metric(holdout.ft_total),winner:bbBtPhase5Metric(holdout.winner),handicap:bbBtPhase5Metric(holdout.handicap)
+  };
+  return {
+    config,hash:bbBtConfigHash(config),train:t,validation:v,holdout:h,
+    trainScore:bbBtJointScore(t),validationScore:bbBtJointScore(v),holdoutScore:bbBtJointScore(h)
+  };
+}
+
+async function bbBtRunPhase5Verification(options={}) {
   const lab=window.__BB_BACKTEST_LAB;
   if(!lab) throw new Error("Backtest Lab is not initialized.");
-
-  // Never require the transient <input type=file> controls. If the page was
-  // suspended/reopened, the durable IndexedDB uploads are sufficient.
-  if ((!lab.validation || !lab.validation.ready) && lab.games?.length && lab.odds?.length) {
-    bbBtValidate();
-  }
+  if ((!lab.validation || !lab.validation.ready) && lab.games?.length && lab.odds?.length) bbBtValidate();
   if(!lab.validation || !lab.validation.ready)
     throw new Error("Phase 5 requires valid persisted games and odds datasets.");
   if(!lab.results || !lab.results.champion)
     throw new Error("Phase 5 requires a completed Phase 4 optimization.");
 
   const result=lab.results;
-  const baseline=bbBtEvaluateVerification(result.baseline.config, lab.matched);
-  const champion=bbBtEvaluateVerification(result.champion.config, lab.matched);
+  const dataHash=bbBtDataHash(lab.matched);
+  const championHash=result.champion.hash || bbBtConfigHash(result.champion.config);
 
-  // 2026 is evaluated here only. It is never passed to the search/refinement logic.
-  const holdoutGate=bbBtHoldoutGate(champion, baseline);
-  const parity=bbBtRunParitySuite(lab.matched, champion.config, options.parityFixtures || 30);
-  const plateau=bbBtPlateauAnalysis(result, options.plateauWindow || 1000);
+  const split=bbBtSplit(lab.matched);
+  const phases=[
+    {id:"baseline_train",label:"baseline · train",config:result.baseline.config,features:split.train,season:"train"},
+    {id:"baseline_validation",label:"baseline · validation",config:result.baseline.config,features:split.validation,season:"validation"},
+    {id:"baseline_holdout",label:"baseline · 2026 holdout",config:result.baseline.config,features:split.holdout,season:"holdout"},
+    {id:"champion_train",label:"champion · train",config:result.champion.config,features:split.train,season:"train"},
+    {id:"champion_validation",label:"champion · validation",config:result.champion.config,features:split.validation,season:"validation"},
+    {id:"champion_holdout",label:"champion · 2026 holdout",config:result.champion.config,features:split.holdout,season:"holdout"}
+  ];
 
-  const stability={
-    trainValidationGap: champion.trainScore!=null && champion.validationScore!=null ?
-      champion.trainScore-champion.validationScore : null,
-    validationHoldoutGap: champion.validationScore!=null && champion.holdoutScore!=null ?
-      champion.validationScore-champion.holdoutScore : null,
-    marketComparison:bbBtCompareMetrics(champion.holdout, baseline.holdout)
+  const parityLimit=Math.max(1,Number(options.parityFixtures)||30);
+  const eligibleParity=(lab.matched||[]).filter(f =>
+    f && f.homeScore!=null && f.awayScore!=null &&
+    f.priorA && f.priorA.length>=3 && f.priorB && f.priorB.length>=3
+  ).slice(0,parityLimit);
+
+  const totalWork=phases.reduce((n,p)=>n+p.features.length,0)+eligibleParity.length;
+  const chunkSize=Math.max(8,Math.min(40,Number(options.chunkSize)||20));
+
+  const stored=await bbBtGetPhase5Checkpoint();
+  const state=stored && stored.jobVersion===1 &&
+    stored.dataHash===dataHash && stored.championHash===championHash ? stored : null;
+
+  if(l.phase5?.verified && !state) return l.phase5;
+
+  let phaseIndex=state ? Math.max(0,Math.min(phases.length,Number(state.phaseIndex)||0)) : 0;
+  let phaseOffset=state ? Math.max(0,Number(state.phaseOffset)||0) : 0;
+  let completedWork=state ? Math.max(0,Number(state.completedWork)||0) : 0;
+  let parityChecks=state && Array.isArray(state.parityChecks) ? state.parityChecks.slice() : [];
+  const phaseResults=state?.phaseResults || {};
+
+  const saveCheckpoint=async(status="running")=>{
+    const payload={
+      version:BB_BACKTEST_LAB_VERSION,jobVersion:1,status,dataHash,championHash,
+      phaseIndex,phaseOffset,completedWork,totalWork,phaseResults,parityChecks,
+      savedAt:Date.now()
+    };
+    lab.phase5Checkpoint=payload;
+    lab.phase5CheckpointSavePromise=(lab.phase5CheckpointSavePromise||Promise.resolve())
+      .catch(()=>true).then(()=>bbBtPutPhase5Checkpoint(payload));
+    await lab.phase5CheckpointSavePromise;
+    bbBtSaveState();
   };
 
-  const verified=!!(
-    holdoutGate.ok &&
-    parity.ok &&
-    (plateau.reached || result.plateauReached) &&
-    result.testedConfigurations &&
-    result.testedConfigurations.length > 0
-  );
+  lab.running=true;
+  lab.phase5CheckpointFn=()=>saveCheckpoint("running");
 
-  const report={
-    version:BB_PHASE5_VERSION,
-    generatedAt:new Date().toISOString(),
-    dataHash:bbBtDataHash(lab.matched),
-    baseline,
-    champion,
-    holdoutGate,
-    parity,
-    plateau,
-    stability,
-    verified,
-    holdoutProtected:true,
-    optimizationSeasons:["2024/25","2025/26"],
-    holdoutSeason:"2026"
+  const updateProgress=(subphase)=>{
+    bbBtSetOptimizationProgress({
+      status:"running",phase:"phase5_verification",subphase,
+      evaluated:completedWork,total:totalWork,best:championHash,
+      bestValidationScore:result.champion.validationScore??null,resumeAvailable:true
+    });
   };
-  lab.phase5=report;
-  lab.results.phase5=report;
-  bbBtSaveState();
-  return report;
+
+  updateProgress(state ? `resuming · ${phases[phaseIndex]?.label || "parity"}` : phases[0].label);
+  await saveCheckpoint("running");
+
+  try {
+    while(phaseIndex<phases.length){
+      const phase=phases[phaseIndex];
+      let metrics=phaseResults[phase.id] || bbBtPhase5MetricsEmpty();
+      phaseResults[phase.id]=metrics;
+
+      while(phaseOffset<phase.features.length){
+        const before=phaseOffset;
+        phaseOffset=await bbBtPhase5EvaluateChunk(
+          phase.features,phase.config,phaseOffset,metrics,chunkSize
+        );
+        completedWork += phaseOffset-before;
+        updateProgress(`${phase.label} · ${phaseOffset.toLocaleString()}/${phase.features.length.toLocaleString()}`);
+        await saveCheckpoint("running");
+        await bbBtYield();
+      }
+
+      // Advance the phase cursor before checkpointing. If Safari suspends now,
+      // reopening starts at the next phase instead of replaying this one.
+      phaseIndex++;
+      phaseOffset=0;
+      updateProgress(phaseIndex<phases.length ? phases[phaseIndex].label : "parity");
+      await saveCheckpoint("running");
+      await bbBtYield();
+    }
+
+    let parityIndex=parityChecks.length;
+    while(parityIndex<eligibleParity.length){
+      const check=bbBtParityCheckFixture(eligibleParity[parityIndex],result.champion.config);
+      parityChecks.push(check);
+      parityIndex++;
+      completedWork++;
+      updateProgress(`parity · ${parityIndex}/${eligibleParity.length}`);
+      await saveCheckpoint("running");
+      await bbBtYield();
+    }
+
+    const baseline=bbBtPhase5BuildEvaluation(result.baseline.config,{
+      train:phaseResults.baseline_train,validation:phaseResults.baseline_validation,holdout:phaseResults.baseline_holdout
+    });
+    const champion=bbBtPhase5BuildEvaluation(result.champion.config,{
+      train:phaseResults.champion_train,validation:phaseResults.champion_validation,holdout:phaseResults.champion_holdout
+    });
+
+    const holdoutGate=bbBtHoldoutGate(champion,baseline);
+    const parity={
+      version:BB_PHASE5_VERSION,checked:parityChecks.length,
+      passed:parityChecks.filter(x=>x.ok).length,
+      failed:parityChecks.filter(x=>!x.ok),
+      ok:parityChecks.length>0 && parityChecks.every(x=>x.ok)
+    };
+    const plateau=bbBtPlateauAnalysis(result,options.plateauWindow||1000);
+    const stability={
+      trainValidationGap:champion.trainScore!=null && champion.validationScore!=null ?
+        champion.trainScore-champion.validationScore:null,
+      validationHoldoutGap:champion.validationScore!=null && champion.holdoutScore!=null ?
+        champion.validationScore-champion.holdoutScore:null,
+      marketComparison:bbBtCompareMetrics(champion.holdout,baseline.holdout)
+    };
+    const verified=!!(
+      holdoutGate.ok && parity.ok &&
+      (plateau.reached || result.plateauReached) &&
+      result.testedConfigurations && result.testedConfigurations.length>0
+    );
+
+    const report={
+      version:BB_PHASE5_VERSION,generatedAt:new Date().toISOString(),dataHash,
+      baseline,champion,holdoutGate,parity,plateau,stability,verified,
+      holdoutProtected:true,optimizationSeasons:["2024/25","2025/26"],holdoutSeason:"2026"
+    };
+
+    lab.phase5=report;
+    lab.results.phase5=report;
+    lab.phase5Checkpoint=null;
+    lab.phase5Runtime=null;
+    await bbBtDeletePhase5Checkpoint();
+    bbBtSaveState();
+    bbBtSetOptimizationProgress({
+      status:"completed",phase:"phase5_complete",
+      subphase:verified?"verified":"gate_failed",
+      evaluated:totalWork,total:totalWork,best:championHash,
+      bestValidationScore:champion.validationScore??null,
+      resumeAvailable:false,lastSavedAt:Date.now()
+    });
+    renderBacktestPanel();
+    return report;
+  } finally {
+    lab.phase5CheckpointFn=null;
+    lab.phase5CheckpointSavePromise=null;
+    lab.running=false;
+  }
 }
 
 window.bbBtRunPhase5Verification=bbBtRunPhase5Verification;
@@ -5867,6 +6083,36 @@ function bbBtDeleteOptimizationCheckpoint() {
     tx.onerror = () => { db.close(); reject(tx.error || new Error("Optimization checkpoint could not be deleted.")); };
   })).catch(() => false);
 }
+
+// Phase 5 uses a separate durable checkpoint so completed optimization state
+// is never overwritten or forced to rerun.
+function bbBtPutPhase5Checkpoint(payload) {
+  return bbBtOpenDataIDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(BB_BACKTEST_OPTIMIZATION_IDB_STORE, "readwrite");
+    tx.objectStore(BB_BACKTEST_OPTIMIZATION_IDB_STORE).put(payload, "phase5");
+    tx.oncomplete = () => { db.close(); resolve(true); };
+    tx.onerror = () => { db.close(); reject(tx.error || new Error("Phase 5 checkpoint could not be saved.")); };
+  })).catch(e => {
+    console.warn("[Backtest Lab] Phase 5 checkpoint save failed:", e);
+    return false;
+  });
+}
+function bbBtGetPhase5Checkpoint() {
+  return bbBtOpenDataIDB().then(db => new Promise((resolve, reject) => {
+    const req = db.transaction(BB_BACKTEST_OPTIMIZATION_IDB_STORE, "readonly")
+      .objectStore(BB_BACKTEST_OPTIMIZATION_IDB_STORE).get("phase5");
+    req.onsuccess = () => { db.close(); resolve(req.result || null); };
+    req.onerror = () => { db.close(); reject(req.error || new Error("Phase 5 checkpoint could not be restored.")); };
+  })).catch(() => null);
+}
+function bbBtDeletePhase5Checkpoint() {
+  return bbBtOpenDataIDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(BB_BACKTEST_OPTIMIZATION_IDB_STORE, "readwrite");
+    tx.objectStore(BB_BACKTEST_OPTIMIZATION_IDB_STORE).delete("phase5");
+    tx.oncomplete = () => { db.close(); resolve(true); };
+    tx.onerror = () => { db.close(); reject(tx.error || new Error("Phase 5 checkpoint could not be deleted.")); };
+  })).catch(() => false);
+}
 function bbBtOptimizationProgressText(p) {
   if (!p) return "Idle";
   if (p.status === "completed") return "Optimization complete";
@@ -5893,7 +6139,7 @@ function bbBtSetOptimizationProgress(patch) {
     const pct = total ? Math.min(100, evaluated / total * 100) : 0;
     const bestScore = p.bestValidationScore == null ? "—" : Number(p.bestValidationScore).toFixed(4);
     host.innerHTML = `
-      <div style="font-weight:800;font-size:12px;letter-spacing:.08em;text-transform:uppercase">Optimization</div>
+      <div style="font-weight:800;font-size:12px;letter-spacing:.08em;text-transform:uppercase">${String(p.phase||"").startsWith("phase5") ? "Phase 5 Verification" : "Optimization"}</div>
       <div style="font-size:13px;margin-top:3px"><b>${p.phase || "Idle"}</b> · ${evaluated.toLocaleString()} / ${total.toLocaleString()}</div>
       <div style="height:8px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin:7px 0 5px">
         <div style="height:100%;width:${pct.toFixed(2)}%;background:#16a34a;transition:width .15s ease"></div>
@@ -7200,31 +7446,22 @@ function renderBacktestPanel(){
     const btn=document.getElementById("bbBtPhase5Btn");
     if(btn)btn.disabled=true;
     try{
-      // Rebuild validation from durable uploads so this action works after a
-      // page reload even when both native file inputs say "no file selected".
+      if(l.running) return;
       if(l.games?.length && l.odds?.length) bbBtValidate();
       if(!l.validation?.ready) throw new Error("Persisted games/odds are not valid yet. Run Validate Data once.");
       if(!l.results?.champion) throw new Error("Run Optimization to completion before Phase 5.");
-      bbBtSetOptimizationProgress({
-        status:"running", phase:"phase5_verification", evaluated:0, total:1,
-        best:l.results.champion.hash||null,
-        bestValidationScore:l.results.champion.validationScore??null,
-        resumeAvailable:false
-      });
       renderBacktestPanel();
-      const report=bbBtRunPhase5Verification();
-      bbBtSetOptimizationProgress({
-        status:"completed", phase:"complete", evaluated:1, total:1,
-        best:l.results.champion.hash||null,
-        bestValidationScore:l.results.champion.validationScore??null,
-        resumeAvailable:false, lastSavedAt:Date.now()
-      });
-      bbBtSaveState();
-      renderBacktestPanel();
+      const report=await bbBtRunPhase5Verification({parityFixtures:30,chunkSize:20});
       console.info("[Backtest Lab] Phase 5 complete", report);
     }catch(e){
       console.error("[Backtest Lab] Phase 5 failed:",e);
-      l.progress=Object.assign({},l.progress||{},{status:"paused",phase:"phase5_verification",resumeAvailable:true,lastError:String(e.message||e)});
+      l.progress=Object.assign({},l.progress||{},{
+        status:"paused",phase:"phase5_verification",resumeAvailable:true,
+        lastError:String(e.message||e),lastSavedAt:Date.now()
+      });
+      if(typeof l.phase5CheckpointFn==="function"){
+        try{ await l.phase5CheckpointFn(); }catch(_){}
+      }
       bbBtSetOptimizationProgress(l.progress);
       bbBtSaveState();
       renderBacktestPanel();
@@ -7240,42 +7477,33 @@ window.renderBacktestPanel=renderBacktestPanel;
 
 document.addEventListener("visibilitychange", () => {
   const l = window.__BB_BACKTEST_LAB;
-  if (document.visibilityState === "hidden" && l?.running && typeof l.optimizationCheckpointFn === "function") {
-    l.optimizationCheckpointFn("running").catch?.(()=>{});
+  if (document.visibilityState === "hidden" && l?.running) {
+    if(typeof l.phase5CheckpointFn==="function") l.phase5CheckpointFn().catch?.(()=>{});
+    if(typeof l.optimizationCheckpointFn==="function") l.optimizationCheckpointFn("running").catch?.(()=>{});
   }
 });
 window.addEventListener("pagehide", () => {
   const l = window.__BB_BACKTEST_LAB;
-  if (l?.running && typeof l.optimizationCheckpointFn === "function") {
-    l.optimizationCheckpointFn("running").catch?.(()=>{});
+  if (l?.running) {
+    if(typeof l.phase5CheckpointFn==="function") l.phase5CheckpointFn().catch?.(()=>{});
+    if(typeof l.optimizationCheckpointFn==="function") l.optimizationCheckpointFn("running").catch?.(()=>{});
   }
 });
 
 bbBtLoadState();
 bbBtRestoreUploads().then(async () => {
   const l = window.__BB_BACKTEST_LAB;
-  // If an optimization was completed before automatic Phase 5 verification was
-  // added, finish verification once the persisted datasets/state are restored.
-  // bbBtRestoreUploads() has already rebuilt validation from the durable raw files.
-  if (l?.validation?.ready && l?.results?.champion && !l?.phase5) {
+  // Resume Phase 5 from its durable checkpoint after Safari/page suspension.
+  // A completed optimization is never rerun.
+  if (l?.validation?.ready && l?.results?.champion) {
     try {
-      bbBtSetOptimizationProgress({
-        status:"running", phase:"phase5_verification", evaluated:0, total:1,
-        best:l.results.champion.hash||null,
-        bestValidationScore:l.results.champion.validationScore??null,
-        resumeAvailable:false
-      });
-      bbBtRunPhase5Verification();
-      bbBtSetOptimizationProgress({
-        status:"completed", phase:"complete", evaluated:1, total:1,
-        best:l.results.champion.hash||null,
-        bestValidationScore:l.results.champion.validationScore??null,
-        resumeAvailable:false, lastSavedAt:Date.now()
-      });
-      bbBtSaveState();
+      const phase5Checkpoint=await bbBtGetPhase5Checkpoint();
+      if(phase5Checkpoint || !l.phase5){
+        await bbBtRunPhase5Verification({parityFixtures:30,chunkSize:20});
+      }
       renderBacktestPanel();
     } catch (e) {
-      console.warn("Automatic Phase 5 verification failed:", e);
+      console.warn("Automatic Phase 5 verification/resume failed:", e);
     }
   }
 }).catch(e => {
