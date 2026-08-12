@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2811,6 +2812,166 @@ function bbBtRunPhase5Verification(options={}) {
 window.bbBtRunPhase5Verification=bbBtRunPhase5Verification;
 window.bbBtRunParitySuite=bbBtRunParitySuite;
 window.bbBtPlateauAnalysis=bbBtPlateauAnalysis;
+
+/* ============================================================================
+ * NBA VERIFIED CONFIG v1 — PHASE 6
+ * Finalize only after Phase 5 verification. No forced activation is allowed.
+ * The 2026 holdout remains protected and is never used to tune the config.
+ * ========================================================================== */
+const NBA_VERIFIED_CONFIG_V1_VERSION = "NBA VERIFIED CONFIG v1";
+const NBA_VERIFIED_CONFIG_V1_STORAGE_KEY = "NBA_VERIFIED_CONFIG_V1";
+const NBA_VERIFIED_CONFIG_V1_ACTIVE_KEY = "NBA_VERIFIED_CONFIG_V1_ACTIVE";
+
+function bbBtPhase6Gate(lab) {
+  if (!lab || !lab.validation || !lab.validation.ready) {
+    return { ok:false, reason:"Validated user-uploaded games and odds are required." };
+  }
+  if (!lab.results || !lab.results.champion || !lab.results.champion.config) {
+    return { ok:false, reason:"Phase 4 optimization has not produced a champion." };
+  }
+  if (!lab.phase5 || !lab.phase5.verified) {
+    return { ok:false, reason:"Phase 5 verification has not passed." };
+  }
+  if (!lab.phase5.holdoutProtected || lab.phase5.holdoutSeason !== "2026") {
+    return { ok:false, reason:"Protected 2026 holdout requirement is not satisfied." };
+  }
+  if (!lab.phase5.parity || !lab.phase5.parity.ok) {
+    return { ok:false, reason:"Engine/backtest parity has not passed." };
+  }
+  if (!lab.phase5.plateau || !(lab.phase5.plateau.reached || lab.results.plateauReached)) {
+    return { ok:false, reason:"Search plateau has not been established." };
+  }
+  if (!lab.results.holdoutAcceptable) {
+    return { ok:false, reason:"Champion has not passed the protected 2026 holdout gate." };
+  }
+  const seasons = lab.validation.seasons || {};
+  for (const s of BB_BACKTEST_ALLOWED_SEASONS) {
+    if (!seasons[s] || Number(seasons[s]) <= 0) {
+      return { ok:false, reason:"Required season is missing: " + s };
+    }
+  }
+  return { ok:true };
+}
+
+function bbBtFinalizeVerifiedConfigV1() {
+  const lab = window.__BB_BACKTEST_LAB;
+  const gate = bbBtPhase6Gate(lab);
+  if (!gate.ok) return gate;
+
+  const champion = lab.results.champion;
+  const phase5 = lab.phase5;
+  const payload = {
+    name: NBA_VERIFIED_CONFIG_V1_VERSION,
+    version: "v1",
+    labVersion: BB_BACKTEST_LAB_VERSION,
+    status: "VERIFIED_PENDING_ACTIVATION",
+    dataRule: {
+      source: "user uploads only",
+      seasons: BB_BACKTEST_ALLOWED_SEASONS.slice(),
+      training: "2024/25",
+      validation: "2025/26",
+      holdout: "2026"
+    },
+    configuration: JSON.parse(JSON.stringify(champion.config)),
+    championHash: champion.hash,
+    baseline: {
+      hash: lab.results.baseline?.hash || null,
+      trainScore: lab.results.baseline?.trainScore ?? null,
+      validationScore: lab.results.baseline?.validationScore ?? null,
+      holdoutScore: lab.results.baseline?.holdoutScore ?? null
+    },
+    candidate: {
+      trainScore: champion.trainScore ?? null,
+      validationScore: champion.validationScore ?? null,
+      holdoutScore: phase5.champion?.holdoutScore ?? lab.results.holdoutScore ?? null
+    },
+    holdoutGate: phase5.holdoutGate,
+    parity: phase5.parity,
+    plateau: phase5.plateau,
+    stability: phase5.stability,
+    search: {
+      samples: lab.results.samples ?? null,
+      seed: lab.results.seed ?? null,
+      testedConfigurations: lab.results.testedConfigurations?.length || 0,
+      dataHash: lab.results.dataHash || phase5.dataHash || null
+    },
+    generatedAt: new Date().toISOString()
+  };
+
+  try {
+    localStorage.setItem(NBA_VERIFIED_CONFIG_V1_STORAGE_KEY, JSON.stringify(payload));
+    window.__BB_BACKTEST_LAB.verifiedConfigV1 = payload;
+    return { ok:true, payload };
+  } catch (e) {
+    return { ok:false, reason:"Unable to persist NBA VERIFIED CONFIG v1: " + (e?.message || String(e)) };
+  }
+}
+
+function bbBtActivateVerifiedConfigV1() {
+  let payload;
+  try { payload = JSON.parse(localStorage.getItem(NBA_VERIFIED_CONFIG_V1_STORAGE_KEY) || "null"); } catch (_) {}
+  if (!payload || payload.name !== NBA_VERIFIED_CONFIG_V1_VERSION || payload.status !== "VERIFIED_PENDING_ACTIVATION") {
+    return { ok:false, reason:"NBA VERIFIED CONFIG v1 has not been finalized." };
+  }
+
+  const lab = window.__BB_BACKTEST_LAB;
+  const gate = bbBtPhase6Gate(lab);
+  if (!gate.ok || lab.results.champion.hash !== payload.championHash) {
+    return { ok:false, reason:gate.ok ? "Champion changed after finalization; re-finalize v1." : gate.reason };
+  }
+
+  const stamp = new Date().toISOString();
+  const applied = [];
+  const failed = [];
+  BB_BACKTEST_CONFIG_KEYS.forEach(key => {
+    if (!Object.prototype.hasOwnProperty.call(payload.configuration, key)) return;
+    if (typeof setTunableParam !== "function") { failed.push(key); return; }
+    const ok = setTunableParam(key, payload.configuration[key], "nba", stamp);
+    (ok ? applied : failed).push(key);
+  });
+
+  if (failed.length) {
+    return { ok:false, reason:"v1 activation failed for parameters: " + failed.join(", "), applied };
+  }
+
+  payload.status = "ACTIVE";
+  payload.activatedAt = stamp;
+  payload.activation = { league:"nba", appliedKeys:applied.slice(), failedKeys:[] };
+  try {
+    localStorage.setItem(NBA_VERIFIED_CONFIG_V1_STORAGE_KEY, JSON.stringify(payload));
+    localStorage.setItem(NBA_VERIFIED_CONFIG_V1_ACTIVE_KEY, "1");
+    window.__BB_BACKTEST_LAB.verifiedConfigV1 = payload;
+    return { ok:true, payload };
+  } catch (e) {
+    return { ok:false, reason:"v1 activation persisted incompletely: " + (e?.message || String(e)) };
+  }
+}
+
+function bbBtGetVerifiedConfigV1() {
+  try { return JSON.parse(localStorage.getItem(NBA_VERIFIED_CONFIG_V1_STORAGE_KEY) || "null"); }
+  catch (_) { return null; }
+}
+
+function bbBtExportVerifiedConfigV1() {
+  const finalized = bbBtFinalizeVerifiedConfigV1();
+  if (!finalized.ok) return finalized;
+  const activated = bbBtActivateVerifiedConfigV1();
+  if (!activated.ok) return activated;
+  const blob = new Blob([JSON.stringify(activated.payload, null, 2)], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "NBA_VERIFIED_CONFIG_v1.json";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  return activated;
+}
+
+window.bbBtPhase6Gate = bbBtPhase6Gate;
+window.bbBtFinalizeVerifiedConfigV1 = bbBtFinalizeVerifiedConfigV1;
+window.bbBtActivateVerifiedConfigV1 = bbBtActivateVerifiedConfigV1;
+window.bbBtGetVerifiedConfigV1 = bbBtGetVerifiedConfigV1;
+window.bbBtExportVerifiedConfigV1 = bbBtExportVerifiedConfigV1;
+
 
 </script>
  <header class="app-header">
@@ -6006,7 +6167,7 @@ function renderBacktestPanel(){
       <label style="margin-left:8px">Historical Odds <input id="bbBtOddsFile" type="file" accept=".csv,.json"></label></div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button id="bbBtValidateBtn" type="button">Validate Data</button><button id="bbBtBaselineBtn" type="button">Run Baseline</button>
-        <button id="bbBtOptimizeBtn" type="button">Run Optimization</button><button id="bbBtExportBtn" type="button">Export Final Config</button>
+        <button id="bbBtOptimizeBtn" type="button">Run Optimization</button><button id="bbBtExportBtn" type="button">Finalize + Lock v1</button>
       </div>
     </div>
     <div id="bbBtDataSummary">${bbBtRenderSummary(v)}</div>
@@ -6023,7 +6184,7 @@ function renderBacktestPanel(){
     bbBtValidate();renderBacktestPanel();}catch(e){alert("Backtest data error: "+e.message);}});
   bind("bbBtBaselineBtn",()=>{if(!l.validation?.ready){alert("Validate both datasets first.");return;}const c=bbBtConfigFromRegistry(),s=bbBtSplit(l.matched);const tr=bbBtEvaluateConfig(s.train,c),va=bbBtEvaluateConfig(s.validation,c),ho=bbBtEvaluateConfig(s.holdout,c);l.results={baseline:{hash:bbBtConfigHash(c),config:c,train:tr,validation:va,holdout:ho,trainScore:bbBtJointScore(tr),validationScore:bbBtJointScore(va),holdoutScore:bbBtJointScore(ho)},baselineHoldout:ho,holdout:ho,holdoutScore:bbBtJointScore(ho),samples:1,champion:null,holdoutAcceptable:false,generatedAt:new Date().toISOString(),dataHash:bbBtDataHash(l.matched)};l.champion=null;bbBtSaveState();renderBacktestPanel();});
   bind("bbBtOptimizeBtn",async()=>{if(!l.validation?.ready){alert("Validate both datasets first.");return;}if(l.running)return;l.running=true;try{await bbBtOptimize(l.matched,{samples:5000,seed:20260812});bbBtSaveState();}catch(e){console.error(e);alert("Optimization failed: "+e.message);}finally{l.running=false;renderBacktestPanel();}});
-  bind("bbBtExportBtn",()=>{const c=l.champion?.config;if(!c||!l.results?.holdoutAcceptable||!l.phase5?.verified){alert("Phase 5 verification has not passed. Run the protected holdout, parity, and plateau verification first.");return;}const payload={name:"NBA VERIFIED CONFIG v1",version:BB_BACKTEST_LAB_VERSION,dataRule:{seasons:BB_BACKTEST_ALLOWED_SEASONS,source:"user uploads only"},config:c,championHash:l.champion.hash,validationScore:l.champion.validationScore,holdoutScore:l.results?.holdoutScore,holdoutAcceptable:true,dataHash:l.results?.dataHash,search:{samples:l.results?.samples,seed:l.results?.seed,history:l.results?.history,plateauReached:l.results?.plateauReached},generatedAt:new Date().toISOString()};const blob=new Blob([JSON.stringify(payload,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="nba_verified_config_v1.json";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);});
+  bind("bbBtExportBtn",()=>{const out=bbBtExportVerifiedConfigV1();if(!out.ok)alert("NBA VERIFIED CONFIG v1 not activated: "+out.reason);else{bbBtSaveState();renderBacktestPanel();}});
 }
 window.renderBacktestPanel=renderBacktestPanel;
 bbBtLoadState();
