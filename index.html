@@ -1,3 +1,4 @@
+Z
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5558,6 +5559,12 @@ function buildCompleteConfig(league, partial) {
  * Older valid seasons are excluded before row-level validation.
  * ========================================================================== */
 /* ============================================================================
+ * PHASE 3.2 — WIDE ODDS ADAPTER + TEAM/DATE MATCHING REPAIR
+ * The supplied odds CSV is wide-format. It is normalized into the internal
+ * market-row representation without external data supplementation.
+ * Exact duplicate odds rows are removed; matching uses date + normalized teams.
+ * ========================================================================== */
+/* ============================================================================
  * NBA BACKTEST LAB v1
  * Replaces all legacy backtest/search code.
  * Data boundary: user uploads only; eligible seasons are 2024/25, 2025/26, 2026.
@@ -5604,6 +5611,43 @@ function bbBtNorm(v) {
   return bbBtText(v).toLowerCase().replace(/&/g, "and")
     .replace(/[^a-z0-9]+/g, " ").replace(/\bthe\b/g, "").replace(/\s+/g, " ").trim();
 }
+
+const BB_BACKTEST_TEAM_ALIASES = Object.freeze({
+  atl: "atl", atlanta: "atl", atlantahawks: "atl",
+  bkn: "bkn", brooklyn: "bkn", brooklynnets: "bkn",
+  bos: "bos", boston: "bos", bostonceltics: "bos",
+  cha: "cha", charlotte: "cha", charlottehornets: "cha",
+  chi: "chi", chicago: "chi", chicagobulls: "chi",
+  cle: "cle", cleveland: "cle", clevelandcavaliers: "cle",
+  dal: "dal", dallas: "dal", dallaswavericks: "dal", dallasmavericks: "dal",
+  den: "den", denver: "den", denvernuggets: "den",
+  det: "det", detroit: "det", detroitpistons: "det",
+  gs: "gs", goldenstate: "gs", goldenstatewarriors: "gs",
+  hou: "hou", houston: "hou", houstonrockets: "hou",
+  ind: "ind", indiana: "ind", indianapacers: "ind",
+  lac: "lac", laclippers: "lac", losangelesclippers: "lac", losangelesclippers: "lac",
+  lal: "lal", lalakers: "lal", losangeleslakers: "lal",
+  mem: "mem", memphis: "mem", memphisgrizzlies: "mem",
+  mia: "mia", miami: "mia", miamiheat: "mia",
+  mil: "mil", milwaukee: "mil", milwaukeebucks: "mil",
+  min: "min", minnesota: "min", minnesotatimberwolves: "min",
+  no: "no", neworleans: "no", neworleanspelicans: "no",
+  ny: "ny", newyork: "ny", newyorkknicks: "ny",
+  okc: "okc", oklahoma: "okc", oklahomacity: "okc", oklahomacitythunder: "okc",
+  orl: "orl", orlando: "orl", orlandomagic: "orl",
+  phi: "phi", philadelphia: "phi", philadelphia76ers: "phi", philadelphiasixers: "phi",
+  phx: "phx", phoenix: "phx", phoenixsuns: "phx",
+  por: "por", portland: "por", portlandtrailblazers: "por",
+  sa: "sa", sanantonio: "sa", sanantoniocspurs: "sa", sanantoniobspurs: "sa", sanantoniobasketball: "sa",
+  sac: "sac", sacramento: "sac", sacramentokings: "sac",
+  tor: "tor", toronto: "tor", torontoraptors: "tor",
+  utah: "utah", utahjazz: "utah",
+  was: "was", wsh: "was", washington: "was", washingtonwizards: "was"
+});
+function bbBtTeamKey(v) {
+  const compact = bbBtNorm(v).replace(/[^a-z0-9]/g, "");
+  return BB_BACKTEST_TEAM_ALIASES[compact] || compact;
+}
 function bbBtNum(v) {
   if (v === null || v === undefined || v === "") return null;
   const n = Number(String(v).replace(/,/g, "").replace(/[−–—]/g, "-"));
@@ -5611,7 +5655,10 @@ function bbBtNum(v) {
 }
 function bbBtDate(v) {
   if (!v) return null;
-  const d = new Date(v);
+  const s = bbBtText(v);
+  const prefix = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (prefix) return prefix[1];
+  const d = new Date(s);
   return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
 }
 function bbBtCanonicalSeasonLabel(v) {
@@ -5630,14 +5677,27 @@ function bbBtCanonicalSeasonLabel(v) {
 }
 function bbBtSeason(v, date) {
   const canonical = bbBtCanonicalSeasonLabel(v);
-  if (canonical === "2024/25" || canonical === "2025/26" || canonical === "2026") return canonical;
-
   const d = bbBtDate(date);
-  if (!d) return null;
-  const y = Number(d.slice(0, 4)), m = Number(d.slice(5, 7));
+  const y = d ? Number(d.slice(0, 4)) : null;
+  const m = d ? Number(d.slice(5, 7)) : null;
 
-  // The explicit 2026 holdout remains calendar-year 2026. An explicit
-  // 2025/26 season label always takes precedence over date inference.
+  // The supplied games file uses numeric season IDs:
+  //   2025 => NBA 2024/25
+  //   2026 + calendar year 2025 => NBA 2025/26
+  //   2026 + calendar year 2026 => protected 2026 holdout.
+  // Date is therefore authoritative for the split when the source season
+  // is numeric. Explicit slash-form season labels remain authoritative.
+  if (canonical === "2024/25" || canonical === "2025/26") return canonical;
+  if (canonical === "2026") {
+    if (y === 2025) return "2025/26";
+    if (y === 2026) return "2026";
+  }
+  if (canonical === "2025") return "2024/25";
+  if (canonical === "2026") {
+    if (y === 2025) return "2025/26";
+    if (y === 2026) return "2026";
+  }
+
   if (y === 2024 && m >= 10) return "2024/25";
   if (y === 2025 && m <= 6) return "2024/25";
   if (y === 2025 && m >= 10) return "2025/26";
@@ -5809,8 +5869,8 @@ async function bbBtRestoreUploads() {
 function bbBtCanonicalGame(row, index) {
   const date = bbBtDate(bbBtFirst(row, ["date","game_date","gameDate","event_date","eventDate","start_date"]));
   const homeName = bbBtTeamName(row, "home"), awayName = bbBtTeamName(row, "away");
-  const homeId = bbBtTeamId(row, "home") || bbBtNorm(homeName);
-  const awayId = bbBtTeamId(row, "away") || bbBtNorm(awayName);
+  const homeId = bbBtTeamKey(homeName);
+  const awayId = bbBtTeamKey(awayName);
   const homeScore = bbBtNum(bbBtFirst(row, ["home_score","homeScore","home_points","homePts","score_home"]));
   const awayScore = bbBtNum(bbBtFirst(row, ["away_score","awayScore","away_points","awayPts","score_away"]));
   return {
@@ -5842,53 +5902,183 @@ function bbBtCanonicalGame(row, index) {
 }
 function bbBtCanonicalOdds(row, index) {
   const date = bbBtDate(bbBtFirst(row, ["date","game_date","gameDate","event_date","eventDate"]));
-  const home = bbBtTeamName(row, "home"), away = bbBtTeamName(row, "away");
-  const marketRaw = bbBtText(bbBtFirst(row, ["market","market_type","marketType","bet_type","type"])).toLowerCase();
-  const market = marketRaw.includes("total") || marketRaw === "ou" || marketRaw === "over_under" ? "ft_total"
-    : marketRaw.includes("winner") || marketRaw === "moneyline" || marketRaw === "ml" ? "winner"
-    : marketRaw.includes("handicap") || marketRaw.includes("spread") || marketRaw === "ats" ? "handicap" : null;
-  const selection = bbBtText(bbBtFirst(row, ["selection","pick","outcome","side","team","name"]));
+  const home = bbBtText(bbBtFirst(row, ["home_team","home","home_team_name","homeTeamName"]));
+  const away = bbBtText(bbBtFirst(row, ["away_team","away","away_team_name","awayTeamName"]));
+  const num = names => bbBtNum(bbBtFirst(row, names));
   return {
-    sourceIndex:index, date, season:bbBtSeason(bbBtFirst(row,["season","season_label","seasonLabel"]),date),
-    home, away, homeNorm:bbBtNorm(home), awayNorm:bbBtNorm(away), market, selection,
-    line:bbBtNum(bbBtFirst(row,["line","market_line","handicap","spread","total_line","total"])),
-    odds:bbBtNum(bbBtFirst(row,["odds","price","decimal_odds","decimalOdds"])), raw:row
+    sourceIndex: index,
+    gameId: bbBtText(bbBtFirst(row, ["game_id","gameId","id"])),
+    date,
+    season: bbBtSeason(bbBtFirst(row, ["season","season_label","seasonLabel"]), date),
+    home,
+    away,
+    homeNorm: bbBtTeamKey(home),
+    awayNorm: bbBtTeamKey(away),
+    markets: {
+      ft_total: {
+        overLine: num(["total_over_points"]),
+        overAmericanOdds: num(["total_over_odds"]),
+        overDecimalOdds: num(["total_over_decimal_odds"]),
+        underLine: num(["total_under_points"]),
+        underAmericanOdds: num(["total_under_odds"]),
+        underDecimalOdds: num(["total_under_decimal_odds"])
+      },
+      winner: {
+        awayAmericanOdds: num(["money_away_odds"]),
+        awayDecimalOdds: num(["money_away_decimal_odds"]),
+        homeAmericanOdds: num(["money_home_odds"]),
+        homeDecimalOdds: num(["money_home_decimal_odds"])
+      },
+      handicap: {
+        awayLine: num(["spread_away_points"]),
+        awayAmericanOdds: num(["spread_away_odds"]),
+        awayDecimalOdds: num(["spread_away_decimal_odds"]),
+        homeLine: num(["spread_home_points"]),
+        homeAmericanOdds: num(["spread_home_odds"]),
+        homeDecimalOdds: num(["spread_home_decimal_odds"])
+      }
+    },
+    raw: row
   };
 }
-function bbBtGameKey(date, home, away) { return [date,bbBtNorm(home),bbBtNorm(away)].join("|"); }
-function bbBtMatchOdds(games, odds) {
-  const exact = new Map(), reverse = new Map();
-  odds.forEach(o => {
-    if (!o.date || !o.market || !o.homeNorm || !o.awayNorm) return;
-    const k = bbBtGameKey(o.date, o.home, o.away);
-    if (!exact.has(k)) exact.set(k, []);
-    exact.get(k).push(o);
-    const rk = bbBtGameKey(o.date, o.away, o.home);
-    if (!reverse.has(rk)) reverse.set(rk, []);
-    reverse.get(rk).push(Object.assign({}, o, { reversed: true }));
-  });
-  return games.map(g => {
-    const k = bbBtGameKey(g.date, g.homeName, g.awayName);
-    const direct = exact.get(k);
-    const rows = direct || (reverse.get(k) || []).map(o => {
-      const x = Object.assign({}, o, { home: g.homeName, away: g.awayName });
-      if (o.market === "winner") {
-        const s = bbBtNorm(o.selection);
-        if (s === o.awayNorm) x.selection = g.homeName;
-        else if (s === o.homeNorm) x.selection = g.awayName;
-      } else if (o.market === "handicap" && o.line != null) {
-        x.line = -Number(o.line);
-        const s = bbBtNorm(o.selection);
-        if (s === o.awayNorm) x.selection = g.homeName;
-        else if (s === o.homeNorm) x.selection = g.awayName;
-      }
-      return x;
+
+function bbBtOddsDecimalValid(v) {
+  return v != null && isFinite(Number(v)) && Number(v) > 1;
+}
+function bbBtExpandOddsSource(o, orientedHome, orientedAway) {
+  const home = orientedHome || o.home, away = orientedAway || o.away;
+  const m = o.markets || {};
+  const rows = [];
+
+  const total = m.ft_total || {};
+  if (total.overLine != null && bbBtOddsDecimalValid(total.overDecimalOdds)) {
+    rows.push({
+      sourceIndex:o.sourceIndex, gameId:o.gameId, date:o.date, home, away,
+      homeNorm:bbBtTeamKey(home), awayNorm:bbBtTeamKey(away),
+      market:"ft_total", selection:"over", line:total.overLine,
+      odds:total.overDecimalOdds, americanOdds:total.overAmericanOdds, raw:o.raw
     });
-    const markets = {};
-    BB_BACKTEST_MARKETS.forEach(m => markets[m] = rows.filter(o => o.market === m));
-    return Object.assign({}, g, { odds: markets, oddsMatched: rows.length > 0 });
+  }
+  if (total.underLine != null && bbBtOddsDecimalValid(total.underDecimalOdds)) {
+    rows.push({
+      sourceIndex:o.sourceIndex, gameId:o.gameId, date:o.date, home, away,
+      homeNorm:bbBtTeamKey(home), awayNorm:bbBtTeamKey(away),
+      market:"ft_total", selection:"under", line:total.underLine,
+      odds:total.underDecimalOdds, americanOdds:total.underAmericanOdds, raw:o.raw
+    });
+  }
+
+  const winner = m.winner || {};
+  if (bbBtOddsDecimalValid(winner.awayDecimalOdds)) {
+    rows.push({
+      sourceIndex:o.sourceIndex, gameId:o.gameId, date:o.date, home, away,
+      homeNorm:bbBtTeamKey(home), awayNorm:bbBtTeamKey(away),
+      market:"winner", selection:away, line:null,
+      odds:winner.awayDecimalOdds, americanOdds:winner.awayAmericanOdds, raw:o.raw
+    });
+  }
+  if (bbBtOddsDecimalValid(winner.homeDecimalOdds)) {
+    rows.push({
+      sourceIndex:o.sourceIndex, gameId:o.gameId, date:o.date, home, away,
+      homeNorm:bbBtTeamKey(home), awayNorm:bbBtTeamKey(away),
+      market:"winner", selection:home, line:null,
+      odds:winner.homeDecimalOdds, americanOdds:winner.homeAmericanOdds, raw:o.raw
+    });
+  }
+
+  const handicap = m.handicap || {};
+  if (handicap.awayLine != null && bbBtOddsDecimalValid(handicap.awayDecimalOdds)) {
+    rows.push({
+      sourceIndex:o.sourceIndex, gameId:o.gameId, date:o.date, home, away,
+      homeNorm:bbBtTeamKey(home), awayNorm:bbBtTeamKey(away),
+      market:"handicap", selection:away, line:handicap.awayLine,
+      odds:handicap.awayDecimalOdds, americanOdds:handicap.awayAmericanOdds, raw:o.raw
+    });
+  }
+  if (handicap.homeLine != null && bbBtOddsDecimalValid(handicap.homeDecimalOdds)) {
+    rows.push({
+      sourceIndex:o.sourceIndex, gameId:o.gameId, date:o.date, home, away,
+      homeNorm:bbBtTeamKey(home), awayNorm:bbBtTeamKey(away),
+      market:"handicap", selection:home, line:handicap.homeLine,
+      odds:handicap.homeDecimalOdds, americanOdds:handicap.homeAmericanOdds, raw:o.raw
+    });
+  }
+  return rows;
+}
+
+function bbBtReverseOddsSource(o) {
+  const m = o.markets || {};
+  return Object.assign({}, o, {
+    home:o.away, away:o.home,
+    homeNorm:o.awayNorm, awayNorm:o.homeNorm,
+    markets: {
+      ft_total: Object.assign({}, m.ft_total || {}),
+      winner: {
+        awayAmericanOdds:m.winner?.homeAmericanOdds,
+        awayDecimalOdds:m.winner?.homeDecimalOdds,
+        homeAmericanOdds:m.winner?.awayAmericanOdds,
+        homeDecimalOdds:m.winner?.awayDecimalOdds
+      },
+      handicap: {
+        awayLine:m.handicap?.homeLine,
+        awayAmericanOdds:m.handicap?.homeAmericanOdds,
+        awayDecimalOdds:m.handicap?.homeDecimalOdds,
+        homeLine:m.handicap?.awayLine,
+        homeAmericanOdds:m.handicap?.awayAmericanOdds,
+        homeDecimalOdds:m.handicap?.awayDecimalOdds
+      }
+    }
   });
 }
+
+function bbBtOddsExactSignature(o) {
+  const raw = o?.raw || {};
+  return Object.keys(raw).sort().map(k => `${k}=${String(raw[k] ?? "")}`).join("\u001f");
+}
+function bbBtDedupeOdds(odds) {
+  const exact = new Set(), byGame = new Map(), out = [], duplicateRows = 0, conflictingGameIds = [];
+  for (const o of odds) {
+    const sig = bbBtOddsExactSignature(o);
+    if (exact.has(sig)) { duplicateRows++; continue; }
+    exact.add(sig);
+    const gameIdentity = o.gameId || bbBtGameKey(o.date, o.home, o.away);
+    if (byGame.has(gameIdentity)) {
+      conflictingGameIds.push(gameIdentity);
+      continue;
+    }
+    byGame.set(gameIdentity, o);
+    out.push(o);
+  }
+  return { rows:out, duplicateRows, conflictingGameIds };
+}
+
+function bbBtMatchOdds(games, odds) {
+  const exact = new Map();
+  const reverse = new Map();
+  odds.forEach(o => {
+    if (!o.date || !o.homeNorm || !o.awayNorm) return;
+    const directKey = bbBtGameKey(o.date, o.home, o.away);
+    if (!exact.has(directKey)) exact.set(directKey, o);
+    const reverseKey = bbBtGameKey(o.date, o.away, o.home);
+    if (!reverse.has(reverseKey)) reverse.set(reverseKey, o);
+  });
+
+  return games.map(g => {
+    const k = bbBtGameKey(g.date, g.homeName, g.awayName);
+    const source = exact.get(k);
+    const reverseSource = reverse.get(k);
+    const oriented = source || (reverseSource ? bbBtReverseOddsSource(reverseSource) : null);
+    const rows = oriented ? bbBtExpandOddsSource(oriented, g.homeName, g.awayName) : [];
+    const markets = {};
+    BB_BACKTEST_MARKETS.forEach(m => markets[m] = rows.filter(o => o.market === m));
+    return Object.assign({}, g, {
+      odds: markets,
+      oddsMatched: rows.length > 0,
+      oddsSource: oriented ? oriented.gameId : null
+    });
+  });
+}
+
 function bbBtPrior(games, date, teamId, n=10) {
   const out = [];
   for (let i=games.length-1;i>=0 && out.length<n;i--) {
@@ -5983,25 +6173,25 @@ function bbBtPickSide(edge,line,league,marketKey,config) {
   return edge>0?"home":"away";
 }
 function bbBtSelectionIsHome(selection, game) {
-  const s = bbBtNorm(selection);
-  return s === bbBtNorm(game.homeName) || /^(home|h|1)$/.test(s);
+  const s = bbBtTeamKey(selection);
+  return s === bbBtTeamKey(game.homeName) || /^(home|h|1)$/.test(bbBtNorm(selection));
 }
 function bbBtSelectionOdds(rows, side, game) {
-  const wanted = side === "over" || side === "under" ? side : (side === "home" || side === "HOME" ? bbBtNorm(game.homeName) : bbBtNorm(game.awayName));
+  const wanted = side === "over" || side === "under"
+    ? side
+    : (side === "home" || side === "HOME" ? bbBtTeamKey(game.homeName) : bbBtTeamKey(game.awayName));
   return rows.find(r => {
-    const s = bbBtNorm(r.selection);
-    if (side === "over" || side === "under") return s === wanted || s.startsWith(wanted + " ");
-    return s === wanted || (side === "home" || side === "HOME" ? /^(home|h|1)$/.test(s) : /^(away|a|2)$/.test(s));
+    const s = side === "over" || side === "under" ? bbBtNorm(r.selection) : bbBtTeamKey(r.selection);
+    if (side === "over" || side === "under") return s === wanted;
+    return s === wanted || (side === "home" || side === "HOME" ? /^(home|h|1)$/.test(bbBtNorm(r.selection)) : /^(away|a|2)$/.test(bbBtNorm(r.selection)));
   }) || rows.find(r => r.odds != null) || rows[0] || null;
 }
 function bbBtNormalizeHandicapLine(row, homeSelected) {
   if (row?.line == null) return null;
-  let line = Number(row.line);
-  if (!isFinite(line)) return null;
-  // Canonical home-perspective line: home selection keeps its quoted line;
-  // away selection is sign-inverted. This preserves the odds source's line.
-  return homeSelected ? line : -line;
+  const line = Number(row.line);
+  return isFinite(line) ? line : null;
 }
+
 function bbBtGrade(results, market, f, projection, config) {
   const rows = f.odds?.[market] || [];
   if (!rows.length) return { status: "missing_odds", pick: "", line: null, odds: null };
@@ -6038,18 +6228,28 @@ function bbBtGrade(results, market, f, projection, config) {
     return { status: "settled", pick, odds: chosen?.odds ?? null, result: pick === actual ? "win" : "loss" };
   }
 
-  const first = rows.find(x => x.line != null) || rows[0];
-  const selection = bbBtNorm(first.selection);
-  const homeSelected = selection === bbBtNorm(f.homeName) || /^(home|h|1)$/.test(selection);
-  const line = bbBtNormalizeHandicapLine(first, homeSelected);
-  if (line == null) return { status: "no_play", pick: "", line: null, odds: null };
-  const edge = margin + line;
+  const homeRow = rows.find(r => bbBtSelectionIsHome(r.selection, f) && r.line != null);
+  const awayRow = rows.find(r => !bbBtSelectionIsHome(r.selection, f) && r.line != null);
+  if (!homeRow && !awayRow) return { status: "no_play", pick: "", line: null, odds: null };
+
+  // Evaluate the model edge from the home perspective against the supplied
+  // home spread. Settlement then uses the selected side's supplied line.
+  const homeLine = bbBtNormalizeHandicapLine(homeRow, true);
+  if (homeLine == null || !isFinite(margin)) return { status: "no_play", pick: "", line: homeLine, odds: null };
+  const edge = margin + homeLine;
   const pick = getMarginPick(edge, "nba", "handicap");
-  if (!pick || pick === "NO PLAY") return { status: "no_play", pick: "", line, odds: null };
+  if (!pick || pick === "NO PLAY") return { status: "no_play", pick: "", line: homeLine, odds: null };
+
   const chosen = bbBtSelectionOdds(rows, pick, f);
-  const actualCover = f.homeScore - f.awayScore + line;
+  const selectedLine = pick === "home" ? homeLine : (awayRow ? Number(awayRow.line) : -homeLine);
+  if (!isFinite(selectedLine)) return { status: "no_play", pick: "", line: homeLine, odds: null };
+
+  const actualCover = pick === "home"
+    ? (f.homeScore - f.awayScore + selectedLine)
+    : (f.awayScore - f.homeScore + selectedLine);
+
   return {
-    status: "settled", pick, line, odds: chosen?.odds ?? null,
+    status: "settled", pick, line: selectedLine, odds: chosen?.odds ?? null,
     result: Math.abs(actualCover) < 1e-9 ? "push" : (actualCover > 0 ? "win" : "loss")
   };
 }
@@ -6156,7 +6356,7 @@ async function bbBtOptimize(features,options={}){
   window.__BB_BACKTEST_LAB.results=result;window.__BB_BACKTEST_LAB.champion=best;window.__BB_BACKTEST_LAB.history=history;window.__BB_BACKTEST_LAB.testedConfigurations=tested;return result;
 }
 function bbBtValidate(){
-  const lab=window.__BB_BACKTEST_LAB, games=lab.games||[], odds=lab.odds||[];
+  const lab=window.__BB_BACKTEST_LAB, games=lab.games||[], oddsRaw=lab.odds||[];
   const counts={}; BB_BACKTEST_ALLOWED_SEASONS.forEach(s=>counts[s]=0);
   const errors=[], warnings=[];
   let excludedOlder=0, excludedInvalid=0;
@@ -6164,8 +6364,6 @@ function bbBtValidate(){
   const eligible=[];
   const gameKeyCounts=new Map();
   games.forEach((g,i)=>{
-    // Classify season before validating the rest of the row. Valid older
-    // records are EXCLUDED, not incorrectly counted as INVALID.
     if(!g.season){
       excludedInvalid++;
       errors.push(`Game ${i+1}: season missing/ambiguous`);
@@ -6179,7 +6377,7 @@ function bbBtValidate(){
     let rowInvalid = false;
     if(!g.date){ errors.push(`Game ${i+1}: missing/invalid date`); rowInvalid = true; }
     if(!g.homeName||!g.awayName){ errors.push(`Game ${i+1}: missing home/away team`); rowInvalid = true; }
-    if(g.homeName&&g.awayName&&bbBtNorm(g.homeName)===bbBtNorm(g.awayName)){
+    if(g.homeName&&g.awayName&&bbBtTeamKey(g.homeName)===bbBtTeamKey(g.awayName)){
       errors.push(`Game ${i+1}: home and away teams are identical`); rowInvalid = true;
     }
     if(g.homeScore==null||g.awayScore==null){ errors.push(`Game ${i+1}: missing final score`); rowInvalid = true; }
@@ -6197,15 +6395,32 @@ function bbBtValidate(){
 
   gameKeyCounts.forEach((n,key)=>{ if(n>1) errors.push(`Duplicate eligible game identity: ${key} (${n} rows)`); });
 
-  const normalizedOdds=[];
-  odds.forEach((o,i)=>{
-    if(!o.date) errors.push(`Odds ${i+1}: missing/invalid date`);
-    if(!o.home||!o.away) errors.push(`Odds ${i+1}: missing home/away team`);
-    if(!o.market) warnings.push(`Odds ${i+1}: unsupported market`);
-    if(o.odds==null||!isFinite(o.odds)||o.odds<=1) errors.push(`Odds ${i+1}: invalid decimal odds`);
-    if(o.market && BB_BACKTEST_MARKETS.includes(o.market) && o.line==null && o.market!=='winner')
-      errors.push(`Odds ${i+1}: ${o.market} record missing line`);
-    if(o.market && BB_BACKTEST_MARKETS.includes(o.market)) normalizedOdds.push(o);
+  const deduped = bbBtDedupeOdds(oddsRaw);
+  const normalizedOdds = deduped.rows;
+
+  if (deduped.duplicateRows) {
+    warnings.push(`Exact duplicate odds rows removed: ${deduped.duplicateRows}`);
+  }
+  if (deduped.conflictingGameIds.length) {
+    warnings.push(`Non-identical duplicate odds game IDs retained first deterministically: ${deduped.conflictingGameIds.length}`);
+  }
+
+  normalizedOdds.forEach((o,i)=>{
+    if(!o.date) errors.push(`Odds ${i+1}: missing/invalid game_date`);
+    if(!o.home||!o.away) errors.push(`Odds ${i+1}: missing home_team/away_team`);
+
+    const total=o.markets?.ft_total||{}, winner=o.markets?.winner||{}, handicap=o.markets?.handicap||{};
+    if(total.overLine==null || total.underLine==null) errors.push(`Odds ${i+1}: FT Total line missing`);
+    if(!bbBtOddsDecimalValid(total.overDecimalOdds) || !bbBtOddsDecimalValid(total.underDecimalOdds))
+      errors.push(`Odds ${i+1}: FT Total decimal odds invalid`);
+
+    if(!bbBtOddsDecimalValid(winner.homeDecimalOdds) || !bbBtOddsDecimalValid(winner.awayDecimalOdds))
+      errors.push(`Odds ${i+1}: Winner decimal odds invalid`);
+
+    if(handicap.homeLine==null || handicap.awayLine==null)
+      errors.push(`Odds ${i+1}: Handicap line missing`);
+    if(!bbBtOddsDecimalValid(handicap.homeDecimalOdds) || !bbBtOddsDecimalValid(handicap.awayDecimalOdds))
+      errors.push(`Odds ${i+1}: Handicap decimal odds invalid`);
   });
 
   const matched=bbBtMatchOdds(eligible,normalizedOdds);
@@ -6216,26 +6431,18 @@ function bbBtValidate(){
     !reverseKeys.has(bbBtGameKey(o.date,o.home,o.away))
   ).length;
 
-  const marketCounts={};
-  const marketRecords={};
-  const gamesMissingMarket={};
+  const marketCounts={}, marketRecords={}, gamesMissingMarket={};
   BB_BACKTEST_MARKETS.forEach(m=>{
     marketCounts[m]=matched.filter(g=>(g.odds[m]||[]).length>0).length;
     marketRecords[m]=matched.reduce((n,g)=>n+(g.odds[m]||[]).length,0);
     gamesMissingMarket[m]=matched.filter(g=>(g.odds[m]||[]).length===0).length;
   });
 
-  const seasonOdds={};
-  BB_BACKTEST_ALLOWED_SEASONS.forEach(s=>seasonOdds[s]=0);
+  const seasonOdds={}; BB_BACKTEST_ALLOWED_SEASONS.forEach(s=>seasonOdds[s]=0);
   normalizedOdds.forEach(o=>{
     const season=bbBtSeason(o.season,o.date);
     if(BB_BACKTEST_ALLOWED_SEASONS.includes(season)) seasonOdds[season]++;
   });
-
-  const ready = eligible.length>0 &&
-    BB_BACKTEST_ALLOWED_SEASONS.every(s=>counts[s]>0) &&
-    BB_BACKTEST_MARKETS.every(m=>marketCounts[m]>0) &&
-    errors.length===0;
 
   if(!counts['2024/25']) errors.push('No eligible 2024/25 games uploaded.');
   if(!counts['2025/26']) errors.push('No eligible 2025/26 games uploaded.');
@@ -6251,7 +6458,10 @@ function bbBtValidate(){
     excludedOlder,
     excludedInvalid,
     eligibleGames:eligible.length,
-    uploadedOdds:odds.length,
+    uploadedOdds:oddsRaw.length,
+    uniqueOddsGames:normalizedOdds.length,
+    oddsDuplicateRows:deduped.duplicateRows,
+    oddsConflictingGameIds:deduped.conflictingGameIds.length,
     oddsRecords:normalizedOdds.length,
     unmatchedOddsRecords:unmatchedOdds,
     matchedGames:matched.length,
@@ -6259,15 +6469,21 @@ function bbBtValidate(){
     marketRecords,
     gamesMissingMarket,
     seasonOdds,
+    overallCoverage:eligible.length ? matched.filter(g=>g.oddsMatched).length/eligible.length : 0,
+    seasonCoverage:Object.fromEntries(BB_BACKTEST_ALLOWED_SEASONS.map(s=>{
+      const total=counts[s]||0;
+      const hit=matched.filter(g=>g.season===s&&g.oddsMatched).length;
+      return [s,{matched:hit,total,coverage:total?hit/total:0}];
+    })),
     sourceSeasonCounts: games.reduce((acc,g)=>{const k=bbBtText(g.raw?.season||g.raw?.season_label||g.raw?.seasonLabel)||"(missing)";acc[k]=(acc[k]||0)+1;return acc;},{}),
-    oddsSourceSeasonCounts: normalizedOdds.reduce((acc,o)=>{const k=bbBtText(o.raw?.season||o.raw?.season_label||o.raw?.seasonLabel)||"(missing)";acc[k]=(acc[k]||0)+1;return acc;},{}),
+    oddsSourceSeasonCounts: normalizedOdds.reduce((acc,o)=>{const k=bbBtText(o.raw?.season||o.raw?.season_label||o.raw?.seasonLabel)||"(date-derived)";acc[k]=(acc[k]||0)+1;return acc;},{}),
     duplicateGameKeys:[...gameKeyCounts.entries()].filter(([,n])=>n>1).map(([key,n])=>({key,count:n})),
     errors:errors.slice(0,200),
     warnings:warnings.slice(0,100),
     ready:false
   };
 
-  // Readiness is evaluated after all required-market checks have been added.
+  // Missing odds are a coverage condition, not a structural validation error.
   v.ready=eligible.length>0 &&
     BB_BACKTEST_ALLOWED_SEASONS.every(s=>counts[s]>0) &&
     BB_BACKTEST_MARKETS.every(m=>marketCounts[m]>0) &&
@@ -6277,6 +6493,7 @@ function bbBtValidate(){
   lab.validation=v;
   return v;
 }
+
 function bbBtSaveState(){
   try{
     const l=window.__BB_BACKTEST_LAB;
@@ -6303,20 +6520,35 @@ function bbBtLoadState(){
 }
 function bbBtRenderSummary(v){
   if(!v)return `<div class="tracker-report-card"><b>DATA STATUS</b><div>Upload both files, then validate.</div></div>`;
-  const rows=BB_BACKTEST_ALLOWED_SEASONS.map(s=>`<div><b>${s}</b> ${v.seasonCounts[s]||0} games</div>`).join("");
-  const markets=BB_BACKTEST_MARKETS.map(m=>`<div><b>${m}</b> ${v.marketCounts[m]||0} matched games · ${v.marketRecords?.[m]||0} odds rows</div>`).join("");
+  const rows=BB_BACKTEST_ALLOWED_SEASONS.map(s=>{
+    const c=v.seasonCoverage?.[s];
+    const coverage=c ? ` · ${((c.coverage||0)*100).toFixed(2)}% odds coverage` : "";
+    return `<div><b>${s}</b> ${v.seasonCounts[s]||0} games${coverage}</div>`;
+  }).join("");
+  const markets=BB_BACKTEST_MARKETS.map(m=>`<div><b>${m}</b> ${v.marketCounts[m]||0} matched games · ${v.marketRecords?.[m]||0} market rows</div>`).join("");
   const missing=BB_BACKTEST_MARKETS.map(m=>`<div><b>${m}</b> ${v.gamesMissingMarket?.[m]||0} eligible games missing odds</div>`).join("");
-  return `<div class="tracker-report-grid"><div class="tracker-report-card"><div class="tracker-report-label">Backtest seasons</div>${rows}<div style="margin-top:6px">Excluded older: <b>${v.excludedOlder}</b> · Invalid excluded: <b>${v.excludedInvalid||0}</b></div></div>
-  <div class="tracker-report-card"><div class="tracker-report-label">Odds coverage</div>${markets}<div style="margin-top:6px">Unmatched supported odds: <b>${v.unmatchedOddsRecords??"—"}</b></div></div>
+  return `<div class="tracker-report-grid">
+  <div class="tracker-report-card"><div class="tracker-report-label">Backtest seasons</div>${rows}
+    <div style="margin-top:6px">Excluded older: <b>${v.excludedOlder}</b> · Invalid: <b>${v.excludedInvalid||0}</b></div>
+  </div>
+  <div class="tracker-report-card"><div class="tracker-report-label">Odds coverage</div>${markets}
+    <div style="margin-top:6px">Overall coverage: <b>${((v.overallCoverage||0)*100).toFixed(2)}%</b></div>
+    <div>Unmatched supplied odds games: <b>${v.unmatchedOddsRecords??"—"}</b></div>
+  </div>
   <div class="tracker-report-card"><div class="tracker-report-label">Required-market gaps</div>${missing}</div>
-  <div class="tracker-report-card"><div class="tracker-report-label">Readiness</div><b>${v.ready?"READY":"NOT READY"}</b><div>${v.errors?.length||0} errors · ${v.warnings?.length||0} warnings</div></div>
+  <div class="tracker-report-card"><div class="tracker-report-label">Readiness</div><b>${v.ready?"READY":"NOT READY"}</b>
+    <div>${v.errors?.length||0} errors · ${v.warnings?.length||0} warnings</div>
+  </div>
   <div class="tracker-report-card"><div class="tracker-report-label">Uploaded datasets</div>
     <div>Games rows: <b>${v.uploadedGames||0}</b> · Odds rows: <b>${v.uploadedOdds||0}</b></div>
-    <div>Supported odds rows: <b>${v.oddsRecords||0}</b></div>
+    <div>Unique odds games: <b>${v.uniqueOddsGames||0}</b> · Exact duplicates removed: <b>${v.oddsDuplicateRows||0}</b></div>
     <div>Stored uploads survive page rerenders/device suspension when IndexedDB is available.</div>
   </div>
-  <div class="tracker-report-card"><div class="tracker-report-label">Data boundary</div><div>USER UPLOADS ONLY</div><div>No external historical supplementation.</div></div></div>`;
+  <div class="tracker-report-card"><div class="tracker-report-label">Data boundary</div>
+    <div>USER UPLOADS ONLY</div><div>No external historical supplementation.</div>
+  </div></div>`;
 }
+
 function bbBtMetricCard(label,m){
   if(!m)return `<div class="tracker-report-card"><div class="tracker-report-label">${label}</div>—</div>`;
   return `<div class="tracker-report-card"><div class="tracker-report-label">${label}</div><b>${m.wins}-${m.losses}-${m.pushes}</b><div>Win %: ${m.winRate==null?"—":(m.winRate*100).toFixed(2)+"%"} · N: ${m.selections}</div><div>Coverage: ${m.coverage} · ROI: ${m.roi==null?"—":(m.roi*100).toFixed(2)+"%"}</div></div>`;
