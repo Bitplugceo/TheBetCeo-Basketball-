@@ -1,4 +1,3 @@
-A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2576,6 +2575,243 @@ body.dark-mode .tracker-analytics-section-head {
     if (e.key === 'Enter') tryUnlock();
   });
 })();
+
+/* ============================================================
+   PHASE 5 — VERIFICATION / HOLDOUT / PARITY / PLATEAU
+   2026 is read-only during verification. No search function
+   receives holdout data for candidate selection.
+   ============================================================ */
+const BB_PHASE5_VERSION = "5.0";
+const BB_PHASE5_MIN_HOLDOUT_DECISIVE = 30;
+const BB_PHASE5_MAX_TRAIN_HOLDOUT_GAP = 0.12;
+const BB_PHASE5_MIN_VALIDATION_SCORE_RATIO = 0.98;
+
+function bbBtMetricDecisive(m) {
+  return Number(m && m.decisive || 0);
+}
+function bbBtMetricWinRate(m) {
+  return m && isFinite(m.winRate) ? Number(m.winRate) : null;
+}
+function bbBtCompareMetrics(a, b) {
+  const out = {};
+  BB_BACKTEST_MARKETS.forEach(m => {
+    const x = a && a[m] || {}, y = b && b[m] || {};
+    out[m] = {
+      winRateDelta: bbBtMetricWinRate(x) == null || bbBtMetricWinRate(y) == null ? null :
+        bbBtMetricWinRate(x) - bbBtMetricWinRate(y),
+      roiDelta: x.roi == null || y.roi == null ? null : Number(x.roi) - Number(y.roi),
+      decisiveA: bbBtMetricDecisive(x),
+      decisiveB: bbBtMetricDecisive(y)
+    };
+  });
+  return out;
+}
+
+/*
+ * True parity check: execute the same production computeFTProjection
+ * path twice under the same historical fixture context, once through
+ * the Backtest adapter and once through a direct engine invocation.
+ * The adapter must not maintain a second mathematical projection.
+ */
+function bbBtParityCheckFixture(f, config) {
+  const eps = 1e-9;
+  const snapshot = {
+    context: AppState.context.data,
+    teams: { A: selectedTeamIds.A, B: selectedTeamIds.B },
+    series: window.__btSeriesOverride,
+    ref: window.__BB_BACKTEST_REFERENCE_DATE,
+    fixture: window.__BB_BACKTEST_FIXTURE_META
+  };
+  try {
+    bbBtOverrideConfig(config);
+    AppState.context.data = {};
+    bbBtSetEngineContext(f);
+    selectedTeamIds.A = f.homeId;
+    selectedTeamIds.B = f.awayId;
+    window.__BB_BACKTEST_REFERENCE_DATE = f.date;
+    window.__BB_BACKTEST_FIXTURE_META = {
+      homeId:f.homeId, awayId:f.awayId, eventDate:f.date,
+      eventId:"phase5_"+f.sourceIndex
+    };
+
+    const parsed = {
+      aFTScored:f.priorA.map(x=>x.scored),
+      bFTScored:f.priorB.map(x=>x.scored),
+      aFTAllowed:f.priorA.map(x=>x.allowed),
+      bFTAllowed:f.priorB.map(x=>x.allowed),
+      aFTH2H:f.h2h.map(x=>x.scoreA),
+      bFTH2H:f.h2h.map(x=>x.scoreB)
+    };
+    const lines = {ftLine:f.totalLine,aLine:f.homeLine,bLine:f.awayLine};
+    const args = {
+      league:"nba", parsed, lines, injMultA:1, injMultB:1,
+      config:{restDaysA:f.derivedRestA,restDaysB:f.derivedRestB}
+    };
+
+    const adapter = bbBtEngineProjection(f, config).projection;
+    const direct = computeFTProjection(args);
+
+    const fields = ["ftProj","projAFT","projBFT","ftEdge","aEdge","bEdge"];
+    const diffs = {};
+    let ok = true;
+    fields.forEach(k => {
+      const a = Number(adapter && adapter[k]), b = Number(direct && direct[k]);
+      const same = (isFinite(a) && isFinite(b) && Math.abs(a-b) <= eps) ||
+                   (!isFinite(a) && !isFinite(b));
+      diffs[k] = {adapter:a,direct:b,diff:isFinite(a)&&isFinite(b)?a-b:null,ok:same};
+      if (!same) ok = false;
+    });
+
+    return {ok, sourceIndex:f.sourceIndex, date:f.date,
+      home:f.homeName, away:f.awayName, differences:diffs};
+  } catch (e) {
+    return {ok:false, sourceIndex:f && f.sourceIndex, error:String(e && e.message || e)};
+  } finally {
+    AppState.context.data=snapshot.context;
+    selectedTeamIds.A=snapshot.teams.A; selectedTeamIds.B=snapshot.teams.B;
+    window.__btSeriesOverride=snapshot.series;
+    window.__BB_BACKTEST_REFERENCE_DATE=snapshot.ref;
+    window.__BB_BACKTEST_FIXTURE_META=snapshot.fixture;
+    bbBtOverrideConfig(null);
+  }
+}
+
+function bbBtRunParitySuite(features, config, limit) {
+  const eligible = (features || []).filter(f =>
+    f && f.homeScore != null && f.awayScore != null &&
+    f.priorA && f.priorA.length >= 3 && f.priorB && f.priorB.length >= 3
+  );
+  const max = Math.max(1, Number(limit) || 30);
+  const fixtures = eligible.slice(0, max);
+  const checks = fixtures.map(f => bbBtParityCheckFixture(f, config));
+  return {
+    version:BB_PHASE5_VERSION,
+    checked:checks.length,
+    passed:checks.filter(x=>x.ok).length,
+    failed:checks.filter(x=>!x.ok),
+    ok:checks.length > 0 && checks.every(x=>x.ok)
+  };
+}
+
+function bbBtEvaluateVerification(config, features) {
+  const split = bbBtSplit(features || []);
+  const train = bbBtEvaluateConfig(split.train, config);
+  const validation = bbBtEvaluateConfig(split.validation, config);
+  const holdout = bbBtEvaluateConfig(split.holdout, config);
+  return {
+    config,
+    hash:bbBtConfigHash(config),
+    train, validation, holdout,
+    trainScore:bbBtJointScore(train),
+    validationScore:bbBtJointScore(validation),
+    holdoutScore:bbBtJointScore(holdout)
+  };
+}
+
+function bbBtHoldoutGate(v, baseline) {
+  const h=v && v.holdout, b=baseline && baseline.holdout;
+  if(!h || !b) return {ok:false,reason:"Missing holdout or baseline evaluation"};
+  const perMarket={};
+  let allSamples=true, allNonCollapse=true;
+  BB_BACKTEST_MARKETS.forEach(m=>{
+    const hm=h[m]||{}, bm=b[m]||{};
+    const n=bbBtMetricDecisive(hm);
+    const wr=bbBtMetricWinRate(hm);
+    const baseWr=bbBtMetricWinRate(bm);
+    const gap=(v.train && v.train[m] && wr!=null) ? bbBtMetricWinRate(v.train[m])-wr : null;
+    const sampleOk=n>=BB_PHASE5_MIN_HOLDOUT_DECISIVE;
+    const nonCollapse=wr!=null && wr>=0.50;
+    const gapOk=gap==null || gap<=BB_PHASE5_MAX_TRAIN_HOLDOUT_GAP;
+    perMarket[m]={decisive:n,winRate:wr,baselineWinRate:baseWr,trainHoldoutGap:gap,
+      sampleOk,nonCollapse,gapOk};
+    if(!sampleOk) allSamples=false;
+    if(!nonCollapse || !gapOk) allNonCollapse=false;
+  });
+  const validationStable = isFinite(v.validationScore) && isFinite(baseline.validationScore) &&
+    v.validationScore >= baseline.validationScore * BB_PHASE5_MIN_VALIDATION_SCORE_RATIO;
+  const scoreOk = isFinite(v.holdoutScore) && isFinite(b.holdoutScore) &&
+    v.holdoutScore >= b.holdoutScore;
+  return {
+    ok:allSamples && allNonCollapse && validationStable && scoreOk,
+    perMarket, allSamples, allNonCollapse, validationStable, scoreOk,
+    reason: allSamples && allNonCollapse && validationStable && scoreOk ? null :
+      "Holdout/validation gate failed"
+  };
+}
+
+function bbBtPlateauAnalysis(result, minWindow) {
+  const history=(result && result.history)||[];
+  const windowSize=Math.max(100,Number(minWindow)||1000);
+  const recent=history.slice(-windowSize);
+  const scores=recent.map(x=>Number(x.validationScore)).filter(isFinite);
+  if(scores.length<windowSize) return {reached:false,windowSize,observations:scores.length,improvement:null};
+  const first=Math.max(...scores.slice(0,Math.floor(scores.length/2)));
+  const second=Math.max(...scores.slice(Math.floor(scores.length/2)));
+  const improvement=second-first;
+  return {
+    reached:improvement <= 0.005,
+    windowSize, observations:scores.length, improvement,
+    firstHalfBest:first, secondHalfBest:second
+  };
+}
+
+function bbBtRunPhase5Verification(options={}) {
+  const lab=window.__BB_BACKTEST_LAB;
+  if(!lab || !lab.validation || !lab.validation.ready)
+    throw new Error("Phase 5 requires validated uploaded games and odds.");
+  if(!lab.results || !lab.results.champion)
+    throw new Error("Phase 5 requires a completed Phase 4 optimization.");
+
+  const result=lab.results;
+  const baseline=bbBtEvaluateVerification(result.baseline.config, lab.matched);
+  const champion=bbBtEvaluateVerification(result.champion.config, lab.matched);
+
+  // 2026 is evaluated here only. It is never passed to the search/refinement logic.
+  const holdoutGate=bbBtHoldoutGate(champion, baseline);
+  const parity=bbBtRunParitySuite(lab.matched, champion.config, options.parityFixtures || 30);
+  const plateau=bbBtPlateauAnalysis(result, options.plateauWindow || 1000);
+
+  const stability={
+    trainValidationGap: champion.trainScore!=null && champion.validationScore!=null ?
+      champion.trainScore-champion.validationScore : null,
+    validationHoldoutGap: champion.validationScore!=null && champion.holdoutScore!=null ?
+      champion.validationScore-champion.holdoutScore : null,
+    marketComparison:bbBtCompareMetrics(champion.holdout, baseline.holdout)
+  };
+
+  const verified=!!(
+    holdoutGate.ok &&
+    parity.ok &&
+    (plateau.reached || result.plateauReached) &&
+    result.testedConfigurations &&
+    result.testedConfigurations.length > 0
+  );
+
+  const report={
+    version:BB_PHASE5_VERSION,
+    generatedAt:new Date().toISOString(),
+    dataHash:bbBtDataHash(lab.matched),
+    baseline,
+    champion,
+    holdoutGate,
+    parity,
+    plateau,
+    stability,
+    verified,
+    holdoutProtected:true,
+    optimizationSeasons:["2024/25","2025/26"],
+    holdoutSeason:"2026"
+  };
+  lab.phase5=report;
+  lab.results.phase5=report;
+  bbBtSaveState();
+  return report;
+}
+
+window.bbBtRunPhase5Verification=bbBtRunPhase5Verification;
+window.bbBtRunParitySuite=bbBtRunParitySuite;
+window.bbBtPlateauAnalysis=bbBtPlateauAnalysis;
+
 </script>
  <header class="app-header">
   <span class="brand-name">TheBetCeo ⚡️</span>
@@ -5466,34 +5702,20 @@ function bbBtSelectionIsHome(selection, game) {
   return s === bbBtNorm(game.homeName) || /^(home|h|1)$/.test(s);
 }
 function bbBtSelectionOdds(rows, side, game) {
-  const wanted = side === "over" || side === "under" ? side : (side === "home" ? bbBtNorm(game.homeName) : bbBtNorm(game.awayName));
+  const wanted = side === "over" || side === "under" ? side : (side === "home" || side === "HOME" ? bbBtNorm(game.homeName) : bbBtNorm(game.awayName));
   return rows.find(r => {
     const s = bbBtNorm(r.selection);
     if (side === "over" || side === "under") return s === wanted || s.startsWith(wanted + " ");
-    if (side === "HOME") return s === wanted || /^(home|h|1)$/.test(s);
-    return s === wanted || /^(away|a|2)$/.test(s);
-  }) || rows.find(r => r.odds != null) || rows[0] || null;
-}
-function bbBtNormalizeHandicapLine(row, homeSelected) {
-  if (row?.line == null) return null;
-  const line = Number(row.line);
-  if (!isFinite(line)) return null;
-  return homeSelected ? line : -line;
-}
-function bbBtSelectionOdds(rows, side, game) {
-  const wanted = side === "over" || side === "under" ? side : (side === "HOME" ? bbBtNorm(game.homeName) : bbBtNorm(game.awayName));
-  return rows.find(r => {
-    const s = bbBtNorm(r.selection);
-    return s === wanted || s.startsWith(wanted + " ");
+    return s === wanted || (side === "home" || side === "HOME" ? /^(home|h|1)$/.test(s) : /^(away|a|2)$/.test(s));
   }) || rows.find(r => r.odds != null) || rows[0] || null;
 }
 function bbBtNormalizeHandicapLine(row, homeSelected) {
   if (row?.line == null) return null;
   let line = Number(row.line);
   if (!isFinite(line)) return null;
-  if (homeSelected && line > 0) line = -line;
-  if (!homeSelected && line < 0) line = -line;
-  return line;
+  // Canonical home-perspective line: home selection keeps its quoted line;
+  // away selection is sign-inverted. This preserves the odds source's line.
+  return homeSelected ? line : -line;
 }
 function bbBtGrade(results, market, f, projection, config) {
   const rows = f.odds?.[market] || [];
@@ -5567,141 +5789,188 @@ function bbBtEvaluateConfig(features,config,includeMarkets=true) {
   };
   return {ft_total:metric(buckets.ft_total),winner:metric(buckets.winner),handicap:metric(buckets.handicap),evaluated:features.length};
 }
-function bbBtJointScore(metrics) {
-  const ms=BB_BACKTEST_MARKETS.map(m=>metrics[m]).filter(x=>x&&x.decisive>=30);
-  if(ms.length<3)return null;
-  const wr=ms.map(x=>x.winRate), cov=ms.map(x=>Math.min(1,x.decisive/200));
-  const stability=1-Math.min(1,Math.max(0,Math.max(...wr)-Math.min(...wr))*2);
-  return (wr.reduce((a,b)=>a+b,0)/wr.length)*0.75+(cov.reduce((a,b)=>a+b,0)/cov.length)*0.15+stability*0.10;
-}
-function bbBtSplit(features){
-  const by={}; features.forEach(f=>(by[f.season]||(by[f.season]=[])).push(f));
-  return {train:(by["2024/25"]||[]).slice(),validation:(by["2025/26"]||[]).slice(),holdout:(by["2026"]||[]).slice()};
-}
-function bbBtConfigHash(config){let s=JSON.stringify(config),h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return (h>>>0).toString(16).padStart(8,"0");}
+const BB_BACKTEST_CURRENT_SEARCH_LEADER = Object.freeze({
+  h2hFactor:1.00,h2hMaxWeight:0.23,h2hLookbackSeasons:1,
+  h2hDecayCurrent:0.72,h2hDecayMinus1:0.68,h2hDecayMinus2:0.25,h2hDecayOlder:0.05,
+  recencyWeights:[1.45,1.25,1.00,0.80,0.60,0.45,0.32,0.22,0.15,0.10],
+  teamWeightBase:0.67,venueMinGames:6,venueModerateWeight:0.51,venueStrongWeight:0.72,
+  venueStrongGames:6,advancedBlendWeight:0.45,quarterVenueProxyFactor:1.0,volatilityLimit:12,
+  fatigueB2BPenalty:-6.0,extremeExpansion:1.32,confidenceAThresh:0.66,confidenceBThresh:0.58,
+  confidenceCThresh:0.51,edgeFTPointThreshold:2.8,edgeWinnerPointThreshold:8.1,
+  edgeHandicapPointThreshold:5.0,underEdgeFactor:1.2,injuryOppBoostFactor:0.20,
+  h1VolScale:1.0,teamVolScale:1.0,quarterVolScale:1.0
+});
+
 function bbBtConfigFromRegistry() {
-  const c = Object.assign({}, BB_BACKTEST_DEFAULT_CONFIG);
-  BB_BACKTEST_CONFIG_KEYS.forEach(k => {
-    if (Object.prototype.hasOwnProperty.call(c, k)) return;
-    const v = typeof getParam === "function" ? getParam(k, "nba") : undefined;
-    if (v !== undefined && v !== null) c[k] = v;
+  const c={};
+  BB_BACKTEST_CONFIG_KEYS.forEach(k=>{
+    let v;
+    try { v=typeof getParam==='function'?getParam(k,'nba'):undefined; } catch (_) {}
+    if(v!==undefined&&v!==null)c[k]=Array.isArray(v)?v.slice():v;
+    else if(Object.prototype.hasOwnProperty.call(BB_BACKTEST_DEFAULT_CONFIG,k)){
+      const d=BB_BACKTEST_DEFAULT_CONFIG[k]; c[k]=Array.isArray(d)?d.slice():d;
+    }
   });
   return c;
 }
-function bbBtSearchSpace(base){
-  const around=(k,vals)=>vals;
-  return {
-    h2hFactor:[0.7,0.85,1],h2hMaxWeight:[0.15,0.20,0.23,0.30,0.35],h2hLookbackSeasons:[1,2,3,4],
-    h2hDecayCurrent:[0.72,0.85,1],h2hDecayMinus1:[0.55,0.68,0.8,0.9],h2hDecayMinus2:[0.25,0.4,0.6],h2hDecayOlder:[0.05,0.15,0.3],
-    recencyWeights:[
-      [1.45,1.25,1.00,0.80,0.60,0.45,0.32,0.22,0.15,0.10],
-      [1.60,1.30,0.90,0.60,0.40,0.28,0.18,0.11,0.07,0.04],
-      [1.35,1.20,1.00,0.85,0.70,0.56,0.44,0.33,0.24,0.16]
-    ],
-    teamWeightBase:[0.55,0.6,0.65,0.67,0.7,0.75],venueMinGames:[4,6,8],venueStrongGames:[6,8,10,12],
-    venueModerateWeight:[0.35,0.45,0.51,0.6],venueStrongWeight:[0.55,0.65,0.72,0.8],advancedBlendWeight:[0,0.25,0.45,0.65],
-    volatilityLimit:[8,10,12,14,16],fatigueB2BPenalty:[-6,-5,-4,-3,-2.5,-1,0],
-    extremeExpansion:[1.1,1.2,1.32,1.4],confidenceAThresh:[0.6,0.64,0.68,0.72],
-    confidenceBThresh:[0.52,0.56,0.6],confidenceCThresh:[0.45,0.5,0.54],
-    edgeFTPointThreshold:[2.0,2.4,2.8,3.2,3.6,4.0],edgeWinnerPointThreshold:[5,6,7,8.1,9,10],
-    edgeHandicapPointThreshold:[3,4,5,6,7],underEdgeFactor:[1,1.1,1.2,1.3,1.4]
-  };
+function bbBtSearchSpace(){return {
+  h2hFactor:[0.70,0.85,1.00,1.15],h2hMaxWeight:[0.15,0.20,0.23,0.28,0.33,0.38],h2hLookbackSeasons:[1,2,3,4],
+  h2hDecayCurrent:[0.60,0.72,0.82,0.92,1.00],h2hDecayMinus1:[0.50,0.60,0.68,0.78,0.88],
+  h2hDecayMinus2:[0.15,0.25,0.40,0.55,0.70],h2hDecayOlder:[0.00,0.05,0.15,0.30,0.45],
+  recencyWeights:[[1.45,1.25,1.00,0.80,0.60,0.45,0.32,0.22,0.15,0.10],[1.60,1.30,0.90,0.60,0.40,0.28,0.18,0.11,0.07,0.04],[1.35,1.20,1.00,0.85,0.70,0.56,0.44,0.33,0.24,0.16]],
+  teamWeightBase:[0.55,0.60,0.65,0.67,0.70,0.75],venueMinGames:[4,5,6,7,8],venueStrongGames:[6,8,10,12],
+  venueModerateWeight:[0.35,0.45,0.51,0.60],venueStrongWeight:[0.55,0.65,0.72,0.80],advancedBlendWeight:[0,0.25,0.45,0.65],
+  quarterVenueProxyFactor:[0.75,1,1.15,1.30],volatilityLimit:[8,10,12,14,16],fatigueB2BPenalty:[-7,-6,-5,-4,-3,-2,0],
+  extremeExpansion:[1.10,1.20,1.32,1.40],confidenceAThresh:[0.60,0.64,0.68,0.72],confidenceBThresh:[0.52,0.56,0.60,0.64],
+  confidenceCThresh:[0.45,0.50,0.54,0.58],edgeFTPointThreshold:[2,2.4,2.8,3.2,3.6,4],
+  edgeWinnerPointThreshold:[5,6,7,8.1,9,10],edgeHandicapPointThreshold:[3,4,5,6,7],underEdgeFactor:[1,1.1,1.2,1.3,1.4],
+  injuryOppBoostFactor:[0.1,0.15,0.2,0.25,0.3],h1VolScale:[0.8,1,1.2],teamVolScale:[0.8,1,1.2],quarterVolScale:[0.8,1,1.2]
+};}
+function bbBtRng(seed){let a=seed>>>0;return()=>{a=(a+0x6D2B79F5)>>>0;let t=a;t=Math.imul(t^t>>>15,t|1);t^=t+Math.imul(t^t>>>7,t|61);return((t^t>>>14)>>>0)/4294967296;};}
+function bbBtSampleConfig(base,space,rng){const c=Object.assign({},base);Object.keys(space).forEach(k=>{const p=space[k],v=p[Math.floor(rng()*p.length)];c[k]=Array.isArray(v)?v.slice():v;});return c;}
+function bbBtConfigHash(config){const s=JSON.stringify(config);let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return(h>>>0).toString(16).padStart(8,'0');}
+function bbBtDataHash(rows){return bbBtConfigHash((rows||[]).map(g=>({date:g.date,season:g.season,home:g.homeId,away:g.awayId,homeScore:g.homeScore,awayScore:g.awayScore,odds:g.odds||{}})));}
+function bbBtJointScore(metrics){
+  const usable=BB_BACKTEST_MARKETS.map(m=>({m,x:metrics?.[m]})).filter(o=>o.x&&o.x.decisive>=30);
+  if(usable.length<3)return null;
+  const wr=usable.map(o=>o.x.winRate),mean=wr.reduce((a,b)=>a+b,0)/wr.length,worst=Math.min(...wr);
+  const coverage=usable.reduce((a,o)=>a+Math.min(1,o.x.decisive/200),0)/usable.length;
+  const rois=usable.map(o=>o.x.roi).filter(v=>v!=null&&isFinite(v));
+  const roiNorm=rois.length?Math.max(0,Math.min(1,0.5+rois.reduce((a,b)=>a+b,0)/rois.length)):0.5;
+  const stability=Math.max(0,1-Math.min(1,(Math.max(...wr)-Math.min(...wr))*2));
+  return mean*0.60+worst*0.15+coverage*0.10+roiNorm*0.10+stability*0.05;
 }
-function bbBtRng(seed){let a=seed>>>0;return()=>{a+=0x6D2B79F5;let t=a;t=Math.imul(t^t>>>15,t|1);t^=t+Math.imul(t^t>>>7,t|61);return((t^t>>>14)>>>0)/4294967296;};}
-function bbBtSampleConfig(base,space,rng){
-  const c=Object.assign({},base); Object.keys(space).forEach(k=>{const p=space[k];c[k]=p[Math.floor(rng()*p.length)];}); return c;
-}
-function bbBtDataHash(rows) {
-  const canonical = (rows || []).map(g => ({
-    date:g.date,season:g.season,home:g.homeId,away:g.awayId,homeScore:g.homeScore,awayScore:g.awayScore,
-    odds:g.odds || {}
-  }));
-  return bbBtConfigHash(canonical);
-}
-function bbBtAcceptCandidate(best,candidate,train,val){
-  if(candidate.trainScore==null||candidate.validationScore==null)return false;
+function bbBtSplit(features){const by={};features.forEach(f=>(by[f.season]||(by[f.season]=[])).push(f));return{train:(by['2024/25']||[]).slice(),validation:(by['2025/26']||[]).slice(),holdout:(by['2026']||[]).slice()};}
+function bbBtAcceptCandidate(best,candidate){
+  if(candidate.trainScore==null||candidate.validationScore==null||!candidate.validationCoverageOK)return best;
   if(best==null)return candidate;
-  if(candidate.validationScore>best.validationScore+1e-9 && candidate.trainScore>=best.trainScore-0.04)return candidate;
-  return best;
+  return candidate.validationScore>best.validationScore+1e-9&&candidate.trainScore>=best.trainScore-0.04?candidate:best;
 }
 async function bbBtOptimize(features,options={}){
-  const split=bbBtSplit(features),base=Object.assign(bbBtConfigFromRegistry(),options.baseline||{});
-  const search=bbBtSearchSpace(base),rng=bbBtRng(Number(options.seed)||20260812);
-  const samples=Math.max(100,Math.min(50000,Number(options.samples)||5000));
-  const history=[], leaderboard=[]; let best=null,plateau=0;
-  const evalOne=(c)=>{
-    const tr=bbBtEvaluateConfig(split.train,c),va=bbBtEvaluateConfig(split.validation,c);
-    const trainScore=bbBtJointScore(tr),validationScore=bbBtJointScore(va);
-    return {config:c,hash:bbBtConfigHash(c),train:tr,validation:va,trainScore,validationScore};
-  };
+  const split=bbBtSplit(features);if(!split.train.length||!split.validation.length||!split.holdout.length)throw new Error('Training, validation, and protected holdout seasons are all required.');
+  const productionBaseline=bbBtConfigFromRegistry(),base=Object.assign({},BB_BACKTEST_CURRENT_SEARCH_LEADER,options.baseline||{}),search=bbBtSearchSpace();
+  const rng=bbBtRng(Number(options.seed)||20260812),samples=Math.max(100,Math.min(50000,Number(options.samples)||5000));
+  const history=[],tested=[];let best=null,plateau=0;
+  const evaluate=(config,stage,index)=>{const tr=bbBtEvaluateConfig(split.train,config),va=bbBtEvaluateConfig(split.validation,config),r={stage,index,config,hash:bbBtConfigHash(config),train:tr,validation:va};r.trainScore=bbBtJointScore(tr);r.validationScore=bbBtJointScore(va);r.validationCoverageOK=BB_BACKTEST_MARKETS.every(m=>(va[m]?.decisive||0)>=30);return r;};
+  const leader=evaluate(base,'benchmark',0);tested.push(leader);best=bbBtAcceptCandidate(null,leader);history.push({phase:'benchmark',evaluated:1,hash:leader.hash,trainScore:leader.trainScore,validationScore:leader.validationScore});
   for(let i=0;i<samples;i++){
-    const c=bbBtSampleConfig(base,search,rng),r=evalOne(c);
-    leaderboard.push(r);
-    const old=best; best=bbBtAcceptCandidate(best,r,split.train,split.validation);
-    if(best!==old){history.push({phase:"search",evaluated:i+1,hash:r.hash,trainScore:r.trainScore,validationScore:r.validationScore});plateau=0;}
-    else plateau++;
-    window.__BB_BACKTEST_LAB.progress={phase:"broad_search",evaluated:i+1,total:samples,best:best?.hash||null,plateau};
-    if(i%5===0)await new Promise(requestAnimationFrame);
+    const r=evaluate(bbBtSampleConfig(base,search,rng),'broad_search',i+1);tested.push(r);const old=best;best=bbBtAcceptCandidate(best,r);if(best!==old){history.push({phase:'broad_search',evaluated:tested.length,hash:r.hash,trainScore:r.trainScore,validationScore:r.validationScore});plateau=0;}else plateau++;
+    window.__BB_BACKTEST_LAB.progress={phase:'broad_search',evaluated:tested.length,total:samples,best:best?.hash||null,plateau};if(i%5===0)await new Promise(requestAnimationFrame);
   }
-  leaderboard.sort((a,b)=>(b.validationScore??-Infinity)-(a.validationScore??-Infinity));
-  const finalists=leaderboard.slice(0,Math.min(25,leaderboard.length));
-  let champion=best;
-  for(let i=0;i<finalists.length;i++){
-    const c=Object.assign({},finalists[i].config);
-    const r=evalOne(c); if(r.validationScore>(champion?.validationScore??-Infinity))champion=r;
-    window.__BB_BACKTEST_LAB.progress={phase:"refinement",evaluated:samples+i+1,total:samples+finalists.length,best:champion?.hash||null,plateau};
-    await new Promise(requestAnimationFrame);
-  }
-
-  const fineCandidates=[];
-  if(champion){
-    Object.keys(search).forEach(k=>{
-      const pool=search[k], current=champion.config[k];
-      if(Array.isArray(current)) return;
-      const idx=pool.findIndex(v=>Number(v)===Number(current));
-      if(idx>=0){
-        [pool[idx-1],pool[idx+1]].forEach(v=>{if(v!==undefined)fineCandidates.push(Object.assign({},champion.config,{[k]:v}));});
-      }
-    });
-  }
-  for(let i=0;i<fineCandidates.length;i++){
-    const r=evalOne(fineCandidates[i]); leaderboard.push(r);
-    if(r.validationScore>(champion?.validationScore??-Infinity) && r.trainScore>=champion.trainScore-0.04) champion=r;
-    window.__BB_BACKTEST_LAB.progress={phase:"fine_search",evaluated:samples+finalists.length+i+1,total:samples+finalists.length+fineCandidates.length,best:champion?.hash||null,plateau};
-    await new Promise(requestAnimationFrame);
-  }
-
-  const baselineEval = evalOne(base);
-  const baselineHoldout = bbBtEvaluateConfig(split.holdout, base);
-  const holdout = champion ? bbBtEvaluateConfig(split.holdout, champion.config) : null;
-  const holdoutScore = holdout ? bbBtJointScore(holdout) : null;
-  const holdoutAcceptable = !!(champion && holdoutScore != null &&
-    baselineHoldout && bbBtJointScore(baselineHoldout) != null &&
-    holdoutScore >= bbBtJointScore(baselineHoldout) - 0.02 &&
-    BB_BACKTEST_MARKETS.every(m => (holdout[m]?.decisive || 0) >= 30 &&
-      (holdout[m]?.winRate ?? 0) >= 0.45));
-  const result={baseline:baselineEval,baselineHoldout,champion,holdout,holdoutScore,holdoutAcceptable,
-    history,leaderboard:leaderboard.slice(0,50),samples,seed:Number(options.seed)||20260812,
-    plateauReached:plateau>=Math.max(100,Number(options.plateauLimit)||1000),
-    generatedAt:new Date().toISOString(),dataHash:bbBtDataHash(window.__BB_BACKTEST_LAB.matched)};
-  result.testedConfigurations = leaderboard;
-  window.__BB_BACKTEST_LAB.results=result; window.__BB_BACKTEST_LAB.champion=champion;
-  window.__BB_BACKTEST_LAB.history=history; window.__BB_BACKTEST_LAB.testedConfigurations=leaderboard;
-  return result;
+  const ranked=tested.filter(x=>x.validationScore!=null).sort((a,b)=>(b.validationScore??-Infinity)-(a.validationScore??-Infinity)).slice(0,25);
+  const refinement=[];ranked.forEach(r=>Object.keys(search).forEach(k=>{const p=search[k],cur=r.config[k];if(Array.isArray(cur))return;const idx=p.findIndex(v=>Number(v)===Number(cur));if(idx<0)return;[idx-1,idx+1].forEach(j=>{if(j>=0&&j<p.length)refinement.push(Object.assign({},r.config,{[k]:p[j]}));});}));
+  for(let i=0;i<refinement.length;i++){const r=evaluate(refinement[i],'refinement',i+1);tested.push(r);const old=best;best=bbBtAcceptCandidate(best,r);if(best!==old){history.push({phase:'refinement',evaluated:tested.length,hash:r.hash,trainScore:r.trainScore,validationScore:r.validationScore});plateau=0;}else plateau++;window.__BB_BACKTEST_LAB.progress={phase:'refinement',evaluated:tested.length,total:samples+refinement.length,best:best?.hash||null,plateau};await new Promise(requestAnimationFrame);}
+  const fine=[];if(best)Object.keys(search).forEach(k=>{const p=search[k],cur=best.config[k];if(Array.isArray(cur))return;const idx=p.findIndex(v=>Number(v)===Number(cur));if(idx<0)return;[idx-1,idx+1].forEach(j=>{if(j>=0&&j<p.length)fine.push(Object.assign({},best.config,{[k]:p[j]}));});});
+  for(let i=0;i<fine.length;i++){const r=evaluate(fine[i],'fine_search',i+1);tested.push(r);const old=best;best=bbBtAcceptCandidate(best,r);if(best!==old){history.push({phase:'fine_search',evaluated:tested.length,hash:r.hash,trainScore:r.trainScore,validationScore:r.validationScore});plateau=0;}else plateau++;window.__BB_BACKTEST_LAB.progress={phase:'fine_search',evaluated:tested.length,total:samples+refinement.length+fine.length,best:best?.hash||null,plateau};await new Promise(requestAnimationFrame);}
+  const bt=bbBtEvaluateConfig(split.train,productionBaseline),bv=bbBtEvaluateConfig(split.validation,productionBaseline),bh=bbBtEvaluateConfig(split.holdout,productionBaseline);
+  const baseline={config:productionBaseline,hash:bbBtConfigHash(productionBaseline),train:bt,validation:bv,holdout:bh,trainScore:bbBtJointScore(bt),validationScore:bbBtJointScore(bv),holdoutScore:bbBtJointScore(bh)};
+  const holdout=best?bbBtEvaluateConfig(split.holdout,best.config):null,holdoutScore=holdout?bbBtJointScore(holdout):null;
+  const holdoutAcceptable=!!(best&&holdoutScore!=null&&BB_BACKTEST_MARKETS.every(m=>(holdout[m]?.decisive||0)>=30)&&holdoutScore>=baseline.holdoutScore-0.02);
+  const leaderboard=tested.slice().sort((a,b)=>(b.validationScore??-Infinity)-(a.validationScore??-Infinity)).slice(0,50);
+  const result={baseline,currentSearchLeader:leader,champion:best,holdout,holdoutScore,holdoutAcceptable,history,leaderboard,testedConfigurations:tested,samples,seed:Number(options.seed)||20260812,plateauReached:plateau>=Math.max(100,Number(options.plateauLimit)||1000),plateauCount:plateau,generatedAt:new Date().toISOString(),dataHash:bbBtDataHash(window.__BB_BACKTEST_LAB.matched),searchSpace:Object.fromEntries(Object.entries(search).map(([k,v])=>[k,v]))};
+  window.__BB_BACKTEST_LAB.results=result;window.__BB_BACKTEST_LAB.champion=best;window.__BB_BACKTEST_LAB.history=history;window.__BB_BACKTEST_LAB.testedConfigurations=tested;return result;
 }
 function bbBtValidate(){
-  const lab=window.__BB_BACKTEST_LAB, games=lab.games, odds=lab.odds;
-  const counts={};BB_BACKTEST_ALLOWED_SEASONS.forEach(s=>counts[s]=games.filter(g=>g.season===s).length);
-  const excluded=games.filter(g=>!BB_BACKTEST_ALLOWED_SEASONS.includes(g.season)).length;
-  const usable=games.filter(g=>BB_BACKTEST_ALLOWED_SEASONS.includes(g.season)&&g.date&&g.homeId&&g.awayId&&g.homeScore!=null&&g.awayScore!=null);
-  const matched=bbBtMatchOdds(usable,odds);
-  const gameKeys=new Set(usable.map(g=>bbBtGameKey(g.date,g.homeName,g.awayName)));
-  const reverseKeys=new Set(usable.map(g=>bbBtGameKey(g.date,g.awayName,g.homeName)));
-  const unmatchedOdds=odds.filter(o=>!gameKeys.has(bbBtGameKey(o.date,o.home,o.away))&&!reverseKeys.has(bbBtGameKey(o.date,o.home,o.away))).length;
-  const marketCounts={};BB_BACKTEST_MARKETS.forEach(m=>marketCounts[m]=matched.filter(g=>(g.odds[m]||[]).length).length);
-  const errors=[];games.forEach((g,i)=>{if(!g.date)errors.push(`Game ${i+1}: missing date`);if(!g.homeName||!g.awayName)errors.push(`Game ${i+1}: missing team`);if(g.homeScore==null||g.awayScore==null)errors.push(`Game ${i+1}: missing final score`);if(!g.season)errors.push(`Game ${i+1}: season missing/ambiguous`);});
-  const v={uploadedGames:games.length,seasonCounts:counts,excludedOlder:excluded,eligibleGames:usable.length,oddsRecords:odds.length,unmatchedOddsRecords:unmatchedOdds,matchedGames:matched.length,marketCounts,errors:errors.slice(0,100),ready:usable.length>0&&counts["2024/25"]>0&&counts["2025/26"]>0&&counts["2026"]>0};
-  lab.matched=bbBtBuildFeatures(matched);lab.validation=v;return v;
+  const lab=window.__BB_BACKTEST_LAB, games=lab.games||[], odds=lab.odds||[];
+  const counts={}; BB_BACKTEST_ALLOWED_SEASONS.forEach(s=>counts[s]=0);
+  const errors=[], warnings=[];
+  let excludedOlder=0, excludedInvalid=0;
+
+  const eligible=[];
+  const gameKeyCounts=new Map();
+  games.forEach((g,i)=>{
+    if(!g.date) errors.push(`Game ${i+1}: missing/invalid date`);
+    if(!g.homeName||!g.awayName) errors.push(`Game ${i+1}: missing home/away team`);
+    if(g.homeName&&g.awayName&&bbBtNorm(g.homeName)===bbBtNorm(g.awayName)) errors.push(`Game ${i+1}: home and away teams are identical`);
+    if(g.homeScore==null||g.awayScore==null) errors.push(`Game ${i+1}: missing final score`);
+    if(!g.season){ errors.push(`Game ${i+1}: season missing/ambiguous`); excludedInvalid++; return; }
+    if(!BB_BACKTEST_ALLOWED_SEASONS.includes(g.season)){ excludedOlder++; return; }
+    if(!g.date||!g.homeId||!g.awayId||g.homeScore==null||g.awayScore==null){ excludedInvalid++; return; }
+    counts[g.season]++;
+    const key=bbBtGameKey(g.date,g.homeName,g.awayName);
+    gameKeyCounts.set(key,(gameKeyCounts.get(key)||0)+1);
+    eligible.push(g);
+  });
+
+  gameKeyCounts.forEach((n,key)=>{ if(n>1) errors.push(`Duplicate eligible game identity: ${key} (${n} rows)`); });
+
+  const normalizedOdds=[];
+  odds.forEach((o,i)=>{
+    if(!o.date) errors.push(`Odds ${i+1}: missing/invalid date`);
+    if(!o.home||!o.away) errors.push(`Odds ${i+1}: missing home/away team`);
+    if(!o.market) warnings.push(`Odds ${i+1}: unsupported market`);
+    if(o.odds==null||!isFinite(o.odds)||o.odds<=1) errors.push(`Odds ${i+1}: invalid decimal odds`);
+    if(o.market && BB_BACKTEST_MARKETS.includes(o.market) && o.line==null && o.market!=='winner')
+      errors.push(`Odds ${i+1}: ${o.market} record missing line`);
+    if(o.market && BB_BACKTEST_MARKETS.includes(o.market)) normalizedOdds.push(o);
+  });
+
+  const matched=bbBtMatchOdds(eligible,normalizedOdds);
+  const gameKeys=new Set(eligible.map(g=>bbBtGameKey(g.date,g.homeName,g.awayName)));
+  const reverseKeys=new Set(eligible.map(g=>bbBtGameKey(g.date,g.awayName,g.homeName)));
+  const unmatchedOdds=normalizedOdds.filter(o=>
+    !gameKeys.has(bbBtGameKey(o.date,o.home,o.away)) &&
+    !reverseKeys.has(bbBtGameKey(o.date,o.home,o.away))
+  ).length;
+
+  const marketCounts={};
+  const marketRecords={};
+  const gamesMissingMarket={};
+  BB_BACKTEST_MARKETS.forEach(m=>{
+    marketCounts[m]=matched.filter(g=>(g.odds[m]||[]).length>0).length;
+    marketRecords[m]=matched.reduce((n,g)=>n+(g.odds[m]||[]).length,0);
+    gamesMissingMarket[m]=matched.filter(g=>(g.odds[m]||[]).length===0).length;
+  });
+
+  const seasonOdds={};
+  BB_BACKTEST_ALLOWED_SEASONS.forEach(s=>seasonOdds[s]=0);
+  normalizedOdds.forEach(o=>{
+    const season=bbBtSeason(o.season,o.date);
+    if(BB_BACKTEST_ALLOWED_SEASONS.includes(season)) seasonOdds[season]++;
+  });
+
+  const ready = eligible.length>0 &&
+    BB_BACKTEST_ALLOWED_SEASONS.every(s=>counts[s]>0) &&
+    BB_BACKTEST_MARKETS.every(m=>marketCounts[m]>0) &&
+    errors.length===0;
+
+  if(!counts['2024/25']) errors.push('No eligible 2024/25 games uploaded.');
+  if(!counts['2025/26']) errors.push('No eligible 2025/26 games uploaded.');
+  if(!counts['2026']) errors.push('No eligible 2026 games uploaded.');
+  BB_BACKTEST_MARKETS.forEach(m=>{
+    if(!marketCounts[m]) errors.push(`No matched historical odds for required market: ${m}`);
+  });
+
+  const v={
+    version:BB_BACKTEST_LAB_VERSION,
+    uploadedGames:games.length,
+    seasonCounts:counts,
+    excludedOlder,
+    excludedInvalid,
+    eligibleGames:eligible.length,
+    uploadedOdds:odds.length,
+    oddsRecords:normalizedOdds.length,
+    unmatchedOddsRecords:unmatchedOdds,
+    matchedGames:matched.length,
+    marketCounts,
+    marketRecords,
+    gamesMissingMarket,
+    seasonOdds,
+    duplicateGameKeys:[...gameKeyCounts.entries()].filter(([,n])=>n>1).map(([key,n])=>({key,count:n})),
+    errors:errors.slice(0,200),
+    warnings:warnings.slice(0,100),
+    ready:false
+  };
+
+  // Readiness is evaluated after all required-market checks have been added.
+  v.ready=eligible.length>0 &&
+    BB_BACKTEST_ALLOWED_SEASONS.every(s=>counts[s]>0) &&
+    BB_BACKTEST_MARKETS.every(m=>marketCounts[m]>0) &&
+    v.errors.length===0;
+
+  lab.matched=bbBtBuildFeatures(matched);
+  lab.validation=v;
+  return v;
 }
 function bbBtSaveState(){
   try{const l=window.__BB_BACKTEST_LAB;localStorage.setItem(BB_BACKTEST_STORAGE_KEY,JSON.stringify({
@@ -5714,10 +5983,12 @@ function bbBtLoadState(){
 function bbBtRenderSummary(v){
   if(!v)return `<div class="tracker-report-card"><b>DATA STATUS</b><div>Upload both files, then validate.</div></div>`;
   const rows=BB_BACKTEST_ALLOWED_SEASONS.map(s=>`<div><b>${s}</b> ${v.seasonCounts[s]||0} games</div>`).join("");
-  const markets=BB_BACKTEST_MARKETS.map(m=>`<div><b>${m}</b> ${v.marketCounts[m]||0} matched games</div>`).join("");
-  return `<div class="tracker-report-grid"><div class="tracker-report-card"><div class="tracker-report-label">Backtest seasons</div>${rows}<div style="margin-top:6px">Excluded older: <b>${v.excludedOlder}</b></div></div>
-  <div class="tracker-report-card"><div class="tracker-report-label">Odds coverage</div>${markets}<div style="margin-top:6px">Odds records: <b>${v.oddsRecords}</b> · Unmatched: <b>${v.unmatchedOddsRecords??"—"}</b></div></div>
-  <div class="tracker-report-card"><div class="tracker-report-label">Readiness</div><b>${v.ready?"READY":"NOT READY"}</b><div>${v.errors?.length||0} validation issues shown</div></div>
+  const markets=BB_BACKTEST_MARKETS.map(m=>`<div><b>${m}</b> ${v.marketCounts[m]||0} matched games · ${v.marketRecords?.[m]||0} odds rows</div>`).join("");
+  const missing=BB_BACKTEST_MARKETS.map(m=>`<div><b>${m}</b> ${v.gamesMissingMarket?.[m]||0} eligible games missing odds</div>`).join("");
+  return `<div class="tracker-report-grid"><div class="tracker-report-card"><div class="tracker-report-label">Backtest seasons</div>${rows}<div style="margin-top:6px">Excluded older: <b>${v.excludedOlder}</b> · Invalid excluded: <b>${v.excludedInvalid||0}</b></div></div>
+  <div class="tracker-report-card"><div class="tracker-report-label">Odds coverage</div>${markets}<div style="margin-top:6px">Unmatched supported odds: <b>${v.unmatchedOddsRecords??"—"}</b></div></div>
+  <div class="tracker-report-card"><div class="tracker-report-label">Required-market gaps</div>${missing}</div>
+  <div class="tracker-report-card"><div class="tracker-report-label">Readiness</div><b>${v.ready?"READY":"NOT READY"}</b><div>${v.errors?.length||0} errors · ${v.warnings?.length||0} warnings</div></div>
   <div class="tracker-report-card"><div class="tracker-report-label">Data boundary</div><div>USER UPLOADS ONLY</div><div>No external historical supplementation.</div></div></div>`;
 }
 function bbBtMetricCard(label,m){
@@ -5739,8 +6010,8 @@ function renderBacktestPanel(){
       </div>
     </div>
     <div id="bbBtDataSummary">${bbBtRenderSummary(v)}</div>
-    ${r?`<div class="tracker-report-grid"><div class="tracker-report-card"><div class="tracker-report-label">Baseline</div><div>Joint: ${r.baseline?.trainScore==null?"—":r.baseline.trainScore.toFixed(4)}</div></div>
-      <div class="tracker-report-card hero"><div class="tracker-report-label">Champion</div><div>${r.champion?.hash||"—"}</div><div>Validation: ${r.champion?.validationScore==null?"—":r.champion.validationScore.toFixed(4)}</div><div>2026 gate: <b>${r.holdoutAcceptable?"PASS":"FAIL"}</b></div></div>
+    ${r?`<div class="tracker-report-grid"><div class="tracker-report-card"><div class="tracker-report-label">Original Production Baseline</div><div>Train: ${r.baseline?.trainScore==null?"—":r.baseline.trainScore.toFixed(4)}</div><div>Validation: ${r.baseline?.validationScore==null?"—":r.baseline.validationScore.toFixed(4)}</div></div>
+      <div class="tracker-report-card hero"><div class="tracker-report-label">Champion / Search Leader</div><div>${r.champion?.hash||"—"}</div><div>Validation: ${r.champion?.validationScore==null?"—":r.champion.validationScore.toFixed(4)}</div><div>2026 gate: <b>${r.holdoutAcceptable?"PASS":"FAIL"}</b></div><div>Phase 5: <b>${l.phase5?.verified?"VERIFIED":"PENDING"}</b></div></div>
       <div class="tracker-report-card"><div class="tracker-report-label">2026 Holdout</div><div>${r.holdoutScore==null?"—":r.holdoutScore.toFixed(4)}</div></div>
       <div class="tracker-report-card"><div class="tracker-report-label">Search</div><div>${r.samples||0} configurations</div><div>${r.plateauReached?"Plateau reached":"Search completed"}</div></div></div>
       <div class="tracker-report-grid">${bbBtMetricCard("FT TOTAL · HOLDOUT",r.holdout?.ft_total)}${bbBtMetricCard("WINNER · HOLDOUT",r.holdout?.winner)}${bbBtMetricCard("HANDICAP · HOLDOUT",r.holdout?.handicap)}</div>`:""}
@@ -5750,13 +6021,9 @@ function renderBacktestPanel(){
   bind("bbBtValidateBtn",async()=>{try{const gf=document.getElementById("bbBtGamesFile")?.files?.[0],of=document.getElementById("bbBtOddsFile")?.files?.[0];
     if(gf)l.games=(await bbBtReadFile(gf)).map(bbBtCanonicalGame); if(of)l.odds=(await bbBtReadFile(of)).map(bbBtCanonicalOdds);
     bbBtValidate();renderBacktestPanel();}catch(e){alert("Backtest data error: "+e.message);}});
-  bind("bbBtBaselineBtn",()=>{if(!l.validation?.ready){alert("Validate both datasets first.");return;}const c=bbBtConfigFromRegistry(),s=bbBtSplit(l.matched);
-    const tr=bbBtEvaluateConfig(s.train,c),va=bbBtEvaluateConfig(s.validation,c),ho=bbBtEvaluateConfig(s.holdout,c);
-    l.results={baseline:{trainScore:bbBtJointScore(tr),validationScore:bbBtJointScore(va),config:c},
-      baselineHoldout:ho,holdout:ho,holdoutScore:bbBtJointScore(ho),samples:1,champion:null,holdoutAcceptable:false,
-      generatedAt:new Date().toISOString(),dataHash:bbBtDataHash(l.matched)};bbBtSaveState();renderBacktestPanel();});
+  bind("bbBtBaselineBtn",()=>{if(!l.validation?.ready){alert("Validate both datasets first.");return;}const c=bbBtConfigFromRegistry(),s=bbBtSplit(l.matched);const tr=bbBtEvaluateConfig(s.train,c),va=bbBtEvaluateConfig(s.validation,c),ho=bbBtEvaluateConfig(s.holdout,c);l.results={baseline:{hash:bbBtConfigHash(c),config:c,train:tr,validation:va,holdout:ho,trainScore:bbBtJointScore(tr),validationScore:bbBtJointScore(va),holdoutScore:bbBtJointScore(ho)},baselineHoldout:ho,holdout:ho,holdoutScore:bbBtJointScore(ho),samples:1,champion:null,holdoutAcceptable:false,generatedAt:new Date().toISOString(),dataHash:bbBtDataHash(l.matched)};l.champion=null;bbBtSaveState();renderBacktestPanel();});
   bind("bbBtOptimizeBtn",async()=>{if(!l.validation?.ready){alert("Validate both datasets first.");return;}if(l.running)return;l.running=true;try{await bbBtOptimize(l.matched,{samples:5000,seed:20260812});bbBtSaveState();}catch(e){console.error(e);alert("Optimization failed: "+e.message);}finally{l.running=false;renderBacktestPanel();}});
-  bind("bbBtExportBtn",()=>{const c=l.champion?.config;if(!c||!l.results?.holdoutAcceptable){alert("No holdout-verified champion exists.");return;}const payload={name:"NBA VERIFIED CONFIG v1",version:BB_BACKTEST_LAB_VERSION,dataRule:{seasons:BB_BACKTEST_ALLOWED_SEASONS,source:"user uploads only"},config:c,championHash:l.champion.hash,validationScore:l.champion.validationScore,holdoutScore:l.results?.holdoutScore,holdoutAcceptable:true,dataHash:l.results?.dataHash,search:{samples:l.results?.samples,seed:l.results?.seed,history:l.results?.history,plateauReached:l.results?.plateauReached},generatedAt:new Date().toISOString()};const blob=new Blob([JSON.stringify(payload,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="nba_verified_config_v1.json";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);});
+  bind("bbBtExportBtn",()=>{const c=l.champion?.config;if(!c||!l.results?.holdoutAcceptable||!l.phase5?.verified){alert("Phase 5 verification has not passed. Run the protected holdout, parity, and plateau verification first.");return;}const payload={name:"NBA VERIFIED CONFIG v1",version:BB_BACKTEST_LAB_VERSION,dataRule:{seasons:BB_BACKTEST_ALLOWED_SEASONS,source:"user uploads only"},config:c,championHash:l.champion.hash,validationScore:l.champion.validationScore,holdoutScore:l.results?.holdoutScore,holdoutAcceptable:true,dataHash:l.results?.dataHash,search:{samples:l.results?.samples,seed:l.results?.seed,history:l.results?.history,plateauReached:l.results?.plateauReached},generatedAt:new Date().toISOString()};const blob=new Blob([JSON.stringify(payload,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="nba_verified_config_v1.json";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);});
 }
 window.renderBacktestPanel=renderBacktestPanel;
 bbBtLoadState();
