@@ -1,3 +1,4 @@
+O
 
 <!DOCTYPE html>
 <html lang="en">
@@ -14167,42 +14168,91 @@ function getPick(edge, line, league, marketKey, context = {}) {
 }
 
     function selectLock(markets) {
-  const valid = markets.filter(m =>
-    m && m.pick !== "NO PLAY" && m.pick !== "—" && !isNaN(m.edge)
+  // GLOBAL LOCK CHAMPIONSHIP — only the candidates in the current output table
+  // compete.  One table/run = one World Cup = exactly one champion.
+  const candidates = Array.isArray(markets) ? markets : [];
 
-    && (m.line > 0 || isFinite(m.marginEdgePct))
+  function getLockWinProbability(m) {
+    const direct = Number(m?.winProbability);
+    if (isFinite(direct)) return direct;
+
+    // Defensive fallback: reconstruct the same calibrated probability used by
+    // the confidence layer when the value was not copied onto the selector row.
+    const marginMarket = isFinite(m?.marginEdgePct);
+    const edgePct = marginMarket
+      ? Number(m.marginEdgePct)
+      : ((Number(m?.line) > 0 && isFinite(Number(m?.edge)))
+          ? Math.abs(Number(m.edge) / Number(m.line))
+          : NaN);
+    if (!isFinite(edgePct)) return NaN;
+
+    const volLimit = Number(m?.volLimit);
+    const volatility = Number(m?.volatility);
+    const volRatio = isFinite(volatility) && isFinite(volLimit) && volLimit > 0
+      ? volatility / volLimit
+      : 0.5;
+
+    const league = m?.league || "";
+    return Number(getConfidenceWinProbability(
+      m?.confidenceGrade || m?.confidence || null,
+      edgePct,
+      volRatio,
+      m?.sampleTier || "thin",
+      !!m?.hasH2H,
+      !!m?.trap,
+      league
+    ));
+  }
+
+  const valid = candidates.filter(m =>
+    m && m.pick !== "NO PLAY" && m.pick !== "—" && isFinite(Number(m.edge))
+    && (Number(m.line) > 0 || isFinite(Number(m.marginEdgePct)))
     && !m.lockRestricted
+    && isFinite(getLockWinProbability(m))
   );
 
-  if (valid.length <= 1) return -1;
+  if (!valid.length) return -1;
+  if (valid.length === 1) return candidates.findIndex(m => m === valid[0]);
 
   const best = [...valid].sort((a, b) => {
+    const aProb = getLockWinProbability(a);
+    const bProb = getLockWinProbability(b);
+
+    // WORLD CUP RULE #1: highest calibrated prediction probability wins.
+    // This is deliberately above grade/edge so a lower-probability A cannot
+    // automatically defeat a materially stronger B prediction.
+    if (Math.abs(bProb - aProb) > 0.000001) return bProb - aProb;
+
     const aGrade = getConfidenceRank(a.confidenceGrade || a.confidence || "");
     const bGrade = getConfidenceRank(b.confidenceGrade || b.confidence || "");
     if (bGrade !== aGrade) return bGrade - aGrade;
 
-    const aEdgePct = isFinite(a.marginEdgePct)
-      ? a.marginEdgePct * 100
-      : ((a.line > 0) ? Math.abs(a.edge / a.line) * 100 : 0);
-    const bEdgePct = isFinite(b.marginEdgePct)
-      ? b.marginEdgePct * 100
-      : ((b.line > 0) ? Math.abs(b.edge / b.line) * 100 : 0);
-
-    const aFullModelBonus = a.fullModel ? 0.6 : 0;
-    const bFullModelBonus = b.fullModel ? 0.6 : 0;
-
-    const aMassacreBonus = isFinite(Number(a.lockStrength)) ? Number(a.lockStrength) : 0;
-    const bMassacreBonus = isFinite(Number(b.lockStrength)) ? Number(b.lockStrength) : 0;
-
-    const aLockScore = aEdgePct + aFullModelBonus + aMassacreBonus;
-    const bLockScore = bEdgePct + bFullModelBonus + bMassacreBonus;
-
-    if (Math.abs(bLockScore - aLockScore) > 0.0001) return bLockScore - aLockScore;
+    const aEdgePct = isFinite(Number(a.marginEdgePct))
+      ? Number(a.marginEdgePct) * 100
+      : ((Number(a.line) > 0) ? Math.abs(Number(a.edge) / Number(a.line)) * 100 : 0);
+    const bEdgePct = isFinite(Number(b.marginEdgePct))
+      ? Number(b.marginEdgePct) * 100
+      : ((Number(b.line) > 0) ? Math.abs(Number(b.edge) / Number(b.line)) * 100 : 0);
     if (Math.abs(bEdgePct - aEdgePct) > 0.0001) return bEdgePct - aEdgePct;
-    return Math.abs(b.edge) - Math.abs(a.edge);
+
+    // Championship tie-breakers only.  These do not override probability.
+    if (!!b.fullModel !== !!a.fullModel) return b.fullModel ? 1 : -1;
+    if (!!b.hasH2H !== !!a.hasH2H) return b.hasH2H ? 1 : -1;
+
+    const aVolRatio = isFinite(Number(a.volatility)) && isFinite(Number(a.volLimit)) && Number(a.volLimit) > 0
+      ? Number(a.volatility) / Number(a.volLimit) : Infinity;
+    const bVolRatio = isFinite(Number(b.volatility)) && isFinite(Number(b.volLimit)) && Number(b.volLimit) > 0
+      ? Number(b.volatility) / Number(b.volLimit) : Infinity;
+    if (Math.abs(aVolRatio - bVolRatio) > 0.0001) return aVolRatio - bVolRatio;
+
+    const aStrength = isFinite(Number(a.lockStrength)) ? Number(a.lockStrength) : 0;
+    const bStrength = isFinite(Number(b.lockStrength)) ? Number(b.lockStrength) : 0;
+    if (Math.abs(bStrength - aStrength) > 0.0001) return bStrength - aStrength;
+
+    return Math.abs(Number(b.edge)) - Math.abs(Number(a.edge));
   })[0];
 
-  return markets.findIndex(m => m === best);
+  return candidates.findIndex(m => m === best);
 }
 
 function computeMarginProjection(teamAProj, teamBProj) {
@@ -19944,7 +19994,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
     const isWnbaRun = league === "wnba" || league === "wnba_pre";
     const isManualLeagueRun = !isNbaOrNcaa;
 
-    const wnbaAllowedMarkets   = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "winner", "handicap", "handicap_h1", "handicap_h2"]);
+    const wnbaAllowedMarkets   = new Set(["ft", "h1", "team_a", "team_b", "q1", "q2", "q3", "q4", "winner", "handicap_h1", "handicap_h2"]);
     const nbaAllowedMarkets    = new Set(["ft", "h1", "h2", "team_a", "team_b", "q1", "q2", "q3", "q4", "h1_team_a", "h1_team_b", "winner", "handicap"]);
     const manualAllowedMarkets = new Set(["ft", "h1", "h2", "team_a", "team_b", "q1", "q2", "q3", "q4", "h1_team_a", "h1_team_b", "winner", "handicap"]);
 
@@ -20121,66 +20171,25 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
       pick: p.pick,
       fullModel: p.fullModel,
       confidence: p.confidence,
+      confidenceGrade: p.confidenceGrade || p.confidence,
+      winProbability: p.winProbability,
+      sampleTier: p.sampleTier,
+      hasH2H: p.hasH2H,
+      volatility: p.volatility,
+      volLimit: p.volLimit,
+      trap: p.trap,
+      league: p.league || league,
+      marketKey: p.marketKey,
       lockStrength: p.lockStrength,
       lockRestricted: !!p.lockRestricted,
 
       marginEdgePct: p.marginEdgePct
     })));
 
-    const _existingLockedPick = (AppState.tracker.state.activePicks || []).find(p =>
-      p && p.eventId && fixtureMeta?.eventId && String(p.eventId) === String(fixtureMeta.eventId) &&
-      p.isLock && String(p.resultStatus || "pending").toLowerCase() === "pending"
-    );
-    if (_existingLockedPick) {
-      const _stillValidIdx = finalPicksForDisplay.findIndex(p =>
-        p && p.marketKey === _existingLockedPick.marketKey && p.pick !== "NO PLAY" && !p.lockRestricted
-      );
-      const _newLockPick = lockIdx >= 0 ? finalPicksForDisplay[lockIdx] : null;
-      if (_stillValidIdx === -1) {
-        engineDebug("lock hysteresis: previous lock market no longer valid, allowing flip", {
-          eventId: fixtureMeta.eventId,
-          previousLockMarket: _existingLockedPick.marketKey,
-          newLockMarket: _newLockPick?.marketKey || null,
-          previousConfigFingerprint: _existingLockedPick.configFingerprint || "unknown",
-          newConfigFingerprint: getLiveConfigFingerprint(league)
-        });
-      } else if (!_newLockPick) {
-        engineDebug("lock hysteresis: no fresh candidate this run, keeping standing lock", {
-          eventId: fixtureMeta.eventId,
-          keptLockMarket: _existingLockedPick.marketKey
-        });
-        lockIdx = _stillValidIdx;
-      } else if (_newLockPick.marketKey !== _existingLockedPick.marketKey) {
-        const _oldRank = getConfidenceRank(_existingLockedPick.confidenceGrade);
-        const _newRank = getConfidenceRank(_newLockPick.confidence);
-        const _oldEdgePct = isFinite(Number(_existingLockedPick.edgePct)) ? Math.abs(Number(_existingLockedPick.edgePct)) : 0;
-        const _newEdgePctRaw = isFinite(_newLockPick.marginEdgePct)
-          ? _newLockPick.marginEdgePct * 100
-          : ((isFinite(_newLockPick.displayLineUsed ?? _newLockPick.line) && (_newLockPick.displayLineUsed ?? _newLockPick.line) > 0)
-              ? Math.abs((_newLockPick.displayEdge ?? _newLockPick.edge) / (_newLockPick.displayLineUsed ?? _newLockPick.line)) * 100
-              : 0);
-        const LOCK_FLIP_EDGE_MARGIN = 2.0;
-        const _decisiveFlip = _newRank > _oldRank || (_newRank === _oldRank && _newEdgePctRaw >= _oldEdgePct + LOCK_FLIP_EDGE_MARGIN);
-        if (_decisiveFlip) {
-          engineDebug("lock hysteresis: new candidate decisively beats standing lock, flipping", {
-            eventId: fixtureMeta.eventId,
-            previousLockMarket: _existingLockedPick.marketKey, previousGrade: _existingLockedPick.confidenceGrade, previousEdgePct: _oldEdgePct,
-            newLockMarket: _newLockPick.marketKey, newGrade: _newLockPick.confidence, newEdgePct: _newEdgePctRaw,
-            previousConfigFingerprint: _existingLockedPick.configFingerprint || "unknown",
-            newConfigFingerprint: getLiveConfigFingerprint(league)
-          });
-        } else {
-          engineDebug("lock hysteresis: standing lock retained, new candidate not a decisive improvement", {
-            eventId: fixtureMeta.eventId,
-            keptLockMarket: _existingLockedPick.marketKey, keptGrade: _existingLockedPick.confidenceGrade, keptEdgePct: _oldEdgePct,
-            candidateMarket: _newLockPick.marketKey, candidateGrade: _newLockPick.confidence, candidateEdgePct: _newEdgePctRaw,
-            previousConfigFingerprint: _existingLockedPick.configFingerprint || "unknown",
-            newConfigFingerprint: getLiveConfigFingerprint(league)
-          });
-          lockIdx = _stillValidIdx;
-        }
-      }
-    }
+    // No lock hysteresis: the current output table is re-championed on every run.
+    // A newly generated candidate may take the single Lock immediately if it wins
+    // the World Cup ranking above. Historical tracker state must not override the
+    // strongest candidate in the current table.
 
     const displayablePicks = finalPicksForDisplay;
 
