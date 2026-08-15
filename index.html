@@ -1,5 +1,3 @@
-Q
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2234,14 +2232,57 @@ body.dark-mode .tracker-analytics-section-head {
   display: table;
 }
 
+.league-trust-desktop-table .tracker-analytics-table {
+  table-layout: fixed;
+}
+
+.league-trust-desktop-table th:nth-child(1),
+.league-trust-desktop-table td:nth-child(1) {
+  width: 13%;
+}
+
 .league-trust-desktop-table th:nth-child(2),
-.league-trust-desktop-table td:nth-child(2),
-.league-trust-desktop-table th:nth-child(8),
-.league-trust-desktop-table td:nth-child(8) {
-  width: auto;
-  max-width: none;
+.league-trust-desktop-table td:nth-child(2) {
+  width: 9%;
   text-align: center;
   white-space: nowrap;
+}
+
+.league-trust-desktop-table th:nth-child(3),
+.league-trust-desktop-table td:nth-child(3),
+.league-trust-desktop-table th:nth-child(4),
+.league-trust-desktop-table td:nth-child(4),
+.league-trust-desktop-table th:nth-child(5),
+.league-trust-desktop-table td:nth-child(5),
+.league-trust-desktop-table th:nth-child(6),
+.league-trust-desktop-table td:nth-child(6) {
+  width: 7%;
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: keep-all;
+  hyphens: none;
+}
+
+.league-trust-desktop-table th:nth-child(7),
+.league-trust-desktop-table td:nth-child(7) {
+  width: 8%;
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: keep-all;
+  hyphens: none;
+}
+
+.league-trust-desktop-table th:nth-child(8),
+.league-trust-desktop-table td:nth-child(8) {
+  width: 9%;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.league-trust-desktop-table th:nth-child(9),
+.league-trust-desktop-table td:nth-child(9) {
+  width: 33%;
+  white-space: normal;
 }
 
 .league-trust-mobile-list {
@@ -7076,7 +7117,7 @@ function getLeagueTrustMeta(league) {
       mode: "full",
       dataMode,
       guidance: dataMode === "manual"
-        ? "Full plays are allowed based on model tuning, but this league has no automated data feed — stats must be entered manually (see SofaScore lookup). Double-check inputs before playing."
+        ? "Full plays allowed via model tuning. No automated feed — enter stats manually (SofaScore) and double-check before playing."
         : "Full plays are allowed. Keep monitoring record and checkpoint review."
     };
   }
@@ -9786,6 +9827,40 @@ function rebuildTrackerStats() {
   return AppState.tracker.state.stats;
 }
 
+function repairMisclassifiedNoPlayTrackedPicks(activeList, archivedList) {
+  const marginMarkets = new Set(["winner", "handicap", "handicap_h1", "handicap_h2"]);
+  let repaired = 0;
+  [activeList, archivedList].forEach(list => {
+    if (!Array.isArray(list)) return;
+    list.forEach(p => {
+      if (!p || p.predictionText !== "NO PLAY") return;
+      const grade = String(p.confidenceGrade || p.confidence || "").toUpperCase();
+      if (!grade || grade === "—" || grade === "NAN") return;
+      const edgeVal = Number(p.rawEdge ?? p.edge);
+      const lineVal = Number(p.rawLine ?? p.line);
+      if (!isFinite(edgeVal) || !isFinite(lineVal) || lineVal <= 0) return;
+      const isMargin = marginMarkets.has(p.marketKey);
+      const fixedPick = isMargin
+        ? getMarginPick(edgeVal, p.league, p.marketKey)
+        : getPick(edgeVal, lineVal, p.league, p.marketKey, {});
+      if (!fixedPick || fixedPick === "NO PLAY") return;
+      p.predictionText = formatMarginPickForDisplay(
+        fixedPick,
+        p.marketKey,
+        p.homeTeam || "Team A",
+        p.awayTeam || "Team B",
+        lineVal
+      );
+      p.smartLineRepaired = true;
+      repaired++;
+    });
+  });
+  if (repaired > 0) {
+    engineDebug("Repaired mis-tagged NO PLAY tracked picks (smart-line/advisory sync bug)", { repaired });
+  }
+  return repaired;
+}
+
 function normalizeTrackerState(raw) {
   const remoteLineMemory = raw?.lineMemory && typeof raw.lineMemory === "object"
     ? raw.lineMemory
@@ -9802,6 +9877,7 @@ function normalizeTrackerState(raw) {
         .slice(0, TRACKER_ARCHIVED_LIMIT)
     : [];
   const reconciled = reconcileTrackerBucketConflicts(normalizedActive, normalizedArchived);
+  repairMisclassifiedNoPlayTrackedPicks(reconciled.activePicks, reconciled.archivedPicks);
 
    AppState.tracker.state = {
     vId: raw?.vId || Date.now(),
@@ -18334,7 +18410,7 @@ function getSampleTierForMarket(market, dx = {}) {
     smartLineMeta: null,
     side,
     predictionText: formatMarginPickForDisplay(
-      pickRow.displayPick || pickRow.pick,
+      pickRow.bufferedPickText || pickRow.displayPick || pickRow.pick,
       marketKey,
       (fixtureMeta.homeTeam && fixtureMeta.homeTeam !== "—") ? fixtureMeta.homeTeam : "Team A",
       (fixtureMeta.awayTeam && fixtureMeta.awayTeam !== "—") ? fixtureMeta.awayTeam : "Team B",
@@ -18444,7 +18520,7 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
           marketKey: marketKeyFromLogic,
           side: _snapSide,
           line: Number(p.displayLineUsed ?? p.line),
-          predictionText: p.displayPick || p.pick,
+          predictionText: p.bufferedPickText || p.displayPick || p.pick,
           confidence: p.confidence || "—",
           eventDate: fixtureMeta.eventDate || "",
           homeTeam: fixtureMeta.homeTeam || "",
@@ -20085,6 +20161,22 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
       }
 
       if (p.leagueTrust?.mode === "advisory" && p.pick !== "NO PLAY" && p.confidence && p.confidence !== "NaN" && p.confidence !== "—") {
+        if (p.smartLineNoPlay) {
+          const advisoryGrade = String(p.confidence || "").toUpperCase();
+          const advisoryIsStrongGrade = advisoryGrade === "A" || advisoryGrade === "B";
+          if (advisoryIsStrongGrade) {
+            p.note = (p.note ? p.note + " · " : "") +
+              "Smart-line: edge fails at unfavourable end of entered range — treat as lean / verify actual line.";
+            p.displayPick = p.pick;
+            p.bufferedPickText = p.pick;
+          } else {
+            p.pick = "NO PLAY";
+            p.confidence = "—";
+            p.displayPick = "NO PLAY";
+            p.bufferedPickText = "NO PLAY";
+          }
+          return;
+        }
 
         return;
       }
