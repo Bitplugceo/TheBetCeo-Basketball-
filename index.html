@@ -1,4 +1,3 @@
-G
 
 <!DOCTYPE html>
 <html lang="en">
@@ -1500,13 +1499,19 @@ body.dark-mode .tracker-analytics-panel {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 96px;
-  padding: 4px 8px;
+  min-width: 0;
+  max-width: 64px;
+  width: 100%;
+  padding: 3px 4px;
   border: 1px solid var(--table-border);
-  font-size: 10px;
+  font-size: 8px;
+  line-height: 1.15;
   font-weight: 800;
   text-transform: uppercase;
-  letter-spacing: 0.4px;
+  letter-spacing: 0.2px;
+  text-align: center;
+  white-space: normal;
+  overflow-wrap: break-word;
 }
 
 .league-trust-pill.trust-trusted {
@@ -2219,13 +2224,22 @@ body.dark-mode .tracker-analytics-section-head {
 }
 
 .league-trust-pill {
-  font-size: 9px;
-  line-height: 1.1;
-  padding: 4px 6px;
+  font-size: 8px;
+  line-height: 1.15;
+  padding: 3px 4px;
 }
 
 .league-trust-desktop-table {
   display: table;
+}
+
+.league-trust-desktop-table th:nth-child(2),
+.league-trust-desktop-table td:nth-child(2),
+.league-trust-desktop-table th:nth-child(8),
+.league-trust-desktop-table td:nth-child(8) {
+  width: 64px;
+  max-width: 64px;
+  text-align: center;
 }
 
 .league-trust-mobile-list {
@@ -14173,6 +14187,12 @@ function getPick(edge, line, league, marketKey, context = {}) {
     function selectLock(markets) {
   // GLOBAL LOCK CHAMPIONSHIP — only the candidates in the current output table
   // compete.  One table/run = one World Cup = exactly one champion.
+  //
+  // Modeled as a literal knockout bracket: every valid candidate takes a turn
+  // challenging the reigning champion using playMatch() below. The champion
+  // has to beat every single challenger, one match at a time, all the way
+  // through to the final — exactly like a real World Cup run. The rules for
+  // who wins a given head-to-head never change; only how we apply them does.
   const candidates = Array.isArray(markets) ? markets : [];
 
   function getLockWinProbability(m) {
@@ -14217,45 +14237,61 @@ function getPick(edge, line, league, marketKey, context = {}) {
   if (!valid.length) return -1;
   if (valid.length === 1) return candidates.findIndex(m => m === valid[0]);
 
-  const best = [...valid].sort((a, b) => {
-    const aProb = getLockWinProbability(a);
-    const bProb = getLockWinProbability(b);
+  // Head-to-head match: given the reigning champion and the next challenger,
+  // decide who advances. Same criteria/order as before, just applied one
+  // match at a time instead of buried inside a single global sort.
+  function playMatch(champion, challenger) {
+    const champProb = getLockWinProbability(champion);
+    const challProb = getLockWinProbability(challenger);
 
-    // WORLD CUP RULE #1: highest calibrated prediction probability wins.
-    // This is deliberately above grade/edge so a lower-probability A cannot
-    // automatically defeat a materially stronger B prediction.
-    if (Math.abs(bProb - aProb) > 0.000001) return bProb - aProb;
+    // MATCH RULE #1: highest calibrated prediction probability wins.
+    // This is deliberately above grade/edge so a lower-probability team
+    // cannot automatically beat a materially stronger opponent.
+    if (Math.abs(challProb - champProb) > 0.000001) {
+      return challProb > champProb ? challenger : champion;
+    }
 
-    const aGrade = getConfidenceRank(a.confidenceGrade || a.confidence || "");
-    const bGrade = getConfidenceRank(b.confidenceGrade || b.confidence || "");
-    if (bGrade !== aGrade) return bGrade - aGrade;
+    const champGrade = getConfidenceRank(champion.confidenceGrade || champion.confidence || "");
+    const challGrade = getConfidenceRank(challenger.confidenceGrade || challenger.confidence || "");
+    if (challGrade !== champGrade) return challGrade > champGrade ? challenger : champion;
 
-    const aEdgePct = isFinite(Number(a.marginEdgePct))
-      ? Number(a.marginEdgePct) * 100
-      : ((Number(a.line) > 0) ? Math.abs(Number(a.edge) / Number(a.line)) * 100 : 0);
-    const bEdgePct = isFinite(Number(b.marginEdgePct))
-      ? Number(b.marginEdgePct) * 100
-      : ((Number(b.line) > 0) ? Math.abs(Number(b.edge) / Number(b.line)) * 100 : 0);
-    if (Math.abs(bEdgePct - aEdgePct) > 0.0001) return bEdgePct - aEdgePct;
+    const champEdgePct = isFinite(Number(champion.marginEdgePct))
+      ? Number(champion.marginEdgePct) * 100
+      : ((Number(champion.line) > 0) ? Math.abs(Number(champion.edge) / Number(champion.line)) * 100 : 0);
+    const challEdgePct = isFinite(Number(challenger.marginEdgePct))
+      ? Number(challenger.marginEdgePct) * 100
+      : ((Number(challenger.line) > 0) ? Math.abs(Number(challenger.edge) / Number(challenger.line)) * 100 : 0);
+    if (Math.abs(challEdgePct - champEdgePct) > 0.0001) {
+      return challEdgePct > champEdgePct ? challenger : champion;
+    }
 
-    // Championship tie-breakers only.  These do not override probability.
-    if (!!b.fullModel !== !!a.fullModel) return b.fullModel ? 1 : -1;
-    if (!!b.hasH2H !== !!a.hasH2H) return b.hasH2H ? 1 : -1;
+    // Championship tie-breakers only. These do not override probability.
+    if (!!challenger.fullModel !== !!champion.fullModel) return challenger.fullModel ? challenger : champion;
+    if (!!challenger.hasH2H !== !!champion.hasH2H) return challenger.hasH2H ? challenger : champion;
 
-    const aVolRatio = isFinite(Number(a.volatility)) && isFinite(Number(a.volLimit)) && Number(a.volLimit) > 0
-      ? Number(a.volatility) / Number(a.volLimit) : Infinity;
-    const bVolRatio = isFinite(Number(b.volatility)) && isFinite(Number(b.volLimit)) && Number(b.volLimit) > 0
-      ? Number(b.volatility) / Number(b.volLimit) : Infinity;
-    if (Math.abs(aVolRatio - bVolRatio) > 0.0001) return aVolRatio - bVolRatio;
+    const champVolRatio = isFinite(Number(champion.volatility)) && isFinite(Number(champion.volLimit)) && Number(champion.volLimit) > 0
+      ? Number(champion.volatility) / Number(champion.volLimit) : Infinity;
+    const challVolRatio = isFinite(Number(challenger.volatility)) && isFinite(Number(challenger.volLimit)) && Number(challenger.volLimit) > 0
+      ? Number(challenger.volatility) / Number(challenger.volLimit) : Infinity;
+    if (Math.abs(champVolRatio - challVolRatio) > 0.0001) {
+      return challVolRatio < champVolRatio ? challenger : champion;
+    }
 
-    const aStrength = isFinite(Number(a.lockStrength)) ? Number(a.lockStrength) : 0;
-    const bStrength = isFinite(Number(b.lockStrength)) ? Number(b.lockStrength) : 0;
-    if (Math.abs(bStrength - aStrength) > 0.0001) return bStrength - aStrength;
+    const champStrength = isFinite(Number(champion.lockStrength)) ? Number(champion.lockStrength) : 0;
+    const challStrength = isFinite(Number(challenger.lockStrength)) ? Number(challenger.lockStrength) : 0;
+    if (Math.abs(challStrength - champStrength) > 0.0001) {
+      return challStrength > champStrength ? challenger : champion;
+    }
 
-    return Math.abs(Number(b.edge)) - Math.abs(Number(a.edge));
-  })[0];
+    return Math.abs(Number(challenger.edge)) > Math.abs(Number(champion.edge)) ? challenger : champion;
+  }
 
-  return candidates.findIndex(m => m === best);
+  // Run the actual tournament: the first candidate opens as champion, then
+  // every remaining candidate steps up as a challenger. Only one team is
+  // left standing after the last match — that's the lock.
+  const champion = valid.reduce((reigningChampion, challenger) => playMatch(reigningChampion, challenger));
+
+  return candidates.findIndex(m => m === champion);
 }
 
 function computeMarginProjection(teamAProj, teamBProj) {
