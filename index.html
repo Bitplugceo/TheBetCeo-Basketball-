@@ -6160,10 +6160,32 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
   const settledUniverse = allPicks.filter(p =>
     p && p.snapshot && p.actualScore != null &&
     (!targetLeague || String(p.league).toLowerCase() === String(targetLeague).toLowerCase()) &&
-    (p.resultStatus === "win" || p.resultStatus === "loss")
+    (p.resultStatus === "win" || p.resultStatus === "loss" || p.resultStatus === "no_play_settled")
   ).sort((a, b) => getTrackedPickTimeMs(a) - getTrackedPickTimeMs(b));
-  const _tunerCutIdx = Math.floor(settledUniverse.length * 0.80);
-  const settled = settledUniverse.slice(0, _tunerCutIdx);
+
+  // B3 fix: share the OOS validator's fixed calendar cutoff instead of a
+  // fresh rolling 80/20 split computed from whatever the current array size
+  // happens to be — otherwise the tuner's "pre-OOS" boundary silently drifts
+  // forward as picks accumulate and can end up training on rows the OOS
+  // report later scores as held-out. Falls back to the old rolling split
+  // only when no cutoff has been established yet for this league, or for
+  // global runs, which span multiple leagues and have no single cutoff.
+  let settled;
+  let _oosCutoffTs = null;
+  if (targetLeague) {
+    try {
+      const _stored = JSON.parse(localStorage.getItem("BB_OOS_CUTOFF_" + String(targetLeague)) || "null");
+      if (_stored && isFinite(_stored.cutoffTs)) _oosCutoffTs = _stored.cutoffTs;
+    } catch(e) {
+      engineDebug("Tuner failed to read shared OOS cutoff", { error: e?.message || String(e), targetLeague });
+    }
+  }
+  if (_oosCutoffTs !== null) {
+    settled = settledUniverse.filter(p => Date.parse(p.createdAt) < _oosCutoffTs);
+  } else {
+    const _tunerCutIdx = Math.floor(settledUniverse.length * 0.80);
+    settled = settledUniverse.slice(0, _tunerCutIdx);
+  }
 
   const minRequired = targetLeague ? 250 : 125;
   if (settled.length < minRequired) {
@@ -14344,17 +14366,17 @@ function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", diverg
   return Math.min(_h2hCap, weight * factor);
 }
 
+  // A1 fix: volatility must NOT shrink the point projection — that was the
+  // original bug (pulling the mean toward a baseline conflates "uncertain"
+  // with "wrong"). The correct treatment of volatility is as the standard
+  // deviation of a predictive distribution built around this same unshifted
+  // mean (see distributionWinProbability/_normalCdf), not as a discount on
+  // the mean itself. This function is intentionally an identity on proj —
+  // the dead volRatio/baseline computation that used to sit here and never
+  // affect the output has been removed rather than left as misleading code.
   function applyVolatility(proj, series, leagueVolLimit, league, baselineOverride) {
-
-  if (!isFinite(proj)) return proj;
-  const volRatio = getVolatilityRatioForSeries(series, leagueVolLimit);
-  if (!isFinite(volRatio) || volRatio <= 1) return proj;
-
-  const baseline = isFinite(baselineOverride) ? baselineOverride : avgOrNaN(series);
-  if (!isFinite(baseline)) return proj;
-
-  return proj;
-}
+    return proj;
+  }
 
 function getVolatilityRatioForSeries(series, leagueVolLimit) {
   const cleanSeries = Array.isArray(series) ? series.map(Number).filter(v => isFinite(v)) : [];
@@ -17438,25 +17460,15 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   aS *= injMultA;
   bS *= injMultB;
 
-  const _extremeExp = 1.0;
-  if (_extremeExp > 1.0 && isFinite(aS) && isFinite(bS)) {
-    const formTotal = aS + bS;
-    const leagueTotal = isFinite(eb) ? eb : 220;
-    const rawA = (typeof avgOrNaN === "function") ? avgOrNaN(aFTS) : NaN;
-    const rawB = (typeof avgOrNaN === "function") ? avgOrNaN(bFTS) : NaN;
-    const rawFormTotal = (isFinite(rawA) && isFinite(rawB)) ? (rawA + rawB) : formTotal;
-    const gapBlended = isFinite(formTotal) ? Math.abs(formTotal - leagueTotal) : 0;
-    const gapRaw = isFinite(rawFormTotal) ? Math.abs(rawFormTotal - leagueTotal) : 0;
-    const signalTotal = (gapRaw > gapBlended) ? rawFormTotal : formTotal;
-    if (isFinite(signalTotal) && signalTotal > 0 && isFinite(formTotal) && formTotal > 0 && isFinite(leagueTotal) && leagueTotal > 0) {
-      const expanded = leagueTotal + (signalTotal - leagueTotal) * _extremeExp;
-      const scale = expanded / formTotal;
-      if (isFinite(scale) && scale > 0.55 && scale < 1.85) {
-        aS *= scale;
-        bS *= scale;
-      }
-    }
-  }
+  // A2 fix: this block used to force-expand the total further away from the
+  // league baseline whenever recent form diverged sharply from it — directly
+  // fighting the volatility-shrink mechanism above (A1) any time both fired
+  // on the same game. It was disabled by hardcoding _extremeExp to 1.0
+  // (making the `> 1.0` guard permanently false) rather than resolving that
+  // contradiction, leaving ~15 lines of unreachable code. Removed outright;
+  // if extreme-divergence handling is wanted later, it needs to be designed
+  // as a single mechanism together with A1's volatility treatment, not as a
+  // second independent knob that can silently reverse the first one.
 
   const _injOppBoostFactor = isFinite(config?.injuryOppBoostFactor) ? Number(config.injuryOppBoostFactor) : (getParam("injuryOppBoostFactor", league) ?? INJURY_OPPONENT_BOOST_FACTOR);
   if (injMultA < 1) bS *= (1 + (1 - injMultA) * _injOppBoostFactor);
@@ -18427,6 +18439,21 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     !String(pickRow.note || "").startsWith("Intel gate") &&
     !String(pickRow.note || "").startsWith("Grade gate");
 
+  // A7 fix: a NO-PLAY caused by a plain insufficient-edge threshold (not an
+  // internal safety gate) still has a valid snapshot + line, so it is worth
+  // tracking as a shadow record purely so the tuner can later re-evaluate it
+  // under candidate thresholds (closing the selection-bias gap where the
+  // tuner only ever saw picks that were actually played). This must never
+  // surface as a live pick, and it requires a matched event so it can be
+  // auto-settled instead of sitting as dead weight in storage forever.
+  const isCleanNoPlay =
+    pickRow &&
+    pickRow.pick === "NO PLAY" &&
+    !String(pickRow.note || "").startsWith("Massacre gate") &&
+    !String(pickRow.note || "").startsWith("Intel gate") &&
+    !String(pickRow.note || "").startsWith("Grade gate");
+  const isTrackableNoPlay = isCleanNoPlay && isFinite(pickRow.line) && !!fixtureMeta.eventId;
+
   const snapshot = (function() {
 
     if (!pickRow || !pickRow.marketKey) return null;
@@ -18494,14 +18521,17 @@ function buildTrackedPickPayload({ pickRow, isLock, fixtureMeta: originalFixture
     (!isFinite(pickRow.line) && !isExoticNoLine)
   );
 
-  if (!isActualPlay) return null;
+  if (!isActualPlay && !isTrackableNoPlay) return null;
 
         const marketKey = pickRow.marketKey;
       let side = getPickSideFromText(pickRow.pick);
       if (!side) {
         if (isExoticNoLine) side = "exotic";
         else if (pickRow.pick === "NO PLAY") {
-          side = (isFinite(pickRow.edge) && pickRow.edge !== 0) ? (pickRow.edge > 0 ? "over" : "under") : "no_play";
+          // Literal "no_play" (not a guessed over/under) so the existing
+          // no-play branch in settleTrackedPickFromCompetition grades this
+          // as "no_play_settled" instead of a fabricated win/loss.
+          side = "no_play";
         }
         else return null;
       }
@@ -18766,7 +18796,10 @@ function getSampleTierForMarket(market, dx = {}) {
     memoryProfileKey,
     environmentKey,
     resultStatus: "pending",
-    isShadow: !fixtureMeta.eventId,
+    // A7 fix: a trackable no-play must always land in the shadow bucket,
+    // never the live tracked-picks list, regardless of whether the event
+    // matched — it's training data, not a bet.
+    isShadow: isTrackableNoPlay ? true : !fixtureMeta.eventId,
     diagnostics: {
       ...(diagnostics || {}),
       phase2Mode: diagnostics?.phase2Activation?.phase2Mode || (isPhase2ShadowMode() ? "shadow" : "live"),
