@@ -1,3 +1,4 @@
+H
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4818,7 +4819,7 @@ function applyTunerProposal(league) {
   try {
     const health = _getCanaryHealth(league || null);
     let canaries = {};
-    try { canaries = JSON.parse(localStorage.getItem("BB_TUNER_CANARIES") || "{}"); } catch (e) {}
+    try { canaries = JSON.parse(localStorage.getItem("BB_TUNER_CANARIES") || "{}"); } catch (e) { engineDebug("Tuner canary load failed", { error: e?.message || String(e), league }); }
     const existingCanary = canaries[scopeKey];
     if (existingCanary && !existingCanary.resolved) {
       const merged = Array.isArray(existingCanary.promotions) ? existingCanary.promotions.map(p => ({ ...p })) : [];
@@ -4904,9 +4905,9 @@ function getStoredConfidenceModelProposal() {
     const coeff = JSON.parse(coeffRaw);
     if (!coeff || !Object.keys(coeff).length) return null;
     let platt = {};
-    try { platt = JSON.parse(localStorage.getItem("BB_PLATT_CALIB_PROPOSED") || "{}"); } catch (e) {}
+    try { platt = JSON.parse(localStorage.getItem("BB_PLATT_CALIB_PROPOSED") || "{}"); } catch (e) { engineDebug("Platt calibration proposal load failed", { error: e?.message || String(e) }); }
     let sampleSizes = {};
-    try { sampleSizes = JSON.parse(localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_N") || "{}"); } catch (e) {}
+    try { sampleSizes = JSON.parse(localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_N") || "{}"); } catch (e) { engineDebug("Confidence coefficient sample-size load failed", { error: e?.message || String(e) }); }
     return { coeff, platt, sampleSizes, scopes: Object.keys(coeff) };
   } catch (e) {
     return null;
@@ -4987,9 +4988,9 @@ const TUNING_GRID = {
 
 
 const BB_LOCK_SHORTLIST_KEY = "BB_LOCK_SHORTLIST_V1";
-const LOCK_MIN_HOLDOUT_DECISIVE = 25;
-const LOCK_MIN_HOLDOUT_WINRATE = 0.52;
-const LOCK_MAX_OVERFIT_GAP = 0.12;
+const LOCK_MIN_HOLDOUT_DECISIVE = 100;
+const LOCK_MIN_HOLDOUT_WINRATE = 0.55;
+const LOCK_MAX_OVERFIT_GAP = 0.08;
 
 function validateLockEvidence(evalResult, opts) {
   opts = opts || {};
@@ -5454,7 +5455,7 @@ function calibrateEngineConstants() {
         const isWin = pick.resultStatus === "win";
         const delta = wouldWin ? (isWin ? 0 : 1) : (isWin ? -1 : 0);
         if (delta !== 0) updateConstantCandidateScore("INJURY_OPPONENT_BOOST_FACTOR", candidate, delta);
-      } catch(e) {  }
+      } catch(e) { engineDebug("INJURY_OPPONENT_BOOST_FACTOR candidate scoring failed", { error: e?.message || String(e) }); }
     });
   });
 
@@ -5873,10 +5874,10 @@ function assertInvariant(condition, label, context) {
   const entry = { label, context, ts: new Date().toISOString() };
   BB_INVARIANT_FAILURES.push(entry);
   if (BB_INVARIANT_FAILURES.length > 200) BB_INVARIANT_FAILURES.shift();
-  try { engineDebug("INVARIANT FAILED: " + label, context); } catch (e) {}
+  try { engineDebug("INVARIANT FAILED: " + label, context); } catch (e) { console.error("[BB Engine] engineDebug failed while reporting invariant", label, e); }
   try {
     localStorage.setItem("BB_INVARIANT_FAILURES", JSON.stringify(BB_INVARIANT_FAILURES.slice(-50)));
-  } catch (e) {}
+  } catch (e) { console.error("[BB Engine] Failed to persist BB_INVARIANT_FAILURES", e); }
   throw new EngineInvariantError(label || "Engine invariant failed");
 }
 
@@ -5957,7 +5958,7 @@ function persistTunerEvalLog(entry) {
   try {
     const key = "BB_TUNER_LOG";
     let log = [];
-    try { log = JSON.parse(localStorage.getItem(key) || "[]"); } catch (e) {}
+    try { log = JSON.parse(localStorage.getItem(key) || "[]"); } catch (e) { engineDebug("BB_TUNER_LOG load failed", { error: e?.message || String(e) }); }
     log.push({ ...entry, ts: new Date().toISOString(), modelVersion: getCurrentModelVersion() });
     if (log.length > 300) log = log.slice(-300);
     localStorage.setItem(key, JSON.stringify(log));
@@ -5998,9 +5999,9 @@ function checkTunerCanaries() {
       c.outcome = "rolled_back";
       c.resolvedAt = new Date().toISOString();
       let rollbacks = [];
-      try { rollbacks = JSON.parse(localStorage.getItem("BB_TUNER_ROLLBACKS") || "[]"); } catch (e) {}
+      try { rollbacks = JSON.parse(localStorage.getItem("BB_TUNER_ROLLBACKS") || "[]"); } catch (e) { engineDebug("BB_TUNER_ROLLBACKS load failed", { error: e?.message || String(e), scopeKey }); }
       rollbacks.push({ scopeKey, promotions: c.promotions, health, ts: c.resolvedAt });
-      try { localStorage.setItem("BB_TUNER_ROLLBACKS", JSON.stringify(rollbacks.slice(-50))); } catch (e) {}
+      try { localStorage.setItem("BB_TUNER_ROLLBACKS", JSON.stringify(rollbacks.slice(-50))); } catch (e) { engineDebug("BB_TUNER_ROLLBACKS save failed", { error: e?.message || String(e), scopeKey }); }
       engineDebug("Tuner canary auto-rolled-back due to win-rate drift", { scopeKey, health });
     } else if (newSettledSinceApply >= (c.canaryWindow || 20)) {
       c.resolved = true;
@@ -6009,22 +6010,24 @@ function checkTunerCanaries() {
       engineDebug("Tuner canary window closed clean — proposal stays live", { scopeKey, health });
     }
   });
-  try { localStorage.setItem("BB_TUNER_CANARIES", JSON.stringify(canaries)); } catch (e) {}
+  try { localStorage.setItem("BB_TUNER_CANARIES", JSON.stringify(canaries)); } catch (e) { engineDebug("Tuner canary save failed", { error: e?.message || String(e) }); }
 }
 
 function runCoordinateAscentTuner(allPicks, targetLeague) {
 
   checkTunerCanaries();
 
-  const settled = allPicks.filter(p =>
-    p && p.snapshot && p.actualScore != null && !p.isShadow &&
+  const settledUniverse = allPicks.filter(p =>
+    p && p.snapshot && p.actualScore != null &&
     (!targetLeague || String(p.league).toLowerCase() === String(targetLeague).toLowerCase()) &&
     (p.resultStatus === "win" || p.resultStatus === "loss")
-  );
+  ).sort((a, b) => getTrackedPickTimeMs(a) - getTrackedPickTimeMs(b));
+  const _tunerCutIdx = Math.floor(settledUniverse.length * 0.80);
+  const settled = settledUniverse.slice(0, _tunerCutIdx);
 
   const minRequired = targetLeague ? 250 : 125;
   if (settled.length < minRequired) {
-    engineDebug(`Coordinate ascent tuner skipped for ${targetLeague || "global"}: needs ${minRequired} picks, has ${settled.length}`);
+    engineDebug(`Coordinate ascent tuner skipped for ${targetLeague || "global"}: needs ${minRequired} pre-OOS picks, has ${settled.length}`);
     return null;
   }
 
@@ -6051,7 +6054,9 @@ const keysToTune = [
     "edgeQPointThreshold",
     "confidenceAThresh",
     "confidenceBThresh",
-    "confidenceCThresh"
+    "confidenceCThresh",
+    "teamVolScale",
+    "quarterVolScale"
   ];
 
   const candidateGrids = {
@@ -6072,7 +6077,9 @@ const keysToTune = [
     edgeQPointThreshold: [2.0, 3.0, 4.0, 5.0, 6.0],
     confidenceAThresh: [0.60, 0.63, 0.66, 0.69, 0.72],
     confidenceBThresh: [0.52, 0.55, 0.58, 0.61, 0.64],
-    confidenceCThresh: [0.45, 0.48, 0.51, 0.54, 0.57]
+    confidenceCThresh: [0.45, 0.48, 0.51, 0.54, 0.57],
+    teamVolScale: [0.30, 0.40, 0.50, 0.60, 0.70, 0.80],
+    quarterVolScale: [0.25, 0.35, 0.45, 0.50, 0.60, 0.70]
   };
 
   const currentParams = {};
@@ -6393,7 +6400,7 @@ function getLearnedRecencyWeights(league, marketSilo) {
   try {
     const configured = getParam("recencyWeights", league);
     if (Array.isArray(configured) && configured.length) return configured.slice(0, 10);
-  } catch(e) {}
+  } catch(e) { engineDebug("recencyWeights param load failed", { error: e?.message || String(e), league }); }
   return Array.isArray(MODEL_TUNING?.recencyWeights)
     ? MODEL_TUNING.recencyWeights.slice(0, 10)
     : [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16];
@@ -7460,7 +7467,7 @@ async function writeAsyncStorage(key, value) {
           g_trackerState.archivedPicks = parsed.archivedPicks;
         }
       }
-    } catch(e) {}
+    } catch(e) { engineDebug("Tracker archive prune/parse failed", { error: e?.message || String(e) }); }
   }
 
   try {
@@ -8312,7 +8319,7 @@ window.recordPickVariance = window.recordPickVariance || function(pick) {
     if (window.g_pickVarianceLog.length > 500) {
       window.g_pickVarianceLog = window.g_pickVarianceLog.slice(-500);
     }
-  } catch (e) {}
+  } catch (e) { engineDebug("g_pickVarianceLog update failed", { error: e?.message || String(e) }); }
 };
 window.getRollingMeanError = window.getRollingMeanError || function(n) {
   const log = window.g_pickVarianceLog || [];
@@ -9010,8 +9017,8 @@ function calculateAdvancedMetrics(sMapMine, sMapOpp, ptsMine, ptsOpp, regMinutes
   }
 
   if (!(isFinite(pace) && pace > 0 && isFinite(ortg) && isFinite(drtg))) {
-    const LEAGUE_AVG_TOTAL = 224;
-    const LEAGUE_AVG_PACE = 99.5;
+    const LEAGUE_AVG_TOTAL = (LEAGUE_BASES[String(league || "").toLowerCase()] || LEAGUE_BASES.unknown) || 224;
+    const LEAGUE_AVG_PACE = LEAGUE_PACE_BASES[String(league || "").toLowerCase()] || LEAGUE_PACE_BASES.default || 99.5;
     const totalPts = ptsMine + ptsOpp;
     const paceEst = LEAGUE_AVG_PACE * (totalPts / LEAGUE_AVG_TOTAL);
     poss = paceEst;
@@ -11812,7 +11819,7 @@ function renderConfigsPanel() {
   try {
     const rawHist = localStorage.getItem("BB_PROMOTION_HISTORY");
     if (rawHist) history = JSON.parse(rawHist) || [];
-  } catch(e) {}
+  } catch(e) { engineDebug("BB_PROMOTION_HISTORY load failed", { error: e?.message || String(e) }); }
 
   if (history.length) {
     html += `
@@ -12067,7 +12074,7 @@ function renderTrackerAnalytics() {
   try {
     const _oosStore = JSON.parse(localStorage.getItem("BB_OOS_VALIDATION_RESULTS") || "{}");
     _oosStored = _oosStore[_oosSelectedLeague] || null;
-  } catch(e) {}
+  } catch(e) { engineDebug("BB_OOS_VALIDATION_RESULTS load failed", { error: e?.message || String(e), league: _oosSelectedLeague }); }
 
   const reviewRows = [];
 
@@ -13987,9 +13994,9 @@ function isPickPeriodComplete(marketKey, currentPeriod, isHalfTime, isGameFinal,
           if (_nowSettled - _prevSettled >= _retrainEvery) {
             setTimeout(() => {
 
-              try { calibrateConfidenceModel(); } catch(e) {}
+              try { calibrateConfidenceModel(); } catch(e) { engineDebug("calibrateConfidenceModel failed during retrain", { error: e?.message || String(e) }); }
 
-              try { calibrateEngineConstants(); } catch(e) {}
+              try { calibrateEngineConstants(); } catch(e) { engineDebug("calibrateEngineConstants failed during retrain", { error: e?.message || String(e) }); }
               try {
                 const allPicks = getAllTrackedPicksForReport();
 
@@ -14004,7 +14011,7 @@ function isPickPeriodComplete(marketKey, currentPeriod, isHalfTime, isGameFinal,
                 const _oosLeague = document.getElementById("leagueSelect")?.value || "";
                 const _oosResult = runOutOfSampleValidation(_oosLeague);
                 if (_oosResult) engineDebug("Out-of-sample validation result", _oosResult);
-              } catch(e) {}
+              } catch(e) { engineDebug("runOutOfSampleValidation threw during retrain", { error: e?.message || String(e) }); }
 
               try {
                 const _snapResult = refreshTrackerSignalSnapshot();
@@ -14013,7 +14020,7 @@ function isPickPeriodComplete(marketKey, currentPeriod, isHalfTime, isGameFinal,
               try {
                 const _healthLg = document.getElementById("leagueSelect")?.value || "";
                 if (_healthLg) checkModelHealth(_healthLg);
-              } catch(e) {}
+              } catch(e) { engineDebug("checkModelHealth threw during retrain", { error: e?.message || String(e) }); }
               localStorage.setItem("BB_RETRAIN_CHECKPOINT", JSON.stringify({
                 settledCount: _nowSettled, ts: new Date().toISOString()
               }));
@@ -14142,26 +14149,32 @@ function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", diverg
   let weight = (Math.log1p(minLen - 1) / Math.log1p(9)) * _h2hCap;
 
   const tier = String(sampleTier || "thin").toLowerCase();
-  if (tier === "thin") weight *= 0.85;
-  else if (tier === "insufficient") weight *= 0.55;
+  const tierPenalty = tier === "insufficient" ? (getParam("h2hTierInsufficientPenalty", league) ?? 0.55) : (tier === "thin" ? (getParam("h2hTierThinPenalty", league) ?? 0.85) : 1.0);
+  weight *= tierPenalty;
 
-  if (isFinite(divergence) && divergence > 0 && isFinite(baselineForMarket) && baselineForMarket > 0) {
-    const relDiv = divergence / baselineForMarket;
-    if (relDiv > 0.12) weight *= Math.max(0.45, 1.0 - (relDiv - 0.12) * 2.5);
-  }
+  const relDiv = (isFinite(divergence) && divergence > 0 && isFinite(baselineForMarket) && baselineForMarket > 0)
+    ? divergence / baselineForMarket
+    : 0;
+  const _divThresh = getParam("h2hDivergenceThreshold", league) ?? 0.12;
+  const _divSlope = getParam("h2hDivergenceSlope", league) ?? 2.5;
+  const divergencePenalty = relDiv > _divThresh ? Math.max(0.45, 1.0 - (relDiv - _divThresh) * _divSlope) : 1.0;
 
+  let contextPenalty = 1.0;
   if (context) {
     const injA = context.injMultA ?? 1.0;
     const injB = context.injMultB ?? 1.0;
     const injuryGap = Math.abs(injA - injB);
-    weight *= Math.max(0.4, 1.0 - injuryGap * 1.5);
     const volRatio = context.volRatio ?? 1.0;
-    weight *= Math.max(0.5, 1.2 - volRatio * 0.4);
     const blowoutGap = context.blowoutGap ?? 0;
-    if (blowoutGap > 15) weight *= 0.8;
     const paceGapRisk = context.paceGapRisk ?? false;
-    if (paceGapRisk) weight *= 0.85;
+    const injuryRisk = Math.min(0.6, injuryGap * (getParam("h2hInjuryRiskSlope", league) ?? 1.5));
+    const volatilityRisk = Math.min(0.4, Math.max(0, volRatio - 1) * (getParam("h2hVolRiskSlope", league) ?? 0.4));
+    const blowoutRisk = blowoutGap > (getParam("h2hBlowoutGapThreshold", league) ?? 15) ? (getParam("h2hBlowoutRisk", league) ?? 0.20) : 0;
+    const paceRisk = paceGapRisk ? (getParam("h2hPaceRisk", league) ?? 0.15) : 0;
+    contextPenalty = Math.max(0.4, 1.0 - injuryRisk - volatilityRisk - blowoutRisk - paceRisk);
   }
+
+  weight *= divergencePenalty * contextPenalty;
   return Math.min(_h2hCap, weight * factor);
 }
 
@@ -14174,8 +14187,7 @@ function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", diverg
   const baseline = isFinite(baselineOverride) ? baselineOverride : avgOrNaN(series);
   if (!isFinite(baseline)) return proj;
 
-  const dampening = Math.max(0.70, 1.0 - (volRatio - 1) * 0.20);
-  return baseline + (proj - baseline) * dampening;
+  return proj;
 }
 
 function getVolatilityRatioForSeries(series, leagueVolLimit) {
@@ -14187,7 +14199,7 @@ function getVolatilityRatioForSeries(series, leagueVolLimit) {
   return Math.min(2.5, sd / limit);
 }
 
-    function getSampleTier(...arrays) {
+function getSampleTier(...arrays) {
   if (!arrays.length) return "insufficient";
   const lens = arrays.map(a => Array.isArray(a) ? a.length : 0);
   const minLen = Math.min(...lens);
@@ -14471,7 +14483,14 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
       else if (models[tierKey]) { coeff = models[tierKey]; _resolvedScope = tierKey; }
       else { coeff = models["global"] || {}; _resolvedScope = "global"; }
     }
-  } catch(e) {}
+  } catch(e) {
+    if (typeof engineDebug === "function") engineDebug("Confidence coefficient load failed", { error: e?.message || String(e), league });
+  }
+
+  const _coeffFitted = !!(coeff && Object.keys(coeff).length > 0);
+  if (!_coeffFitted) {
+    return 0.50;
+  }
 
   const logOdds =
     (coeff.intercept   ?? -0.2) +
@@ -14498,9 +14517,11 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
         _calibratedLogOdds = platt.a * _calibratedLogOdds + platt.b;
       }
     }
-  } catch(e) {}
+  } catch(e) {
+    if (typeof engineDebug === "function") engineDebug("Platt calibration load failed", { error: e?.message || String(e), league: _resolvedScope });
+  }
 
-  return parseFloat(clampNumber(1 / (1 + Math.exp(-Math.min(10, Math.max(-10, _calibratedLogOdds)))), 0.02, 0.98).toFixed(3));
+  return Number(clampNumber(1 / (1 + Math.exp(-Math.min(10, Math.max(-10, _calibratedLogOdds)))), 0.02, 0.98).toFixed(3));
 }
 
 function isConfidenceCoeffFitted(league) {
@@ -14522,10 +14543,18 @@ function resolveConfidenceGradeFromWinProbability(winProb, league = "") {
   try {
     const storedThresholds = localStorage.getItem("BB_CONFIDENCE_THRESHOLDS");
     if (storedThresholds) learnedThresholds = JSON.parse(storedThresholds);
-  } catch(e) {}
+  } catch(e) {
+    if (typeof engineDebug === "function") engineDebug("Confidence threshold load failed", { error: e?.message || String(e), league });
+  }
   const threshA = getParam("confidenceAThresh", league) ?? learnedThresholds?.aThresh ?? 0.66;
   const threshB = getParam("confidenceBThresh", league) ?? learnedThresholds?.bThresh ?? 0.58;
   const threshC = getParam("confidenceCThresh", league) ?? learnedThresholds?.cThresh ?? 0.51;
+  if (!isConfidenceCoeffFitted(league)) return winProb >= threshC ? "B" : "D";
+  if (getLeagueTrustMeta(league).level === "advisory") {
+    if (winProb >= threshB) return "B";
+    if (winProb >= threshC) return "C";
+    return "D";
+  }
   if (winProb >= threshA) return "A";
   if (winProb >= threshB) return "B";
   if (winProb >= threshC) return "C";
@@ -14581,15 +14610,15 @@ function getMarginConfidenceGrade(params) {
   return resolveConfidenceGradeFromWinProbability(winProb, league);
 }
 
-    const _anchorCapCache = new Map();
+const _anchorCapCache = new Map();
 const _ANCHOR_CAP_TTL_MS = 90000;
 
 function anchorProjection(proj, sampleSize, leagueBase) {
   if (!isFinite(proj)) return proj;
   const n = Math.max(0, Number(sampleSize) || 0);
   const base = Number(leagueBase) || proj;
-  if (n >= 6) return proj;
-  const blendFactor = n / 6;
+  if (n >= 10) return proj;
+  const blendFactor = n / 10;
   return proj * blendFactor + base * (1 - blendFactor);
 }
 
@@ -15500,12 +15529,21 @@ btn.addEventListener("click", () => { section.classList.toggle("collapsed"); });
       }
 
       const share = ppg / avgPPG;
-      const impact = Math.min(isOut ? share * 0.65 : share * 0.30, 0.22);
+      let avgMinutes = 0;
+      for (const cat of (athlete?.statistics?.splits?.categories || [])) {
+        for (const stat of (cat.stats || [])) {
+          if (stat.name === "avgMinutes" || stat.name === "minutesPerGame" || stat.abbreviation === "MPG") {
+            avgMinutes = parseFloat(stat.value) || 0;
+          }
+        }
+      }
+      const minutesFactor = avgMinutes > 0 ? clampNumber(avgMinutes / 30, 0.50, 1.30) : 1.0;
+      const impact = Math.min((isOut ? share * 0.65 : share * 0.30) * minutesFactor, 0.22);
       totalReduction += impact;
 
       result.notes.push({
         type: isOut ? "out" : "dtd",
-        text: `${playerName} (${ppg.toFixed(1)} ppg) — ${tag} → -${(impact * 100).toFixed(1)}% offense`
+        text: `${playerName} (${ppg.toFixed(1)} ppg, ${avgMinutes > 0 ? avgMinutes.toFixed(1) + " mpg" : "minutes unknown"}) — ${tag} → -${(impact * 100).toFixed(1)}% offense`
       });
     }
 
@@ -17182,7 +17220,7 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   aS *= injMultA;
   bS *= injMultB;
 
-  const _extremeExp = isFinite(config?.extremeExpansion) ? Number(config.extremeExpansion) : (getParam("extremeExpansion", league) ?? 1.30);
+  const _extremeExp = 1.0;
   if (_extremeExp > 1.0 && isFinite(aS) && isFinite(bS)) {
     const formTotal = aS + bS;
     const leagueTotal = isFinite(eb) ? eb : 220;
@@ -17835,7 +17873,7 @@ function calibrateConfidenceModel() {
       settledBucketCounts: _settledBucketCounts, universeBucketCounts: _universeBucketCounts,
       weights: _biasWeightByBucket, ts: new Date().toISOString()
     }));
-  } catch (e) {}
+  } catch (e) { engineDebug("Settled bias audit computation/save failed", { error: e?.message || String(e) }); }
 
   const _chronoSorted = allPicks.slice().sort((a, b) => Date.parse(a.createdAt || 0) - Date.parse(b.createdAt || 0));
   const _calSplitIdx = Math.floor(_chronoSorted.length * 0.8);
@@ -17843,7 +17881,7 @@ function calibrateConfidenceModel() {
   const calPicks = _chronoSorted.slice(_calSplitIdx);
 
   const gradeWinRates = { A: [], B: [], C: [], D: [] };
-  allPicks.forEach(p => {
+  fitPicks.forEach(p => {
     const grade = String(p.confidenceGrade || p.confidence || "").toUpperCase();
     if (gradeWinRates[grade] !== undefined) {
       gradeWinRates[grade].push(p.resultStatus === "win" ? 1 : 0);
@@ -17884,7 +17922,7 @@ function calibrateConfidenceModel() {
       localStorage.setItem("BB_CONFIDENCE_THRESHOLDS", JSON.stringify(gradeThresholds));
       localStorage.setItem("BB_CONFIDENCE_GRADE_WIN_RATES", JSON.stringify(thresholds));
       engineDebug("Confidence grade thresholds calibrated", { gradeThresholds, winRates: thresholds });
-    } catch(e) {}
+    } catch(e) { console.error("[BB Engine] Confidence grade threshold save failed", e); }
   }
 
   const buildF = (p) => ({
@@ -18039,7 +18077,7 @@ function calibrateConfidenceModel() {
       localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF_N", JSON.stringify(modelSampleSizes));
 
       localStorage.setItem("BB_PLATT_CALIB_PROPOSED", JSON.stringify(plattCalib));
-    } catch(e) {}
+    } catch(e) { console.error("[BB Engine] Confidence model coefficient proposal save failed", e); }
     engineDebug("Confidence model coefficients proposed (not auto-applied — review in Configs panel)", Object.keys(models));
   }
 }
@@ -18051,7 +18089,7 @@ function runOutOfSampleValidation(league) {
     p.createdAt
   ).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
   if (allPicks.length < 75) return null;
-  const splitIdx = Math.floor(allPicks.length * 0.7);
+  const splitIdx = Math.floor(allPicks.length * 0.8);
   const testSet = allPicks.slice(splitIdx);
   const wins = testSet.filter(p => p.resultStatus === "win").length;
   const result = { testSize: testSet.length, winRate: wins / testSet.length, trainSize: splitIdx };
@@ -21680,7 +21718,7 @@ try {
     const selectElement = document.getElementById("leagueSelect");
     if (!selectElement) return;
     let verifiedTunings = {};
-    try { verifiedTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS")) || {}; } catch (e) {}
+    try { verifiedTunings = JSON.parse(localStorage.getItem("BB_VERIFIED_TUNINGS")) || {}; } catch (e) { engineDebug("BB_VERIFIED_TUNINGS load failed", { error: e?.message || String(e) }); }
 
     Array.from(selectElement.options).forEach(option => {
       const leagueValue = option.value;
@@ -21852,7 +21890,7 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
         waitCycles++;
       }
 
-    } catch(e) {}
+    } catch(e) { engineDebug("Wait-for-tracker-state loop failed", { error: e?.message || String(e) }); }
 
     let totalSuspects = 0;
 
@@ -22196,10 +22234,10 @@ function copyConfigsData() {
             lines.push('Manual Override: ' + (data.manualOverride ? 'Yes' : 'No'));
             lines.push('');
           }
-        } catch(e) {}
+        } catch(e) { engineDebug("Verified config entry parse failed during export", { key: k, error: e?.message || String(e) }); }
       }
     });
-  } catch(e) {}
+  } catch(e) { engineDebug("Verified configs export scan failed", { error: e?.message || String(e) }); }
   if (!hasVerified) lines.push('No verified configs locked yet.');
   lines.push('');
 
@@ -22223,10 +22261,10 @@ function copyConfigsData() {
             lines.push('Net Delta     : ' + best.netDelta + ' over ' + best.count + ' picks');
             lines.push('');
           }
-        } catch(e) {}
+        } catch(e) { engineDebug("Candidate config entry parse failed during export", { key: k, error: e?.message || String(e) }); }
       }
     });
-  } catch(e) {}
+  } catch(e) { engineDebug("Candidate configs export scan failed", { error: e?.message || String(e) }); }
   if (!hasCandidates) lines.push('No candidate config data yet.');
   lines.push('');
 
