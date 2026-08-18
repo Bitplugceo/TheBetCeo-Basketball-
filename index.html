@@ -1,3 +1,4 @@
+X
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3209,10 +3210,11 @@ body.dark-mode .tracker-analytics-section-head {
   <div class="actions">
     <button id="runBtn" type="button">Run</button>
     <button id="clearBtn" type="button">Clear</button>
+    <button id="mathTestsBtn" type="button" title="Run golden math tests (no console needed)" style="background: #3a404c !important; color: #fff !important; box-shadow: 0 2px 8px rgba(0,0,0,0.2) !important; font-weight: 700 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">Math tests</button>
     <button id="auditCopyBtn" type="button" title="Copy Audit" style="background: #d4af37 !important; color: #111 !important; box-shadow: 0 2px 8px rgba(212, 175, 55, 0.35) !important; font-weight: 700 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">📋</button>
     <button id="inputsCopyBtn" type="button" title="Copy Inputs &amp; Market Lines" style="background: #d4af37 !important; color: #111 !important; box-shadow: 0 2px 8px rgba(212, 175, 55, 0.35) !important; font-weight: 700 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">🗒️</button>
-
   </div>
+  <div id="mathTestsPanel" style="display:none; margin: 8px 10px 12px; padding: 10px 12px; border: 1px solid var(--panel-border); background: var(--panel-soft); font-size: 11px; font-weight: 700; line-height: 1.45; white-space: pre-wrap; word-break: break-word;"></div>
 
   <div class="table-wrap">
     <table id="results" style="display:none;">
@@ -5040,7 +5042,17 @@ function getStoredConfidenceModelProposal() {
         || "{}"
       );
     } catch (e) { engineDebug("Confidence coefficient sample-size load failed", { error: e?.message || String(e) }); }
-    return { coeff, platt, sampleSizes, scopes: Object.keys(coeff) };
+    let thresholds = null;
+    try {
+      const tRaw = localStorage.getItem("BB_CONFIDENCE_THRESHOLDS_PROPOSED");
+      if (tRaw) thresholds = JSON.parse(tRaw);
+    } catch (e) { engineDebug("Confidence thresholds proposal load failed", { error: e?.message || String(e) }); }
+    let gradeWinRates = null;
+    try {
+      const gRaw = localStorage.getItem("BB_CONFIDENCE_GRADE_WIN_RATES_PROPOSED");
+      if (gRaw) gradeWinRates = JSON.parse(gRaw);
+    } catch (e) { engineDebug("Grade win-rates proposal load failed", { error: e?.message || String(e) }); }
+    return { coeff, platt, sampleSizes, thresholds, gradeWinRates, scopes: Object.keys(coeff) };
   } catch (e) {
     engineDebug("getStoredConfidenceModelProposal failed", { error: e?.message || String(e) });
     return null;
@@ -5051,25 +5063,33 @@ function applyConfidenceModelProposal() {
   const proposal = getStoredConfidenceModelProposal();
   if (!proposal) return false;
   try {
+    // Atomic promote: coeffs + N + Platt + grade thresholds together (never N alone)
     localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF", JSON.stringify(proposal.coeff));
     localStorage.setItem("BB_PLATT_CALIB", JSON.stringify(proposal.platt));
-    // Promote sample sizes only when coeffs go live (keeps min-N gate paired with active model)
     if (proposal.sampleSizes && typeof proposal.sampleSizes === "object") {
       localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF_N", JSON.stringify(proposal.sampleSizes));
+    }
+    if (proposal.thresholds && typeof proposal.thresholds === "object") {
+      localStorage.setItem("BB_CONFIDENCE_THRESHOLDS", JSON.stringify(proposal.thresholds));
+    }
+    if (proposal.gradeWinRates && typeof proposal.gradeWinRates === "object") {
+      localStorage.setItem("BB_CONFIDENCE_GRADE_WIN_RATES", JSON.stringify(proposal.gradeWinRates));
     }
     localStorage.removeItem("BB_CONFIDENCE_MODEL_COEFF_PROPOSED");
     localStorage.removeItem("BB_PLATT_CALIB_PROPOSED");
     localStorage.removeItem("BB_CONFIDENCE_MODEL_COEFF_N_PROPOSED");
+    localStorage.removeItem("BB_CONFIDENCE_THRESHOLDS_PROPOSED");
+    localStorage.removeItem("BB_CONFIDENCE_GRADE_WIN_RATES_PROPOSED");
   } catch (e) {
     engineDebug("applyConfidenceModelProposal failed to write live keys: " + (e?.message || String(e)), { error: e });
     return false;
   }
-  engineDebug("Confidence model + Platt calibration manually applied via Configs panel", { scopes: proposal.scopes });
+  engineDebug("Confidence model + Platt + thresholds applied atomically", { scopes: proposal.scopes, hasThresholds: !!proposal.thresholds });
   return true;
 }
 
 window.applyConfidenceModelProposalFromUI = function() {
-  if (!confirm("Apply the pending confidence model + calibration proposal? This will overwrite the live coefficients used for every new pick.")) return;
+  if (!confirm("Apply pending confidence model atomically (coeffs + N + Platt + grade thresholds)? This overwrites live grading for every new pick.")) return;
   if (applyConfidenceModelProposal()) {
     if (typeof renderConfigsPanel === "function") renderConfigsPanel();
   }
@@ -5821,7 +5841,7 @@ function testConfigurationSignificance(challengerRecord, baselineRecord, require
 }
 
 function calculateCalibrationMetrics(evaluationResults) {
-  const valid = evaluationResults.filter(r => r && !r.isNoPlay && r.winProbability != null && (r.win || r.loss));
+  const valid = evaluationResults.filter(r => r && !r.isNoPlay && r.winProbability != null && Number.isFinite(Number(r.winProbability)) && (r.win || r.loss));
   if (!valid.length) return { brier: 1.0, ece: 1.0 };
 
   let brierSum = 0;
@@ -5829,10 +5849,11 @@ function calculateCalibrationMetrics(evaluationResults) {
 
   valid.forEach(r => {
     const outcome = r.win ? 1 : 0;
-    brierSum += Math.pow(r.winProbability - outcome, 2);
+    const wp = Number(r.winProbability);
+    brierSum += Math.pow(wp - outcome, 2);
 
-    const bi = Math.min(9, Math.floor(r.winProbability * 10));
-    bins[bi].sp += r.winProbability;
+    const bi = Math.min(9, Math.floor(wp * 10));
+    bins[bi].sp += wp;
     bins[bi].so += outcome;
     bins[bi].n++;
   });
@@ -5844,8 +5865,56 @@ function calculateCalibrationMetrics(evaluationResults) {
   return { brier, ece, count: valid.length };
 }
 
+/** Persist per-league/market ECE for grade dampening (resolveConfidenceGradeFromWinProbability). */
+function recordMarketECE(league, marketKey, ece, n) {
+  if (!Number.isFinite(ece) || !Number.isFinite(n) || n < 1) return;
+  try {
+    const map = JSON.parse(localStorage.getItem("BB_MARKET_ECE") || "{}");
+    const lk = String(league || "unknown").toLowerCase();
+    const mk = String(marketKey || "ft").toLowerCase();
+    map[lk + ":" + mk] = { ece: Number(ece), n: Number(n), ts: new Date().toISOString() };
+    localStorage.setItem("BB_MARKET_ECE", JSON.stringify(map));
+  } catch (e) {
+    if (typeof engineDebug === "function") engineDebug("recordMarketECE failed", { error: e?.message || String(e) });
+  }
+}
+
+function refreshAllMarketECEFromTracker() {
+  try {
+    if (typeof getAllTrackedPicksForReport !== "function" || typeof calculateCalibrationMetrics !== "function") return;
+    const all = getAllTrackedPicksForReport().filter(p =>
+      (p.resultStatus === "win" || p.resultStatus === "loss") &&
+      Number.isFinite(Number(p.winProbability))
+    );
+    const groups = {};
+    all.forEach(p => {
+      const lk = String(p.league || "unknown").toLowerCase();
+      const mk = String(p.marketKey || p.marketName || "ft").toLowerCase().split("<")[0].trim();
+      const key = lk + "|" + mk;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push({
+        win: p.resultStatus === "win",
+        loss: p.resultStatus === "loss",
+        winProbability: Number(p.winProbability),
+        isNoPlay: false
+      });
+    });
+    Object.entries(groups).forEach(([key, rows]) => {
+      if (rows.length < 15) return;
+      const [lk, mk] = key.split("|");
+      const metrics = calculateCalibrationMetrics(rows);
+      if (metrics && Number.isFinite(metrics.ece)) {
+        recordMarketECE(lk, mk, metrics.ece, metrics.count);
+      }
+    });
+  } catch (e) {
+    if (typeof engineDebug === "function") engineDebug("refreshAllMarketECEFromTracker failed", { error: e?.message || String(e) });
+  }
+}
+
 function updateEnginePerformanceScore() {
   try {
+    try { refreshAllMarketECEFromTracker(); } catch (_e) { /* non-fatal */ }
     const MIN_N = 10;
     let log = [];
     try { log = JSON.parse(localStorage.getItem("bb_engine_accuracy_log")) || []; } catch(_) { engineDebug("bb_engine_accuracy_log parse failed", { error: _?.message || String(_) }); }
@@ -14527,6 +14596,164 @@ function getVolatilityRatioForSeries(series, leagueVolLimit) {
   return Math.min(2.5, sd / limit);
 }
 
+
+// --- Golden math self-tests (Phase C seed) ---
+// Run via: window.__BB_RUN_MATH_TESTS__() from console or a "Run math tests" button.
+
+document.addEventListener("DOMContentLoaded", function () {
+  var btn = document.getElementById("mathTestsBtn");
+  if (!btn || btn._mathWired) return;
+  btn._mathWired = true;
+  btn.addEventListener("click", function () {
+    var panel = document.getElementById("mathTestsPanel");
+    var report;
+    try {
+      if (typeof window.__BB_RUN_MATH_TESTS__ !== "function") {
+        report = { ok: false, failCount: 1, fails: ["__BB_RUN_MATH_TESTS__ not found — engine script failed to load"], message: "Harness missing" };
+      } else {
+        report = window.__BB_RUN_MATH_TESTS__();
+      }
+    } catch (e) {
+      report = { ok: false, failCount: 1, fails: [String(e && e.message || e)], message: "Harness threw" };
+    }
+    var lines = [];
+    lines.push(report.ok ? "✅ MATH TESTS PASSED" : "❌ MATH TESTS FAILED (" + (report.failCount || 0) + ")");
+    lines.push(report.message || "");
+    if (report.fails && report.fails.length) {
+      lines.push("---");
+      report.fails.forEach(function (f, i) { lines.push((i + 1) + ". " + f); });
+    }
+    var textOut = lines.join("\\n");
+    if (panel) {
+      panel.style.display = "block";
+      panel.style.borderColor = report.ok ? "#2f8f4a" : "#c91920";
+      panel.style.color = report.ok ? "#1e6e39" : "#b11a20";
+      panel.textContent = textOut;
+    }
+    try { alert(textOut); } catch (_) {}
+  });
+});
+
+window.__BB_RUN_MATH_TESTS__ = function __BB_RUN_MATH_TESTS__() {
+  const fails = [];
+  const assert = (cond, msg) => { if (!cond) fails.push(msg); };
+
+  // --- A1 periodPoss / ORTG honesty ---
+  if (typeof derivePeriodAdvanced === "function") {
+    const full = { pace: 100, ortg: 110, drtg: 108, possessions: 100 };
+    const ok = derivePeriodAdvanced(full, 55, 52, 0.5, "nba");
+    assert(ok && Number.isFinite(ok.ortg), "derivePeriodAdvanced should return finite ortg");
+    assert(ok && Math.abs(ok.possessions - 50) < 0.01, "periodPoss = gamePoss * fraction");
+    assert(ok && Math.abs(ok.ortg - 110) < 0.5, "ORTG = 100 * pts / periodPoss");
+    assert(ok && Math.abs(ok.drtg - 104) < 0.5, "DRTG = 100 * oppPts / periodPoss");
+    const thin = derivePeriodAdvanced(full, 2, 2, 0.05, "nba");
+    assert(thin === null, "thin periodPoss (<5) must reject");
+    const badFrac = derivePeriodAdvanced(full, 55, 52, 0, "nba");
+    assert(badFrac === null, "zero periodFraction must reject");
+  }
+
+  // --- A2 applyVolatility is identity ---
+  if (typeof applyVolatility === "function") {
+    assert(applyVolatility(100, [90,100,110], 12, "nba") === 100, "applyVolatility must be identity on proj");
+    assert(applyVolatility(88.5, [], 12, "ncaa") === 88.5, "applyVolatility identity with empty series");
+  }
+
+  // --- A1 period series min sample + no FT leak ---
+  if (typeof getPeriodAdvancedSeries === "function") {
+    const thinCtx = { ortg10_h2: [110,111,112], drtg10_h2: [105,106,107], pace10_h2: [98,99,100], ortg10: [112], drtg10: [108], pace10: [100] };
+    const r = getPeriodAdvancedSeries(thinCtx, "h2");
+    assert(r.source === "none", "h2 with <5 samples must source=none (no FT leak)");
+    const thinH1 = getPeriodAdvancedSeries({ ortg10_h1: [1,2,3,4], drtg10_h1: [1,2,3,4], ortg10: [110], drtg10: [105] }, "h1");
+    assert(thinH1.source === "none", "h1 with <5 samples must source=none");
+    const fullCtx = {
+      ortg10_h2: [110,111,112,113,114], drtg10_h2: [105,106,107,108,109], pace10_h2: [98,99,100,101,102]
+    };
+    const r2 = getPeriodAdvancedSeries(fullCtx, "h2");
+    assert(r2.source === "h2" && r2.ortg.length >= 5, "h2 with ≥5 samples must be period-native");
+    const qThin = getPeriodAdvancedSeries({ ortg10_q1: [100,101], drtg10_q1: [99,98], ortg10: [110] }, "q1");
+    assert(qThin.source === "none", "q1 thin must not fall back to FT");
+  }
+
+  // --- B5 feature parity train/serve ---
+  if (typeof buildConfidenceFeatures === "function") {
+    const fLive = buildConfidenceFeatures({ edgePct: 0.08, volatilityRatio: 1.2, sampleTier: "full", hasH2H: true, trap: false, league: "nba" });
+    const fFit = buildConfidenceFeatures({ edgePct: 8.0, godsEyeMemory: { aVol: 14.4, bVol: 14.4, sampleTier: "full", hasH2H: true, trap: false }, league: "nba", marketKey: "ft" });
+    assert(Number.isFinite(fLive.edgePct) && Number.isFinite(fFit.edgePct), "features must be finite");
+    assert(Math.abs(fLive.edgePct - fFit.edgePct) < 1e-9, "live fraction and fit percent must normalize to same edgePct feature");
+    assert(fLive.sampleFull === 1 && fLive.h2h === 1 && fLive.trap === 0, "live flags sampleFull/h2h/trap");
+    assert(fFit.sampleFull === 1 && fFit.h2h === 1, "fit flags sampleFull/h2h");
+    // pivot 0.060 only — edge 0.08 → feature 0.02
+    assert(Math.abs(fLive.edgePct - 0.02) < 1e-9, "edge feature = edgeFrac - 0.060");
+    const zero = buildConfidenceFeatures({ edgePct: 0.06, sampleTier: "thin", hasH2H: false, trap: true });
+    assert(Math.abs(zero.edgePct) < 1e-9 && zero.sampleFull === 0 && zero.trap === 1, "pivot edge and thin/trap flags");
+  }
+
+  // --- A3/D14 NaN grade sentinel, never fake D from null ---
+  if (typeof resolveConfidenceGradeFromWinProbability === "function") {
+    assert(resolveConfidenceGradeFromWinProbability(null, "nba") === "NaN", "null winProb → NaN grade, never fake D");
+    assert(resolveConfidenceGradeFromWinProbability(undefined, "nba") === "NaN", "undefined winProb → NaN");
+    assert(resolveConfidenceGradeFromWinProbability(NaN, "nba") === "NaN", "NaN winProb → NaN");
+  }
+  if (typeof getConfidenceGrade === "function") {
+    assert(getConfidenceGrade({ pick: "NO PLAY", line: 220, edge: 5, league: "nba" }) === "NaN", "NO PLAY → NaN");
+    assert(getConfidenceGrade({ pick: "OVER", line: null, edge: 5, league: "nba" }) === "NaN", "null line → NaN");
+    assert(getConfidenceGrade({ pick: "OVER", line: 220, edge: NaN, league: "nba" }) === "NaN", "NaN edge → NaN");
+  }
+
+  // --- distribution win prob ---
+  if (typeof distributionWinProbability === "function") {
+    const p = distributionWinProbability(3, 12, 1.0);
+    assert(Number.isFinite(p) && p > 0.5 && p < 1, "positive edge → winProb > 0.5");
+    const p0 = distributionWinProbability(0, 12, 1.0);
+    assert(Number.isFinite(p0) && Math.abs(p0 - 0.5) < 0.02, "zero edge → ~0.5");
+    assert(distributionWinProbability(NaN, 12, 1) === null, "NaN meanEdge → null");
+  }
+
+  // --- sample tier / quality ---
+  if (typeof getSampleTier === "function") {
+    assert(getSampleTier([1,2,3,4,5,6,7,8,9,10], [1,2,3,4,5,6,7,8,9,10]) === "full", "10+ → full");
+    assert(getSampleTier([1,2,3,4,5], [1,2,3,4,5,6]) === "thin", "5–9 → thin");
+    assert(getSampleTier([1,2], [1,2,3]) === "insufficient", "<5 → insufficient");
+  }
+
+  // --- getMarketVolLimit present ---
+  if (typeof getMarketVolLimit === "function") {
+    const v = getMarketVolLimit("nba", "ft");
+    assert(Number.isFinite(v) && v > 0, "getMarketVolLimit returns positive finite");
+  }
+
+  // --- Number.isFinite null trap regression ---
+  assert(isFinite(null) === true, "document JS quirk isFinite(null)===true");
+  assert(Number.isFinite(null) === false, "Number.isFinite(null)===false (required for grades)");
+
+  const report = {
+    ok: fails.length === 0,
+    failCount: fails.length,
+    fails: fails.slice(0, 40),
+    message: fails.length === 0 ? "All golden math tests passed" : (fails.length + " golden math test(s) failed")
+  };
+  if (typeof engineDebug === "function") engineDebug("MATH_TESTS", report);
+  try { console.log("[BB Engine] MATH_TESTS", report); } catch (_c) {}
+  try {
+    var panel = document.getElementById("mathTestsPanel");
+    if (panel) {
+      var lines = [];
+      lines.push(report.ok ? "✅ MATH TESTS PASSED" : "❌ MATH TESTS FAILED (" + (report.failCount || 0) + ")");
+      lines.push(report.message || "");
+      if (report.fails && report.fails.length) {
+        lines.push("---");
+        report.fails.forEach(function (f, i) { lines.push((i + 1) + ". " + f); });
+      }
+      panel.style.display = "block";
+      panel.style.borderColor = report.ok ? "#2f8f4a" : "#c91920";
+      panel.style.color = report.ok ? "#1e6e39" : "#b11a20";
+      panel.textContent = lines.join("\n");
+    }
+  } catch (_p) {}
+  return report;
+};
+
+
 function getSampleTier(...arrays) {
   if (!arrays.length) return "insufficient";
   const lens = arrays.map(a => Array.isArray(a) ? a.length : 0);
@@ -14556,11 +14783,12 @@ function getPeriodAdvancedSeries(ctx, marketKey) {
   const o = c["ortg10_" + mk];
   const d = c["drtg10_" + mk];
   const p = c["pace10_" + mk];
-  if (Array.isArray(o) && o.length >= 3 && Array.isArray(d) && d.length >= 3) {
+  // Policy: min sample ≥5 for period-native advanced; never silently thin-leak FT ORTG into H2/Q.
+  if (Array.isArray(o) && o.length >= 5 && Array.isArray(d) && d.length >= 5) {
     return {
       ortg: o,
       drtg: d,
-      pace: (Array.isArray(p) && p.length >= 3) ? p : (Array.isArray(c.pace10) ? c.pace10 : []),
+      pace: (Array.isArray(p) && p.length >= 5) ? p : (Array.isArray(c.pace10) ? c.pace10 : []),
       source: mk
     };
   }
@@ -14957,6 +15185,55 @@ function distributionWinProbability(meanEdge, leagueVolLimit, volRatio) {
   return clampNumber(_normalCdf(z), 0.02, 0.98);
 }
 
+// Shared feature dictionary for train (calibrateConfidenceModel) and serve (live logistic).
+// One path: edgePct is absolute fraction (e.g. 0.08 for 8%), already NOT percent.
+// Pivot 0.060 is the sole edge centering; no second 0.055 abs boost.
+const CONFIDENCE_EDGE_PIVOT = 0.060;
+function buildConfidenceFeatures(pickOrArgs) {
+  const p = pickOrArgs || {};
+  // Live path passes plain args; fit path passes tracked pick objects.
+  const edgePctRaw = (p.edgePct != null && p.edgePct !== "")
+    ? Number(p.edgePct)
+    : (p.godsEyeMemory && p.godsEyeMemory.edgePct != null ? Number(p.godsEyeMemory.edgePct) : NaN);
+  // Tracked picks often store edgePct as percent (e.g. 8.0); live uses fraction (0.08).
+  // Normalize: values > 1 treated as percent.
+  let edgeFrac = edgePctRaw;
+  if (Number.isFinite(edgeFrac) && Math.abs(edgeFrac) > 1) edgeFrac = edgeFrac / 100;
+  if (!Number.isFinite(edgeFrac)) edgeFrac = 0;
+
+  const league = p.league || "";
+  const marketKey = String(p.marketKey || p.marketName || "ft").toLowerCase();
+  const volBase = (typeof getMarketVolLimit === "function")
+    ? (getMarketVolLimit(league, marketKey) || (typeof getLeagueVolLimit === "function" ? getLeagueVolLimit(league) : 12) || 12)
+    : 12;
+
+  let volRatioFeat;
+  if (p.volatilityRatio != null && Number.isFinite(Number(p.volatilityRatio))) {
+    volRatioFeat = Number(p.volatilityRatio) - 1.0;
+  } else {
+    const aVol = Number(p.godsEyeMemory?.aVol ?? p.aVol ?? 0);
+    const bVol = Number(p.godsEyeMemory?.bVol ?? p.bVol ?? 0);
+    const avgVol = (Number.isFinite(aVol) || Number.isFinite(bVol))
+      ? ((Number.isFinite(aVol) ? aVol : 0) + (Number.isFinite(bVol) ? bVol : 0)) / 2
+      : volBase;
+    volRatioFeat = (avgVol / (volBase || 12)) - 1.0;
+  }
+
+  const sampleTier = String(
+    p.sampleTier || p.godsEyeMemory?.sampleTier || ""
+  ).toLowerCase();
+  const hasH2H = !!(p.hasH2H ?? p.godsEyeMemory?.hasH2H);
+  const trap = !!(p.trap ?? p.godsEyeMemory?.trap);
+
+  return {
+    edgePct: clampNumber(edgeFrac - CONFIDENCE_EDGE_PIVOT, -0.06, 0.15),
+    volRatio: clampNumber(volRatioFeat, -1, 2.5),
+    sampleFull: sampleTier === "full" ? 1 : 0,
+    h2h: hasH2H ? 1 : 0,
+    trap: trap ? 1 : 0
+  };
+}
+
 function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier, hasH2H, trap, league, newSignals = {}) {
   let coeff = {};
   let _resolvedScope = "global";
@@ -14978,7 +15255,7 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
   }
 
   const _requiredCoeffKeys = ["intercept", "edgePct", "volRatio", "sampleFull", "h2h", "trap"];
-  const _coeffFitted = !!(coeff && _requiredCoeffKeys.every(k => isFinite(coeff[k])));
+  const _coeffFitted = !!(coeff && _requiredCoeffKeys.every(k => Number.isFinite(coeff[k])));
   if (!_coeffFitted) {
     return null;
   }
@@ -15031,29 +15308,30 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
     : 0;
   const _defFloorSideMult = newSignals.pickSide === "under" ? 1 : (newSignals.pickSide === "over" ? -1 : 0);
 
+  // Feature parity with calibrateConfidenceModel via buildConfidenceFeatures.
+  // Single edge definition (pivot 0.060). Double-boost (0.055 abs) removed.
+  const _feat = buildConfidenceFeatures({
+    edgePct: edgePct,
+    volatilityRatio: volatilityRatio,
+    sampleTier: sampleTier,
+    hasH2H: hasH2H,
+    trap: trap,
+    league: league
+  });
   const logOdds =
     (coeff.intercept   ?? -0.2) +
-    (coeff.edgePct     ??  8.0) * ((edgePct || 0) - 0.060) +
-    (coeff.volRatio    ?? -0.8) * ((volatilityRatio ?? 1.0) - 1.0) +
-    (coeff.sampleFull  ??  0.4) * (sampleTier === "full" ? 1 : 0) +
-
-    (coeff.h2h         ??  0.2) * (hasH2H ? 1 : 0) +
-
-    (coeff.trap        ?? -0.5) * (trap ? 1 : 0) +
-
+    (coeff.edgePct     ??  8.0) * _feat.edgePct +
+    (coeff.volRatio    ?? -0.8) * _feat.volRatio +
+    (coeff.sampleFull  ??  0.4) * _feat.sampleFull +
+    (coeff.h2h         ??  0.2) * _feat.h2h +
+    (coeff.trap        ?? -0.5) * _feat.trap +
     (coeff.lineupQuality ?? 0.6) * (_lineupQualityVal - 1.0) +
     (coeff.paceGapRisk   ?? -0.15) * (newSignals.paceGapRisk ? 1 : 0) +
     (coeff.blowoutRisk   ?? -0.20) * (_blowoutRiskFlag ? 1 : 0) +
     (coeff.siblingAgree  ?? 0.15) * _siblingAgree +
     (coeff.defensiveFloor ?? 0.10) * (newSignals.defensiveFloorFlag ? _defFloorSideMult : 0);
 
-  const _absEdgeBoost = (isFinite(edgePct) && edgePct > 0.055)
-    ? Math.min(0.35, (edgePct - 0.055) * 4.0)
-    : 0;
-
-  const _logOddsWithBoost = logOdds + (typeof _absEdgeBoost === "number" ? _absEdgeBoost : 0);
-
-  let _calibratedLogOdds = Math.min(10, Math.max(-10, _logOddsWithBoost));
+  let _calibratedLogOdds = Math.min(10, Math.max(-10, logOdds));
   try {
     const plattStored = localStorage.getItem("BB_PLATT_CALIB");
     if (plattStored) {
@@ -15079,11 +15357,24 @@ function isConfidenceCoeffFitted(league) {
     const tierKey = "tier_" + getLeagueTrustMeta(league).level;
     const coeff = models[league] || models[leagueGroup] || models[tierKey] || models["global"];
     const _requiredCoeffKeys = ["intercept", "edgePct", "volRatio", "sampleFull", "h2h", "trap"];
-    return !!(coeff && _requiredCoeffKeys.every(k => isFinite(coeff[k])));
+    return !!(coeff && _requiredCoeffKeys.every(k => Number.isFinite(coeff[k])));
   } catch(e) { engineDebug("isConfidenceCoeffFitted failed", { league, error: e?.message || String(e) }); return false; }
 }
 
-function resolveConfidenceGradeFromWinProbability(winProb, league = "") {
+function getMarketECE(league, marketKey) {
+  try {
+    const raw = localStorage.getItem("BB_MARKET_ECE");
+    if (!raw) return null;
+    const map = JSON.parse(raw);
+    const lk = String(league || "").toLowerCase();
+    const mk = String(marketKey || "ft").toLowerCase();
+    const entry = map[lk + ":" + mk] || map[mk] || map[lk] || null;
+    if (entry && Number.isFinite(Number(entry.ece))) return { ece: Number(entry.ece), n: Number(entry.n) || 0 };
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+function resolveConfidenceGradeFromWinProbability(winProb, league = "", marketKey = "") {
   // Number.isFinite: isFinite(null)===true would map unfitted null → grade D
   if (!Number.isFinite(winProb)) return "NaN";
   let learnedThresholds = null;
@@ -15096,15 +15387,28 @@ function resolveConfidenceGradeFromWinProbability(winProb, league = "") {
   const threshA = getParam("confidenceAThresh", league) ?? learnedThresholds?.aThresh ?? 0.66;
   const threshB = getParam("confidenceBThresh", league) ?? learnedThresholds?.bThresh ?? 0.58;
   const threshC = getParam("confidenceCThresh", league) ?? learnedThresholds?.cThresh ?? 0.51;
-  if (!isConfidenceCoeffFitted(league)) return winProb >= threshC ? "B" : "D";
+  // D13: when market ECE is poor and sample is meaningful, soft-cap grade (never invent a grade from null).
+  let gradeCap = null; // null = no cap; "B" = max B; "C" = max C
+  const eceInfo = getMarketECE(league, marketKey);
+  if (eceInfo && eceInfo.n >= 30) {
+    if (eceInfo.ece > 0.12) gradeCap = "C";
+    else if (eceInfo.ece > 0.08) gradeCap = "B";
+  }
+  const applyCap = (g) => {
+    if (!gradeCap) return g;
+    const order = { A: 3, B: 2, C: 1, D: 0, NaN: -1 };
+    const capRank = order[gradeCap] ?? 3;
+    return (order[g] ?? 0) > capRank ? gradeCap : g;
+  };
+  if (!isConfidenceCoeffFitted(league)) return applyCap(winProb >= threshC ? "B" : "D");
   if (getLeagueTrustMeta(league).level === "advisory") {
-    if (winProb >= threshB) return "B";
-    if (winProb >= threshC) return "C";
+    if (winProb >= threshB) return applyCap("B");
+    if (winProb >= threshC) return applyCap("C");
     return "D";
   }
-  if (winProb >= threshA) return "A";
-  if (winProb >= threshB) return "B";
-  if (winProb >= threshC) return "C";
+  if (winProb >= threshA) return applyCap("A");
+  if (winProb >= threshB) return applyCap("B");
+  if (winProb >= threshC) return applyCap("C");
   return "D";
 }
 
@@ -15159,7 +15463,7 @@ function getConfidenceGrade(params) {
     return "NaN";
   }
 
-  return resolveConfidenceGradeFromWinProbability(winProb, league);
+  return resolveConfidenceGradeFromWinProbability(winProb, league, params?.marketKey || "");
 }
 
 function getMarginConfidenceGrade(params) {
@@ -15183,7 +15487,7 @@ function getMarginConfidenceGrade(params) {
     return "NaN";
   }
 
-  return resolveConfidenceGradeFromWinProbability(winProb, league);
+  return resolveConfidenceGradeFromWinProbability(winProb, league, params?.marketKey || "margin");
 }
 
 const _anchorCapCache = new Map();
@@ -18115,23 +18419,25 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   // Prefer H1-native box advanced series when auto-fetch built them.
   const _advA1 = (typeof getPeriodAdvancedSeries === "function") ? getPeriodAdvancedSeries(ctxA, "h1") : { ortg: [], drtg: [], pace: [], source: "none" };
   const _advB1 = (typeof getPeriodAdvancedSeries === "function") ? getPeriodAdvancedSeries(ctxB, "h1") : { ortg: [], drtg: [], pace: [], source: "none" };
-  const _usePeriod1 = _advA1.source === "h1" && _advB1.source === "h1";
-  const _ortgArrA1 = _usePeriod1 ? _advA1.ortg : (ctxA.ortg10 || []);
-  const _drtgArrA1 = _usePeriod1 ? _advA1.drtg : (ctxA.drtg10 || []);
-  const _ortgArrB1 = _usePeriod1 ? _advB1.ortg : (ctxB.ortg10 || []);
-  const _drtgArrB1 = _usePeriod1 ? _advB1.drtg : (ctxB.drtg10 || []);
-  const _paceArrA1 = _usePeriod1 && _advA1.pace.length ? _advA1.pace : (ctxA.pace10 || []);
-  const _paceArrB1 = _usePeriod1 && _advB1.pace.length ? _advB1.pace : (ctxB.pace10 || []);
+  // Honesty: never fall back to FT ORTG for 1H. Period-native series only, else points-only.
+  const _usePeriod1 = _advA1.source === "h1" && _advB1.source === "h1"
+    && (_advA1.ortg || []).length >= 5 && (_advB1.ortg || []).length >= 5;
+  const _ortgArrA1 = _usePeriod1 ? _advA1.ortg : [];
+  const _drtgArrA1 = _usePeriod1 ? _advA1.drtg : [];
+  const _ortgArrB1 = _usePeriod1 ? _advB1.ortg : [];
+  const _drtgArrB1 = _usePeriod1 ? _advB1.drtg : [];
+  const _paceArrA1 = _usePeriod1 && _advA1.pace.length ? _advA1.pace : [];
+  const _paceArrB1 = _usePeriod1 && _advB1.pace.length ? _advB1.pace : [];
 
   const avgPaceA = avgOrNaN(_paceArrA1);
   const avgPaceB = avgOrNaN(_paceArrB1);
   const clamp = getEffectivePaceClamp(league);
 
   let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
-  hasRealPace = hasRealPace && _paceArrA1.length >= 3 && _paceArrB1.length >= 3;
+  hasRealPace = hasRealPace && _paceArrA1.length >= 5 && _paceArrB1.length >= 5;
 
   let hasRealRatings = isFinite(avgOrNaN(_ortgArrA1)) && isFinite(avgOrNaN(_drtgArrA1)) && isFinite(avgOrNaN(_ortgArrB1)) && isFinite(avgOrNaN(_drtgArrB1))
-    && _ortgArrA1.length >= 3 && _ortgArrB1.length >= 3;
+    && _ortgArrA1.length >= 5 && _ortgArrB1.length >= 5;
 
   const leaguePaceNorm1H = 48 / (getLeagueRegulationMinutes(league) || 48);
   let synPace = leaguePaceBase;
@@ -18316,9 +18622,7 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
   hasRealPace = hasRealPace && (ctxA.pace10 || []).length >= 5 && (ctxB.pace10 || []).length >= 5;
-
-  let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10))
-    && (ctxA.ortg10 || []).length >= 5 && (ctxB.ortg10 || []).length >= 5;
+  // No FT ORTG gate on 2H — advanced path uses period-native H2 series or synthetic H2 points/pace only.
 
   const leaguePaceNorm2H = 48 / (getLeagueRegulationMinutes(league) || 48);
   let synPace = leaguePaceBase;
@@ -18708,28 +19012,15 @@ function calibrateConfidenceModel() {
     }
     const gradeThresholds = { aThresh: aThreshold, bThresh: bThreshold, cThresh: cThreshold };
     try {
-      localStorage.setItem("BB_CONFIDENCE_THRESHOLDS", JSON.stringify(gradeThresholds));
-      localStorage.setItem("BB_CONFIDENCE_GRADE_WIN_RATES", JSON.stringify(thresholds));
-      engineDebug("Confidence grade thresholds calibrated", { gradeThresholds, winRates: thresholds });
-    } catch(e) { console.error("[BB Engine] Confidence grade threshold save failed", e); }
+      // Propose only — live thresholds promote with coeffs/Platt/N (atomic apply)
+      localStorage.setItem("BB_CONFIDENCE_THRESHOLDS_PROPOSED", JSON.stringify(gradeThresholds));
+      localStorage.setItem("BB_CONFIDENCE_GRADE_WIN_RATES_PROPOSED", JSON.stringify(thresholds));
+      engineDebug("Confidence grade thresholds proposed (not auto-applied)", { gradeThresholds, winRates: thresholds });
+    } catch(e) { console.error("[BB Engine] Confidence grade threshold proposal save failed", e); }
   }
 
-  const buildF = (p) => {
-    // Same vol path as live getMarketVolLimit so fitted volRatio coeff matches serving feature
-    const _mkt = String(p.marketKey || p.marketName || "ft").toLowerCase();
-    const _volBase = (typeof getMarketVolLimit === "function")
-      ? (getMarketVolLimit(p.league, _mkt) || getLeagueVolLimit(p.league) || 12)
-      : (getLeagueVolLimit(p.league) || 12);
-    return {
-    edgePct:   clampNumber(Number(p.edgePct || p.godsEyeMemory?.edgePct || 0) / 100 - 0.060, -0.06, 0.15),
-    volRatio:  clampNumber(
-                 ((Number(p.godsEyeMemory?.aVol || 0) + Number(p.godsEyeMemory?.bVol || 0)) / 2)
-                 / _volBase - 1.0, -1, 2.5),
-    sampleFull: (String(p.godsEyeMemory?.sampleTier || "").toLowerCase() === "full") ? 1 : 0,
-    h2h:       (p.godsEyeMemory?.hasH2H) ? 1 : 0,
-    trap:      (p.godsEyeMemory?.trap) ? 1 : 0
-  };
-  };
+  // Train/serve identity: same feature builder as live getConfidenceWinProbability.
+  const buildF = (p) => buildConfidenceFeatures(p);
 
   const _gd = (data, lr, lambda) => {
     let c = { intercept: -0.2, edgePct: 8.0, volRatio: -0.8, sampleFull: 0.4, h2h: 0.2, trap: -1.2 };
@@ -21564,7 +21855,7 @@ window.__LAST_AUDIT_STATE = {
     h1ConfigOverrideKeys: Object.keys(h1ConfigOverride),
     gradeThresholds: _aud_gradeThresholds,
 
-    confidenceModelNote: "Live model is logistic getConfidenceWinProbability (edgePct pivot ~0.060, sampleFull/h2h/trap terms, optional Platt scaling). Grades A/B/C from winProb vs per-league or learned thresholds. NaN = NO PLAY.",
+    confidenceModelNote: "Live model is logistic getConfidenceWinProbability via shared buildConfidenceFeatures (edgePct pivot 0.060 only — no 0.055 abs boost; sampleFull/h2h/trap; optional Platt). Train/serve identical features. Grades A/B/C from winProb vs thresholds. NaN = NO PLAY.",
     phase2Control: PHASE2_CONTROL,
     trackerPolicy: TRACKER_POLICY,
     trackerLearningEnabled: TRACKER_LEARNING_ENABLED,
