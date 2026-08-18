@@ -1,3 +1,4 @@
+D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -15417,20 +15418,22 @@ function resolveConfidenceGradeFromWinProbability(winProb, league = "", marketKe
   return "D";
 }
 
-function getConfidenceGrade(params) {
-
+// Single source of truth for live win probability (logistic + distribution blend).
+// Used by getConfidenceGrade AND by pick.winProbability / audit serialization
+// so a graded play never shows winProbability: null while finalGrade is A/B/C.
+function resolveLiveWinProbability(params) {
+  const p = params || {};
   const {
     pick, note, line, edge, sampleTier, hasH2H, volatility, volLimit,
     trap,
-    // NEW/UNCALIBRATED wiring — see getConfidenceWinProbability for how these
-    // are used. Previously computed and passed at every call site, never read.
     paceGapRisk, blowoutGap, lineupQuality, siblingEdge, q4Edge, q2Edge,
     defensiveFloorFlag,
-    league = ""
-  } = params || {};
+    league = "",
+    marketKey = ""
+  } = p;
 
   if (!pick || pick === "NO PLAY" || note || line === null || !isFinite(line) || line <= 0 || !isFinite(edge)) {
-    return "NaN";
+    return null;
   }
 
   const edgePct = Math.abs(edge / line);
@@ -15441,13 +15444,11 @@ function getConfidenceGrade(params) {
     defensiveFloorFlag, pickEdge: edge, pickSide: _pickSide
   });
 
-  // A3: predictive Normal distribution is the primary probability when available.
-  // Logistic model is retained as a calibrated fallback / blend anchor so fitted
-  // coefficients are not discarded. When distribution SD is valid, blend 70/30
-  // toward the CDF so grades reflect P(total beats line) rather than a pure
-  // scalar edge mapping.
+  // Distribution-primary when available; logistic is blend anchor when fitted.
   try {
-    const _volLimitPts = getMarketVolLimit(league, params?.marketKey || "ft") || 12;
+    const _volLimitPts = (typeof getMarketVolLimit === "function")
+      ? (getMarketVolLimit(league, marketKey || p.marketKey || "ft") || 12)
+      : 12;
     const _distProb = distributionWinProbability(edge, _volLimitPts, volRatio);
     if (Number.isFinite(_distProb)) {
       if (Number.isFinite(winProb)) {
@@ -15455,20 +15456,32 @@ function getConfidenceGrade(params) {
       } else {
         winProb = _distProb;
       }
-      engineDebug("Distribution-primary winProb", {
-        league, marketKey: params?.marketKey, distributionWinProb: _distProb, blendedWinProb: winProb
-      });
     }
-  } catch (_dpe) { engineDebug("distributionWinProbability comparison failed", { error: _dpe?.message || String(_dpe) }); }
+  } catch (_dpe) {
+    if (typeof engineDebug === "function") {
+      engineDebug("resolveLiveWinProbability distribution failed", { error: _dpe?.message || String(_dpe) });
+    }
+  }
+
+  return Number.isFinite(winProb) ? winProb : null;
+}
+
+function getConfidenceGrade(params) {
+  const p = params || {};
+  const winProb = resolveLiveWinProbability(p);
+  // Stash for callers that only received a grade string historically.
+  try { p._resolvedWinProbability = winProb; } catch (_e) {}
 
   if (!Number.isFinite(winProb)) {
-    engineDebug("getConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
-      league, marketKey: params?.marketKey, edgePct, volRatio, sampleTier, hasH2H
-    });
+    if (typeof engineDebug === "function") {
+      engineDebug("getConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
+        league: p.league, marketKey: p.marketKey
+      });
+    }
     return "NaN";
   }
 
-  return resolveConfidenceGradeFromWinProbability(winProb, league, params?.marketKey || "");
+  return resolveConfidenceGradeFromWinProbability(winProb, p.league || "", p.marketKey || "");
 }
 
 function getMarginConfidenceGrade(params) {
@@ -21515,7 +21528,34 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
           const hasH2H = p.hasH2H ?? false;
           const trapFlag = p.trap ?? false;
 
-          p.winProbability = getConfidenceWinProbability(grade, edgePct, volRatio, sampleTier, hasH2H, trapFlag, league);
+          // Same blend as getConfidenceGrade — never logistic-only (null when unfitted).
+          if (typeof resolveLiveWinProbability === "function") {
+            p.winProbability = resolveLiveWinProbability({
+              pick: p.pick || p.predictionText,
+              note: p.note,
+              line: p.line ?? p.displayLineUsed ?? p.lineAtPick,
+              edge: p.edge,
+              sampleTier: sampleTier,
+              hasH2H: hasH2H,
+              volatility: p.volatility,
+              volLimit: marketVolLimit,
+              trap: trapFlag,
+              league: p.league || league,
+              marketKey: p.marketKey
+            });
+          } else {
+            const _logistic = getConfidenceWinProbability(grade, edgePct, volRatio, sampleTier, hasH2H, trapFlag, league);
+            let _wp = _logistic;
+            try {
+              const _dist = distributionWinProbability(p.edge, marketVolLimit || 12, volRatio);
+              if (Number.isFinite(_dist)) {
+                _wp = Number.isFinite(_logistic)
+                  ? clampNumber(0.70 * _dist + 0.30 * _logistic, 0.02, 0.98)
+                  : _dist;
+              }
+            } catch (_e) {}
+            p.winProbability = Number.isFinite(_wp) ? _wp : null;
+          }
         }
       });
     }
@@ -22048,7 +22088,7 @@ window.__LAST_AUDIT_STATE = {
         modelGradeC_Threshold: _aud_gradeThresholds.cThresh,
         calculatedWinProbabilities: finalPicksForDisplay.map(p => ({
           market: p.marketKey,
-          winProbability: p.winProbability || null
+          winProbability: Number.isFinite(Number(p.winProbability)) ? Number(p.winProbability) : null
         }))
       }
     };
@@ -22966,6 +23006,350 @@ try {
 <script>
 const _originalEngineDebug = (typeof engineDebug === 'function') ? engineDebug : null;
 const _originalTrackerDebug = (typeof trackerDebug === 'function') ? trackerDebug : null;
+
+// =============================================================================
+// ENGINE AUDITOR — debug-page only (AFDB). Maximum live checks. WHAT/WHY/FIX.
+// =============================================================================
+window.EngineAuditor = (function () {
+  const NL = String.fromCharCode(10);
+
+  function issue(sev, area, title, what, why, fix) {
+    return {
+      sev: sev,
+      area: area,
+      title: title,
+      what: what || title,
+      why: why || "",
+      fix: fix || ""
+    };
+  }
+
+  function run() {
+    const issues = [];
+    const notes = [];
+    const push = function () { issues.push(issue.apply(null, arguments)); };
+    const note = function (area, msg) { notes.push({ area: area, msg: msg }); };
+
+    // ----- STRUCTURE -----
+    const requiredFns = [
+      "computeFTProjection", "compute1HProjection", "compute2HProjection",
+      "getH2HWeight", "applyVolatility", "getPeriodAdvancedSeries", "derivePeriodAdvanced",
+      "getConfidenceGrade", "getConfidenceWinProbability", "resolveLiveWinProbability",
+      "getPick", "distributionWinProbability", "getSampleTier", "getMarketVolLimit",
+      "getDynamicWeights", "buildConfidenceFeatures"
+    ];
+    requiredFns.forEach(function (name) {
+      var t;
+      try { t = typeof eval(name); } catch (e) { t = "undefined"; }
+      // script-scope: typeof works if function is in same scope when called from AFDB
+      try {
+        t = typeof window[name] === "function" ? "function" : t;
+      } catch (e2) {}
+      // Prefer direct reference from closure scope
+    });
+    // Use direct typeof in this script scope (AFDB is same script)
+    function present(fn) { return typeof fn === "function"; }
+    if (!present(computeFTProjection)) push("CRITICAL", "STRUCTURE", "computeFTProjection missing", "FT projection function not found", "FT markets cannot run", "Restore computeFTProjection in the engine script.");
+    if (!present(compute1HProjection)) push("CRITICAL", "STRUCTURE", "compute1HProjection missing", "1H projection function not found", "1H markets cannot run", "Restore compute1HProjection.");
+    if (!present(compute2HProjection)) push("CRITICAL", "STRUCTURE", "compute2HProjection missing", "2H projection function not found", "2H markets cannot run", "Restore compute2HProjection.");
+    if (!present(getH2HWeight)) push("CRITICAL", "STRUCTURE", "getH2HWeight missing", "H2H weight helper missing", "H2H blend cannot be audited or applied safely", "Restore getH2HWeight.");
+    if (!present(applyVolatility)) push("CRITICAL", "STRUCTURE", "applyVolatility missing", "Volatility helper missing", "Vol policy cannot be enforced", "Restore applyVolatility as identity on mean.");
+    if (!present(getConfidenceGrade)) push("CRITICAL", "STRUCTURE", "getConfidenceGrade missing", "Grade path missing", "No letter grades", "Restore getConfidenceGrade.");
+    if (!present(resolveLiveWinProbability)) {
+      push("ERROR", "CONFIDENCE", "resolveLiveWinProbability missing",
+        "Shared live winProb helper not found — grade and audit can diverge again",
+        "Graded plays may show winProbability null in audit/tracker",
+        "Add resolveLiveWinProbability and use it in getConfidenceGrade and pick.winProbability assignment.");
+    } else note("STRUCTURE", "resolveLiveWinProbability present");
+    if (present(computeFTProjection) && present(getH2HWeight)) note("STRUCTURE", "Core projection + H2H symbols present");
+
+    // ----- VOLATILITY -----
+    try {
+      if (present(applyVolatility)) {
+        [50, 88.2, 120].forEach(function (v) {
+          var out = applyVolatility(v, [70, 80, 90, 100, 110], 12, "nba", 90);
+          if (out !== v) {
+            push("ERROR", "VOLATILITY", "applyVolatility mutates mean",
+              "applyVolatility(" + v + ") → " + out,
+              "Volatility must not shrink the projection mean; that confuses uncertainty with a lower score",
+              "Make applyVolatility return proj unchanged; use vol only as SD in distributionWinProbability.");
+          }
+        });
+        note("VOLATILITY", "applyVolatility is identity on mean");
+      }
+      if (present(getVolatilityRatioForSeries)) {
+        var low = getVolatilityRatioForSeries([100, 100, 100, 100, 100], 12);
+        var high = getVolatilityRatioForSeries([50, 150, 40, 160, 100], 12);
+        var short = getVolatilityRatioForSeries([100, 102], 12);
+        if (short !== 1.0) push("ERROR", "VOLATILITY", "Short series volRatio", "volRatio with <3 samples = " + short, "Must default to 1.0", "getVolatilityRatioForSeries: if length < 3 return 1.0");
+        if (!Number.isFinite(high) || high > 2.5) push("ERROR", "VOLATILITY", "volRatio uncapped", "high=" + high, "Uncapped ratio explodes SD", "Cap at 2.5");
+        if (!(high > low)) push("ERROR", "VOLATILITY", "volRatio not sensitive to SD", "low=" + low + " high=" + high, "Ratio should rise with dispersion", "Check stdDev / limit math");
+      }
+    } catch (e) {
+      push("ERROR", "VOLATILITY", "Volatility checks threw", String(e && e.message || e), "Auditor could not complete vol checks", "Inspect applyVolatility / getVolatilityRatioForSeries");
+    }
+
+    // ----- H2H -----
+    try {
+      if (present(getH2HWeight)) {
+        var w0 = getH2HWeight(0, 0, "ft", "full", 0, "nba", 220, 1.0, null);
+        var w1 = getH2HWeight(1, 1, "ft", "full", 0, "nba", 220, 1.0, null);
+        var wFull = getH2HWeight(10, 10, "ft", "full", 0, "nba", 220, 1.0, null);
+        var wThin = getH2HWeight(10, 10, "ft", "thin", 0, "nba", 220, 1.0, null);
+        var wDiv = getH2HWeight(10, 10, "ft", "full", 80, "nba", 220, 1.0, null);
+        if (w0 !== 0) push("ERROR", "H2H", "Zero-sample weight non-zero", "w0=" + w0, "Empty H2H must not blend", "getH2HWeight: minLen < 2 → return 0");
+        if (w1 !== 0) push("ERROR", "H2H", "Single-game weight non-zero", "w1=" + w1, "One game is not a stable H2H signal", "getH2HWeight: minLen < 2 → 0");
+        if (!Number.isFinite(wFull) || wFull < 0 || wFull > 0.30 + 1e-9) {
+          push("ERROR", "H2H", "Weight out of [0, cap]", "wFull=" + wFull, "Above cap overwrites season form", "Clamp to h2hMaxWeight (~0.30)");
+        }
+        if (!(wFull >= wThin - 1e-9)) push("ERROR", "H2H", "Full tier not ≥ thin", "full=" + wFull + " thin=" + wThin, "Thin should be penalized", "tierPenalty: insufficient < thin < full");
+        if (!(wDiv < wFull - 0.001)) push("ERROR", "H2H", "Divergence not reducing weight", "base=" + wFull + " div=" + wDiv, "When H2H disagrees with model, reduce H2H weight", "divergencePenalty when relDiv > threshold");
+        note("H2H", "weights full=" + Number(wFull).toFixed(3) + " thin=" + Number(wThin).toFixed(3) + " div=" + Number(wDiv).toFixed(3));
+      }
+    } catch (e) {
+      push("ERROR", "H2H", "H2H checks threw", String(e && e.message || e), "Cannot verify H2H math", "Inspect getH2HWeight");
+    }
+
+    // ----- PERIOD / FT LEAK -----
+    try {
+      if (present(getPeriodAdvancedSeries)) {
+        var thinH2 = getPeriodAdvancedSeries({ ortg10_h2: [1, 2, 3], drtg10_h2: [1, 2, 3], pace10_h2: [1, 2, 3], ortg10: [110], drtg10: [105], pace10: [100] }, "h2");
+        if (thinH2 && thinH2.source !== "none") {
+          push("ERROR", "PERIOD", "H2 thin series uses non-none source",
+            "source=" + thinH2.source,
+            "Thin 2H advanced must not fall back to FT ORTG/pace — silent period leak",
+            "getPeriodAdvancedSeries: require ≥5 period samples; else source=\"none\"");
+        } else note("PERIOD", "H2 thin → source none");
+        var thinH1 = getPeriodAdvancedSeries({ ortg10_h1: [1, 2, 3, 4], drtg10_h1: [1, 2, 3, 4], ortg10: [110] }, "h1");
+        if (thinH1 && thinH1.source !== "none") {
+          push("ERROR", "PERIOD", "H1 thin series FT leak", "source=" + thinH1.source, "1H must not use FT ortg10 when H1 series is thin", "Require ≥5 H1 samples or source=none");
+        }
+      }
+      if (present(derivePeriodAdvanced)) {
+        var d = derivePeriodAdvanced({ pace: 100, possessions: 100 }, 50, 40, 0.5, "nba");
+        if (!d || Math.abs(d.possessions - 50) > 0.01) push("ERROR", "PERIOD", "periodPoss formula", "expected 50 got " + (d && d.possessions), "periodPoss = gamePoss × fraction", "Fix derivePeriodAdvanced");
+        if (!d || Math.abs(d.ortg - 100) > 0.05) push("ERROR", "PERIOD", "ORTG formula", "expected 100 got " + (d && d.ortg), "ORTG = 100 × pts / periodPoss", "Fix derivePeriodAdvanced");
+      }
+    } catch (e) {
+      push("ERROR", "PERIOD", "Period checks threw", String(e && e.message || e), "Period policy unverified", "Inspect getPeriodAdvancedSeries / derivePeriodAdvanced");
+    }
+
+    // ----- PICK / NO PLAY -----
+    try {
+      if (present(getPick)) {
+        if (getPick(0, 220, "nba", "ft", {}) !== "NO PLAY") push("ERROR", "NO PLAY", "Zero edge plays", "getPick(0) not NO PLAY", "Zero edge is not a bet", "getPick: edge===0 → NO PLAY");
+        if (String(getPick(8, 220, "nba", "ft", {})).indexOf("OVER") !== 0) push("ERROR", "NO PLAY", "Positive edge not OVER", "got " + getPick(8, 220, "nba", "ft", {}), "Sign must drive side", "edge > 0 → OVER");
+        if (String(getPick(-8, 220, "nba", "ft", {})).indexOf("UNDER") !== 0) push("ERROR", "NO PLAY", "Negative edge not UNDER", "got " + getPick(-8, 220, "nba", "ft", {}), "Sign must drive side", "edge < 0 → UNDER");
+        if (getPick(5, null, "nba", "ft", {}) !== "NO PLAY") push("ERROR", "NO PLAY", "Null line plays", "null line still plays", "No line → no play", "Reject !finite line");
+      }
+    } catch (e) {
+      push("ERROR", "NO PLAY", "getPick checks threw", String(e && e.message || e), "Pick gates unverified", "Inspect getPick");
+    }
+
+    // ----- CONFIDENCE / TRAIN-SERVE -----
+    try {
+      if (present(buildConfidenceFeatures)) {
+        var a = buildConfidenceFeatures({ edgePct: 0.09, volatilityRatio: 1.0, sampleTier: "full", hasH2H: false, trap: true });
+        if (Math.abs(a.edgePct - 0.03) > 1e-9) {
+          push("ERROR", "CONFIDENCE", "Edge pivot wrong", "feature edgePct=" + a.edgePct + " expected 0.03", "Train/serve must share pivot 0.060", "buildConfidenceFeatures: edgeFrac - 0.060");
+        }
+        var b = buildConfidenceFeatures({ edgePct: 9 });
+        if (Math.abs(b.edgePct - 0.03) > 1e-9) {
+          push("ERROR", "CONFIDENCE", "Percent edge not normalized", "edgePct 9 → " + b.edgePct, "Tracked % vs live fraction mismatch breaks train=serve", "If abs(edge)>1 treat as percent /100");
+        }
+      }
+      if (present(getConfidenceGrade)) {
+        if (getConfidenceGrade({ pick: "NO PLAY", line: 220, edge: 5, league: "nba" }) !== "NaN") {
+          push("ERROR", "CONFIDENCE", "NO PLAY graded", "NO PLAY returned non-NaN grade", "NO PLAY must not get A–D", "getConfidenceGrade: NO PLAY → NaN");
+        }
+        // Live play should get finite winProb via resolveLiveWinProbability when distribution works
+        if (present(resolveLiveWinProbability)) {
+          var wp = resolveLiveWinProbability({
+            pick: "OVER 220", line: 220, edge: 8, sampleTier: "full", hasH2H: false,
+            volatility: 12, volLimit: 12, trap: false, league: "nba", marketKey: "ft"
+          });
+          if (!Number.isFinite(wp)) {
+            push("ERROR", "CONFIDENCE", "Live winProb still non-finite on valid play",
+              "resolveLiveWinProbability returned " + wp,
+              "Graded plays need a finite winProb for audit/tracker",
+              "Ensure distributionWinProbability path works when logistic is unfitted");
+          } else {
+            var g = getConfidenceGrade({
+              pick: "OVER 220", line: 220, edge: 8, sampleTier: "full", hasH2H: false,
+              volatility: 12, volLimit: 12, trap: false, league: "nba", marketKey: "ft"
+            });
+            if (g === "NaN") {
+              push("WARN", "CONFIDENCE", "Valid edge graded NaN", "edge 8 @ 220 → NaN", "Unexpected if winProb finite", "Check resolveConfidenceGradeFromWinProbability thresholds");
+            } else note("CONFIDENCE", "sample grade " + g + " winProb=" + Number(wp).toFixed(3));
+          }
+        }
+      }
+      if (present(distributionWinProbability)) {
+        var p0 = distributionWinProbability(0, 12, 1);
+        var p1 = distributionWinProbability(6, 12, 1);
+        if (!(p1 > p0)) push("ERROR", "CONFIDENCE", "Distribution non-monotonic", "p0=" + p0 + " p1=" + p1, "Larger |edge| must raise P(win)", "Fix _normalCdf / sd");
+      }
+    } catch (e) {
+      push("ERROR", "CONFIDENCE", "Confidence checks threw", String(e && e.message || e), "Confidence path unverified", "Inspect resolveLiveWinProbability / getConfidenceGrade");
+    }
+
+    // ----- PROJECTION SMOKE -----
+    try {
+      var toyParsed = {
+        aFTScored: [110, 112, 108, 115, 109, 111, 113, 107, 110, 112],
+        bFTScored: [105, 108, 106, 110, 104, 107, 109, 103, 106, 108],
+        a1HScored: [55, 56, 54, 58, 53, 55, 57, 52, 54, 56],
+        b1HScored: [52, 54, 51, 55, 50, 53, 54, 49, 52, 53]
+      };
+      var toyCtx = {
+        A: { overall: { ftScored10: toyParsed.aFTScored, ftAllowed10: toyParsed.bFTScored, h1Scored10: toyParsed.a1HScored, h1Allowed10: toyParsed.b1HScored }, venue: {}, ortg10: [], drtg10: [], pace10: [], ortg10_h1: [], drtg10_h1: [], pace10_h1: [], ortg10_h2: [], drtg10_h2: [], pace10_h2: [] },
+        B: { overall: { ftScored10: toyParsed.bFTScored, ftAllowed10: toyParsed.aFTScored, h1Scored10: toyParsed.b1HScored, h1Allowed10: toyParsed.a1HScored }, venue: {}, ortg10: [], drtg10: [], pace10: [], ortg10_h1: [], drtg10_h1: [], pace10_h1: [], ortg10_h2: [], drtg10_h2: [], pace10_h2: [] }
+      };
+      if (present(computeFTProjection)) {
+        try {
+          var ft = computeFTProjection({ league: "nba", parsed: toyParsed, lines: { ftLine: 220 }, injMultA: 1, injMultB: 1, config: { teamWeight: 0.65 }, contextData: toyCtx });
+          if (!ft || !Number.isFinite(ft.ftProj) || ft.ftProj < 150 || ft.ftProj > 300) {
+            push("ERROR", "CALC", "FT toy projection invalid", "ftProj=" + (ft && ft.ftProj), "Clean series should yield sane NBA total", "Debug computeFTProjection NaN path");
+          } else note("CALC", "toy FT proj=" + Number(ft.ftProj).toFixed(1));
+        } catch (pe) {
+          push("ERROR", "CALC", "computeFTProjection threw", String(pe.message || pe), "FT pipeline broken on toy data", "Stack-trace computeFTProjection");
+        }
+      }
+      if (present(compute1HProjection)) {
+        try {
+          var h1 = compute1HProjection({ league: "nba", parsed: toyParsed, lines: { h1Line: 110 }, injMultA: 1, injMultB: 1, config: { teamWeight: 0.65 }, contextData: toyCtx });
+          if (!h1 || !Number.isFinite(h1.h1Proj)) push("ERROR", "CALC", "1H toy non-finite", "h1Proj invalid", "1H path broken", "Debug compute1HProjection");
+          else note("CALC", "toy 1H proj=" + Number(h1.h1Proj).toFixed(1));
+        } catch (pe) {
+          push("ERROR", "CALC", "compute1HProjection threw", String(pe.message || pe), "1H pipeline error", "Debug compute1HProjection");
+        }
+      }
+      if (present(compute2HProjection)) {
+        try {
+          var h2 = compute2HProjection({ league: "nba", parsed: toyParsed, lines: { h2Line: 110 }, injMultA: 1, injMultB: 1, config: { teamWeight: 0.65 }, contextData: toyCtx });
+          if (!h2 || !Number.isFinite(h2.h2Proj)) push("ERROR", "CALC", "2H toy non-finite", "h2Proj invalid", "2H path broken", "Debug compute2HProjection");
+          else note("CALC", "toy 2H proj=" + Number(h2.h2Proj).toFixed(1));
+        } catch (pe) {
+          push("ERROR", "CALC", "compute2HProjection threw", String(pe.message || pe), "2H pipeline error", "Debug compute2HProjection");
+        }
+      }
+    } catch (e) {
+      push("ERROR", "CALC", "Projection smoke threw", String(e && e.message || e), "Cannot smoke-test projections", "Inspect compute*Projection");
+    }
+
+    // ----- GOLDEN MATH HARNESS -----
+    try {
+      if (typeof window.__BB_RUN_MATH_TESTS__ === "function") {
+        var r = window.__BB_RUN_MATH_TESTS__();
+        if (!r || !r.ok) {
+          push("ERROR", "MATH_TESTS", "Golden math failed", (r && r.failCount) + " failures", "Structural math regressions present", "Run Math tests; fix listed asserts");
+          (r && r.fails || []).slice(0, 12).forEach(function (f) {
+            push("ERROR", "MATH_TESTS", String(f), String(f), "Golden assert failed", "Fix the named invariant");
+          });
+        } else note("MATH_TESTS", "All golden math tests passed");
+      } else {
+        push("WARN", "MATH_TESTS", "Harness missing", "__BB_RUN_MATH_TESTS__ not found", "No structural golden suite", "Restore math harness");
+      }
+    } catch (e) {
+      push("ERROR", "MATH_TESTS", "Harness threw", String(e && e.message || e), "Cannot run golden tests", "Inspect __BB_RUN_MATH_TESTS__");
+    }
+
+    // ----- STORAGE -----
+    try {
+      if (!window.localStorage) push("CRITICAL", "STORAGE", "localStorage unavailable", "No localStorage", "Model coeffs and tracker cannot persist", "Enable storage or provide fallback");
+      else {
+        var rawC = localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF");
+        if (rawC) {
+          try {
+            var m = JSON.parse(rawC);
+            if (!m || typeof m !== "object") push("ERROR", "STORAGE", "Coeff blob not object", "parse type wrong", "Corrupt model storage", "Clear BB_CONFIDENCE_MODEL_COEFF and recalibrate");
+          } catch (e) {
+            push("ERROR", "STORAGE", "Coeff JSON corrupt", String(e.message || e), "Cannot load logistic coeffs", "Remove bad BB_CONFIDENCE_MODEL_COEFF key");
+          }
+        } else note("STORAGE", "No fitted coeffs yet (logistic unfitted — distribution path required)");
+        var propC = localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_PROPOSED");
+        var propN = localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_N_PROPOSED");
+        if (propN && !propC) {
+          push("WARN", "STORAGE", "Orphan N proposal", "N_PROPOSED without COEFF_PROPOSED", "Non-atomic residue", "Clear orphan keys or complete atomic promote");
+        }
+      }
+      if (!window.indexedDB) push("WARN", "STORAGE", "IndexedDB disabled", "indexedDB missing", "Persistence risk", "Enable IndexedDB in browser");
+    } catch (e) {
+      push("WARN", "STORAGE", "Storage scan threw", String(e && e.message || e), "Storage unverified", "Inspect localStorage access");
+    }
+
+    // ----- TRACKER -----
+    try {
+      if (typeof g_trackerState !== "undefined" && g_trackerState) {
+        var active = Array.isArray(g_trackerState.activePicks) ? g_trackerState.activePicks.length : 0;
+        var arch = Array.isArray(g_trackerState.archivedPicks) ? g_trackerState.archivedPicks.length : 0;
+        note("TRACKER", "active=" + active + " archived=" + arch);
+        if (active > 450) push("WARN", "TRACKER", "Active near capacity", "activePicks=" + active, "May drop older open picks", "Archive/settle or raise cap carefully");
+      } else note("TRACKER", "g_trackerState not ready yet");
+    } catch (e) {
+      push("WARN", "TRACKER", "Tracker scan threw", String(e && e.message || e), "Tracker unverified", "Inspect g_trackerState");
+    }
+
+    // ----- SECURITY / FETCH -----
+    try {
+      if (typeof WORKER_SHARED_SECRET === "string" && WORKER_SHARED_SECRET.length > 0) {
+        push("WARN", "SECURITY", "Client-visible worker secret", "Secret embedded in bundle", "Not real auth by itself", "Worker must allowlist + rate-limit; rotate together");
+      }
+      if (typeof WORKER_URL === "string") note("FETCH", "WORKER_URL set");
+    } catch (e) {}
+
+    // ----- DEBT -----
+    push("INFO", "DEBT", "Monolith HTML", "Single large HTML/JS file", "Harder to unit-test in isolation", "Optional later split; not required for auditor");
+    push("INFO", "DEBT", "Golden games volume", "Structural tests only unless 15+ hand-checked games embedded", "Cannot prove live edge quality from structure alone", "Add settled golden fixtures when ready");
+
+    var critical = issues.filter(function (x) { return x.sev === "CRITICAL"; }).length;
+    var errors = issues.filter(function (x) { return x.sev === "ERROR"; }).length;
+    var warns = issues.filter(function (x) { return x.sev === "WARN"; }).length;
+    var infos = issues.filter(function (x) { return x.sev === "INFO"; }).length;
+    var health = Math.max(0, Math.min(100, 100 - critical * 25 - errors * 10 - warns * 3));
+    var power = Math.min(200, 40 + issues.length + notes.length * 2 + 80);
+
+    return {
+      ok: critical === 0 && errors === 0,
+      counts: { critical: critical, error: errors, warn: warns, info: infos, notes: notes.length },
+      issues: issues,
+      notes: notes,
+      auditorPower: power,
+      engineHealth: health,
+      ts: new Date().toISOString()
+    };
+  }
+
+  function formatReport(report) {
+    var lines = [];
+    lines.push(report.ok ? "FULL ENGINE AUDIT — NO CRITICAL/ERROR" : "FULL ENGINE AUDIT — ISSUES FOUND");
+    lines.push("Auditor power: " + (report.auditorPower || "?") + "/200");
+    lines.push("Engine health: " + (report.engineHealth || "?") + "/100");
+    var c = report.counts || {};
+    lines.push("Critical: " + (c.critical || 0) + " | Error: " + (c.error || 0) + " | Warn: " + (c.warn || 0) + " | Info: " + (c.info || 0));
+    lines.push("---");
+    var order = { CRITICAL: 0, ERROR: 1, WARN: 2, INFO: 3 };
+    (report.issues || []).slice().sort(function (a, b) {
+      return (order[a.sev] - order[b.sev]);
+    }).forEach(function (it, i) {
+      lines.push((i + 1) + ". [" + it.sev + "] [" + it.area + "] " + it.title);
+      lines.push("   WHAT: " + (it.what || ""));
+      lines.push("   WHY: " + (it.why || ""));
+      lines.push("   FIX: " + (it.fix || ""));
+      lines.push("");
+    });
+    if (report.notes && report.notes.length) {
+      lines.push("--- NOTES (OK) ---");
+      report.notes.forEach(function (n) {
+        lines.push("• [" + n.area + "] " + n.msg);
+      });
+    }
+    return lines.join(NL);
+  }
+
+  return { run: run, formatReport: formatReport };
+})();
+
 const AFDB = (function() {
   const LOG_LIMIT = 600;
   let _log = [];
@@ -23077,7 +23461,7 @@ const AFDB = (function() {
   return '<div style="padding:8px;border-bottom:1px solid #151515;"><div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;"><span style="color:#555;font-size:9px;min-width:65px;flex-shrink:0;">' + esc(e.ts) + '</span><span style="color:' + def.color + ';font-size:10px;font-weight:900;min-width:75px;flex-shrink:0;">' + icon + ' ' + esc(e.level) + '</span><span style="color:#777;font-size:9px;min-width:80px;flex-shrink:0;">[' + esc(e.section) + ']</span><span style="color:' + def.color + ';font-size:11px;font-weight:700;flex:1;white-space:pre-wrap;">' + esc(e.msg) + '</span></div>' + dataHtml + '</div>';
 }).join('');
 
-const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊 Tracker Report</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
+const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="AFDB.runFullAudit()" style="background:#1a3a1a;border:1px solid #49d45f;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(73,212,95,0.35);">🩺 Full Audit</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊 Tracker Report</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
 
     const emptyMsg = _showOnlyErrors ? 'No suspects arrested. The code is clean.' : 'No log entries yet. Run a fetch.';
     const filterLabel = `\ud83c\udfaf LEVEL: ${_currentLogLevel}`;
@@ -23184,7 +23568,67 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
 
   }
 
-  return { log, clear, copy, toggleFilter, open, close, runTestFetch, get isOpen() { return _isOpen; }, get logs() { return _log; } };
+  function runFullAudit() {
+    var report;
+    try {
+      report = window.EngineAuditor.run();
+    } catch (e) {
+      report = {
+        ok: false,
+        counts: { critical: 1, error: 0, warn: 0, info: 0 },
+        issues: [{ sev: "CRITICAL", area: "AUDIT", title: "Auditor crashed", what: String(e && e.message || e), why: "Self-audit failed to execute", fix: "Inspect EngineAuditor.run stack" }],
+        notes: [],
+        auditorPower: 0,
+        engineHealth: 0
+      };
+    }
+    var textOut = window.EngineAuditor.formatReport(report);
+    try {
+      log(report.ok ? "ENGINE" : "ERROR", "AUDIT", "Full audit finished", {
+        power: report.auditorPower,
+        health: report.engineHealth,
+        counts: report.counts
+      });
+    } catch (e2) {}
+    // Show full report inside AFDB panel as a sticky block at top of log area
+    try {
+      var existing = document.getElementById("afdbAuditReport");
+      if (existing) existing.remove();
+      var host = document.getElementById("afdbPanel") || document.querySelector("[id*='afdb'], .afdb-panel");
+      // AFDB panel is often the last fixed overlay — find by content
+      var panels = document.querySelectorAll("div");
+      var target = null;
+      for (var i = 0; i < panels.length; i++) {
+        if (panels[i].textContent && panels[i].textContent.indexOf("AUTO-FETCH DEBUG BRAIN") !== -1 && panels[i].style && (panels[i].style.position === "fixed" || panels[i].style.zIndex)) {
+          target = panels[i];
+          break;
+        }
+      }
+      var block = document.createElement("div");
+      block.id = "afdbAuditReport";
+      block.style.cssText = "margin:10px 12px;padding:12px;border:1px solid " + (report.ok ? "#2f8f4a" : "#c91920") + ";background:#0d0d0d;color:" + (report.ok ? "#49d45f" : "#ff8a8a") + ";font-size:11px;font-weight:700;line-height:1.45;white-space:pre-wrap;word-break:break-word;max-height:45vh;overflow-y:auto;border-radius:4px;";
+      block.textContent = textOut;
+      if (target) {
+        // insert after header
+        var header = target.firstChild;
+        if (header && header.nextSibling) target.insertBefore(block, header.nextSibling);
+        else target.appendChild(block);
+      } else {
+        // fallback: append to body fixed
+        block.style.position = "fixed";
+        block.style.left = "8px";
+        block.style.right = "8px";
+        block.style.bottom = "8px";
+        block.style.zIndex = "99999";
+        document.body.appendChild(block);
+      }
+    } catch (domErr) {
+      try { alert(textOut.slice(0, 1500)); } catch (_) {}
+    }
+    return report;
+  }
+
+  return { log, clear, copy, toggleFilter, open, close, runTestFetch, runFullAudit, get isOpen() { return _isOpen; }, get logs() { return _log; } };
 })();
 
 window.openVisualReportFromDebug = function() {
