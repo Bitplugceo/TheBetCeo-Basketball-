@@ -1,3 +1,4 @@
+V
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9271,6 +9272,34 @@ function calculateAdvancedMetrics(sMapMine, sMapOpp, ptsMine, ptsOpp, regMinutes
   };
 }
 
+/**
+ * Period advanced from full-game box possessions + period points (linescores).
+ * ESPN team box stats are full-game only; period FGA is not available.
+ * possessions_period = possessions_game * periodFraction (time share).
+ * pace stays the game rate (possessions per 48).
+ */
+function derivePeriodAdvanced(fullAdv, ptsMine, ptsOpp, periodFraction, league) {
+  if (!fullAdv || !isFinite(periodFraction) || periodFraction <= 0 || periodFraction > 1) return null;
+  if (!(isFinite(ptsMine) && ptsMine > 0 && isFinite(ptsOpp) && ptsOpp > 0)) return null;
+  const gamePoss = Number(fullAdv.possessions);
+  const pace = Number(fullAdv.pace);
+  if (!(isFinite(gamePoss) && gamePoss > 0 && isFinite(pace) && pace > 0)) return null;
+  const periodPoss = gamePoss * periodFraction;
+  if (!(periodPoss > 5)) return null;
+  const ortg = 100 * ptsMine / periodPoss;
+  const drtg = 100 * ptsOpp / periodPoss;
+  if (!(isFinite(ortg) && ortg > 0 && isFinite(drtg) && drtg > 0)) return null;
+  // Wider bounds for short periods (variance higher than full game)
+  if (ortg < 50 || ortg > 180 || drtg < 50 || drtg > 180) return null;
+  return {
+    pace: Number(pace.toFixed(2)),
+    ortg: Number(ortg.toFixed(2)),
+    drtg: Number(drtg.toFixed(2)),
+    possessions: Number(periodPoss.toFixed(2)),
+    periodFraction: periodFraction
+  };
+}
+
     function logDebug(...args) {
       if (DEBUG) console.log("[BB Engine]", ...args);
     }
@@ -9921,6 +9950,15 @@ function getTrackedPickEdgeAbsPct(pick = {}) {
   if (!isFinite(edge) || !isFinite(line) || !line) return NaN;
 
   return Math.abs((edge / line) * 100);
+}
+
+function getTrackedPickEdgeAbsPoints(pick = {}) {
+  const edge = Number(pick?.edge);
+  if (isFinite(edge)) return Math.abs(edge);
+  const line = Number(pick?.lineAtPick ?? pick?.line);
+  const pct = Number(pick?.edgePct);
+  if (isFinite(pct) && isFinite(line) && line > 0) return Math.abs((pct / 100) * line);
+  return NaN;
 }
 
 function getEdgeBucketSortRank(key = "") {
@@ -14491,6 +14529,33 @@ function getSampleTier(...arrays) {
 }
 
 /** Continuous 0..1 sample quality (smooth; no cliff at 5/10). */
+
+/** Period-native advanced series from auto-fetch context; empty if unavailable. */
+function getPeriodAdvancedSeries(ctx, marketKey) {
+  const c = ctx || {};
+  const mk = String(marketKey || "ft").toLowerCase();
+  if (mk === "ft" || mk === "full") {
+    return {
+      ortg: Array.isArray(c.ortg10) ? c.ortg10 : [],
+      drtg: Array.isArray(c.drtg10) ? c.drtg10 : [],
+      pace: Array.isArray(c.pace10) ? c.pace10 : [],
+      source: "ft"
+    };
+  }
+  const o = c["ortg10_" + mk];
+  const d = c["drtg10_" + mk];
+  const p = c["pace10_" + mk];
+  if (Array.isArray(o) && o.length >= 3 && Array.isArray(d) && d.length >= 3) {
+    return {
+      ortg: o,
+      drtg: d,
+      pace: (Array.isArray(p) && p.length >= 3) ? p : (Array.isArray(c.pace10) ? c.pace10 : []),
+      source: mk
+    };
+  }
+  return { ortg: [], drtg: [], pace: [], source: "none" };
+}
+
 function getSampleQuality(...arrays) {
   const lens = arrays.map(a => Array.isArray(a) ? a.length : 0);
   const minLen = Math.min(...(lens.length ? lens : [0]));
@@ -16359,6 +16424,37 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
 
   if (isNaN(ms) || isNaN(os) || ms <= 0 || os <= 0) return null;
 
+  // Period advanced: split full-game possessions by regulation time share + linescore points.
+  let advancedH1 = null, advancedH2 = null;
+  let advancedQ = { q1: null, q2: null, q3: null, q4: null };
+  if (advanced && gotLS) {
+    const _regP = (typeof rules !== "undefined" && rules && rules.regulationPeriods) ? Number(rules.regulationPeriods) : 4;
+    if (gotLS && h1m > 0 && h1o > 0) {
+      advancedH1 = derivePeriodAdvanced(advanced, h1m, h1o, 0.5, leagueKey);
+    }
+    if (ref.qs && Array.isArray(ref.qs.m) && Array.isArray(ref.qs.o) && ref.qs.m.length >= 4) {
+      const _qm = ref.qs.m.map(Number);
+      const _qo = ref.qs.o.map(Number);
+      for (let qi = 0; qi < 4; qi++) {
+        if (isFinite(_qm[qi]) && _qm[qi] > 0 && isFinite(_qo[qi]) && _qo[qi] > 0) {
+          advancedQ["q" + (qi + 1)] = derivePeriodAdvanced(advanced, _qm[qi], _qo[qi], 0.25, leagueKey);
+        }
+      }
+      const h2m = (Number(_qm[2]) || 0) + (Number(_qm[3]) || 0);
+      const h2o = (Number(_qo[2]) || 0) + (Number(_qo[3]) || 0);
+      if (h2m > 0 && h2o > 0) {
+        advancedH2 = derivePeriodAdvanced(advanced, h2m, h2o, 0.5, leagueKey);
+      }
+    } else if (_regP === 2 && isFinite(ms) && isFinite(os) && h1m > 0 && h1o > 0) {
+      // Two-half leagues: H2 = full regulation minus H1 (OT already stripped from ms/os).
+      const h2m = Math.max(0, Number(ms) - Number(h1m));
+      const h2o = Math.max(0, Number(os) - Number(h1o));
+      if (h2m > 0 && h2o > 0) {
+        advancedH2 = derivePeriodAdvanced(advanced, h2m, h2o, 0.5, leagueKey);
+      }
+    }
+  }
+
   return {
     ms: Math.round(ms),
     os: Math.round(os),
@@ -16366,6 +16462,9 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
     h1o: gotLS && h1o > 0 ? Math.round(h1o) : null,
     qs: ref.qs,
     advanced: advanced,
+    advancedH1: advancedH1,
+    advancedH2: advancedH2,
+    advancedQ: advancedQ,
 
     date: ref.date || null,
     venueCity: ref.venueCity || null,
@@ -16405,6 +16504,25 @@ q1Allowed: qA.q1.slice(0, 10), q2Allowed: qA.q2.slice(0, 10), q3Allowed: qA.q3.s
         ortg10: summaries.filter(s => s && s.advanced).map(s => s.advanced.ortg),
         drtg10: summaries.filter(s => s && s.advanced).map(s => s.advanced.drtg),
         pace10: summaries.filter(s => s && s.advanced).map(s => s.advanced.pace),
+        // Period-native advanced series (box possessions × period points)
+        ortg10_h1: summaries.filter(s => s && s.advancedH1).map(s => s.advancedH1.ortg),
+        drtg10_h1: summaries.filter(s => s && s.advancedH1).map(s => s.advancedH1.drtg),
+        pace10_h1: summaries.filter(s => s && s.advancedH1).map(s => s.advancedH1.pace),
+        ortg10_h2: summaries.filter(s => s && s.advancedH2).map(s => s.advancedH2.ortg),
+        drtg10_h2: summaries.filter(s => s && s.advancedH2).map(s => s.advancedH2.drtg),
+        pace10_h2: summaries.filter(s => s && s.advancedH2).map(s => s.advancedH2.pace),
+        ortg10_q1: summaries.filter(s => s && s.advancedQ && s.advancedQ.q1).map(s => s.advancedQ.q1.ortg),
+        drtg10_q1: summaries.filter(s => s && s.advancedQ && s.advancedQ.q1).map(s => s.advancedQ.q1.drtg),
+        pace10_q1: summaries.filter(s => s && s.advancedQ && s.advancedQ.q1).map(s => s.advancedQ.q1.pace),
+        ortg10_q2: summaries.filter(s => s && s.advancedQ && s.advancedQ.q2).map(s => s.advancedQ.q2.ortg),
+        drtg10_q2: summaries.filter(s => s && s.advancedQ && s.advancedQ.q2).map(s => s.advancedQ.q2.drtg),
+        pace10_q2: summaries.filter(s => s && s.advancedQ && s.advancedQ.q2).map(s => s.advancedQ.q2.pace),
+        ortg10_q3: summaries.filter(s => s && s.advancedQ && s.advancedQ.q3).map(s => s.advancedQ.q3.ortg),
+        drtg10_q3: summaries.filter(s => s && s.advancedQ && s.advancedQ.q3).map(s => s.advancedQ.q3.drtg),
+        pace10_q3: summaries.filter(s => s && s.advancedQ && s.advancedQ.q3).map(s => s.advancedQ.q3.pace),
+        ortg10_q4: summaries.filter(s => s && s.advancedQ && s.advancedQ.q4).map(s => s.advancedQ.q4.ortg),
+        drtg10_q4: summaries.filter(s => s && s.advancedQ && s.advancedQ.q4).map(s => s.advancedQ.q4.drtg),
+        pace10_q4: summaries.filter(s => s && s.advancedQ && s.advancedQ.q4).map(s => s.advancedQ.q4.pace),
         scored10,
         allowed10,
         h1Scored10,
@@ -17137,6 +17255,12 @@ async function fetchESPNCore(league, teamAName, teamBName) {
         roster: rostA || [],
         venue: aVenueStats ? { ...aVenueStats, ftScored10: aVenueStats.scored10 || [], ftAllowed10: aVenueStats.allowed10 || [] } : null,
         ortg10: aStats?.ortg10 || [], drtg10: aStats?.drtg10 || [], pace10: aStats?.pace10 || [],
+        ortg10_h1: aStats?.ortg10_h1 || [], drtg10_h1: aStats?.drtg10_h1 || [], pace10_h1: aStats?.pace10_h1 || [],
+        ortg10_h2: aStats?.ortg10_h2 || [], drtg10_h2: aStats?.drtg10_h2 || [], pace10_h2: aStats?.pace10_h2 || [],
+        ortg10_q1: aStats?.ortg10_q1 || [], drtg10_q1: aStats?.drtg10_q1 || [], pace10_q1: aStats?.pace10_q1 || [],
+        ortg10_q2: aStats?.ortg10_q2 || [], drtg10_q2: aStats?.drtg10_q2 || [], pace10_q2: aStats?.pace10_q2 || [],
+        ortg10_q3: aStats?.ortg10_q3 || [], drtg10_q3: aStats?.drtg10_q3 || [], pace10_q3: aStats?.pace10_q3 || [],
+        ortg10_q4: aStats?.ortg10_q4 || [], drtg10_q4: aStats?.drtg10_q4 || [], pace10_q4: aStats?.pace10_q4 || [],
 
         lastGameDate: aStats?.lastGameDate || "",
         lastGameCity: aStats?.lastGameCity || null,
@@ -17156,6 +17280,12 @@ async function fetchESPNCore(league, teamAName, teamBName) {
         roster: rostB || [],
         venue: bVenueStats ? { ...bVenueStats, ftScored10: bVenueStats.scored10 || [], ftAllowed10: bVenueStats.allowed10 || [] } : null,
         ortg10: bStats?.ortg10 || [], drtg10: bStats?.drtg10 || [], pace10: bStats?.pace10 || [],
+        ortg10_h1: bStats?.ortg10_h1 || [], drtg10_h1: bStats?.drtg10_h1 || [], pace10_h1: bStats?.pace10_h1 || [],
+        ortg10_h2: bStats?.ortg10_h2 || [], drtg10_h2: bStats?.drtg10_h2 || [], pace10_h2: bStats?.pace10_h2 || [],
+        ortg10_q1: bStats?.ortg10_q1 || [], drtg10_q1: bStats?.drtg10_q1 || [], pace10_q1: bStats?.pace10_q1 || [],
+        ortg10_q2: bStats?.ortg10_q2 || [], drtg10_q2: bStats?.drtg10_q2 || [], pace10_q2: bStats?.pace10_q2 || [],
+        ortg10_q3: bStats?.ortg10_q3 || [], drtg10_q3: bStats?.drtg10_q3 || [], pace10_q3: bStats?.pace10_q3 || [],
+        ortg10_q4: bStats?.ortg10_q4 || [], drtg10_q4: bStats?.drtg10_q4 || [], pace10_q4: bStats?.pace10_q4 || [],
 
         lastGameDate: bStats?.lastGameDate || "",
         lastGameCity: bStats?.lastGameCity || null,
@@ -17969,16 +18099,26 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const ctxA = _ctxRoot.A || {};
   const ctxB = _ctxRoot.B || {};
-  const avgPaceA = avgOrNaN(ctxA.pace10);
-  const avgPaceB = avgOrNaN(ctxB.pace10);
+  // Prefer H1-native box advanced series when auto-fetch built them.
+  const _advA1 = (typeof getPeriodAdvancedSeries === "function") ? getPeriodAdvancedSeries(ctxA, "h1") : { ortg: [], drtg: [], pace: [], source: "none" };
+  const _advB1 = (typeof getPeriodAdvancedSeries === "function") ? getPeriodAdvancedSeries(ctxB, "h1") : { ortg: [], drtg: [], pace: [], source: "none" };
+  const _usePeriod1 = _advA1.source === "h1" && _advB1.source === "h1";
+  const _ortgArrA1 = _usePeriod1 ? _advA1.ortg : (ctxA.ortg10 || []);
+  const _drtgArrA1 = _usePeriod1 ? _advA1.drtg : (ctxA.drtg10 || []);
+  const _ortgArrB1 = _usePeriod1 ? _advB1.ortg : (ctxB.ortg10 || []);
+  const _drtgArrB1 = _usePeriod1 ? _advB1.drtg : (ctxB.drtg10 || []);
+  const _paceArrA1 = _usePeriod1 && _advA1.pace.length ? _advA1.pace : (ctxA.pace10 || []);
+  const _paceArrB1 = _usePeriod1 && _advB1.pace.length ? _advB1.pace : (ctxB.pace10 || []);
+
+  const avgPaceA = avgOrNaN(_paceArrA1);
+  const avgPaceB = avgOrNaN(_paceArrB1);
   const clamp = getEffectivePaceClamp(league);
 
   let hasRealPace = isFinite(avgPaceA) && avgPaceA > 0 && isFinite(avgPaceB) && avgPaceB > 0;
+  hasRealPace = hasRealPace && _paceArrA1.length >= 3 && _paceArrB1.length >= 3;
 
-  hasRealPace = hasRealPace && (ctxA.pace10 || []).length >= 5 && (ctxB.pace10 || []).length >= 5;
-
-  let hasRealRatings = isFinite(avgOrNaN(ctxA.ortg10)) && isFinite(avgOrNaN(ctxA.drtg10)) && isFinite(avgOrNaN(ctxB.ortg10)) && isFinite(avgOrNaN(ctxB.drtg10))
-    && (ctxA.ortg10 || []).length >= 5 && (ctxB.ortg10 || []).length >= 5;
+  let hasRealRatings = isFinite(avgOrNaN(_ortgArrA1)) && isFinite(avgOrNaN(_drtgArrA1)) && isFinite(avgOrNaN(_ortgArrB1)) && isFinite(avgOrNaN(_drtgArrB1))
+    && _ortgArrA1.length >= 3 && _ortgArrB1.length >= 3;
 
   const leaguePaceNorm1H = 48 / (getLeagueRegulationMinutes(league) || 48);
   let synPace = leaguePaceBase;
@@ -17996,8 +18136,8 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const projB1H_points = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw1 + aAllowed * _ow1) : bS_pre;
 
   if (isEspnLeague && hasRealRatings && hasRealPace) {
-    const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
-    const projectedRatingB = avgOrNaN(ctxB.ortg10) + avgOrNaN(ctxA.drtg10) - leagueRatingBase;
+    const projectedRatingA = avgOrNaN(_ortgArrA1) + avgOrNaN(_drtgArrB1) - leagueRatingBase;
+    const projectedRatingB = avgOrNaN(_ortgArrB1) + avgOrNaN(_drtgArrA1) - leagueRatingBase;
     const _h1RegMinutes = getLeagueRegulationMinutes(league);
     const halfDivisor = 200 * (48 / _h1RegMinutes);
     let projA1H_adv = (synPace * projectedRatingA) / halfDivisor;
@@ -18180,25 +18320,39 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const projA2H_points = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw2 + bAllowed * _ow2) : aS_pre;
   const projB2H_points = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw2 + aAllowed * _ow2) : bS_pre;
 
-  // 2H advanced: efficiency from H2 scored/allowed; pace rate from game pace only.
-  // Does NOT use ctx.ortg10/drtg10 (those are full-game).
+  // 2H advanced: prefer auto-fetch H2 box series (possessions × H2 points).
+  // Fallback: synthetic efficiency from H2 scored/allowed + game pace (no FT ORTG).
   {
     const _h2RegMinutes = getLeagueRegulationMinutes(league) || 48;
-    const halfMins = _h2RegMinutes / 2;
-    const halfPoss = (isFinite(synPace) && synPace > 0) ? (synPace * halfMins / 48) : NaN;
-    const ortgA_h2 = (isFinite(halfPoss) && halfPoss > 0 && isFinite(aS_pre)) ? (100 * aS_pre / halfPoss) : NaN;
-    const drtgA_h2 = (isFinite(halfPoss) && halfPoss > 0 && isFinite(aAllowed)) ? (100 * aAllowed / halfPoss) : NaN;
-    const ortgB_h2 = (isFinite(halfPoss) && halfPoss > 0 && isFinite(bS_pre)) ? (100 * bS_pre / halfPoss) : NaN;
-    const drtgB_h2 = (isFinite(halfPoss) && halfPoss > 0 && isFinite(bAllowed)) ? (100 * bAllowed / halfPoss) : NaN;
+    const halfDivisor = 200 * (48 / _h2RegMinutes);
+    const _advA2 = (typeof getPeriodAdvancedSeries === "function") ? getPeriodAdvancedSeries(ctxA, "h2") : { ortg: [], drtg: [], pace: [], source: "none" };
+    const _advB2 = (typeof getPeriodAdvancedSeries === "function") ? getPeriodAdvancedSeries(ctxB, "h2") : { ortg: [], drtg: [], pace: [], source: "none" };
+    let ortgA_h2, drtgA_h2, ortgB_h2, drtgB_h2, paceForAdv = synPace;
+
+    if (_advA2.source === "h2" && _advB2.source === "h2") {
+      ortgA_h2 = avgOrNaN(_advA2.ortg);
+      drtgA_h2 = avgOrNaN(_advA2.drtg);
+      ortgB_h2 = avgOrNaN(_advB2.ortg);
+      drtgB_h2 = avgOrNaN(_advB2.drtg);
+      const pA = avgOrNaN(_advA2.pace); const pB = avgOrNaN(_advB2.pace);
+      if (isFinite(pA) && pA > 0 && isFinite(pB) && pB > 0) paceForAdv = (pA + pB) / 2;
+    } else {
+      const halfMins = _h2RegMinutes / 2;
+      const halfPoss = (isFinite(synPace) && synPace > 0) ? (synPace * halfMins / 48) : NaN;
+      ortgA_h2 = (isFinite(halfPoss) && halfPoss > 0 && isFinite(aS_pre)) ? (100 * aS_pre / halfPoss) : NaN;
+      drtgA_h2 = (isFinite(halfPoss) && halfPoss > 0 && isFinite(aAllowed)) ? (100 * aAllowed / halfPoss) : NaN;
+      ortgB_h2 = (isFinite(halfPoss) && halfPoss > 0 && isFinite(bS_pre)) ? (100 * bS_pre / halfPoss) : NaN;
+      drtgB_h2 = (isFinite(halfPoss) && halfPoss > 0 && isFinite(bAllowed)) ? (100 * bAllowed / halfPoss) : NaN;
+    }
+
     const hasNativeAdv2H = isFinite(ortgA_h2) && isFinite(drtgA_h2) && isFinite(ortgB_h2) && isFinite(drtgB_h2)
-      && isFinite(synPace) && synPace > 0;
+      && isFinite(paceForAdv) && paceForAdv > 0;
 
     if (hasNativeAdv2H) {
       const projectedRatingA = ortgA_h2 + drtgB_h2 - leagueRatingBase;
       const projectedRatingB = ortgB_h2 + drtgA_h2 - leagueRatingBase;
-      const halfDivisor = 200 * (48 / _h2RegMinutes);
-      let projA2H_adv = (synPace * projectedRatingA) / halfDivisor;
-      let projB2H_adv = (synPace * projectedRatingB) / halfDivisor;
+      let projA2H_adv = (paceForAdv * projectedRatingA) / halfDivisor;
+      let projB2H_adv = (paceForAdv * projectedRatingB) / halfDivisor;
       const advTotal2H = (isFinite(projA2H_adv) ? projA2H_adv : 0) + (isFinite(projB2H_adv) ? projB2H_adv : 0);
       const _eb2 = isFinite(eb) ? eb : 220;
       const advSane2H = advTotal2H > 0 && advTotal2H < _eb2 * 1.15
@@ -20070,31 +20224,47 @@ if (isFinite(_h2ReconGap) && typeof engineDebug === "function") {
       const projA_pts = anchorProjection(_dateAwareAvgAQ * _twQ + avgOrNaN(bA) * _owQ, sampleSize, leagueBaseQ);
       const projB_pts = anchorProjection(_dateAwareAvgBQ * _twQ + avgOrNaN(aA) * _owQ, sampleSize, leagueBaseQ);
 
-      // Quarter advanced: efficiency from this quarter's scored/allowed; pace rate from game pace.
-      // Does NOT use full-game ortg10/drtg10 as the efficiency source.
+      // Quarter advanced: prefer auto-fetch period box series for this qKey;
+      // else synthetic efficiency from this quarter's scored/allowed + game pace.
       {
         const _qRegMinutes = getLeagueRegulationMinutes(league) || 48;
         const qMins = _qRegMinutes / 4;
-        const paceA = avgOrNaN(ctxAQ.pace10);
-        const paceB = avgOrNaN(ctxBQ.pace10);
-        const synPaceQ = (isFinite(paceA) && paceA > 0 && isFinite(paceB) && paceB > 0)
-          ? (paceA + paceB) / 2
-          : (LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 99.5);
-        const qPoss = (isFinite(synPaceQ) && synPaceQ > 0) ? (synPaceQ * qMins / 48) : NaN;
-        const avgAQ = _dateAwareAvgAQ;
-        const avgBQ = _dateAwareAvgBQ;
-        const allAQ = avgOrNaN(aA);
-        const allBQ = avgOrNaN(bA);
-        const ortgA_q = (isFinite(qPoss) && qPoss > 0 && isFinite(avgAQ)) ? (100 * avgAQ / qPoss) : NaN;
-        const drtgA_q = (isFinite(qPoss) && qPoss > 0 && isFinite(allAQ)) ? (100 * allAQ / qPoss) : NaN;
-        const ortgB_q = (isFinite(qPoss) && qPoss > 0 && isFinite(avgBQ)) ? (100 * avgBQ / qPoss) : NaN;
-        const drtgB_q = (isFinite(qPoss) && qPoss > 0 && isFinite(allBQ)) ? (100 * allBQ / qPoss) : NaN;
+        const qDivisor = 400 * (48 / _qRegMinutes);
+        const _advAQ = (typeof getPeriodAdvancedSeries === "function") ? getPeriodAdvancedSeries(ctxAQ, qKey) : { ortg: [], drtg: [], pace: [], source: "none" };
+        const _advBQ = (typeof getPeriodAdvancedSeries === "function") ? getPeriodAdvancedSeries(ctxBQ, qKey) : { ortg: [], drtg: [], pace: [], source: "none" };
+        let ortgA_q, drtgA_q, ortgB_q, drtgB_q, synPaceQ;
+
+        if (_advAQ.source === qKey && _advBQ.source === qKey) {
+          ortgA_q = avgOrNaN(_advAQ.ortg);
+          drtgA_q = avgOrNaN(_advAQ.drtg);
+          ortgB_q = avgOrNaN(_advBQ.ortg);
+          drtgB_q = avgOrNaN(_advBQ.drtg);
+          const pA = avgOrNaN(_advAQ.pace); const pB = avgOrNaN(_advBQ.pace);
+          synPaceQ = (isFinite(pA) && pA > 0 && isFinite(pB) && pB > 0)
+            ? (pA + pB) / 2
+            : (LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 99.5);
+        } else {
+          const paceA = avgOrNaN(ctxAQ.pace10);
+          const paceB = avgOrNaN(ctxBQ.pace10);
+          synPaceQ = (isFinite(paceA) && paceA > 0 && isFinite(paceB) && paceB > 0)
+            ? (paceA + paceB) / 2
+            : (LEAGUE_PACE_BASES[league] || LEAGUE_PACE_BASES.default || 99.5);
+          const qPoss = (isFinite(synPaceQ) && synPaceQ > 0) ? (synPaceQ * qMins / 48) : NaN;
+          const avgAQ = _dateAwareAvgAQ;
+          const avgBQ = _dateAwareAvgBQ;
+          const allAQ = avgOrNaN(aA);
+          const allBQ = avgOrNaN(bA);
+          ortgA_q = (isFinite(qPoss) && qPoss > 0 && isFinite(avgAQ)) ? (100 * avgAQ / qPoss) : NaN;
+          drtgA_q = (isFinite(qPoss) && qPoss > 0 && isFinite(allAQ)) ? (100 * allAQ / qPoss) : NaN;
+          ortgB_q = (isFinite(qPoss) && qPoss > 0 && isFinite(avgBQ)) ? (100 * avgBQ / qPoss) : NaN;
+          drtgB_q = (isFinite(qPoss) && qPoss > 0 && isFinite(allBQ)) ? (100 * allBQ / qPoss) : NaN;
+        }
+
         const hasNativeAdvQ = isFinite(ortgA_q) && isFinite(drtgA_q) && isFinite(ortgB_q) && isFinite(drtgB_q);
 
         if (hasNativeAdvQ) {
           const projRatingAQ = ortgA_q + drtgB_q - leagueRatingBaseQ;
           const projRatingBQ = ortgB_q + drtgA_q - leagueRatingBaseQ;
-          const qDivisor = 400 * (48 / _qRegMinutes);
           const projA_adv = (synPaceQ * projRatingAQ) / qDivisor;
           const projB_adv = (synPaceQ * projRatingBQ) / qDivisor;
           const advTotalQ = (isFinite(projA_adv) ? projA_adv : 0) + (isFinite(projB_adv) ? projB_adv : 0);
