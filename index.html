@@ -1,4 +1,3 @@
-J
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5933,26 +5932,15 @@ function evaluatePickWithParams(pick, paramOverrides) {
       lineVal = finalLines.bLine;
       edge = calc.bEdge;
     } else if (marketKey.startsWith("q")) {
-      const qKey = marketKey;
-      const aS = parsed["a" + qKey.toUpperCase() + "Scored"] || [];
-      const bA = parsed["b" + qKey.toUpperCase() + "Allowed"] || [];
-      const bS = parsed["b" + qKey.toUpperCase() + "Scored"] || [];
-      const aA = parsed["a" + qKey.toUpperCase() + "Allowed"] || [];
-      if (aS.length < 2 || bS.length < 2) return null;
-
-      const _tw = window.getParam("teamWeightBase", league) ?? 0.65;
-      const _ow = 1 - _tw;
-      let projA = (avgOrNaN(aS) * _tw + avgOrNaN(bA) * _ow);
-      let projB = (avgOrNaN(bS) * _tw + avgOrNaN(aA) * _ow);
-      projA *= injMultA;
-      projB *= injMultB;
-      const qProj = projA + projB;
-      proj = qProj;
-      lineVal = finalLines[qKey + "Line"];
-      edge = qProj - lineVal;
+      // Quarter parameter tuning is disabled until the tuner is routed through
+      // the same live computeQ kernel. The previous branch used a separate
+      // simplified formula and could therefore learn parameters for a model
+      // different from the production quarter model.
+      return { decision: "NO PLAY", side: null, win: false, push: false, loss: false, isNoPlay: true, tunerDisabled: true };
     } else {
       return null;
     }
+---
 
     const decision = getPick(edge, lineVal, league, marketKey, { underEdgeFactorOverride: paramOverrides?.underEdgeFactor });
     if (decision === "NO PLAY") {
@@ -6524,25 +6512,13 @@ async function runRetrospectiveAnalysis(pick) {
                 edge = calc.bEdge;
                 pickDecision = getPick(edge, line, league, "team", { teamSc: calc.bS });
               } else if (marketKey === "q1" || marketKey === "q2" || marketKey === "q3" || marketKey === "q4") {
-const qLine = lines[marketKey + "Line"];
-if (!qLine) continue;
-const aS = (parsed['a' + marketKey.toUpperCase() + 'Scored'] || []).slice(0,10);
-const bS = (parsed['b' + marketKey.toUpperCase() + 'Scored'] || []).slice(0,10);
-const aA = (parsed['a' + marketKey.toUpperCase() + 'Allowed'] || []).slice(0,10);
-const bA = (parsed['b' + marketKey.toUpperCase() + 'Allowed'] || []).slice(0,10);
-if (aS.length < 2 || bS.length < 2) continue;
-                let projA = (avgOrNaN(aS) * 0.55 + avgOrNaN(bA) * 0.45);
-                let projB = (avgOrNaN(bS) * 0.55 + avgOrNaN(aA) * 0.45);
-                projA *= injMultA;
-                projB *= injMultB;
-                const qProj = projA + projB;
-                proj = qProj;
-                line = qLine;
-                edge = qProj - qLine;
-                pickDecision = getPick(edge, line, league, marketKey, {});
+                // Quarter retrospective tuning disabled: this legacy branch is not
+                // the live computeQ kernel and must not feed learned parameters.
+                continue;
               } else {
                 continue;
               }
+---
             } catch(e) { engineDebug("runRetrospectiveAnalysis sweep iteration failed", { league, marketKey, error: e?.message || String(e) }); continue; }
 
             if (pickDecision === "NO PLAY") continue;
@@ -9758,16 +9734,36 @@ function trimmedAvg(arr) {
   const minVal = sorted[0];
   const maxVal = sorted[sorted.length - 1];
 
+  // Drop one extreme min and one extreme max by value, but keep each survivor
+  // bound to its original chronological index so recency weights do not reindex.
   let removedMin = false, removedMax = false;
   const trimmed = [];
-  for (const v of work) {
+  for (let i = 0; i < work.length; i++) {
+    const v = work[i];
     if (!removedMin && v === minVal) { removedMin = true; continue; }
     if (!removedMax && v === maxVal) { removedMax = true; continue; }
-    trimmed.push(v);
+    trimmed.push({ value: v, originalIndex: i });
   }
 
-  return weightedRecentAverage(trimmed);
+  const weights = (typeof getParam === "function" ? getParam("recencyWeights") : null)
+    || (typeof MODEL_TUNING !== "undefined" ? MODEL_TUNING.recencyWeights : null);
+  if (!Array.isArray(weights) || !weights.length) {
+    return trimmed.reduce((s, item) => s + item.value, 0) / (trimmed.length || 1);
+  }
+
+  let weightedSum = 0;
+  let weightTotal = 0;
+  for (const item of trimmed) {
+    const w = Number(weights[item.originalIndex]);
+    if (isFinite(w) && w > 0) {
+      weightedSum += item.value * w;
+      weightTotal += w;
+    }
+  }
+  if (weightTotal > 0) return weightedSum / weightTotal;
+  return trimmed.reduce((s, item) => s + item.value, 0) / (trimmed.length || 1);
 }
+---
 
 function weightedRecentAverageByDate(items, weights = (typeof getParam === "function" ? getParam("recencyWeights", "nba") : null) || MODEL_TUNING.recencyWeights) {
   const clean = Array.isArray(items)
@@ -14568,6 +14564,23 @@ function getPick(edge, line, league, marketKey, context = {}) {
 
   if (edge < 0) pointThreshold *= _underEdgeFactor;
 
+  // NEW/UNCALIBRATED: blowoutGap was computed and passed in context at the
+  // FT/team_a/team_b call sites but never read. Reusing the existing
+  // h2hBlowoutGapThreshold param (already the blowout cutoff used elsewhere)
+  // and a new placeholder multiplier: require a bigger edge before playing
+  // a market where a blowout is likely, since blowout scoring is noisier.
+  // Not wired for call sites that don't pass blowoutGap (H1/H2/Q1-Q4) —
+  // context.blowoutGap is undefined there so this is a no-op, unchanged
+  // behavior for those markets.
+  // NOTE: context.aSc/bSc/teamSc/aScScores/bScScores remain unused — no
+  // defensible derivation from raw team scores alone was identified; flagging
+  // rather than guessing at one.
+  if (isFinite(context?.blowoutGap)) {
+    const _blowoutGapThresh = getParam("h2hBlowoutGapThreshold", league) ?? 15;
+    const _blowoutPickMult = getParam("pickBlowoutThresholdMult", league) ?? 1.15;
+    if (context.blowoutGap > _blowoutGapThresh) pointThreshold *= _blowoutPickMult;
+  }
+
   if (absEdge < pointThreshold) return "NO PLAY";
 
   return edge > 0 ? "OVER " + displayLine(line) : "UNDER " + displayLine(line);
@@ -14838,11 +14851,16 @@ function distributionWinProbability(meanEdge, leagueVolLimit, volRatio) {
   if (!isFinite(meanEdge) || !isFinite(leagueVolLimit) || leagueVolLimit <= 0) return null;
   const sd = leagueVolLimit * Math.max(0.5, isFinite(volRatio) ? volRatio : 1.0);
   if (!isFinite(sd) || sd <= 0) return null;
-  const z = meanEdge / sd;
+  // Side-agnostic win probability for the already-selected side.
+  // Call sites pass edge = proj - line. After getPick, OVER has edge > 0 and
+  // UNDER has edge < 0, so |edge| is the favorable distance from the line.
+  // P(selected side wins) = Phi(|meanEdge| / sd), clamped.
+  const z = Math.abs(meanEdge) / sd;
   return clampNumber(_normalCdf(z), 0.02, 0.98);
 }
+---
 
-function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier, hasH2H, trap, league) {
+function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier, hasH2H, trap, league, newSignals = {}) {
   let coeff = {};
   let _resolvedScope = "global";
   try {
@@ -14868,6 +14886,44 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
     return 0.50;
   }
 
+  // NEW/UNCALIBRATED (added [today's date], not part of any backtest/fit):
+  // these five terms were previously computed at every call site and silently
+  // dropped before reaching this function. They are wired in below as fixed
+  // placeholder log-odds contributions, same override pattern as the fitted
+  // terms above (coeff.xxx ?? default), but intentionally excluded from
+  // _requiredCoeffKeys so they don't affect the fitted/unfitted gate and
+  // don't invalidate any coefficient set already sitting in
+  // BB_CONFIDENCE_MODEL_COEFF. If the fitting pipeline is ever extended to
+  // learn these, populating coeff.lineupQuality/paceGapRisk/blowoutRisk/
+  // siblingAgree/defensiveFloor will override the placeholders automatically.
+  //   lineupQuality: 0.3-1.0 roster/injury quality score, 1.0 = full strength.
+  //     Deviation below 1.0 reduces confidence (more missing/degraded signal
+  //     in the projection inputs, not a directional bias toward either side).
+  //   paceGapRisk: true when the two teams' pace differs by >6 poss/game.
+  //     Larger unmodeled variance in the total -> reduces confidence.
+  //   blowoutRisk: derived from blowoutGap vs the existing h2hBlowoutGapThreshold
+  //     param (same threshold already used to discount H2H weight). Large
+  //     projected margin -> garbage-time scoring noise -> reduces confidence.
+  //   siblingAgree: does a related market's edge (siblingEdge for Q1-Q4,
+  //     q4Edge for FT, q2Edge for H1) point the same direction as this pick?
+  //     Agreement is a mild corroborating signal; disagreement is a caution.
+  //     null/unavailable = no contribution.
+  //   defensiveFloor: true when a defensiveFloorFlag was computed for this
+  //     market. Placeholder assumes a stout scoring floor is mildly
+  //     confidence-negative for OVER picks and neutral/positive for UNDER —
+  //     this directional assumption has NOT been validated and is the
+  //     single most likely one of these five to need revisiting.
+  const _blowoutGapThresh = getParam("h2hBlowoutGapThreshold", league) ?? 15;
+  const _blowoutRiskFlag = isFinite(newSignals.blowoutGap) && newSignals.blowoutGap > _blowoutGapThresh;
+  const _lineupQualityVal = isFinite(newSignals.lineupQuality) ? newSignals.lineupQuality : 1.0;
+  const _childEdge = isFinite(newSignals.siblingEdge) ? newSignals.siblingEdge
+    : (isFinite(newSignals.q4Edge) ? newSignals.q4Edge
+    : (isFinite(newSignals.q2Edge) ? newSignals.q2Edge : null));
+  const _siblingAgree = (_childEdge !== null && isFinite(newSignals.pickEdge) && newSignals.pickEdge !== 0)
+    ? (Math.sign(_childEdge) === Math.sign(newSignals.pickEdge) ? 1 : -1)
+    : 0;
+  const _defFloorSideMult = newSignals.pickSide === "under" ? 1 : (newSignals.pickSide === "over" ? -1 : 0);
+
   const logOdds =
     (coeff.intercept   ?? -0.2) +
     (coeff.edgePct     ??  8.0) * ((edgePct || 0) - 0.060) +
@@ -14876,7 +14932,13 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
 
     (coeff.h2h         ??  0.2) * (hasH2H ? 1 : 0) +
 
-    (coeff.trap        ?? -0.5) * (trap ? 1 : 0);
+    (coeff.trap        ?? -0.5) * (trap ? 1 : 0) +
+
+    (coeff.lineupQuality ?? 0.6) * (_lineupQualityVal - 1.0) +
+    (coeff.paceGapRisk   ?? -0.15) * (newSignals.paceGapRisk ? 1 : 0) +
+    (coeff.blowoutRisk   ?? -0.20) * (_blowoutRiskFlag ? 1 : 0) +
+    (coeff.siblingAgree  ?? 0.15) * _siblingAgree +
+    (coeff.defensiveFloor ?? 0.10) * (newSignals.defensiveFloorFlag ? _defFloorSideMult : 0);
 
   const _absEdgeBoost = (isFinite(edgePct) && edgePct > 0.055)
     ? Math.min(0.35, (edgePct - 0.055) * 4.0)
@@ -14943,6 +15005,10 @@ function getConfidenceGrade(params) {
   const {
     pick, note, line, edge, sampleTier, hasH2H, volatility, volLimit,
     trap,
+    // NEW/UNCALIBRATED wiring — see getConfidenceWinProbability for how these
+    // are used. Previously computed and passed at every call site, never read.
+    paceGapRisk, blowoutGap, lineupQuality, siblingEdge, q4Edge, q2Edge,
+    defensiveFloorFlag,
     league = ""
   } = params || {};
 
@@ -14952,7 +15018,11 @@ function getConfidenceGrade(params) {
 
   const edgePct = Math.abs(edge / line);
   const volRatio = (isFinite(volatility) && isFinite(volLimit) && volLimit > 0) ? volatility / volLimit : 0.5;
-  let winProb = getConfidenceWinProbability(null, edgePct, volRatio, sampleTier, hasH2H, !!trap, league);
+  const _pickSide = (typeof getPickSideFromText === "function") ? getPickSideFromText(pick) : "";
+  let winProb = getConfidenceWinProbability(null, edgePct, volRatio, sampleTier, hasH2H, !!trap, league, {
+    paceGapRisk, blowoutGap, lineupQuality, siblingEdge, q4Edge, q2Edge,
+    defensiveFloorFlag, pickEdge: edge, pickSide: _pickSide
+  });
 
   // A3: predictive Normal distribution is the primary probability when available.
   // Logistic model is retained as a calibrated fallback / blend anchor so fitted
@@ -17590,9 +17660,11 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const totalB = avgOrNaN(bFTS) + avgOrNaN(bFTA);
     if (isFinite(totalA) && isFinite(totalB)) {
       const rawPace = ((totalA + totalB) / (eb * 2)) * leaguePaceBase;
-      synPace = clampNumber(rawPace, leaguePaceBase * clamp.min, leaguePaceBase * clamp.max);
+      // Same unit system as the real-pace branch (includes leaguePaceNorm).
+      synPace = clampNumber(rawPace, leaguePaceBase * leaguePaceNorm * clamp.min, leaguePaceBase * leaguePaceNorm * clamp.max);
     }
   }
+---
 
   let aS, bS;
 
@@ -17673,13 +17745,24 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const _aVolRatio = getVolatilityRatioForSeries(aFTS, volLimit);
   const _bVolRatio = getVolatilityRatioForSeries(bFTS, volLimit);
-  const _ftVolRatioRaw = Math.max(_aVolRatio, _bVolRatio);
+  // Independent-team total SD: σ_T = √(σ_A² + σ_B²). Cov=0 is conservative
+  // when team scores are positively correlated; still strictly better than max().
+  const _aTotalSd = Number(_aVolRatio) * Number(volLimit);
+  const _bTotalSd = Number(_bVolRatio) * Number(volLimit);
+  const _ftTotalSd = Math.sqrt(
+    (isFinite(_aTotalSd) ? _aTotalSd * _aTotalSd : 0) +
+    (isFinite(_bTotalSd) ? _bTotalSd * _bTotalSd : 0)
+  );
+  const _ftVolRatioRaw = (isFinite(_ftTotalSd) && isFinite(volLimit) && volLimit > 0)
+    ? clampNumber(_ftTotalSd / volLimit, 0.5, 2.5)
+    : Math.max(_aVolRatio || 0, _bVolRatio || 0);
 
   const _ftSosAvg = meanFromList([ctxA?.sos, ctxB?.sos]);
 
   const _ftVolRatio = isFinite(_ftSosAvg)
     ? clampNumber(_ftVolRatioRaw + (0.5 - _ftSosAvg) * 0.5, 0, 2.5)
     : _ftVolRatioRaw;
+---
 
   const aH2H = getH2HSeries("A", "ft", parsed);
   const bH2H = getH2HSeries("B", "ft", parsed);
@@ -17698,7 +17781,20 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const usedDecayB = massacreH2H.B.length >= 2;
 
     const _ftH2hFactor = isFinite(config?.h2hFactor) ? Number(config.h2hFactor) : (getParam("h2hFactor", league) ?? 1.0);
-    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "ft", ftSampleTier, Math.abs(aS - bS), league, leagueBase, _ftH2hFactor, {
+    const _ftH2hW = massacreH2H.weights;
+    const avgH2HA = (_ftH2hW && _ftH2hW.length === decayH2HA.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HA.length; i++) { const v = Number(decayH2HA[i]), w = Number(_ftH2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HA); })()
+      : avgOrNaN(decayH2HA);
+    const avgH2HB = (_ftH2hW && _ftH2hW.length === decayH2HB.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HB.length; i++) { const v = Number(decayH2HB[i]), w = Number(_ftH2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HB); })()
+      : avgOrNaN(decayH2HB);
+    // Divergence = |H2H total − current model total|, not |teamA − teamB|.
+    const _modelTotalForH2H = isFinite(aS) && isFinite(bS) ? Number(aS) + Number(bS) : NaN;
+    const _h2hTotalForDivergence = isFinite(avgH2HA) && isFinite(avgH2HB) ? Number(avgH2HA) + Number(avgH2HB) : NaN;
+    const _h2hDivergence = isFinite(_modelTotalForH2H) && isFinite(_h2hTotalForDivergence)
+      ? Math.abs(_h2hTotalForDivergence - _modelTotalForH2H)
+      : 0;
+    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "ft", ftSampleTier, _h2hDivergence, league, leagueBase, _ftH2hFactor, {
       injMultA,
       injMultB,
       volRatio: _ftVolRatio,
@@ -17708,15 +17804,9 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
     assertInvariant(isFinite(hw) && hw >= 0 && hw <= 1, "ft.h2hWeight out of [0,1]", { hw, league, decayHA: decayH2HA.length, decayHB: decayH2HB.length });
 
-    const _ftH2hW = massacreH2H.weights;
-    const avgH2HA = (_ftH2hW && _ftH2hW.length === decayH2HA.length)
-      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HA.length; i++) { const v = Number(decayH2HA[i]), w = Number(_ftH2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HA); })()
-      : avgOrNaN(decayH2HA);
-    const avgH2HB = (_ftH2hW && _ftH2hW.length === decayH2HB.length)
-      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HB.length; i++) { const v = Number(decayH2HB[i]), w = Number(_ftH2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HB); })()
-      : avgOrNaN(decayH2HB);
     projAFT = isFinite(projAFT) ? (isFinite(avgH2HA) ? (projAFT * (1 - hw) + avgH2HA * hw) : projAFT) : avgH2HA;
     projBFT = isFinite(projBFT) ? (isFinite(avgH2HB) ? (projBFT * (1 - hw) + avgH2HB * hw) : projBFT) : avgH2HB;
+---
 
     const _aInjAdjBaseline = avgOrNaN(aFTS) * injMultA * (injMultB < 1 ? (1 + (1 - injMultB) * _injOppBoostFactor) : 1);
     const _bInjAdjBaseline = avgOrNaN(bFTS) * injMultB * (injMultA < 1 ? (1 + (1 - injMultA) * _injOppBoostFactor) : 1);
@@ -17897,7 +17987,16 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const aVol1 = getVolatilityRatioForSeries(aS1, volLimit);
   const bVol1 = getVolatilityRatioForSeries(bS1, volLimit);
-  const combinedVol = Math.max(aVol1, bVol1);
+  const _aTotalSd1 = Number(aVol1) * Number(volLimit);
+  const _bTotalSd1 = Number(bVol1) * Number(volLimit);
+  const _h1TotalSd = Math.sqrt(
+    (isFinite(_aTotalSd1) ? _aTotalSd1 * _aTotalSd1 : 0) +
+    (isFinite(_bTotalSd1) ? _bTotalSd1 * _bTotalSd1 : 0)
+  );
+  const combinedVol = (isFinite(_h1TotalSd) && isFinite(volLimit) && volLimit > 0)
+    ? clampNumber(_h1TotalSd / volLimit, 0.5, 2.5)
+    : Math.max(aVol1 || 0, bVol1 || 0);
+---
 
   const aH2H = getH2HSeries("A", "h1", parsed);
   const bH2H = getH2HSeries("B", "h1", parsed);
@@ -17912,7 +18011,19 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const usedDecayB = massacreH2H.B.length >= 2;
 
     const _h1H2hFactor = isFinite(config?.h2hFactor) ? Number(config.h2hFactor) : (getParam("h2hFactor", league) ?? 1.0);
-    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "h1", h1SampleTier, Math.abs(projA1H - projB1H), league, leagueBase1H, _h1H2hFactor, {
+    const _h1H2hW = massacreH2H.weights;
+    const avgH2HA = (_h1H2hW && _h1H2hW.length === decayH2HA.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HA.length; i++) { const v = Number(decayH2HA[i]), w = Number(_h1H2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HA); })()
+      : avgOrNaN(decayH2HA);
+    const avgH2HB = (_h1H2hW && _h1H2hW.length === decayH2HB.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HB.length; i++) { const v = Number(decayH2HB[i]), w = Number(_h1H2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HB); })()
+      : avgOrNaN(decayH2HB);
+    const _modelTotalForH2H1 = isFinite(projA1H) && isFinite(projB1H) ? Number(projA1H) + Number(projB1H) : NaN;
+    const _h2hTotalForDivergence1 = isFinite(avgH2HA) && isFinite(avgH2HB) ? Number(avgH2HA) + Number(avgH2HB) : NaN;
+    const _h2hDivergence1 = isFinite(_modelTotalForH2H1) && isFinite(_h2hTotalForDivergence1)
+      ? Math.abs(_h2hTotalForDivergence1 - _modelTotalForH2H1)
+      : 0;
+    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "h1", h1SampleTier, _h2hDivergence1, league, leagueBase1H, _h1H2hFactor, {
       enabled: h1HasH2H,
       injMultA,
       injMultB,
@@ -17923,15 +18034,9 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
     assertInvariant(isFinite(hw) && hw >= 0 && hw <= 1, "h1.h2hWeight out of [0,1]", { hw, league, decayHA: decayH2HA.length, decayHB: decayH2HB.length });
 
-    const _h1H2hW = massacreH2H.weights;
-    const avgH2HA = (_h1H2hW && _h1H2hW.length === decayH2HA.length)
-      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HA.length; i++) { const v = Number(decayH2HA[i]), w = Number(_h1H2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HA); })()
-      : avgOrNaN(decayH2HA);
-    const avgH2HB = (_h1H2hW && _h1H2hW.length === decayH2HB.length)
-      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HB.length; i++) { const v = Number(decayH2HB[i]), w = Number(_h1H2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HB); })()
-      : avgOrNaN(decayH2HB);
     projA1H = isFinite(projA1H) ? (isFinite(avgH2HA) ? (projA1H * (1 - hw) + avgH2HA * hw) : projA1H) : avgH2HA;
     projB1H = isFinite(projB1H) ? (isFinite(avgH2HB) ? (projB1H * (1 - hw) + avgH2HB * hw) : projB1H) : avgH2HB;
+---
 
     const _aInjAdjBaseline1H = avgOrNaN(aS1) * injMultA * (injMultB < 1 ? (1 + (1 - injMultB) * _injOppBoostFactorH1) : 1);
     const _bInjAdjBaseline1H = avgOrNaN(bS1) * injMultB * (injMultA < 1 ? (1 + (1 - injMultA) * _injOppBoostFactorH1) : 1);
@@ -18070,7 +18175,16 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const aVol2 = getVolatilityRatioForSeries(aS2, volLimit);
   const bVol2 = getVolatilityRatioForSeries(bS2, volLimit);
-  const combinedVol2 = Math.max(aVol2, bVol2);
+  const _aTotalSd2 = Number(aVol2) * Number(volLimit);
+  const _bTotalSd2 = Number(bVol2) * Number(volLimit);
+  const _h2TotalSd = Math.sqrt(
+    (isFinite(_aTotalSd2) ? _aTotalSd2 * _aTotalSd2 : 0) +
+    (isFinite(_bTotalSd2) ? _bTotalSd2 * _bTotalSd2 : 0)
+  );
+  const combinedVol2 = (isFinite(_h2TotalSd) && isFinite(volLimit) && volLimit > 0)
+    ? clampNumber(_h2TotalSd / volLimit, 0.5, 2.5)
+    : Math.max(aVol2 || 0, bVol2 || 0);
+---
 
   const aH2H = getH2HSeries("A", "h2", parsed);
   const bH2H = getH2HSeries("B", "h2", parsed);
@@ -18079,7 +18193,14 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     const decayH2HA = aH2H;
     const decayH2HB = bH2H;
     const _h2H2hFactor = isFinite(config?.h2hFactor) ? Number(config.h2hFactor) : (getParam("h2hFactor", league) ?? 1.0);
-    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "h2", h2SampleTier, Math.abs(projA2H - projB2H), league, leagueBase2H, _h2H2hFactor, {
+    const avgH2HA = avgOrNaN(decayH2HA);
+    const avgH2HB = avgOrNaN(decayH2HB);
+    const _modelTotalForH2H2 = isFinite(projA2H) && isFinite(projB2H) ? Number(projA2H) + Number(projB2H) : NaN;
+    const _h2hTotalForDivergence2 = isFinite(avgH2HA) && isFinite(avgH2HB) ? Number(avgH2HA) + Number(avgH2HB) : NaN;
+    const _h2hDivergence2 = isFinite(_modelTotalForH2H2) && isFinite(_h2hTotalForDivergence2)
+      ? Math.abs(_h2hTotalForDivergence2 - _modelTotalForH2H2)
+      : 0;
+    const hw = getH2HWeight(decayH2HA.length, decayH2HB.length, "h2", h2SampleTier, _h2hDivergence2, league, leagueBase2H, _h2H2hFactor, {
       enabled: h2HasH2H,
       injMultA,
       injMultB,
@@ -18088,10 +18209,9 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       paceGapRisk: Math.abs((avgPaceA || 74) - (avgPaceB || 74)) > 6
     });
     assertInvariant(isFinite(hw) && hw >= 0 && hw <= 1, "h2.h2hWeight out of [0,1]", { hw, league, decayHA: decayH2HA.length, decayHB: decayH2HB.length });
-    const avgH2HA = avgOrNaN(decayH2HA);
-    const avgH2HB = avgOrNaN(decayH2HB);
     projA2H = isFinite(projA2H) ? (isFinite(avgH2HA) ? (projA2H * (1 - hw) + avgH2HA * hw) : projA2H) : avgH2HA;
     projB2H = isFinite(projB2H) ? (isFinite(avgH2HB) ? (projB2H * (1 - hw) + avgH2HB * hw) : projB2H) : avgH2HB;
+---
 
     const _aInjAdjBaseline2H = avgOrNaN(aS2) * injMultA * (injMultB < 1 ? (1 + (1 - injMultB) * _injOppBoostFactorH2) : 1);
     const _bInjAdjBaseline2H = avgOrNaN(bS2) * injMultB * (injMultA < 1 ? (1 + (1 - injMultA) * _injOppBoostFactorH2) : 1);
@@ -20225,6 +20345,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
 
       paceGapRisk: h1Calc.paceGapRisk,
       blowoutGap: Math.abs((h1Calc.projA1H || 0) - (h1Calc.projB1H || 0)),
+      defensiveFloorFlag: h1Calc.defensiveFloorFlag,
       volatility: h1VolatilityForConf,
       volLimit: getMarketVolLimit(league, "h1"),
       marketKey: "h1",
@@ -20246,6 +20367,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       fullModel: h2Calc.h2FullModel, trap: h2Trap, hasH2H: h2Calc.h2HasH2H,
       paceGapRisk: h2Calc.paceGapRisk,
       blowoutGap: Math.abs((h2Calc.projA2H || 0) - (h2Calc.projB2H || 0)),
+      defensiveFloorFlag: h2Calc.defensiveFloorFlag,
       volatility: h2VolatilityForConf,
       volLimit: getMarketVolLimit(league, "h2"),
       marketKey: "h2",
