@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4294,12 +4295,14 @@ function buildGlobalModelState({ league, parsed, lines, injMultA = 1, injMultB =
 
 const MODEL_TUNING = {
   anchorEnabled: { ft: true, h1: true, h2: true, team: true },
-  anchorScale: { ft: 0.75, h1: 0.75, h2: 0.75, team: 0.85 },
+  // anchorScale removed: never read by anchorProjection (blend is always n/10).
+  // Historical localStorage keys that still hold anchorScale are ignored.
   h2hMaxWeight: 0.30,
   recencyWeights: [1.35, 1.20, 1.00, 0.85, 0.70, 0.56, 0.44, 0.33, 0.24, 0.16],
 
   quarterAnchorBlendWeight: 0.7
 };
+---
 
 const TUNABLE_PARAM_REGISTRY = {
 
@@ -14883,8 +14886,12 @@ function getConfidenceWinProbability(grade, edgePct, volatilityRatio, sampleTier
   const _requiredCoeffKeys = ["intercept", "edgePct", "volRatio", "sampleFull", "h2h", "trap"];
   const _coeffFitted = !!(coeff && _requiredCoeffKeys.every(k => isFinite(coeff[k])));
   if (!_coeffFitted) {
-    return 0.50;
+    // Do not return a fake calibrated 0.50. Callers that blend with
+    // distributionWinProbability already fall back to dist-only when this is
+    // non-finite. Grade path also treats non-finite as distribution-primary.
+    return null;
   }
+---
 
   // NEW/UNCALIBRATED (added [today's date], not part of any backtest/fit):
   // these five terms were previously computed at every call site and silently
@@ -17670,8 +17677,11 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const _tw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
   const _ow = 1 - _tw;
+  const _missingDefenseA = !isFinite(bAllowed); // team A points need opponent B allowed
+  const _missingDefenseB = !isFinite(aAllowed); // team B points need opponent A allowed
   const aS_points = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw + bAllowed * _ow) : aS_pre;
   const bS_points = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw + aAllowed * _ow) : bS_pre;
+---
 
   if (isEspnLeague && hasRealRatings && hasRealPace) {
     const projectedRatingA = avgOrNaN(ctxA.ortg10) + avgOrNaN(ctxB.drtg10) - leagueRatingBase;
@@ -17759,9 +17769,16 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
 
   const _ftSosAvg = meanFromList([ctxA?.sos, ctxB?.sos]);
 
-  const _ftVolRatio = isFinite(_ftSosAvg)
-    ? clampNumber(_ftVolRatioRaw + (0.5 - _ftSosAvg) * 0.5, 0, 2.5)
+  // SOS = opponent win% (higher = harder). Harder schedule widens uncertainty.
+  let _ftVolRatio = isFinite(_ftSosAvg)
+    ? clampNumber(_ftVolRatioRaw + (_ftSosAvg - 0.5) * 0.5, 0, 2.5)
     : _ftVolRatioRaw;
+  // Missing opponent-allowed series → offense-only blend is less trustworthy.
+  if (_missingDefenseA || _missingDefenseB) {
+    _ftVolRatio = clampNumber(_ftVolRatio * 1.15, 0, 2.5);
+  }
+---
+---
 ---
 
   const aH2H = getH2HSeries("A", "ft", parsed);
@@ -17851,6 +17868,10 @@ function computeFTProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     aS, bS, aScores: aFTS, bScores: bFTS,
 
     defensiveFloorFlag: (isFinite(aAllowed) && aAllowed <= leagueBaseFT * 0.92) || (isFinite(bAllowed) && bAllowed <= leagueBaseFT * 0.92),
+    missingDefense: !!( _missingDefenseA || _missingDefenseB ),
+    missingDefenseA: !!_missingDefenseA,
+    missingDefenseB: !!_missingDefenseB,
+---
 
     aVenueEnabled: aVenueDiag.enabled, bVenueEnabled: bVenueDiag.enabled,
     aVenueAdjustment: aVenueDiag, bVenueAdjustment: bVenueDiag,
@@ -17945,6 +17966,9 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   let projA1H, projB1H;
   const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
   const _ow1 = 1 - _tw1;
+  const _missingDefenseA1 = !isFinite(bAllowed);
+  const _missingDefenseB1 = !isFinite(aAllowed);
+---
   const projA1H_points = isFinite(aS_pre) && isFinite(bAllowed) ? (aS_pre * _tw1 + bAllowed * _ow1) : aS_pre;
   const projB1H_points = isFinite(bS_pre) && isFinite(aAllowed) ? (bS_pre * _tw1 + aAllowed * _ow1) : bS_pre;
 
@@ -17982,8 +18006,9 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   projB1H *= injMultB;
 
   const _injOppBoostFactorH1 = getParam("injuryOppBoostFactor", league) ?? INJURY_OPPONENT_BOOST_FACTOR;
-  if (injMultA < 1) projB1H *= (1 + (1 - injMultA) * _injOppBoostFactorH1);
-  if (injMultB < 1) projA1H *= (1 + (1 - injMultB) * _injOppBoostFactorH1);
+  if (injMultA < 1) projB1H *= (1 + Math.min(0.20, (1 - injMultA) * _injOppBoostFactorH1));
+  if (injMultB < 1) projA1H *= (1 + Math.min(0.20, (1 - injMultB) * _injOppBoostFactorH1));
+---
 
   const aVol1 = getVolatilityRatioForSeries(aS1, volLimit);
   const bVol1 = getVolatilityRatioForSeries(bS1, volLimit);
@@ -18038,8 +18063,9 @@ function compute1HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projB1H = isFinite(projB1H) ? (isFinite(avgH2HB) ? (projB1H * (1 - hw) + avgH2HB * hw) : projB1H) : avgH2HB;
 ---
 
-    const _aInjAdjBaseline1H = avgOrNaN(aS1) * injMultA * (injMultB < 1 ? (1 + (1 - injMultB) * _injOppBoostFactorH1) : 1);
-    const _bInjAdjBaseline1H = avgOrNaN(bS1) * injMultB * (injMultA < 1 ? (1 + (1 - injMultA) * _injOppBoostFactorH1) : 1);
+    const _aInjAdjBaseline1H = avgOrNaN(aS1) * injMultA * (injMultB < 1 ? (1 + Math.min(0.20, (1 - injMultB) * _injOppBoostFactorH1)) : 1);
+    const _bInjAdjBaseline1H = avgOrNaN(bS1) * injMultB * (injMultA < 1 ? (1 + Math.min(0.20, (1 - injMultA) * _injOppBoostFactorH1)) : 1);
+---
     const _postH2HVolLimit1H = volLimit * 1.35;
     projA1H = applyVolatility(projA1H, aS1, _postH2HVolLimit1H, league, _aInjAdjBaseline1H);
     projB1H = applyVolatility(projB1H, bS1, _postH2HVolLimit1H, league, _bInjAdjBaseline1H);
@@ -18170,8 +18196,9 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   projB2H *= injMultB;
 
   const _injOppBoostFactorH2 = getParam("injuryOppBoostFactor", league) ?? INJURY_OPPONENT_BOOST_FACTOR;
-  if (injMultA < 1) projB2H *= (1 + (1 - injMultA) * _injOppBoostFactorH2);
-  if (injMultB < 1) projA2H *= (1 + (1 - injMultB) * _injOppBoostFactorH2);
+  if (injMultA < 1) projB2H *= (1 + Math.min(0.20, (1 - injMultA) * _injOppBoostFactorH2));
+  if (injMultB < 1) projA2H *= (1 + Math.min(0.20, (1 - injMultB) * _injOppBoostFactorH2));
+---
 
   const aVol2 = getVolatilityRatioForSeries(aS2, volLimit);
   const bVol2 = getVolatilityRatioForSeries(bS2, volLimit);
@@ -18190,11 +18217,18 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
   const bH2H = getH2HSeries("B", "h2", parsed);
   const h2HasH2H = maybeReadH2HEnabled("h2") && aH2H.length >= 2 && bH2H.length >= 2;
   if (h2HasH2H) {
-    const decayH2HA = aH2H;
-    const decayH2HB = bH2H;
+    const massacreH2H = getMassacreH2HSeries("h2", getCurrentFixtureMeta(), parsed);
+    const decayH2HA = massacreH2H.A.length >= 2 ? massacreH2H.A : aH2H;
+    const decayH2HB = massacreH2H.B.length >= 2 ? massacreH2H.B : bH2H;
     const _h2H2hFactor = isFinite(config?.h2hFactor) ? Number(config.h2hFactor) : (getParam("h2hFactor", league) ?? 1.0);
-    const avgH2HA = avgOrNaN(decayH2HA);
-    const avgH2HB = avgOrNaN(decayH2HB);
+    const _h2H2hW = massacreH2H.weights;
+    const avgH2HA = (_h2H2hW && _h2H2hW.length === decayH2HA.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HA.length; i++) { const v = Number(decayH2HA[i]), w = Number(_h2H2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HA); })()
+      : avgOrNaN(decayH2HA);
+    const avgH2HB = (_h2H2hW && _h2H2hW.length === decayH2HB.length)
+      ? (() => { let sv = 0, sw = 0; for (let i = 0; i < decayH2HB.length; i++) { const v = Number(decayH2HB[i]), w = Number(_h2H2hW[i]); if (isFinite(v) && isFinite(w) && w > 0) { sv += v * w; sw += w; } } return sw > 0 ? sv / sw : avgOrNaN(decayH2HB); })()
+      : avgOrNaN(decayH2HB);
+---
     const _modelTotalForH2H2 = isFinite(projA2H) && isFinite(projB2H) ? Number(projA2H) + Number(projB2H) : NaN;
     const _h2hTotalForDivergence2 = isFinite(avgH2HA) && isFinite(avgH2HB) ? Number(avgH2HA) + Number(avgH2HB) : NaN;
     const _h2hDivergence2 = isFinite(_modelTotalForH2H2) && isFinite(_h2hTotalForDivergence2)
@@ -18213,8 +18247,9 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
     projB2H = isFinite(projB2H) ? (isFinite(avgH2HB) ? (projB2H * (1 - hw) + avgH2HB * hw) : projB2H) : avgH2HB;
 ---
 
-    const _aInjAdjBaseline2H = avgOrNaN(aS2) * injMultA * (injMultB < 1 ? (1 + (1 - injMultB) * _injOppBoostFactorH2) : 1);
-    const _bInjAdjBaseline2H = avgOrNaN(bS2) * injMultB * (injMultA < 1 ? (1 + (1 - injMultA) * _injOppBoostFactorH2) : 1);
+    const _aInjAdjBaseline2H = avgOrNaN(aS2) * injMultA * (injMultB < 1 ? (1 + Math.min(0.20, (1 - injMultB) * _injOppBoostFactorH2)) : 1);
+    const _bInjAdjBaseline2H = avgOrNaN(bS2) * injMultB * (injMultA < 1 ? (1 + Math.min(0.20, (1 - injMultA) * _injOppBoostFactorH2)) : 1);
+---
     const _postH2HVolLimit2H = volLimit * 1.35;
     projA2H = applyVolatility(projA2H, aS2, _postH2HVolLimit2H, league, _aInjAdjBaseline2H);
     projB2H = applyVolatility(projB2H, bS2, _postH2HVolLimit2H, league, _bInjAdjBaseline2H);
@@ -20053,8 +20088,9 @@ if (isFinite(_h2ReconGap) && typeof engineDebug === "function") {
       projB *= injB;
 
       const _qInjOppBoostFactor = getParam("injuryOppBoostFactor", league) ?? INJURY_OPPONENT_BOOST_FACTOR;
-      if (injA < 1) projB *= (1 + (1 - injA) * _qInjOppBoostFactor);
-      if (injB < 1) projA *= (1 + (1 - injB) * _qInjOppBoostFactor);
+      if (injA < 1) projB *= (1 + Math.min(0.20, (1 - injA) * _qInjOppBoostFactor));
+      if (injB < 1) projA *= (1 + Math.min(0.20, (1 - injB) * _qInjOppBoostFactor));
+---
 
       const aH2H = getH2HSeries("A", qKey, parsed);
       const bH2H = getH2HSeries("B", qKey, parsed);
