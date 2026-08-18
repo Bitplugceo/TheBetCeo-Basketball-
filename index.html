@@ -1,4 +1,3 @@
-V
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5034,7 +5033,13 @@ function getStoredConfidenceModelProposal() {
     let platt = {};
     try { platt = JSON.parse(localStorage.getItem("BB_PLATT_CALIB_PROPOSED") || "{}"); } catch (e) { engineDebug("Platt calibration proposal load failed", { error: e?.message || String(e) }); }
     let sampleSizes = {};
-    try { sampleSizes = JSON.parse(localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_N") || "{}"); } catch (e) { engineDebug("Confidence coefficient sample-size load failed", { error: e?.message || String(e) }); }
+    try {
+      sampleSizes = JSON.parse(
+        localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_N_PROPOSED")
+        || localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_N")
+        || "{}"
+      );
+    } catch (e) { engineDebug("Confidence coefficient sample-size load failed", { error: e?.message || String(e) }); }
     return { coeff, platt, sampleSizes, scopes: Object.keys(coeff) };
   } catch (e) {
     engineDebug("getStoredConfidenceModelProposal failed", { error: e?.message || String(e) });
@@ -5048,9 +5053,13 @@ function applyConfidenceModelProposal() {
   try {
     localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF", JSON.stringify(proposal.coeff));
     localStorage.setItem("BB_PLATT_CALIB", JSON.stringify(proposal.platt));
-
+    // Promote sample sizes only when coeffs go live (keeps min-N gate paired with active model)
+    if (proposal.sampleSizes && typeof proposal.sampleSizes === "object") {
+      localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF_N", JSON.stringify(proposal.sampleSizes));
+    }
     localStorage.removeItem("BB_CONFIDENCE_MODEL_COEFF_PROPOSED");
     localStorage.removeItem("BB_PLATT_CALIB_PROPOSED");
+    localStorage.removeItem("BB_CONFIDENCE_MODEL_COEFF_N_PROPOSED");
   } catch (e) {
     engineDebug("applyConfidenceModelProposal failed to write live keys: " + (e?.message || String(e)), { error: e });
     return false;
@@ -5688,9 +5697,10 @@ function updateCandidateScore(league, marketKey, config, delta, winProbability, 
   if (!Array.isArray(scores[key].deltas)) scores[key].deltas = [];
   if (scores[key].deltas.length < 2000) scores[key].deltas.push(delta);
 
-  if (isFinite(winProbability) && (outcome === 0 || outcome === 1)) {
-    if (!isFinite(scores[key].brierSum)) scores[key].brierSum = 0;
-    if (!isFinite(scores[key].brierCount)) scores[key].brierCount = 0;
+  // Number.isFinite: isFinite(null)===true would corrupt Brier with 0 during unfitted phase
+  if (Number.isFinite(winProbability) && (outcome === 0 || outcome === 1)) {
+    if (!Number.isFinite(scores[key].brierSum)) scores[key].brierSum = 0;
+    if (!Number.isFinite(scores[key].brierCount)) scores[key].brierCount = 0;
     scores[key].brierSum += Math.pow(winProbability - outcome, 2);
     scores[key].brierCount++;
   }
@@ -5968,8 +5978,9 @@ function evaluatePickWithParams(pick, paramOverrides) {
     let winProbability = getConfidenceWinProbability(null, edgePct, volRatio, sampleTier, hasH2H, false, league);
     try {
       const _distProb = distributionWinProbability(edge, volLimit || 12, volRatio);
-      if (isFinite(_distProb)) {
-        winProbability = isFinite(winProbability)
+      if (Number.isFinite(_distProb)) {
+        // isFinite(null) is true in JS — must use Number.isFinite so unfitted null falls to dist-only
+        winProbability = Number.isFinite(winProbability)
           ? clampNumber(0.70 * _distProb + 0.30 * winProbability, 0.02, 0.98)
           : _distProb;
       }
@@ -15073,7 +15084,8 @@ function isConfidenceCoeffFitted(league) {
 }
 
 function resolveConfidenceGradeFromWinProbability(winProb, league = "") {
-  if (!isFinite(winProb)) return "NaN";
+  // Number.isFinite: isFinite(null)===true would map unfitted null → grade D
+  if (!Number.isFinite(winProb)) return "NaN";
   let learnedThresholds = null;
   try {
     const storedThresholds = localStorage.getItem("BB_CONFIDENCE_THRESHOLDS");
@@ -15128,8 +15140,8 @@ function getConfidenceGrade(params) {
   try {
     const _volLimitPts = getMarketVolLimit(league, params?.marketKey || "ft") || 12;
     const _distProb = distributionWinProbability(edge, _volLimitPts, volRatio);
-    if (isFinite(_distProb)) {
-      if (isFinite(winProb)) {
+    if (Number.isFinite(_distProb)) {
+      if (Number.isFinite(winProb)) {
         winProb = clampNumber(0.70 * _distProb + 0.30 * winProb, 0.02, 0.98);
       } else {
         winProb = _distProb;
@@ -15140,7 +15152,7 @@ function getConfidenceGrade(params) {
     }
   } catch (_dpe) { engineDebug("distributionWinProbability comparison failed", { error: _dpe?.message || String(_dpe) }); }
 
-  if (!isFinite(winProb)) {
+  if (!Number.isFinite(winProb)) {
     engineDebug("getConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
       league, marketKey: params?.marketKey, edgePct, volRatio, sampleTier, hasH2H
     });
@@ -15163,7 +15175,8 @@ function getMarginConfidenceGrade(params) {
   const volRatio = isFinite(marginVolRatio) ? marginVolRatio : 0.5;
   let winProb = getConfidenceWinProbability(null, marginEdgePct, volRatio, sampleTier, hasH2H, !!trap, league);
 
-  if (!isFinite(winProb)) {
+  // Number.isFinite so null (unfitted logistic) → NaN grade, not silent "D"
+  if (!Number.isFinite(winProb)) {
     engineDebug("getMarginConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
       league, marketKey: params?.marketKey, marginEdgePct, volRatio, sampleTier, hasH2H
     });
@@ -18355,7 +18368,8 @@ function compute2HProjection({ league, parsed, lines, injMultA = 1, injMultB = 1
       let projB2H_adv = (paceForAdv * projectedRatingB) / halfDivisor;
       const advTotal2H = (isFinite(projA2H_adv) ? projA2H_adv : 0) + (isFinite(projB2H_adv) ? projB2H_adv : 0);
       const _eb2 = isFinite(eb) ? eb : 220;
-      const advSane2H = advTotal2H > 0 && advTotal2H < _eb2 * 1.15
+      // Match 1H band [0.36, 0.64] × expected full-game total (was loose: >0 && <1.15×eb)
+      const advSane2H = isFinite(advTotal2H) && advTotal2H >= _eb2 * 0.36 && advTotal2H <= _eb2 * 0.64
         && isFinite(projA2H_adv) && isFinite(projB2H_adv);
       const _advW2 = isFinite(config?.advancedBlendWeight)
         ? Number(config.advancedBlendWeight)
@@ -18675,7 +18689,7 @@ function calibrateConfidenceModel() {
     const volRatio = (isFinite(p.volatility) && isFinite(p.volLimit) && p.volLimit > 0) ? p.volatility / p.volLimit : 0.5;
     const wp = getConfidenceWinProbability(null, edgePct, volRatio, p.sampleTier, p.hasH2H, false, p.league);
     return { winProb: wp, result: p.resultStatus };
-  }).filter(s => s && isFinite(s.winProb));
+  }).filter(s => s && Number.isFinite(s.winProb));
   if (winProbs.length >= 30) {
     winProbs.sort((a,b) => a.winProb - b.winProb);
     let aThreshold = winProbs[Math.floor(winProbs.length * 0.8)]?.winProb ?? 0.66;
@@ -18700,16 +18714,22 @@ function calibrateConfidenceModel() {
     } catch(e) { console.error("[BB Engine] Confidence grade threshold save failed", e); }
   }
 
-  const buildF = (p) => ({
+  const buildF = (p) => {
+    // Same vol path as live getMarketVolLimit so fitted volRatio coeff matches serving feature
+    const _mkt = String(p.marketKey || p.marketName || "ft").toLowerCase();
+    const _volBase = (typeof getMarketVolLimit === "function")
+      ? (getMarketVolLimit(p.league, _mkt) || getLeagueVolLimit(p.league) || 12)
+      : (getLeagueVolLimit(p.league) || 12);
+    return {
     edgePct:   clampNumber(Number(p.edgePct || p.godsEyeMemory?.edgePct || 0) / 100 - 0.060, -0.06, 0.15),
-
     volRatio:  clampNumber(
                  ((Number(p.godsEyeMemory?.aVol || 0) + Number(p.godsEyeMemory?.bVol || 0)) / 2)
-                 / getLeagueVolLimit(p.league) - 1.0, -1, 2.5),
+                 / _volBase - 1.0, -1, 2.5),
     sampleFull: (String(p.godsEyeMemory?.sampleTier || "").toLowerCase() === "full") ? 1 : 0,
     h2h:       (p.godsEyeMemory?.hasH2H) ? 1 : 0,
     trap:      (p.godsEyeMemory?.trap) ? 1 : 0
-  });
+  };
+  };
 
   const _gd = (data, lr, lambda) => {
     let c = { intercept: -0.2, edgePct: 8.0, volRatio: -0.8, sampleFull: 0.4, h2h: 0.2, trap: -1.2 };
@@ -18848,9 +18868,8 @@ function calibrateConfidenceModel() {
 
     try {
       localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF_PROPOSED", JSON.stringify(models));
-
-      localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF_N", JSON.stringify(modelSampleSizes));
-
+      // Do NOT write live COEFF_N until apply — keeps trust gate aligned with active coeffs
+      localStorage.setItem("BB_CONFIDENCE_MODEL_COEFF_N_PROPOSED", JSON.stringify(modelSampleSizes));
       localStorage.setItem("BB_PLATT_CALIB_PROPOSED", JSON.stringify(plattCalib));
     } catch(e) { console.error("[BB Engine] Confidence model coefficient proposal save failed", e); }
     engineDebug("Confidence model coefficients proposed (not auto-applied — review in Configs panel)", Object.keys(models));
