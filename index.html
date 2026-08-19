@@ -1,3 +1,4 @@
+F
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3225,6 +3226,18 @@ body.dark-mode .tracker-analytics-section-head {
         <th>Prediction</th>
       </tr>
     </table>
+  </div>
+
+  <div id="parlayBasketPanel" style="display:none; margin: 10px 0 14px; border: 1px solid var(--panel-border); background: var(--panel); box-shadow: var(--shadow);">
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 10px; background:#3a404c; color:#fff; font-weight:900; font-size:12px;">
+      <span>🎯 Parlay Basket <span id="parlayBasketCount" style="opacity:0.85; font-weight:700;">0/8</span></span>
+      <span id="parlayTicketBadge" style="font-size:10px; font-weight:900; padding:3px 8px; border-radius:99px; background:#555;">—</span>
+    </div>
+    <div id="parlayBasketBody" style="padding:8px 10px; font-size:11px; font-weight:700;"></div>
+    <div style="display:flex; gap:8px; padding:0 10px 10px;">
+      <button type="button" id="parlayBasketClearBtn" style="background:#c91920; color:#fff; border:none; padding:6px 12px; font-weight:800; font-size:11px; cursor:pointer;">Clear ticket</button>
+      <button type="button" id="parlayBasketCopyBtn" style="background:#3a404c; color:#fff; border:none; padding:6px 12px; font-weight:800; font-size:11px; cursor:pointer;">Copy legs</button>
+    </div>
   </div>
 
   <div id="trackerModal" class="tracker-modal" aria-hidden="true">
@@ -7489,6 +7502,219 @@ function getLeagueTrustSortRank(level) {
   if (key === "advisory") return 1;
   return 2;
 }
+
+// ─── Living Top-8 Parlay Basket ─────────────────────────────────────────────
+// One locked pick per match. Basket holds up to 8. Stronger legs replace weaker.
+const PARLAY_BASKET_KEY = "BB_PARLAY_BASKET_V1";
+const PARLAY_BASKET_MAX = 8;
+
+function loadParlayBasket() {
+  try {
+    const raw = localStorage.getItem(PARLAY_BASKET_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return []; }
+}
+
+function saveParlayBasket(legs) {
+  try {
+    localStorage.setItem(PARLAY_BASKET_KEY, JSON.stringify(Array.isArray(legs) ? legs.slice(0, 24) : []));
+  } catch (e) { /* non-fatal */ }
+}
+
+function parlayMatchKey(pick) {
+  if (pick?.eventId) return "e:" + String(pick.eventId);
+  const home = String(pick?.homeTeam || "").trim().toLowerCase();
+  const away = String(pick?.awayTeam || "").trim().toLowerCase();
+  const date = String(pick?.eventDate || "").slice(0, 10);
+  return "m:" + date + "|" + home + "|" + away;
+}
+
+function scoreParlayLeg(pick) {
+  const grade = String(pick?.confidenceGrade || pick?.confidence || "").toUpperCase();
+  let pts = 0;
+  if (grade === "A") pts = 3;
+  else if (grade === "B") pts = 2;
+  else if (grade === "C") pts = 1;
+  else pts = 0;
+
+  const trust = (typeof getLeagueTrustMeta === "function")
+    ? getLeagueTrustMeta(pick?.league || "")
+    : { level: "advisory" };
+  if (trust.level === "trusted") pts += 1;
+  else if (trust.level === "blocked") pts -= 1;
+
+  const mk = String(pick?.marketKey || "").toLowerCase();
+  const stretch = ["q3", "q4", "q1", "q2", "high_q", "low_q"].includes(mk);
+  if (stretch) pts -= 1;
+
+  return Math.max(0, Math.min(3, pts));
+}
+
+function getParlayTicketConfidence(legs) {
+  const list = Array.isArray(legs) ? legs : [];
+  if (!list.length) return { label: "—", level: "empty", score: 0, detail: "No legs yet" };
+
+  const scores = list.map(scoreParlayLeg);
+  const total = scores.reduce((a, b) => a + b, 0);
+  const hasZero = scores.some(s => s === 0);
+  const thinCount = list.filter(p => {
+    const t = (typeof getLeagueTrustMeta === "function") ? getLeagueTrustMeta(p?.league || "") : { level: "advisory" };
+    return t.level !== "trusted";
+  }).length;
+
+  let level = "weak";
+  let label = "Weak";
+  if (total >= 18 && !hasZero && thinCount <= 1) { level = "strong"; label = "Strong"; }
+  else if (total >= 13 && thinCount <= 2) { level = "medium"; label = "Medium"; }
+  else if (total >= 8) { level = "weak"; label = "Weak"; }
+  else { level = "avoid"; label = "Avoid"; }
+
+  if (hasZero && level === "strong") { level = "medium"; label = "Medium"; }
+  if (thinCount >= 3) { level = "avoid"; label = "Avoid"; }
+
+  return {
+    label,
+    level,
+    score: total,
+    detail: total + " pts · " + thinCount + " non-core league" + (thinCount === 1 ? "" : "s")
+  };
+}
+
+function considerParlayBasketAdd(pick) {
+  if (!pick || pick.pick === "NO PLAY" || pick.predictionText === "NO PLAY") {
+    return { ok: false, reason: "no_play" };
+  }
+  const mk = parlayMatchKey(pick);
+  let legs = loadParlayBasket();
+  const newScore = scoreParlayLeg(pick);
+  const leg = {
+    id: (pick.signature || mk) + "_" + Date.now(),
+    matchKey: mk,
+    eventId: pick.eventId || null,
+    league: pick.league || "",
+    homeTeam: pick.homeTeam || "",
+    awayTeam: pick.awayTeam || "",
+    marketKey: pick.marketKey || "",
+    marketName: pick.marketName || pick.marketKey || "",
+    predictionText: pick.predictionText || pick.pick || "",
+    confidenceGrade: String(pick.confidenceGrade || pick.confidence || "NaN").toUpperCase(),
+    line: pick.line,
+    edge: pick.edge,
+    eventDate: pick.eventDate || pick.createdAt || "",
+    score: newScore,
+    addedAt: new Date().toISOString()
+  };
+
+  const sameIdx = legs.findIndex(l => l.matchKey === mk);
+  if (sameIdx >= 0) {
+    if (newScore > (legs[sameIdx].score || 0)) {
+      legs[sameIdx] = leg;
+      saveParlayBasket(legs);
+      return { ok: true, action: "replaced_same_match", leg };
+    }
+    return { ok: false, reason: "same_match_weaker" };
+  }
+
+  if (legs.length < PARLAY_BASKET_MAX) {
+    legs.push(leg);
+    saveParlayBasket(legs);
+    return { ok: true, action: "added", leg };
+  }
+
+  let weakIdx = 0;
+  for (let i = 1; i < legs.length; i++) {
+    if ((legs[i].score || 0) < (legs[weakIdx].score || 0)) weakIdx = i;
+  }
+  if (newScore > (legs[weakIdx].score || 0)) {
+    const removed = legs[weakIdx];
+    legs[weakIdx] = leg;
+    saveParlayBasket(legs);
+    return { ok: true, action: "replaced_weakest", leg, removed };
+  }
+  return { ok: false, reason: "weaker_than_basket" };
+}
+
+function removeParlayBasketLeg(id) {
+  const legs = loadParlayBasket().filter(l => l.id !== id);
+  saveParlayBasket(legs);
+  renderParlayBasket();
+}
+
+function clearParlayBasket() {
+  saveParlayBasket([]);
+  renderParlayBasket();
+}
+
+function renderParlayBasket() {
+  const panel = document.getElementById("parlayBasketPanel");
+  const body = document.getElementById("parlayBasketBody");
+  const countEl = document.getElementById("parlayBasketCount");
+  const badge = document.getElementById("parlayTicketBadge");
+  if (!panel || !body) return;
+
+  const legs = loadParlayBasket();
+  const conf = getParlayTicketConfidence(legs);
+
+  if (!legs.length) {
+    panel.style.display = "none";
+    return;
+  }
+  panel.style.display = "block";
+  if (countEl) countEl.textContent = legs.length + "/" + PARLAY_BASKET_MAX;
+  if (badge) {
+    badge.textContent = conf.label + (conf.score ? " · " + conf.score + "pts" : "");
+    const colors = { strong: "#3a9c35", medium: "#d4af37", weak: "#e67e22", avoid: "#c91920", empty: "#555" };
+    badge.style.background = colors[conf.level] || "#555";
+    badge.style.color = conf.level === "medium" ? "#111" : "#fff";
+  }
+
+  body.innerHTML = legs.map((l, i) => {
+    const match = [l.homeTeam, l.awayTeam].filter(Boolean).join(" vs ") || "Match";
+    const grade = l.confidenceGrade || "—";
+    return `<div style="display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-bottom:1px solid var(--panel-border); align-items:flex-start;">
+      <div style="flex:1; min-width:0;">
+        <div style="font-weight:900; text-transform:uppercase; font-size:10px; color:var(--muted);">${i + 1}. ${String(l.league || "").toUpperCase()} · ${match}</div>
+        <div style="font-weight:900; margin-top:2px;">${l.predictionText || l.marketName || "—"} <span style="opacity:0.7; font-size:10px;">(${l.marketName || l.marketKey || ""})</span></div>
+        <div style="font-size:10px; margin-top:2px; color:var(--muted);">Grade ${grade} · leg score ${l.score}/3</div>
+      </div>
+      <button type="button" data-parlay-remove="${l.id}" style="background:transparent; border:1px solid #c91920; color:#c91920; font-weight:900; font-size:10px; padding:4px 8px; cursor:pointer; flex-shrink:0;">✕</button>
+    </div>`;
+  }).join("") + `<div style="margin-top:8px; font-size:10px; color:var(--muted); font-weight:700;">${conf.detail} · Max 1 leg per match · Weaker legs get replaced</div>`;
+
+  body.querySelectorAll("[data-parlay-remove]").forEach(btn => {
+    btn.addEventListener("click", () => removeParlayBasketLeg(btn.getAttribute("data-parlay-remove")));
+  });
+}
+
+function initParlayBasketUI() {
+  const clearBtn = document.getElementById("parlayBasketClearBtn");
+  const copyBtn = document.getElementById("parlayBasketCopyBtn");
+  if (clearBtn) clearBtn.onclick = () => { if (confirm("Clear the whole parlay ticket?")) clearParlayBasket(); };
+  if (copyBtn) copyBtn.onclick = () => {
+    const legs = loadParlayBasket();
+    const conf = getParlayTicketConfidence(legs);
+    const text = legs.map((l, i) =>
+      `${i + 1}. [${String(l.league || "").toUpperCase()}] ${l.homeTeam || "A"} vs ${l.awayTeam || "B"} — ${l.predictionText || l.marketName} (${l.confidenceGrade || "—"})`
+    ).join("\n") + `\n\nTicket: ${conf.label} (${conf.detail})`;
+    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text);
+    else prompt("Copy ticket:", text);
+  };
+  renderParlayBasket();
+}
+
+if (typeof window !== "undefined") {
+  window.considerParlayBasketAdd = considerParlayBasketAdd;
+  window.renderParlayBasket = renderParlayBasket;
+  window.loadParlayBasket = loadParlayBasket;
+  window.clearParlayBasket = clearParlayBasket;
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initParlayBasketUI);
+  } else {
+    setTimeout(initParlayBasketUI, 0);
+  }
+}
+// ─── End Parlay Basket ──────────────────────────────────────────────────────
 
 const LEAGUE_FETCH_RULES = {
     nba: {
@@ -22113,6 +22339,17 @@ if (trackedToSave.length) {
     trackedToSave: trackedToSave.length,
     trackerStateAfterSave: getTrackerStateDebugScore(g_trackerState)
   });
+  // Living top-8: only the match Lock can enter the parlay basket (one leg per match)
+  try {
+    const lockedPick = trackedToSave.find(p => p && p.isLock);
+    if (lockedPick && typeof considerParlayBasketAdd === "function") {
+      const result = considerParlayBasketAdd(lockedPick);
+      engineDebug("parlay basket update", result);
+      if (typeof renderParlayBasket === "function") renderParlayBasket();
+    }
+  } catch (e) {
+    engineDebug("parlay basket update failed", { error: e?.message || String(e) });
+  }
 } else if (actionablePicks.length) {
   engineDebug("actionable picks were not saved to tracker", { reason: "tracker payload validation rejected every actionable pick" });
 }
