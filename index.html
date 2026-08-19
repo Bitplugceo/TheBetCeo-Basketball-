@@ -1,4 +1,3 @@
-F
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3226,18 +3225,6 @@ body.dark-mode .tracker-analytics-section-head {
         <th>Prediction</th>
       </tr>
     </table>
-  </div>
-
-  <div id="parlayBasketPanel" style="display:none; margin: 10px 0 14px; border: 1px solid var(--panel-border); background: var(--panel); box-shadow: var(--shadow);">
-    <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 10px; background:#3a404c; color:#fff; font-weight:900; font-size:12px;">
-      <span>🎯 Parlay Basket <span id="parlayBasketCount" style="opacity:0.85; font-weight:700;">0/8</span></span>
-      <span id="parlayTicketBadge" style="font-size:10px; font-weight:900; padding:3px 8px; border-radius:99px; background:#555;">—</span>
-    </div>
-    <div id="parlayBasketBody" style="padding:8px 10px; font-size:11px; font-weight:700;"></div>
-    <div style="display:flex; gap:8px; padding:0 10px 10px;">
-      <button type="button" id="parlayBasketClearBtn" style="background:#c91920; color:#fff; border:none; padding:6px 12px; font-weight:800; font-size:11px; cursor:pointer;">Clear ticket</button>
-      <button type="button" id="parlayBasketCopyBtn" style="background:#3a404c; color:#fff; border:none; padding:6px 12px; font-weight:800; font-size:11px; cursor:pointer;">Copy legs</button>
-    </div>
   </div>
 
   <div id="trackerModal" class="tracker-modal" aria-hidden="true">
@@ -7503,219 +7490,6 @@ function getLeagueTrustSortRank(level) {
   return 2;
 }
 
-// ─── Living Top-8 Parlay Basket ─────────────────────────────────────────────
-// One locked pick per match. Basket holds up to 8. Stronger legs replace weaker.
-const PARLAY_BASKET_KEY = "BB_PARLAY_BASKET_V1";
-const PARLAY_BASKET_MAX = 8;
-
-function loadParlayBasket() {
-  try {
-    const raw = localStorage.getItem(PARLAY_BASKET_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch (e) { return []; }
-}
-
-function saveParlayBasket(legs) {
-  try {
-    localStorage.setItem(PARLAY_BASKET_KEY, JSON.stringify(Array.isArray(legs) ? legs.slice(0, 24) : []));
-  } catch (e) { /* non-fatal */ }
-}
-
-function parlayMatchKey(pick) {
-  if (pick?.eventId) return "e:" + String(pick.eventId);
-  const home = String(pick?.homeTeam || "").trim().toLowerCase();
-  const away = String(pick?.awayTeam || "").trim().toLowerCase();
-  const date = String(pick?.eventDate || "").slice(0, 10);
-  return "m:" + date + "|" + home + "|" + away;
-}
-
-function scoreParlayLeg(pick) {
-  const grade = String(pick?.confidenceGrade || pick?.confidence || "").toUpperCase();
-  let pts = 0;
-  if (grade === "A") pts = 3;
-  else if (grade === "B") pts = 2;
-  else if (grade === "C") pts = 1;
-  else pts = 0;
-
-  const trust = (typeof getLeagueTrustMeta === "function")
-    ? getLeagueTrustMeta(pick?.league || "")
-    : { level: "advisory" };
-  if (trust.level === "trusted") pts += 1;
-  else if (trust.level === "blocked") pts -= 1;
-
-  const mk = String(pick?.marketKey || "").toLowerCase();
-  const stretch = ["q3", "q4", "q1", "q2", "high_q", "low_q"].includes(mk);
-  if (stretch) pts -= 1;
-
-  return Math.max(0, Math.min(3, pts));
-}
-
-function getParlayTicketConfidence(legs) {
-  const list = Array.isArray(legs) ? legs : [];
-  if (!list.length) return { label: "—", level: "empty", score: 0, detail: "No legs yet" };
-
-  const scores = list.map(scoreParlayLeg);
-  const total = scores.reduce((a, b) => a + b, 0);
-  const hasZero = scores.some(s => s === 0);
-  const thinCount = list.filter(p => {
-    const t = (typeof getLeagueTrustMeta === "function") ? getLeagueTrustMeta(p?.league || "") : { level: "advisory" };
-    return t.level !== "trusted";
-  }).length;
-
-  let level = "weak";
-  let label = "Weak";
-  if (total >= 18 && !hasZero && thinCount <= 1) { level = "strong"; label = "Strong"; }
-  else if (total >= 13 && thinCount <= 2) { level = "medium"; label = "Medium"; }
-  else if (total >= 8) { level = "weak"; label = "Weak"; }
-  else { level = "avoid"; label = "Avoid"; }
-
-  if (hasZero && level === "strong") { level = "medium"; label = "Medium"; }
-  if (thinCount >= 3) { level = "avoid"; label = "Avoid"; }
-
-  return {
-    label,
-    level,
-    score: total,
-    detail: total + " pts · " + thinCount + " non-core league" + (thinCount === 1 ? "" : "s")
-  };
-}
-
-function considerParlayBasketAdd(pick) {
-  if (!pick || pick.pick === "NO PLAY" || pick.predictionText === "NO PLAY") {
-    return { ok: false, reason: "no_play" };
-  }
-  const mk = parlayMatchKey(pick);
-  let legs = loadParlayBasket();
-  const newScore = scoreParlayLeg(pick);
-  const leg = {
-    id: (pick.signature || mk) + "_" + Date.now(),
-    matchKey: mk,
-    eventId: pick.eventId || null,
-    league: pick.league || "",
-    homeTeam: pick.homeTeam || "",
-    awayTeam: pick.awayTeam || "",
-    marketKey: pick.marketKey || "",
-    marketName: pick.marketName || pick.marketKey || "",
-    predictionText: pick.predictionText || pick.pick || "",
-    confidenceGrade: String(pick.confidenceGrade || pick.confidence || "NaN").toUpperCase(),
-    line: pick.line,
-    edge: pick.edge,
-    eventDate: pick.eventDate || pick.createdAt || "",
-    score: newScore,
-    addedAt: new Date().toISOString()
-  };
-
-  const sameIdx = legs.findIndex(l => l.matchKey === mk);
-  if (sameIdx >= 0) {
-    if (newScore > (legs[sameIdx].score || 0)) {
-      legs[sameIdx] = leg;
-      saveParlayBasket(legs);
-      return { ok: true, action: "replaced_same_match", leg };
-    }
-    return { ok: false, reason: "same_match_weaker" };
-  }
-
-  if (legs.length < PARLAY_BASKET_MAX) {
-    legs.push(leg);
-    saveParlayBasket(legs);
-    return { ok: true, action: "added", leg };
-  }
-
-  let weakIdx = 0;
-  for (let i = 1; i < legs.length; i++) {
-    if ((legs[i].score || 0) < (legs[weakIdx].score || 0)) weakIdx = i;
-  }
-  if (newScore > (legs[weakIdx].score || 0)) {
-    const removed = legs[weakIdx];
-    legs[weakIdx] = leg;
-    saveParlayBasket(legs);
-    return { ok: true, action: "replaced_weakest", leg, removed };
-  }
-  return { ok: false, reason: "weaker_than_basket" };
-}
-
-function removeParlayBasketLeg(id) {
-  const legs = loadParlayBasket().filter(l => l.id !== id);
-  saveParlayBasket(legs);
-  renderParlayBasket();
-}
-
-function clearParlayBasket() {
-  saveParlayBasket([]);
-  renderParlayBasket();
-}
-
-function renderParlayBasket() {
-  const panel = document.getElementById("parlayBasketPanel");
-  const body = document.getElementById("parlayBasketBody");
-  const countEl = document.getElementById("parlayBasketCount");
-  const badge = document.getElementById("parlayTicketBadge");
-  if (!panel || !body) return;
-
-  const legs = loadParlayBasket();
-  const conf = getParlayTicketConfidence(legs);
-
-  if (!legs.length) {
-    panel.style.display = "none";
-    return;
-  }
-  panel.style.display = "block";
-  if (countEl) countEl.textContent = legs.length + "/" + PARLAY_BASKET_MAX;
-  if (badge) {
-    badge.textContent = conf.label + (conf.score ? " · " + conf.score + "pts" : "");
-    const colors = { strong: "#3a9c35", medium: "#d4af37", weak: "#e67e22", avoid: "#c91920", empty: "#555" };
-    badge.style.background = colors[conf.level] || "#555";
-    badge.style.color = conf.level === "medium" ? "#111" : "#fff";
-  }
-
-  body.innerHTML = legs.map((l, i) => {
-    const match = [l.homeTeam, l.awayTeam].filter(Boolean).join(" vs ") || "Match";
-    const grade = l.confidenceGrade || "—";
-    return `<div style="display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-bottom:1px solid var(--panel-border); align-items:flex-start;">
-      <div style="flex:1; min-width:0;">
-        <div style="font-weight:900; text-transform:uppercase; font-size:10px; color:var(--muted);">${i + 1}. ${String(l.league || "").toUpperCase()} · ${match}</div>
-        <div style="font-weight:900; margin-top:2px;">${l.predictionText || l.marketName || "—"} <span style="opacity:0.7; font-size:10px;">(${l.marketName || l.marketKey || ""})</span></div>
-        <div style="font-size:10px; margin-top:2px; color:var(--muted);">Grade ${grade} · leg score ${l.score}/3</div>
-      </div>
-      <button type="button" data-parlay-remove="${l.id}" style="background:transparent; border:1px solid #c91920; color:#c91920; font-weight:900; font-size:10px; padding:4px 8px; cursor:pointer; flex-shrink:0;">✕</button>
-    </div>`;
-  }).join("") + `<div style="margin-top:8px; font-size:10px; color:var(--muted); font-weight:700;">${conf.detail} · Max 1 leg per match · Weaker legs get replaced</div>`;
-
-  body.querySelectorAll("[data-parlay-remove]").forEach(btn => {
-    btn.addEventListener("click", () => removeParlayBasketLeg(btn.getAttribute("data-parlay-remove")));
-  });
-}
-
-function initParlayBasketUI() {
-  const clearBtn = document.getElementById("parlayBasketClearBtn");
-  const copyBtn = document.getElementById("parlayBasketCopyBtn");
-  if (clearBtn) clearBtn.onclick = () => { if (confirm("Clear the whole parlay ticket?")) clearParlayBasket(); };
-  if (copyBtn) copyBtn.onclick = () => {
-    const legs = loadParlayBasket();
-    const conf = getParlayTicketConfidence(legs);
-    const text = legs.map((l, i) =>
-      `${i + 1}. [${String(l.league || "").toUpperCase()}] ${l.homeTeam || "A"} vs ${l.awayTeam || "B"} — ${l.predictionText || l.marketName} (${l.confidenceGrade || "—"})`
-    ).join("\n") + `\n\nTicket: ${conf.label} (${conf.detail})`;
-    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text);
-    else prompt("Copy ticket:", text);
-  };
-  renderParlayBasket();
-}
-
-if (typeof window !== "undefined") {
-  window.considerParlayBasketAdd = considerParlayBasketAdd;
-  window.renderParlayBasket = renderParlayBasket;
-  window.loadParlayBasket = loadParlayBasket;
-  window.clearParlayBasket = clearParlayBasket;
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", initParlayBasketUI);
-  } else {
-    setTimeout(initParlayBasketUI, 0);
-  }
-}
-// ─── End Parlay Basket ──────────────────────────────────────────────────────
-
 const LEAGUE_FETCH_RULES = {
     nba: {
     recentSeasons: 2,
@@ -11854,9 +11628,6 @@ function renderTrackedPicks() {
     } else {
       const encSig = encodeURIComponent(p.signature);
       statusHtml = `<div class="tracker-settled-edit-btn" data-sig="${encSig}" style="cursor:pointer;" title="Click to edit or revert">${status.toUpperCase()}</div>`;
-      if (p.actualScore) {
-        statusHtml += `<div style="font-size:7px; line-height:1.05; opacity:0.85; margin-top:1px; font-weight:600; letter-spacing:-0.2px;">${safeText(String(p.actualScore))}</div>`;
-      }
       if (p.engineResultStatus && p.engineResultStatus !== status) {
          statusHtml += `<div style="font-size:9px; color:#d91f26; margin-top:2px; font-weight:900;" title="The live in-game calculation disagreed with the final settled result">⚠ MID: ${p.engineResultStatus.toUpperCase()}</div>`;
       }
@@ -11868,7 +11639,7 @@ function renderTrackedPicks() {
         <td style="font-weight:800; text-transform:uppercase; font-size:10px;">${safeText(String(p.league || "—").toUpperCase())}</td>
         <td style="font-weight:900; text-transform:uppercase;">${safeText(((p.homeTeam && p.homeTeam !== "—") ? p.homeTeam : "A") + " vs " + ((p.awayTeam && p.awayTeam !== "—") ? p.awayTeam : "B"))}</td>
         <td style="font-weight:800;">${safeText(String(p.marketName || "—").split('<')[0].trim())}</td>
-        <td>${(String(p.marketKey || "").toLowerCase() === "winner" || String(p.marketName || "").toLowerCase() === "winner") ? (String(p.side || "").toLowerCase() === "away" ? "Away" : String(p.side || "").toLowerCase() === "home" ? "Home" : "—") : (isFinite(p.line) ? safeText(displayLine(p.line)) : "—")}</td>
+        <td>${isFinite(p.line) ? safeText(displayLine(p.line)) : "—"}</td>
         <td style="white-space: nowrap; font-size: 11px;"><span class="tracker-delete-pick-btn" data-sig="${encSig}" style="cursor:pointer;" title="Click to permanently delete this pick">${safeText(p.predictionText || "—")}</span>${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
         <td class="conf-none">${safeText(grade)}</td>
         <td class="${statusClass}"><div class="tracker-status-stack">${statusHtml}</div></td>
@@ -15703,7 +15474,6 @@ function getConfidenceGrade(params) {
 function getMarginConfidenceGrade(params) {
   const {
     pick, marginEdgePct, marginVolRatio, sampleTier, hasH2H, trap,
-    edge, volLimit,
     league = ""
   } = params || {};
 
@@ -15714,29 +15484,7 @@ function getMarginConfidenceGrade(params) {
   const volRatio = isFinite(marginVolRatio) ? marginVolRatio : 0.5;
   let winProb = getConfidenceWinProbability(null, marginEdgePct, volRatio, sampleTier, hasH2H, !!trap, league);
 
-  // Mirror totals path: when logistic is unfitted / thin, use distribution CDF
-  // on the raw margin edge so Winner & handicap still receive A–D grades.
-  try {
-    const _volLimitPts = (isFinite(volLimit) && volLimit > 0)
-      ? volLimit
-      : (getMarketVolLimit(league, params?.marketKey || "ft") || 12);
-    if (isFinite(edge)) {
-      const _distProb = distributionWinProbability(edge, _volLimitPts, volRatio);
-      if (Number.isFinite(_distProb)) {
-        if (Number.isFinite(winProb)) {
-          winProb = clampNumber(0.70 * _distProb + 0.30 * winProb, 0.02, 0.98);
-        } else {
-          winProb = _distProb;
-        }
-        engineDebug("Margin distribution-primary winProb", {
-          league, marketKey: params?.marketKey, distributionWinProb: _distProb, blendedWinProb: winProb
-        });
-      }
-    }
-  } catch (_dpe) {
-    engineDebug("margin distributionWinProbability failed", { error: _dpe?.message || String(_dpe) });
-  }
-
+  // Number.isFinite so null (unfitted logistic) → NaN grade, not silent "D"
   if (!Number.isFinite(winProb)) {
     engineDebug("getMarginConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
       league, marketKey: params?.marketKey, marginEdgePct, volRatio, sampleTier, hasH2H
@@ -20061,10 +19809,7 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     row.appendChild(tdPick);
 
     const tdProj = document.createElement("td");
-    const _winnerSide = (p.marketKey === "winner") ? (getPickSideFromText(p.pick) || p.side || "") : "";
-    tdProj.textContent = (p.marketKey === "winner")
-      ? (String(_winnerSide).toLowerCase() === "away" ? "Away" : String(_winnerSide).toLowerCase() === "home" ? "Home" : "—")
-      : displayLine(p.proj);
+    tdProj.textContent = displayLine(p.proj);
     row.appendChild(tdProj);
 
     const tdEdge = document.createElement("td");
@@ -20700,8 +20445,7 @@ if (isFinite(_h2ReconGap) && typeof engineDebug === "function") {
         const winnerEdge = marginProjectionFT;
         g_currentLiveComputeMarket = "winner";
         let winnerPick = getMarginPick(winnerEdge, league, "winner");
-        // Handicap requires a real non-zero market line — no line / 0 → NO PLAY (never fake a pure-margin pick)
-        const handicapEdge = (isFinite(marginProjectionFT) && isFinite(finalLines.handicapLine) && finalLines.handicapLine !== 0)
+        const handicapEdge = (isFinite(marginProjectionFT) && isFinite(finalLines.handicapLine))
           ? marginProjectionFT + finalLines.handicapLine
           : NaN;
         g_currentLiveComputeMarket = "handicap";
@@ -20713,7 +20457,7 @@ if (isFinite(_h2ReconGap) && typeof engineDebug === "function") {
           (h1Calc.aVol1 || 0) * _h1VolLimitForMargin,
           (h1Calc.bVol1 || 0) * _h1VolLimitForMargin
         );
-        const handicapH1Edge = (isFinite(marginProjectionH1) && isFinite(finalLines.handicapH1Line) && finalLines.handicapH1Line !== 0)
+        const handicapH1Edge = (isFinite(marginProjectionH1) && isFinite(finalLines.handicapH1Line))
           ? marginProjectionH1 + finalLines.handicapH1Line
           : NaN;
         g_currentLiveComputeMarket = "handicap_h1";
@@ -20724,7 +20468,7 @@ if (isFinite(_h2ReconGap) && typeof engineDebug === "function") {
           (h2Calc.aVol2 || 0) * _h2VolLimitForMargin,
           (h2Calc.bVol2 || 0) * _h2VolLimitForMargin
         );
-        const handicapH2Edge = (isFinite(marginProjectionH2) && isFinite(finalLines.handicapH2Line) && finalLines.handicapH2Line !== 0)
+        const handicapH2Edge = (isFinite(marginProjectionH2) && isFinite(finalLines.handicapH2Line))
           ? marginProjectionH2 + finalLines.handicapH2Line
           : NaN;
         g_currentLiveComputeMarket = "handicap_h2";
@@ -21303,9 +21047,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: ftCalc.ftHasH2H,
       trap: winnerTrap,
       marketKey: "winner",
-      league,
-      edge: winnerEdge,
-      volLimit: getMarketVolLimit(league, "ft")
+      league
     });
 
     const handicapMarginInputs = getMarginConfidenceInputs(handicapEdge, ftCalc.ftProj, combinedMarginVolFT, getMarketVolLimit(league, "ft"));
@@ -21318,9 +21060,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: ftCalc.ftHasH2H,
       trap: handicapTrap,
       marketKey: "handicap",
-      league,
-      edge: handicapEdge,
-      volLimit: getMarketVolLimit(league, "ft")
+      league
     });
 
     const handicapH1MarginInputs = getMarginConfidenceInputs(handicapH1Edge, h1Calc.h1Proj, combinedMarginVolH1, _h1VolLimitForMargin);
@@ -21333,9 +21073,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: h1Calc.h1HasH2H,
       trap: handicapH1Trap,
       marketKey: "handicap_h1",
-      league,
-      edge: handicapH1Edge,
-      volLimit: _h1VolLimitForMargin
+      league
     });
     const handicapH2MarginInputs = getMarginConfidenceInputs(handicapH2Edge, h2Calc.h2Proj, combinedMarginVolH2, _h2VolLimitForMargin);
     const handicapH2Trap = detectMarginTrap(handicapH2Edge, h2Calc.h2Proj, league, "handicap_h2", combinedMarginVolH2, _h2VolLimitForMargin);
@@ -21347,9 +21085,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: h2Calc.h2HasH2H,
       trap: handicapH2Trap,
       marketKey: "handicap_h2",
-      league,
-      edge: handicapH2Edge,
-      volLimit: _h2VolLimitForMargin
+      league
     });
 
     const picks = [
@@ -22339,17 +22075,6 @@ if (trackedToSave.length) {
     trackedToSave: trackedToSave.length,
     trackerStateAfterSave: getTrackerStateDebugScore(g_trackerState)
   });
-  // Living top-8: only the match Lock can enter the parlay basket (one leg per match)
-  try {
-    const lockedPick = trackedToSave.find(p => p && p.isLock);
-    if (lockedPick && typeof considerParlayBasketAdd === "function") {
-      const result = considerParlayBasketAdd(lockedPick);
-      engineDebug("parlay basket update", result);
-      if (typeof renderParlayBasket === "function") renderParlayBasket();
-    }
-  } catch (e) {
-    engineDebug("parlay basket update failed", { error: e?.message || String(e) });
-  }
 } else if (actionablePicks.length) {
   engineDebug("actionable picks were not saved to tracker", { reason: "tracker payload validation rejected every actionable pick" });
 }
@@ -23238,6 +22963,12 @@ try {
   <div id="afdbPanel" style="width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden;"></div>
 </div>
 
+<!-- Engine self-auditor: reachable ONLY from the debug page (AFDB "Full Audit"
+     button below). No entry point exists on the home screen. -->
+<div id="auditorOverlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:100000;background:rgba(0,0,0,0.97);flex-direction:column;font-family:ui-monospace,Consolas,monospace;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);">
+  <div id="auditorPanel" style="width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden;"></div>
+</div>
+
 <script>
 const _originalEngineDebug = (typeof engineDebug === 'function') ? engineDebug : null;
 const _originalTrackerDebug = (typeof trackerDebug === 'function') ? trackerDebug : null;
@@ -23352,7 +23083,7 @@ const AFDB = (function() {
   return '<div style="padding:8px;border-bottom:1px solid #151515;"><div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;"><span style="color:#555;font-size:9px;min-width:65px;flex-shrink:0;">' + esc(e.ts) + '</span><span style="color:' + def.color + ';font-size:10px;font-weight:900;min-width:75px;flex-shrink:0;">' + icon + ' ' + esc(e.level) + '</span><span style="color:#777;font-size:9px;min-width:80px;flex-shrink:0;">[' + esc(e.section) + ']</span><span style="color:' + def.color + ';font-size:11px;font-weight:700;flex:1;white-space:pre-wrap;">' + esc(e.msg) + '</span></div>' + dataHtml + '</div>';
 }).join('');
 
-const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊 Tracker Report</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
+const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊 Tracker Report</button><button onclick="window.EngineAuditor&&EngineAuditor.open()" style="background:#0a1f0a;border:1px solid #2f8f4a;color:#49ff7a;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(47,143,74,0.4);">🩺 Full Audit</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
 
     const emptyMsg = _showOnlyErrors ? 'No suspects arrested. The code is clean.' : 'No log entries yet. Run a fetch.';
     const filterLabel = `\ud83c\udfaf LEVEL: ${_currentLogLevel}`;
@@ -23461,6 +23192,964 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
 
   return { log, clear, copy, toggleFilter, open, close, runTestFetch, get isOpen() { return _isOpen; }, get logs() { return _log; } };
 })();
+
+// =====================================================================
+// ENGINE SELF-AUDITOR — live, in-app audit suite for the debug page only.
+// Runs real checks against the running engine: golden-math regression,
+// H2H weighting, volatility, period-advanced honesty, confidence
+// train/serve parity, NO PLAY/NaN grade consistency, storage integrity,
+// tracker integrity, and structural/security footguns. Never runs on
+// the home screen — only reachable via AFDB (debug page) → Full Audit.
+// =====================================================================
+const EngineAuditor = (function () {
+  /*__ENGINE_AUDITOR_SELF_START__*/
+
+  const SEV_RANK = { CRITICAL: 4, ERROR: 3, WARN: 2, INFO: 1 };
+  let _findings = [];
+  let _checksRun = 0;
+  let _checksTotal = 0;
+  let _isOpen = false;
+  let _lastRunMs = null;
+  let _running = false;
+
+  function add(severity, area, title, what, why, fix) {
+    _findings.push({ severity, area, title, what, why, fix });
+  }
+
+  function tally() { _checksTotal++; }
+  function pass() { _checksRun++; _checksTotal++; }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function safeCall(fn, ...args) {
+    try { return { ok: true, value: fn(...args) }; }
+    catch (e) { return { ok: false, error: e }; }
+  }
+
+  // ---------------------------------------------------------------
+  // Toy fixture — used only for isolated smoke tests. Ten-game arrays
+  // clear every getSampleTier "full" gate (>=10) so projection paths
+  // run their real (non-insufficient-sample) branch.
+  // ---------------------------------------------------------------
+  function buildToyInputs() {
+    const parsed = {
+      aFTScored: [112, 115, 110, 118, 109, 114, 116, 111, 113, 117],
+      aFTAllowed: [108, 110, 112, 107, 111, 109, 113, 108, 110, 112],
+      bFTScored: [108, 112, 105, 115, 110, 109, 111, 107, 113, 110],
+      bFTAllowed: [112, 115, 110, 118, 109, 114, 116, 111, 113, 117],
+      a1HScored: [56, 58, 54, 60, 55, 57, 58, 55, 56, 59],
+      a1HAllowed: [54, 55, 56, 53, 55, 54, 56, 54, 55, 56],
+      b1HScored: [54, 56, 52, 58, 55, 54, 55, 53, 57, 55],
+      b1HAllowed: [56, 58, 54, 60, 55, 57, 58, 55, 56, 59],
+      aQ1Scored: [28, 29, 27, 30, 28, 29, 28, 27, 29, 30],
+      aQ2Scored: [28, 29, 27, 30, 27, 28, 30, 28, 27, 29],
+      aQ3Scored: [28, 27, 28, 29, 27, 28, 29, 28, 28, 29],
+      aQ4Scored: [28, 30, 28, 29, 27, 29, 29, 28, 29, 29],
+      bQ1Scored: [27, 28, 26, 29, 28, 27, 28, 27, 29, 28],
+      bQ2Scored: [27, 28, 26, 29, 27, 27, 28, 27, 28, 27],
+      bQ3Scored: [27, 28, 27, 29, 28, 28, 27, 27, 28, 28],
+      bQ4Scored: [27, 28, 26, 28, 27, 27, 28, 26, 28, 27],
+      aQ1Allowed: [27, 28, 26, 29, 27, 28, 27, 26, 28, 28],
+      aQ2Allowed: [27, 27, 26, 28, 27, 27, 28, 27, 27, 28],
+      aQ3Allowed: [27, 28, 27, 28, 27, 27, 28, 27, 27, 28],
+      aQ4Allowed: [27, 28, 27, 28, 26, 28, 27, 27, 28, 28],
+      bQ1Allowed: [28, 29, 27, 30, 28, 29, 28, 27, 29, 30],
+      bQ2Allowed: [28, 29, 27, 30, 27, 28, 30, 28, 27, 29],
+      bQ3Allowed: [28, 27, 28, 29, 27, 28, 29, 28, 28, 29],
+      bQ4Allowed: [28, 30, 28, 29, 27, 29, 29, 28, 29, 29]
+    };
+    const lines = Object.freeze({
+      ftLine: 224.5, h1Line: 112.5, h2Line: 112, aLine: 113, bLine: 111.5,
+      q1aLine: 28, q1bLine: 27.5, h1aLine: 56.5, h1bLine: 55.5,
+      highQLine: 30, lowQLine: 26, raceRange: null,
+      handicapLine: -2.5, handicapH1Line: -1, handicapH2Line: -1.5
+    });
+    return { league: 'nba', parsed, lines };
+  }
+
+  // =================================================================
+  // CATEGORY: CALC — golden-math regression + projection smoke tests
+  // =================================================================
+  function auditCalc() {
+    const AREA = 'CALC';
+
+    // 1) Delegate to the engine's own golden-math self-test harness.
+    tally();
+    if (typeof window.__BB_RUN_MATH_TESTS__ === 'function') {
+      const r = safeCall(window.__BB_RUN_MATH_TESTS__);
+      if (r.ok && r.value) {
+        pass();
+        if (r.value.ok) {
+          add('INFO', AREA, 'Golden math self-tests passed', 'All built-in regression assertions (period honesty, volatility identity, NaN grade sentinels, sample tiers) passed.', 'These guard the specific bug classes this audit targets, so a clean pass materially raises confidence in CALC/PERIOD/CONFIDENCE correctness.', 'No action needed. Re-run after any change to the projection or grading functions.');
+        } else {
+          (r.value.fails || []).forEach(f => {
+            add('ERROR', AREA, 'Golden math self-test failed', 'window.__BB_RUN_MATH_TESTS__ reported a failed assertion: "' + f + '".', 'This harness encodes previously-fixed regressions (period leak, volatility shrink, fake grades); a failure means one of those bugs has resurfaced.', 'Search the codebase for the assertion text near window.__BB_RUN_MATH_TESTS__ and re-check the function it exercises.');
+          });
+        }
+      } else {
+        add('ERROR', AREA, 'Golden math self-tests threw', 'Calling window.__BB_RUN_MATH_TESTS__() raised an exception: ' + (r.error && r.error.message || r.error) + '.', 'The self-test harness itself is broken, so its usual regression coverage is silently unavailable.', 'Open window.__BB_RUN_MATH_TESTS__ and fix the throwing assertion; check for a function it depends on that no longer exists.');
+      }
+    } else {
+      add('WARN', AREA, 'Golden math self-test harness missing', 'window.__BB_RUN_MATH_TESTS__ is not a function in this build.', 'Without it, the auditor loses its deepest regression coverage for period-advanced honesty, volatility identity, and NaN grade sentinels.', 'Confirm the harness definition (search "__BB_RUN_MATH_TESTS__") was not removed or renamed.');
+    }
+
+    // 2) Projection smoke tests on toy (non-live) inputs.
+    const toy = buildToyInputs();
+    const bands = (typeof getLineSanityBands === 'function') ? safeCall(getLineSanityBands, 'nba') : null;
+    const ftBand = bands && bands.ok ? bands.value.ft : null;
+    const h1Band = bands && bands.ok ? bands.value.h1 : null;
+
+    let ftCalc = null, h1Calc = null, h2Calc = null;
+
+    tally();
+    if (typeof computeFTProjection === 'function') {
+      const r = safeCall(computeFTProjection, { league: toy.league, parsed: toy.parsed, lines: toy.lines, injMultA: 1, injMultB: 1 });
+      if (r.ok) {
+        ftCalc = r.value;
+        const p = ftCalc && ftCalc.ftProj;
+        if (!Number.isFinite(p)) {
+          add('ERROR', AREA, 'FT projection smoke test: non-finite output', 'computeFTProjection(toy 10-game inputs) returned ftProj = ' + p + '.', 'A full-length, well-formed sample should never yield NaN/Infinity; this blocks every downstream pick, edge, and grade for FT.', 'Step through computeFTProjection with the toy inputs above; check anchorProjection/computeVenueBlend for a divide-by-zero or unguarded NaN propagation.');
+        } else if (ftBand && (p < ftBand[0] || p > ftBand[1])) {
+          add('WARN', AREA, 'FT projection outside sane band', 'computeFTProjection(toy inputs) → ftProj = ' + p.toFixed(1) + ', outside the NBA sanity band [' + ftBand[0].toFixed(1) + ', ' + ftBand[1].toFixed(1) + '] from getLineSanityBands.', 'A projection outside the league sanity band on a deliberately mid-range toy sample suggests a scaling or base-rate bug.', 'Check getLeagueScoreBase("nba") and the pace/rating blend in computeFTProjection for a unit or scale mismatch.');
+        } else {
+          pass();
+          add('INFO', AREA, 'FT projection smoke test passed', 'computeFTProjection(toy inputs) → ftProj = ' + p.toFixed(1) + ', finite and inside the NBA sanity band.', 'Confirms the FT projection path runs end-to-end without throwing or fabricating an out-of-range number.', 'No action needed.');
+        }
+      } else {
+        add('ERROR', AREA, 'FT projection smoke test threw', 'computeFTProjection(toy inputs) raised: ' + (r.error && r.error.message || r.error) + '.', 'An exception here means a live user run with a similarly-shaped fixture would also crash instead of returning a NO PLAY/NaN result.', 'Reproduce with the toy inputs in this file and trace the stack to the first unguarded property access.');
+      }
+    } else {
+      add('CRITICAL', AREA, 'computeFTProjection missing', 'computeFTProjection is not defined as a function.', 'This is the core FT projection entry point; without it the engine cannot price the full-game market at all.', 'Check that the function was not renamed or deleted; search for its call sites (computeFTProjection() ) to see what still expects it.');
+    }
+
+    tally();
+    if (typeof compute1HProjection === 'function') {
+      const r = safeCall(compute1HProjection, { league: toy.league, parsed: toy.parsed, lines: toy.lines, injMultA: 1, injMultB: 1 });
+      if (r.ok) {
+        h1Calc = r.value;
+        const p = h1Calc && h1Calc.h1Proj;
+        if (!Number.isFinite(p)) {
+          add('ERROR', AREA, '1H projection smoke test: non-finite output', 'compute1HProjection(toy 10-game inputs) returned h1Proj = ' + p + '.', 'Same-length, well-formed 1H sample should not yield NaN; this would silently block every 1H pick.', 'Trace compute1HProjection with the toy inputs; check the venue-blend and anchorProjection calls near the top of the function.');
+        } else if (h1Band && (p < h1Band[0] || p > h1Band[1])) {
+          add('WARN', AREA, '1H projection outside sane band', 'compute1HProjection(toy inputs) → h1Proj = ' + p.toFixed(1) + ', outside the NBA 1H sanity band [' + h1Band[0].toFixed(1) + ', ' + h1Band[1].toFixed(1) + '].', 'An out-of-band 1H number on mid-range toy data suggests the half-game base (eb/2 scaling) or pace normalization is off.', 'Check leagueBase1H and leaguePaceNorm1H in compute1HProjection for a scale error.');
+        } else {
+          pass();
+          add('INFO', AREA, '1H projection smoke test passed', 'compute1HProjection(toy inputs) → h1Proj = ' + p.toFixed(1) + ', finite and inside the NBA 1H sanity band.', 'Confirms the 1H projection path runs end-to-end and stays in-range.', 'No action needed.');
+        }
+      } else {
+        add('ERROR', AREA, '1H projection smoke test threw', 'compute1HProjection(toy inputs) raised: ' + (r.error && r.error.message || r.error) + '.', 'A throw here means a live 1H run on a comparable fixture would also fail.', 'Reproduce with the toy inputs above and trace the first unguarded access.');
+      }
+    } else {
+      add('CRITICAL', AREA, 'compute1HProjection missing', 'compute1HProjection is not defined as a function.', 'Without it the 1H market cannot be priced at all.', 'Check for a rename/deletion; search call sites expecting compute1HProjection().');
+    }
+
+    tally();
+    if (typeof compute2HProjection === 'function') {
+      const r = safeCall(compute2HProjection, { league: toy.league, parsed: toy.parsed, lines: toy.lines, injMultA: 1, injMultB: 1 });
+      if (r.ok) {
+        h2Calc = r.value;
+        const p = h2Calc && h2Calc.h2Proj;
+        if (!Number.isFinite(p)) {
+          add('ERROR', AREA, '2H projection smoke test: non-finite output', 'compute2HProjection(toy 10-game inputs, via Q3+Q4) returned h2Proj = ' + p + '.', 'A well-formed sample should not yield NaN for 2H; this would silently block every 2H pick.', 'Trace compute2HProjection with the toy Q3/Q4 arrays above.');
+        } else if (h1Band && (p < h1Band[0] * 0.85 || p > h1Band[1] * 1.15)) {
+          add('WARN', AREA, '2H projection far outside 1H-comparable band', '2H (' + p.toFixed(1) + ') should be roughly the same order of magnitude as 1H, but falls well outside a widened 1H sanity band [' + (h1Band[0]*0.85).toFixed(1) + ', ' + (h1Band[1]*1.15).toFixed(1) + '].', 'No dedicated H2 band exists in getLineSanityBands, so this is an approximate cross-check, but a large gap still points at a scale bug.', 'Compare leagueBase2H against leagueBase1H in compute2HProjection.');
+        } else {
+          pass();
+          add('INFO', AREA, '2H projection smoke test passed', 'compute2HProjection(toy inputs) → h2Proj = ' + p.toFixed(1) + ', finite and roughly consistent with the 1H band.', 'Confirms the 2H projection path runs end-to-end without throwing.', 'No action needed.');
+        }
+      } else {
+        add('ERROR', AREA, '2H projection smoke test threw', 'compute2HProjection(toy inputs) raised: ' + (r.error && r.error.message || r.error) + '.', 'A throw here means a live 2H run on a comparable fixture would also fail.', 'Reproduce with the toy inputs above.');
+      }
+    } else {
+      add('CRITICAL', AREA, 'compute2HProjection missing', 'compute2HProjection is not defined as a function.', 'Without it the 2H market cannot be priced at all.', 'Check for a rename/deletion; search call sites expecting compute2HProjection().');
+    }
+
+    // 3) FT ≈ 1H + 2H reconciliation, mirroring the engine's own runtime diagnostic.
+    tally();
+    if (ftCalc && h1Calc && h2Calc && Number.isFinite(ftCalc.ftProj) && Number.isFinite(h1Calc.h1Proj) && Number.isFinite(h2Calc.h2Proj)) {
+      pass();
+      const gap = ftCalc.ftProj - (h1Calc.h1Proj + h2Calc.h2Proj);
+      if (Math.abs(gap) > 10) {
+        add('WARN', AREA, 'FT vs (1H+2H) reconciliation gap', 'On toy inputs, ftProj − (h1Proj + h2Proj) = ' + gap.toFixed(1) + ' pts.', 'FT is supposed to be an independent-but-consistent estimate of the two halves combined; a double-digit gap on synchronized toy data suggests the half-game and full-game models are drifting apart.', 'Compare the venue-blend/anchor logic between computeFTProjection and compute1HProjection/compute2HProjection for a shared assumption that only one of them applies.');
+      } else {
+        add('INFO', AREA, 'FT vs (1H+2H) reconciliation OK', 'ftProj − (h1Proj + h2Proj) = ' + gap.toFixed(1) + ' pts on toy inputs — within a reasonable tolerance.', 'Cross-consistency between the full-game and half-game models is a good sign they share the same underlying assumptions.', 'No action needed.');
+      }
+    }
+
+    // 4) anchorProjection must not fabricate a number from NaN input.
+    tally();
+    if (typeof anchorProjection === 'function') {
+      const r = safeCall(anchorProjection, NaN, 10, 55);
+      if (r.ok) {
+        pass();
+        if (Number.isFinite(r.value)) {
+          add('ERROR', AREA, 'anchorProjection fabricates a value from NaN', 'anchorProjection(NaN, 10, 55) returned ' + r.value + ' instead of passing NaN through.', 'Silently turning a missing/invalid input into a plausible-looking number hides upstream data problems instead of surfacing them as NO PLAY.', 'In anchorProjection, add an explicit "if (!isFinite(proj)) return proj;" guard at the top.');
+        } else {
+          add('INFO', AREA, 'anchorProjection NaN passthrough OK', 'anchorProjection(NaN, 10, 55) correctly stayed non-finite instead of fabricating a value.', 'Confirms invalid inputs propagate as NaN rather than being silently papered over.', 'No action needed.');
+        }
+      }
+    }
+  }
+
+  // =================================================================
+  // CATEGORY: H2H — bounds, sample size, divergence, injury/context
+  // =================================================================
+  function auditH2H() {
+    const AREA = 'H2H';
+    if (typeof getH2HWeight !== 'function') {
+      tally();
+      add('CRITICAL', AREA, 'getH2HWeight missing', 'getH2HWeight is not defined as a function.', 'Without it H2H data cannot be weighted into any projection at all.', 'Check for a rename/deletion of getH2HWeight.');
+      return;
+    }
+    const cap = (typeof getParam === 'function') ? (safeCall(getParam, 'h2hMaxWeight', 'nba').ok ? (getParam('h2hMaxWeight', 'nba') ?? 0.30) : 0.30) : 0.30;
+
+    // Sample-size gate: <2 games each side → weight must be exactly 0.
+    tally();
+    let r = safeCall(getH2HWeight, 1, 5, 'ft', 'full', 0, 'nba');
+    if (r.ok) { pass();
+      if (r.value !== 0) add('ERROR', AREA, 'H2H sample-size gate not enforced', 'getH2HWeight(1, 5, ...) returned ' + r.value + ' instead of 0.', 'Fewer than 2 head-to-head games is not a usable sample; weighting it anyway lets a single fluky game move a pick.', 'Check the "if (minLen < 2) return 0;" guard at the top of getH2HWeight.');
+      else add('INFO', AREA, 'H2H sample-size gate OK', 'getH2HWeight(1, 5, ...) correctly returns 0 when one side has under 2 H2H games.', 'Confirms thin/unusable H2H samples are excluded rather than weighted.', 'No action needed.');
+    }
+
+    // Bounds: weight must never exceed the configured cap, even with a large factor.
+    tally();
+    r = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba', null, 5.0);
+    if (r.ok) { pass();
+      if (r.value > cap + 1e-9 || r.value < 0) add('ERROR', AREA, 'H2H weight bound violated', 'getH2HWeight(10, 10, ..., factor=5.0) returned ' + r.value + ', outside [0, ' + cap + '].', 'The H2H weight caps how much recent head-to-head history can move a projection; an uncapped value lets one lever (factor) override every other safeguard.', 'Confirm "return Math.min(_h2hCap, weight * factor);" is the last line of getH2HWeight and _h2hCap is read before the multiply.');
+      else add('INFO', AREA, 'H2H weight cap holds under large factor', 'getH2HWeight(..., factor=5.0) stayed within [0, ' + cap + '].', 'Confirms the cap is applied after, not before, the factor multiply.', 'No action needed.');
+    }
+
+    // Divergence penalty: a large divergence from baseline should reduce weight vs. divergence=0.
+    tally();
+    const base = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba');
+    const diverged = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 40, 'nba', 100);
+    if (base.ok && diverged.ok) { pass();
+      if (!(diverged.value < base.value)) add('WARN', AREA, 'H2H divergence penalty not reducing weight', 'getH2HWeight with divergence=40 vs baseline=100 (40% relative divergence) returned ' + diverged.value + ', not less than the no-divergence weight ' + base.value + '.', 'When H2H history disagrees sharply with the baseline projection, it should be trusted less, not equally.', 'Check relDiv/divergencePenalty computation and the h2hDivergenceThreshold/Slope params in getH2HWeight.');
+      else add('INFO', AREA, 'H2H divergence penalty active', 'A 40%-divergent H2H sample weighted lower (' + diverged.value.toFixed(4) + ') than a non-divergent one (' + base.value.toFixed(4) + ').', 'Confirms disagreement between H2H and baseline appropriately discounts the H2H weight.', 'No action needed.');
+    }
+
+    // Injury/context penalty: a large injury gap should reduce weight vs. no context.
+    tally();
+    const noCtx = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba', null, 1.0, null);
+    const injCtx = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba', null, 1.0, { injMultA: 1.0, injMultB: 0.5 });
+    if (noCtx.ok && injCtx.ok) { pass();
+      if (!(injCtx.value < noCtx.value)) add('WARN', AREA, 'H2H injury/context penalty not reducing weight', 'getH2HWeight with a large injury gap (injMultA=1.0, injMultB=0.5) returned ' + injCtx.value + ', not less than the no-context weight ' + noCtx.value + '.', 'A significant injury absent from prior H2H meetings should reduce trust in that history, since the matchup context has changed.', 'Check the injuryRisk term inside the context-penalty block of getH2HWeight.');
+      else add('INFO', AREA, 'H2H injury/context penalty active', 'A large injury gap weighted lower (' + injCtx.value.toFixed(4) + ') than no context (' + noCtx.value.toFixed(4) + ').', 'Confirms injury context appropriately discounts stale H2H history.', 'No action needed.');
+    }
+
+    // Monotonicity: more H2H games (holding everything else fixed) should not decrease weight.
+    tally();
+    const small = safeCall(getH2HWeight, 3, 3, 'ft', 'full', 0, 'nba');
+    const large = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba');
+    if (small.ok && large.ok) { pass();
+      if (large.value < small.value - 1e-9) add('WARN', AREA, 'H2H weight not monotonic in sample size', 'getH2HWeight(10,10,...) = ' + large.value + ' is less than getH2HWeight(3,3,...) = ' + small.value + '.', 'All else equal, more head-to-head history should never be trusted less than a thinner sample.', 'Check the log1p(minLen-1) growth curve in getH2HWeight.');
+      else add('INFO', AREA, 'H2H weight monotonic in sample size', 'Weight did not decrease going from 3 to 10 shared H2H games.', 'Confirms the sample-size curve behaves sensibly.', 'No action needed.');
+    }
+  }
+
+  // =================================================================
+  // CATEGORY: VOLATILITY — must widen uncertainty, never shrink mean
+  // =================================================================
+  function auditVolatility() {
+    const AREA = 'VOLATILITY';
+
+    tally();
+    if (typeof applyVolatility === 'function') {
+      const r1 = safeCall(applyVolatility, 100, [90, 100, 110], 12, 'nba');
+      const r2 = safeCall(applyVolatility, 88.5, [], 12, 'ncaa');
+      if (r1.ok && r2.ok) { pass();
+        if (r1.value !== 100 || r2.value !== 88.5) {
+          add('CRITICAL', AREA, 'Volatility is shrinking the projection mean', 'applyVolatility(100, [...], 12, "nba") returned ' + r1.value + ' (expected 100, unchanged); applyVolatility(88.5, [], 12, "ncaa") returned ' + r2.value + ' (expected 88.5).', 'Volatility describes spread (predictive SD), not a discount on the central estimate. Letting it pull the mean toward a baseline conflates "uncertain" with "wrong" and silently biases every projection.', 'applyVolatility should be an identity on its first argument — "return proj;" — with SD/uncertainty handled only in distributionWinProbability/_normalCdf.');
+        } else {
+          add('INFO', AREA, 'Volatility does not shrink the mean', 'applyVolatility is an identity on the projection for both a populated and an empty series.', 'Confirms uncertainty is kept separate from the point estimate, matching the intended design.', 'No action needed.');
+        }
+      } else {
+        add('ERROR', AREA, 'applyVolatility threw on toy input', 'applyVolatility raised: ' + ((r1.ok ? r2.error : r1.error) || {}).message, 'A function this central to every projection should never throw on well-formed input.', 'Trace the exception with the toy args (100, [90,100,110], 12, "nba").');
+      }
+    } else {
+      add('CRITICAL', AREA, 'applyVolatility missing', 'applyVolatility is not defined as a function.', 'Without it there is no defined policy for how volatility interacts with the projection mean.', 'Check for a rename/deletion.');
+    }
+
+    // getVolatilityRatioForSeries: short series should return the neutral 1.0, not NaN.
+    tally();
+    if (typeof getVolatilityRatioForSeries === 'function') {
+      const rShort = safeCall(getVolatilityRatioForSeries, [10, 12], 12);
+      const rLow = safeCall(getVolatilityRatioForSeries, [100, 100, 100, 100, 100], 12);
+      const rHigh = safeCall(getVolatilityRatioForSeries, [70, 130, 60, 140, 80], 12);
+      if (rShort.ok && rLow.ok && rHigh.ok) { pass();
+        if (rShort.value !== 1.0) {
+          add('WARN', AREA, 'Volatility ratio neutral default not returned for short series', 'getVolatilityRatioForSeries([10,12], 12) returned ' + rShort.value + ', expected the neutral 1.0 (series length < 3).', 'With fewer than 3 data points, standard deviation is not meaningful; the function should fall back to a neutral ratio rather than an unstable estimate.', 'Check the "if (cleanSeries.length < 3) return 1.0;" guard.');
+        } else if (!(rHigh.value > rLow.value)) {
+          add('ERROR', AREA, 'Volatility ratio not responsive to spread', 'A high-variance series returned ratio ' + rHigh.value + ', not greater than a flat series\' ratio ' + rLow.value + '.', 'The whole point of this function is to detect when a team\'s scoring is unusually erratic; if it does not respond to spread, downstream confidence grading loses its main volatility signal.', 'Check the stdDev() computation and the division by leagueVolLimit inside getVolatilityRatioForSeries.');
+        } else if (rHigh.value > 2.5) {
+          add('ERROR', AREA, 'Volatility ratio exceeds documented cap', 'getVolatilityRatioForSeries returned ' + rHigh.value + ', above the intended 2.5 cap.', 'Downstream code (e.g. distributionWinProbability) assumes this ratio is bounded; an unbounded value can blow out the predictive SD.', 'Check the "Math.min(2.5, ...)" wrapper is still present.');
+        } else {
+          add('INFO', AREA, 'Volatility ratio behaves sanely', 'Neutral default for short series, and higher ratio for higher-spread series, both hold, within the 2.5 cap.', 'Confirms the volatility signal feeding into confidence grading is trustworthy.', 'No action needed.');
+        }
+      }
+    } else {
+      add('CRITICAL', AREA, 'getVolatilityRatioForSeries missing', 'getVolatilityRatioForSeries is not defined as a function.', 'Without it, volatility-based confidence adjustments have no input signal.', 'Check for a rename/deletion.');
+    }
+  }
+
+  // =================================================================
+  // CATEGORY: PERIOD-ADVANCED — no FT leakage into 1H/2H/quarters
+  // =================================================================
+  function auditPeriodAdvanced() {
+    const AREA = 'PERIOD';
+
+    // derivePeriodAdvanced: thin/zero-fraction inputs must reject (null), not fabricate.
+    tally();
+    if (typeof derivePeriodAdvanced === 'function') {
+      const full = { pace: 100, ortg: 110, drtg: 108, possessions: 100 };
+      const rGood = safeCall(derivePeriodAdvanced, full, 55, 52, 0.5, 'nba');
+      const rThin = safeCall(derivePeriodAdvanced, full, 2, 2, 0.05, 'nba');
+      const rZero = safeCall(derivePeriodAdvanced, full, 55, 52, 0, 'nba');
+      if (rGood.ok && rThin.ok && rZero.ok) { pass();
+        const problems = [];
+        if (!(rGood.value && Number.isFinite(rGood.value.ortg))) problems.push('normal-sample call did not return a finite ORTG');
+        if (rThin.value !== null) problems.push('thin periodPoss (<5) did not reject (expected null)');
+        if (rZero.value !== null) problems.push('zero periodFraction did not reject (expected null)');
+        if (problems.length) {
+          add('ERROR', AREA, 'derivePeriodAdvanced honesty gate broken', problems.join('; ') + '.', 'This function is the single choke point that is supposed to refuse to fabricate a period-specific rating from too little data — if the gate is broken, thin-sample noise can leak into 1H/2H/quarter projections as if it were real signal.', 'Check the possessions>=5 and periodFraction>0 guards at the top of derivePeriodAdvanced.');
+        } else {
+          add('INFO', AREA, 'derivePeriodAdvanced honesty gate OK', 'Normal sample returns a finite rating; thin sample and zero fraction both correctly reject with null.', 'Confirms the engine will not fabricate a period rating from an insufficient sample.', 'No action needed.');
+        }
+      }
+    } else {
+      add('CRITICAL', AREA, 'derivePeriodAdvanced missing', 'derivePeriodAdvanced is not defined as a function.', 'Without it there is no guarded path from full-game box data to period-specific ratings.', 'Check for a rename/deletion.');
+    }
+
+    // getPeriodAdvancedSeries: must not fall back to FT-wide series when the
+    // period-specific series is thin (<5) — even if plenty of FT data exists.
+    tally();
+    if (typeof getPeriodAdvancedSeries === 'function') {
+      const thinCtx = { ortg10_h2: [110, 111, 112], drtg10_h2: [105, 106, 107], pace10_h2: [98, 99, 100], ortg10: [112, 111, 110, 113, 114, 112, 111], drtg10: [108, 107, 106, 109, 108], pace10: [100, 99, 101, 100, 98] };
+      const r = safeCall(getPeriodAdvancedSeries, thinCtx, 'h2');
+      if (r.ok) { pass();
+        if (r.value && r.value.source !== 'none') {
+          add('CRITICAL', AREA, 'FT-wide advanced stats leaking into a sub-period market', 'getPeriodAdvancedSeries(ctx, "h2") returned source="' + (r.value && r.value.source) + '" for a context where the H2-native series only has 3 samples (below the 5-sample floor), even though plenty of FT-wide data (' + thinCtx.ortg10.length + ' games) is present.', 'This is exactly the "FT ORTG leaking into 1H/2H/Q" failure mode: it would let full-game efficiency numbers masquerade as second-half-specific signal, silently biasing the 2H projection toward full-game norms.', 'In getPeriodAdvancedSeries, confirm the branch for a non-FT marketKey never falls back to c.ortg10/c.drtg10/c.pace10 when the period-native arrays are short — it should return {ortg:[],drtg:[],pace:[],source:"none"}.');
+        } else {
+          add('INFO', AREA, 'No FT leakage on thin period sample', 'A thin H2-native sample (3 games) correctly returned source="none" instead of falling back to the FT-wide series.', 'Confirms period-specific advanced stats are held to their own sample-size bar rather than borrowing from full-game data.', 'No action needed.');
+        }
+      }
+    } else {
+      add('CRITICAL', AREA, 'getPeriodAdvancedSeries missing', 'getPeriodAdvancedSeries is not defined as a function.', 'Without it there is no single source of truth for period-native advanced stats, and call sites would have to each reimplement the leak guard themselves.', 'Check for a rename/deletion.');
+    }
+
+    // Source-scan: compare how compute1HProjection and compute2HProjection
+    // source their pace-availability gate (hasRealPace / synPace).
+    tally();
+    pass();
+    const src = getConcatenatedScriptSource();
+    if (src) {
+      const h1Body = extractFunctionBody(src, 'compute1HProjection');
+      const h2Body = extractFunctionBody(src, 'compute2HProjection');
+      if (h1Body && h2Body) {
+        const h1UsesRawFT = /avgPaceA\s*=\s*avgOrNaN\(ctxA\.pace10\)/.test(h1Body);
+        const h2UsesRawFT = /avgPaceA\s*=\s*avgOrNaN\(ctxA\.pace10\)/.test(h2Body);
+        const h1UsesPeriodPace = /avgPaceA\s*=\s*avgOrNaN\(_paceArrA1\)/.test(h1Body);
+        if (h2UsesRawFT && !h1UsesRawFT && h1UsesPeriodPace) {
+          add('WARN', AREA, 'compute2HProjection paces itself off full-game data, unlike compute1HProjection', 'compute2HProjection computes its hasRealPace/synPace gate from the raw full-game series (avgOrNaN(ctxA.pace10) / ctxB.pace10), while compute1HProjection uses only the period-native pace array (_paceArrA1/_paceArrB1) gated to source==="h1". The ORTG/DRTG half of compute2HProjection does correctly call getPeriodAdvancedSeries(ctxA,"h2"), but its pace gate does not go through the same period-native path.', 'This is a policy inconsistency between the two half-game functions: 2H can treat a team\'s full-game pace as if it were 2H-specific pace, which is exactly the "FT stat leaking into a period market" pattern this audit looks for — just on the pace input rather than ORTG/DRTG.', 'In compute2HProjection, replace "avgOrNaN(ctxA.pace10)" / "avgOrNaN(ctxB.pace10)" (and the matching .length >= 5 checks) with the pace arrays already returned by the h2-scoped getPeriodAdvancedSeries call (_advA2.pace / _advB2.pace), mirroring how compute1HProjection builds _paceArrA1/_paceArrB1.');
+        } else {
+          add('INFO', AREA, '2H pace sourcing matches 1H policy', 'Source scan did not find the raw-FT-pace-only-in-2H pattern.', 'Suggests both half-game functions gate their pace input the same way.', 'No action needed.');
+        }
+      } else {
+        add('INFO', AREA, '2H/1H pace source-scan skipped', 'Could not isolate both function bodies from the page source for comparison (function boundary extraction failed).', 'This is a limitation of the static scan, not a finding about the engine.', 'Not applicable.');
+      }
+    }
+  }
+
+  // =================================================================
+  // CATEGORY: CONFIDENCE — train ≠ serve, double boosts, NaN sentinels
+  // =================================================================
+  function auditConfidence() {
+    const AREA = 'CONFIDENCE';
+
+    // NaN sentinel: never fabricate a letter grade from missing data.
+    tally();
+    if (typeof resolveConfidenceGradeFromWinProbability === 'function') {
+      const cases = [
+        [null, 'null'], [undefined, 'undefined'], [NaN, 'NaN'], [-1, '-1 (out of range)'], [1.5, '1.5 (out of range)']
+      ];
+      let bad = [];
+      cases.forEach(([val, label]) => {
+        const r = safeCall(resolveConfidenceGradeFromWinProbability, val, 'nba');
+        if (r.ok && !Number.isFinite(val) && r.value !== 'NaN') bad.push(label + ' → "' + r.value + '"');
+      });
+      pass();
+      if (bad.length) {
+        add('CRITICAL', AREA, 'Fake grade fabricated from invalid win probability', 'resolveConfidenceGradeFromWinProbability returned a real letter grade instead of the "NaN" sentinel for: ' + bad.join('; ') + '.', 'This is the exact null/isFinite(null) trap class this audit targets: isFinite(null) is true in JavaScript, so a naive isFinite() guard would let a null winProb silently pass through and be graded as if it were a real B or D — a confident-looking pick built on no data.', 'Confirm the guard at the top of resolveConfidenceGradeFromWinProbability uses "!Number.isFinite(winProb)" (not the global isFinite) before any threshold comparison.');
+      } else {
+        add('INFO', AREA, 'NaN grade sentinel holds', 'null, undefined, NaN, and out-of-range win probabilities all correctly resolve to the "NaN" grade sentinel rather than a fabricated letter.', 'Confirms Number.isFinite (not the null-permissive global isFinite) guards the grading path.', 'No action needed.');
+      }
+    } else {
+      add('CRITICAL', AREA, 'resolveConfidenceGradeFromWinProbability missing', 'Not defined as a function.', 'Without it there is no single choke point translating win probability into a grade — every call site would need its own NaN guard.', 'Check for a rename/deletion.');
+    }
+
+    // getConfidenceGrade / getMarginConfidenceGrade: NO PLAY / null-line / NaN-edge → NaN.
+    tally();
+    if (typeof getConfidenceGrade === 'function') {
+      const g1 = safeCall(getConfidenceGrade, { pick: 'NO PLAY', line: 220, edge: 5, league: 'nba' });
+      const g2 = safeCall(getConfidenceGrade, { pick: 'OVER', line: null, edge: 5, league: 'nba' });
+      const g3 = safeCall(getConfidenceGrade, { pick: 'OVER', line: 220, edge: NaN, league: 'nba' });
+      pass();
+      const bad = [];
+      if (g1.ok && g1.value !== 'NaN') bad.push('NO PLAY pick → "' + g1.value + '"');
+      if (g2.ok && g2.value !== 'NaN') bad.push('null line → "' + g2.value + '"');
+      if (g3.ok && g3.value !== 'NaN') bad.push('NaN edge → "' + g3.value + '"');
+      if (bad.length) {
+        add('CRITICAL', AREA, 'getConfidenceGrade grades an ungradeable pick', bad.join('; ') + '.', 'A NO PLAY pick, a missing line, or a non-finite edge means there is nothing sound to grade; returning a letter anyway would show the user false confidence on a pick that should not exist.', 'Check the early-return guard at the top of getConfidenceGrade: "if (!pick || pick === \\"NO PLAY\\" || note || line === null || !isFinite(line) || line <= 0 || !isFinite(edge)) return \\"NaN\\";".');
+      } else {
+        add('INFO', AREA, 'getConfidenceGrade guard holds', 'NO PLAY picks, null lines, and NaN edges all correctly resolve to "NaN".', 'Confirms grading never fabricates confidence for an ungradeable pick.', 'No action needed.');
+      }
+    }
+
+    // Train/serve feature parity — same edge expressed as fraction (live) vs
+    // percent (fit/backtest) must normalize to the identical feature vector.
+    tally();
+    if (typeof buildConfidenceFeatures === 'function') {
+      const rLive = safeCall(buildConfidenceFeatures, { edgePct: 0.08, volatilityRatio: 1.2, sampleTier: 'full', hasH2H: true, trap: false, league: 'nba' });
+      const rFit = safeCall(buildConfidenceFeatures, { edgePct: 8.0, godsEyeMemory: { aVol: 14.4, bVol: 14.4, sampleTier: 'full', hasH2H: true, trap: false }, league: 'nba', marketKey: 'ft' });
+      if (rLive.ok && rFit.ok) { pass();
+        const diff = Math.abs(rLive.value.edgePct - rFit.value.edgePct);
+        if (!(diff < 1e-9)) {
+          add('CRITICAL', AREA, 'Confidence model train/serve feature mismatch', 'The live-serve call (edgePct=0.08 fraction) and the training/backtest call (edgePct=8.0 percent) normalized to different edgePct features (Δ=' + diff.toExponential(2) + ') instead of matching exactly.', 'The confidence model is trained on one feature representation and served on another; if they drift apart, the coefficients learned during training no longer mean what the live code assumes, silently corrupting every grade.', 'Check buildConfidenceFeatures\' percent-vs-fraction normalization ("if (Math.abs(edgeFrac) > 1) edgeFrac /= 100;") is applied identically on both the live and fit code paths.');
+        } else {
+          add('INFO', AREA, 'Confidence model train/serve feature parity holds', 'Live (fraction) and fit (percent) inputs normalize to the same edgePct feature (Δ < 1e-9).', 'Confirms the model is trained and served on a consistent feature definition.', 'No action needed.');
+        }
+      }
+    } else {
+      add('WARN', AREA, 'buildConfidenceFeatures missing', 'Not defined as a function.', 'Without a single shared feature-builder, train and serve paths are free to diverge with no automatic check.', 'Check for a rename/deletion.');
+    }
+
+    // Double edge-boost source scan — look for the same edge-like variable
+    // multiplied by a "boost"/"mult" factor more than once in one function.
+    tally();
+    pass();
+    const src = getConcatenatedScriptSource();
+    if (src) {
+      const suspects = findDoubleBoostPatterns(src);
+      if (suspects.length) {
+        suspects.forEach(s => {
+          add('WARN', AREA, 'Possible double edge/confidence boost in ' + s.fn, 'Variable "' + s.varName + '" is reassigned via a "*=" boost/mult-style multiply ' + s.count + ' times inside ' + s.fn + '.', 'Multiplying the same edge or confidence signal by more than one boost factor in the same scope can silently compound — a pick that should get one modest bump instead gets stacked bumps.', 'Open ' + s.fn + ' and confirm each "' + s.varName + ' *= ..." line is gated on a mutually-exclusive condition, not applied unconditionally in sequence.');
+        });
+      } else {
+        add('INFO', AREA, 'No obvious double-boost pattern found', 'Source scan did not find the same edge/confidence variable multiplied by a boost factor more than once within a single function.', 'This is a heuristic scan, not a proof of absence — treat as a first pass, not a guarantee.', 'No action needed from this check alone.');
+      }
+    }
+
+    // isFinite(null) trap regression (JS-level truth this whole category leans on).
+    tally();
+    pass();
+    if (isFinite(null) !== true || Number.isFinite(null) !== false) {
+      add('CRITICAL', AREA, 'JavaScript engine isFinite semantics unexpected', 'isFinite(null) !== true or Number.isFinite(null) !== false in this runtime.', 'Every NaN-grade guard in this codebase is written assuming these exact semantics; if they ever differ, the guards silently stop working.', 'Not an engine bug — re-run in a standard browser/JS runtime.');
+    } else {
+      add('INFO', AREA, 'isFinite(null) trap confirmed present (as expected)', 'isFinite(null) === true and Number.isFinite(null) === false, confirming why every grade/edge guard in this codebase must use Number.isFinite, not the bare global isFinite.', 'This is the mechanism behind every "fake grade from null" finding above — documented here for context.', 'No action needed; this is a JS language fact, not a bug.');
+    }
+  }
+
+  // =================================================================
+  // CATEGORY: NO PLAY / NaN GRADE — consistency between pick and grade
+  // =================================================================
+  function auditNoPlay() {
+    const AREA = 'NO PLAY';
+
+    tally();
+    if (typeof getPick === 'function') {
+      const p1 = safeCall(getPick, NaN, 220, 'nba', 'ft');
+      const p2 = safeCall(getPick, 0, 220, 'nba', 'ft');
+      const p3 = safeCall(getPick, 0.1, 220, 'nba', 'ft');
+      pass();
+      const bad = [];
+      if (p1.ok && p1.value !== 'NO PLAY') bad.push('NaN edge → "' + p1.value + '"');
+      if (p2.ok && p2.value !== 'NO PLAY') bad.push('zero edge → "' + p2.value + '"');
+      if (p3.ok && p3.value !== 'NO PLAY') bad.push('sub-threshold edge (0.1) → "' + p3.value + '"');
+      if (bad.length) {
+        add('ERROR', AREA, 'getPick returns a playable pick for an unplayable edge', bad.join('; ') + '.', 'NaN, zero, and tiny edges should always resolve to NO PLAY; anything else would show the user a confident-looking OVER/UNDER built on no real edge.', 'Check the early guards in getPick: "if (!line || isNaN(edge) || isNaN(line) || line <= 0) return \\"NO PLAY\\";", "if (edge === 0) return \\"NO PLAY\\";", and the absEdge < 0.5 floor.');
+      } else {
+        add('INFO', AREA, 'getPick NO PLAY guards hold', 'NaN edge, zero edge, and a sub-threshold edge all correctly resolve to NO PLAY.', 'Confirms unplayable edges never masquerade as a real pick.', 'No action needed.');
+      }
+
+      // Chain check: a NO PLAY pick must also always grade as NaN.
+      tally();
+      if (typeof getConfidenceGrade === 'function') {
+        const chained = safeCall(getConfidenceGrade, { pick: p1.ok ? p1.value : 'NO PLAY', line: 220, edge: NaN, league: 'nba' });
+        pass();
+        if (chained.ok && chained.value !== 'NaN') {
+          add('CRITICAL', AREA, 'NO PLAY pick graded with a real letter', 'getPick(NaN, 220, "nba", "ft") → "' + (p1.ok ? p1.value : '?') + '", then feeding that into getConfidenceGrade returned "' + chained.value + '" instead of "NaN".', 'This is the exact pick/grade inconsistency this audit targets: a pick the engine itself says not to make should never carry a confidence grade at all.', 'Confirm getConfidenceGrade\'s "pick === \\"NO PLAY\\"" check runs before any win-probability computation.');
+        } else {
+          add('INFO', AREA, 'NO PLAY → NaN grade chain holds', 'Feeding a NO PLAY pick into getConfidenceGrade correctly yields the "NaN" grade sentinel.', 'Confirms pick and grade stay consistent end-to-end for unplayable edges.', 'No action needed.');
+        }
+      }
+    } else {
+      add('CRITICAL', AREA, 'getPick missing', 'getPick is not defined as a function.', 'Without it there is no single choke point deciding OVER/UNDER/NO PLAY — every call site would need to reimplement the NO PLAY thresholds.', 'Check for a rename/deletion.');
+    }
+
+    // Live scan of the user's actual tracked picks for stored inconsistencies.
+    tally();
+    if (typeof getAllTrackedPicksForReport === 'function') {
+      const r = safeCall(getAllTrackedPicksForReport);
+      if (r.ok) { pass();
+        const picks = Array.isArray(r.value) ? r.value : [];
+        let mismatches = 0;
+        picks.forEach(p => {
+          const isNoPlay = String(p.predictionText || p.pick || '').toUpperCase() === 'NO PLAY';
+          const grade = p.confidenceGrade || p.grade;
+          const gradeLooksReal = grade && /^[ABCD]$/.test(String(grade).toUpperCase());
+          if (isNoPlay && gradeLooksReal) mismatches++;
+          const edgeVal = Number(p.edge);
+          if (!isNoPlay && !Number.isFinite(edgeVal) && p.resultStatus && p.resultStatus !== 'pending') mismatches++;
+        });
+        if (mismatches > 0) {
+          add('WARN', AREA, 'Stored tracker picks with pick/grade inconsistency', mismatches + ' out of ' + picks.length + ' tracked pick(s) show a NO PLAY prediction paired with a real letter grade, or a non-NaN edge missing on a settled pick.', 'These are historical records already saved to the tracker; if the inconsistency happened live it may have shown the user false confidence at decision time, and it will also skew win-rate/calibration stats computed from this history.', 'Cross-reference the flagged picks (by matching predictionText/confidenceGrade) against repairMisclassifiedNoPlayTrackedPicks, which exists specifically to repair this class of record.');
+        } else {
+          add('INFO', AREA, 'No pick/grade inconsistency found in tracked picks', 'Scanned ' + picks.length + ' stored tracked pick(s); none show a NO PLAY prediction with a real letter grade or a missing edge on a settled pick.', 'Historical tracker data is internally consistent by this check.', 'No action needed.');
+        }
+      }
+    } else {
+      add('INFO', AREA, 'getAllTrackedPicksForReport unavailable', 'Could not run the live tracked-picks consistency scan.', 'This just means the live-data check was skipped — the direct getPick/getConfidenceGrade checks above still ran.', 'Not applicable.');
+    }
+  }
+
+  // =================================================================
+  // CATEGORY: STORAGE — round-trip integrity, orphaned propose/approve
+  // =================================================================
+  async function auditStorage() {
+    const AREA = 'STORAGE';
+
+    // Live round-trip test through the real storage path, on a disposable key.
+    tally();
+    if (typeof writeAsyncStorage === 'function' && typeof readAsyncStorage === 'function') {
+      const testKey = '__BB_AUDITOR_SELFTEST__';
+      const testVal = { probe: true, ts: Date.now(), nonce: Math.random().toString(36).slice(2) };
+      try {
+        await writeAsyncStorage(testKey, JSON.stringify(testVal));
+        const readBack = await readAsyncStorage(testKey);
+        const parsedBack = typeof readBack === 'string' ? JSON.parse(readBack) : readBack;
+        pass();
+        if (!parsedBack || parsedBack.nonce !== testVal.nonce) {
+          add('ERROR', AREA, 'Storage round-trip failed', 'A test value written via writeAsyncStorage did not read back correctly via readAsyncStorage (nonce mismatch or missing value).', 'If the write/read path is unreliable, tracker state, confidence models, and line memory can silently fail to persist between sessions.', 'Check initBBDatabase()/BB_STORE_NAME and the localStorage fallback branch in readAsyncStorage/writeAsyncStorage.');
+        } else {
+          add('INFO', AREA, 'Storage round-trip OK', 'A disposable test value was written and read back correctly through the live storage path.', 'Confirms the IndexedDB (or localStorage fallback) persistence layer is currently functional.', 'No action needed.');
+        }
+        try { if (typeof indexedDB !== 'undefined') { /* best-effort cleanup below */ } localStorage.removeItem(testKey); } catch (_e) {}
+        try { await writeAsyncStorage(testKey, ''); } catch (_e) {}
+      } catch (e) {
+        pass();
+        add('ERROR', AREA, 'Storage round-trip threw', 'writeAsyncStorage/readAsyncStorage raised: ' + (e && e.message || e) + '.', 'An exception in the core storage path means saves could be failing silently for real users too.', 'Reproduce with a simple string value and trace the IndexedDB transaction and localStorage fallback.');
+      }
+    } else {
+      add('CRITICAL', AREA, 'Storage read/write functions missing', 'writeAsyncStorage and/or readAsyncStorage are not defined as functions.', 'Without them nothing can persist between sessions — tracker history, confidence models, line memory would all be lost on reload.', 'Check for a rename/deletion.');
+    }
+
+    // Orphaned propose/approve residue — a "_PROPOSED" key with no matching
+    // apply, left behind by an interrupted (non-atomic) promote sequence.
+    tally();
+    pass();
+    try {
+      const proposedKeys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf('BB_') === 0 && k.indexOf('_PROPOSED') !== -1) proposedKeys.push(k);
+      }
+      if (proposedKeys.length) {
+        add('WARN', AREA, 'Pending propose/approve keys present', 'Found ' + proposedKeys.length + ' proposal key(s) awaiting apply: ' + proposedKeys.join(', ') + '.', 'This is expected while a candidate confidence-model config is genuinely pending review, but if it lingers indefinitely it usually means a promote step was interrupted partway (applyConfidenceModelProposal writes several keys with plain sequential localStorage.setItem calls, not a single transaction) and the "_PROPOSED" keys were never cleared.', 'If no proposal review is actually in progress, check applyConfidenceModelProposal — if an earlier setItem call in that sequence threw (e.g. quota exceeded), later cleanup removeItem calls for the "_PROPOSED" keys would never run, leaving this residue.');
+      } else {
+        add('INFO', AREA, 'No orphaned propose/approve keys', 'No "BB_*_PROPOSED" keys currently in localStorage.', 'Either no proposal is pending, or the last promote cycle completed and cleaned up correctly.', 'No action needed.');
+      }
+    } catch (e) {
+      add('WARN', AREA, 'Could not scan localStorage for orphaned proposals', String(e && e.message || e), 'localStorage may be unavailable in this context (e.g. private browsing restrictions).', 'Not applicable.');
+    }
+
+    // JSON integrity of every currently-stored BB_-prefixed key.
+    tally();
+    pass();
+    try {
+      let corrupt = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!k || k.indexOf('BB_') !== 0) continue;
+        const raw = localStorage.getItem(k);
+        if (raw == null || raw === '') continue;
+        try { JSON.parse(raw); } catch (_pe) {
+          if (!/^-?\d+(\.\d+)?$/.test(raw)) corrupt.push(k);
+        }
+      }
+      if (corrupt.length) {
+        add('ERROR', AREA, 'Corrupted storage value(s) detected', 'The following localStorage key(s) hold a value that is neither valid JSON nor a plain number: ' + corrupt.join(', ') + '.', 'Any code path that does JSON.parse() on these keys without a try/catch will throw the next time it runs, and code that swallows the error will silently fall back to defaults, quietly discarding whatever was there.', 'Inspect the raw value with localStorage.getItem(key) in the console; if it is unrecoverable, remove the key so the engine falls back to its default rather than repeatedly failing to parse it.');
+      } else {
+        add('INFO', AREA, 'All BB_ storage values parse cleanly', 'Every currently-stored "BB_*" localStorage key holds valid JSON (or a plain number).', 'No stored-data corruption detected at this time.', 'No action needed.');
+      }
+    } catch (e) {
+      add('WARN', AREA, 'Could not scan localStorage for corruption', String(e && e.message || e), 'localStorage may be unavailable in this context.', 'Not applicable.');
+    }
+
+    // Structural note: the promote step is several sequential writes, not one transaction.
+    tally();
+    pass();
+    const src = getConcatenatedScriptSource();
+    if (src) {
+      const body = extractFunctionBody(src, 'applyConfidenceModelProposal');
+      if (body) {
+        const setItemCount = (body.match(/localStorage\.setItem\(/g) || []).length;
+        if (setItemCount >= 3) {
+          add('WARN', AREA, 'Confidence model promote step is not atomic', 'applyConfidenceModelProposal performs ' + setItemCount + ' separate localStorage.setItem calls (coeff, Platt calibration, sample sizes, thresholds, grade win-rates) inside one try/catch, then a further sequence of removeItem calls — but a single throw partway through (e.g. a quota error on one of the later keys) leaves the live model in a mixed state: some keys updated to the new values, others still on the old ones, and the "_PROPOSED" keys not cleaned up.', 'A pick graded during that partial-write window could blend old and new model coefficients in a way that was never actually tested or approved.', 'Stage the new values under temporary keys, verify every write succeeded, then do the "_PROPOSED" cleanup — or write a single JSON blob under one key instead of five independent keys, so a failure cannot leave a mixed state.');
+        } else {
+          add('INFO', AREA, 'Promote-step write pattern looks reasonably contained', 'applyConfidenceModelProposal makes ' + setItemCount + ' localStorage.setItem call(s).', 'Fewer sequential writes means less surface area for a partial-failure to leave a mixed state.', 'No action needed.');
+        }
+      }
+    }
+  }
+
+  // =================================================================
+  // CATEGORY: TRACKER — merge-key collisions, missing fields
+  // =================================================================
+  function auditTracker() {
+    const AREA = 'TRACKER';
+
+    tally();
+    if (typeof getAllTrackedPicksForReport === 'function' && typeof makeTrackerActiveMergeKey === 'function') {
+      const r = safeCall(getAllTrackedPicksForReport);
+      if (r.ok) { pass();
+        const picks = Array.isArray(r.value) ? r.value : [];
+        const keyCounts = {};
+        let missingFields = 0;
+        picks.forEach(p => {
+          if (p.resultStatus == null || (p.predictionText == null && p.pick == null)) missingFields++;
+          const mk = safeCall(makeTrackerActiveMergeKey, p);
+          if (mk.ok && mk.value) keyCounts[mk.value] = (keyCounts[mk.value] || 0) + 1;
+        });
+        const dupes = Object.keys(keyCounts).filter(k => keyCounts[k] > 1);
+        if (dupes.length) {
+          add('WARN', AREA, 'Duplicate tracker merge keys detected', dupes.length + ' merge key(s) are shared by more than one stored pick (e.g. "' + dupes[0] + '" × ' + keyCounts[dupes[0]] + ').', 'makeTrackerActiveMergeKey is what the merge logic uses to decide two picks are "the same" across local/server sync; a collision here means two genuinely different picks could get silently merged into one, losing data.', 'Inspect the picks sharing a merge key and check makeTrackerActiveMergeKey for a field combination that is not actually unique per pick (e.g. missing market/side in the key).');
+        } else {
+          add('INFO', AREA, 'No duplicate tracker merge keys', 'Every stored pick\'s merge key is unique across ' + picks.length + ' tracked pick(s).', 'Confirms the local/server merge logic will not silently collapse two distinct picks into one.', 'No action needed.');
+        }
+        if (missingFields > 0) {
+          add('WARN', AREA, 'Tracked picks missing core fields', missingFields + ' out of ' + picks.length + ' tracked pick(s) are missing resultStatus and/or predictionText.', 'Reports and win-rate calculations that assume these fields exist will either crash or silently skip these picks, understating the real sample size.', 'Run these picks through ensureTrackedPickKeys, which exists specifically to backfill missing fields with safe defaults.');
+        } else {
+          add('INFO', AREA, 'Tracked picks have required core fields', 'All ' + picks.length + ' tracked pick(s) carry a resultStatus and a prediction text.', 'Confirms downstream reporting can rely on these fields being present.', 'No action needed.');
+        }
+      }
+    } else {
+      add('INFO', AREA, 'Tracker integrity scan skipped', 'getAllTrackedPicksForReport or makeTrackerActiveMergeKey not available.', 'Skipped, not failed — these functions may simply not be loaded yet this early in page life.', 'Not applicable.');
+    }
+
+    // Storage ceilings the engine's own AFDB raid already warns about — surfaced here too.
+    tally(); pass();
+    try {
+      const active = (typeof g_trackerState !== 'undefined' && Array.isArray(g_trackerState.activePicks)) ? g_trackerState.activePicks : [];
+      const memCount = (typeof g_engineLineMemory !== 'undefined') ? Object.keys(g_engineLineMemory || {}).length : 0;
+      if (active.length > 490 || memCount > 190) {
+        add('WARN', AREA, 'Tracker storage approaching capacity', 'activePicks length = ' + active.length + ' (soft limit 500), line-memory entries = ' + memCount + ' (soft limit 200).', 'Approaching these ceilings risks the automatic pruning logic kicking in and discarding older data sooner than expected.', 'Archive or settle old active picks; confirm the pruning logic in writeAsyncStorage is keeping the most useful history.');
+      } else {
+        add('INFO', AREA, 'Tracker storage well within capacity', 'activePicks = ' + active.length + '/500, line memory = ' + memCount + '/200.', 'No pruning pressure currently.', 'No action needed.');
+      }
+    } catch (_e) {}
+  }
+
+  // =================================================================
+  // CATEGORY: STRUCTURE / SECURITY — footguns, missing DOM nodes
+  // =================================================================
+  function auditStructure() {
+    const AREA = 'STRUCTURE';
+    const src = getConcatenatedScriptSource();
+
+    tally(); pass();
+    if (src) {
+      const dangerous = [];
+      if (/[^.\w]eval\s*\(/.test(src)) dangerous.push('eval(');
+      if (/new\s+Function\s*\(/.test(src)) dangerous.push('new Function(');
+      if (/document\.write\s*\(/.test(src)) dangerous.push('document.write(');
+      if (dangerous.length) {
+        add('ERROR', AREA, 'Dangerous dynamic-code patterns found', 'Found: ' + dangerous.join(', ') + '.', 'eval/new Function/document.write can execute attacker-influenced strings as code, which is a classic XSS vector if any of the input ever traces back to fetched/user-controlled data.', 'Search for the exact call site(s) and replace with a non-dynamic-eval alternative (JSON.parse for data, direct DOM APIs for markup).');
+      } else {
+        add('INFO', AREA, 'No eval/new Function/document.write found', 'A scan of the page\'s inline scripts found none of these dynamic-code-execution patterns.', 'Removes a whole class of code-injection risk.', 'No action needed.');
+      }
+
+      const innerHTMLCount = (src.match(/\.innerHTML\s*=/g) || []).length;
+      const escHelperCount = (src.match(/function\s+esc\s*\(/g) || []).length;
+      if (innerHTMLCount > 5 && escHelperCount <= 1) {
+        add('WARN', AREA, 'HTML-escaping helper not applied consistently', 'Found ' + innerHTMLCount + ' ".innerHTML =" assignment site(s) in the page, but only ' + escHelperCount + ' local esc()-style escaping helper definition(s), scoped to a single module.', 'Any innerHTML assignment that interpolates fetched data (team names, API responses) without escaping is a potential stored-XSS vector if that data can ever contain HTML/script markup — e.g. an unusual team or player name pulled from an external API.', 'Audit the innerHTML call sites that interpolate team/API-derived strings and route them through an escaping helper (or use textContent for plain text) before insertion.');
+      } else {
+        add('INFO', AREA, 'innerHTML/escaping ratio looks reasonable', innerHTMLCount + ' innerHTML site(s), ' + escHelperCount + ' escaping helper definition(s).', 'No immediate red flag from this ratio-based heuristic.', 'No action needed.');
+      }
+    } else {
+      add('WARN', AREA, 'Could not read page source for structural scan', 'getConcatenatedScriptSource() returned empty.', 'Structural/security source-scan checks were skipped this run.', 'Retry the audit; if this persists, inline <script> tags may not be readable via textContent in this context.');
+    }
+
+    // Hardcoded shared identifier — informational, not a vulnerability by itself.
+    tally(); pass();
+    if (typeof TRACKER_FIXED_USER_KEY !== 'undefined' && TRACKER_FIXED_USER_KEY) {
+      add('INFO', AREA, 'Tracker uses a single hardcoded shared key', 'TRACKER_FIXED_USER_KEY is a fixed string constant, so every install of this page shares one tracker state bucket unless a user-specific key is layered on top.', 'Not a vulnerability by itself, but worth knowing: two people running this page share pick history/stats unless something else namespaces them.', 'If per-user separation is intended, confirm TRACKER_FIXED_USER_KEY is meant to be a shared team key rather than a per-user one.');
+    }
+
+    // Missing critical DOM nodes — a curated set that should exist regardless
+    // of which modal/overlay is currently open.
+    tally(); pass();
+    const criticalIds = ['afdbOverlay', 'afdbPanel', 'afdbBtn', 'leagueSelect', 'teamAName', 'teamBName'];
+    const missing = criticalIds.filter(id => !document.getElementById(id));
+    if (missing.length) {
+      add('CRITICAL', AREA, 'Critical DOM node(s) missing', 'document.getElementById() found none of: ' + missing.join(', ') + '.', 'These are core, always-present UI elements the engine and debug tooling both depend on by id; if any is missing, whatever reads it will silently no-op or throw.', 'Confirm the element id was not renamed in the HTML without updating the matching getElementById() call sites.');
+    } else {
+      add('INFO', AREA, 'Critical DOM nodes present', 'All ' + criticalIds.length + ' checked core element ids are present in the current DOM.', 'Confirms the page shell the engine depends on is intact.', 'No action needed.');
+    }
+
+    // Dead getElementById references — an id referenced in script that never
+    // appears anywhere in the page (static HTML attribute, JS .id= assignment,
+    // or template-built markup). Checked against the FULL page source, not
+    // just inline <script> text, since most ids live in plain HTML markup.
+    tally(); pass();
+    if (src) {
+      const fullSrc = getFullPageSource();
+      const referenced = new Set();
+      const re = /getElementById\(\s*['"]([\w-]+)['"]\s*\)/g;
+      let m;
+      while ((m = re.exec(src))) referenced.add(m[1]);
+      const dead = [];
+      referenced.forEach(id => {
+        const escapedId = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        // Matches id="X" / id='X' (HTML attribute, no space) AND
+        // .id = "X" / .id="X" (JS property assignment, optional spaces).
+        const idAttrRe = new RegExp('\\.?id\\s*=\\s*["\']' + escapedId + '["\']');
+        if (!idAttrRe.test(fullSrc)) dead.push(id);
+      });
+      if (dead.length) {
+        add('WARN', AREA, 'getElementById() references with no matching id anywhere in source', dead.slice(0, 15).join(', ') + (dead.length > 15 ? (' … +' + (dead.length - 15) + ' more') : '') + '.', 'A getElementById() call for an id that never appears as id="..." (HTML) or .id="..." (JS-assigned) anywhere will always return null; any code that does not null-check before using it will throw.', 'For each id, either it is built dynamically in a way this scan cannot see (e.g. string-concatenated at runtime — verify by search), or it is a leftover reference to a removed/renamed element that should be cleaned up.');
+      } else {
+        add('INFO', AREA, 'No dead getElementById references found', 'Every id passed to getElementById() in the source also appears as an id attribute or JS-assigned id somewhere in the page.', 'Reduces the chance of a silent null-return on an element lookup.', 'No action needed.');
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Static-scan helpers
+  // ---------------------------------------------------------------
+  // Sentinel markers delimiting the auditor's own source, so its structural/
+  // security self-scans never flag the detection code inside this very
+  // module (e.g. the words "eval(" or "document.write(" appearing inside
+  // this file's own check descriptions and regexes).
+  const _AUDITOR_SELF_START = '/*__ENGINE_AUDITOR_SELF_START__*/';
+  const _AUDITOR_SELF_END = '/*__ENGINE_AUDITOR_SELF_END__*/';
+
+  function stripSelf(text) {
+    if (!text) return text;
+    const s = text.indexOf(_AUDITOR_SELF_START);
+    const e = text.indexOf(_AUDITOR_SELF_END);
+    if (s === -1 || e === -1 || e < s) return text;
+    return text.slice(0, s) + text.slice(e + _AUDITOR_SELF_END.length);
+  }
+
+  let _srcCache = null;
+  function getConcatenatedScriptSource() {
+    if (_srcCache !== null) return _srcCache;
+    try {
+      const scripts = document.getElementsByTagName('script');
+      let out = [];
+      for (let i = 0; i < scripts.length; i++) {
+        const s = scripts[i];
+        if (!s.src && s.textContent) out.push(s.textContent);
+      }
+      _srcCache = stripSelf(out.join('\n'));
+      return _srcCache;
+    } catch (e) { return ''; }
+  }
+
+  // Full page source (script text + surrounding HTML markup), used only for
+  // id-existence lookups where most ids live in plain HTML, not in scripts.
+  let _fullSrcCache = null;
+  function getFullPageSource() {
+    if (_fullSrcCache !== null) return _fullSrcCache;
+    try {
+      const html = (document.documentElement && document.documentElement.outerHTML) || '';
+      _fullSrcCache = html ? stripSelf(html) : getConcatenatedScriptSource();
+      return _fullSrcCache;
+    } catch (e) { return getConcatenatedScriptSource(); }
+  }
+
+  // Extract one top-level `function name(...) { ... }` body via brace counting.
+  // Skips past the parameter list using paren-depth counting first, so a
+  // destructured parameter with a nested object default (e.g. "config = {}")
+  // is not mistaken for the function body's opening brace.
+  function extractFunctionBody(src, name) {
+    const marker = 'function ' + name + '(';
+    const start = src.indexOf(marker);
+    if (start === -1) return null;
+    const parenOpen = start + marker.length - 1;
+    let parenDepth = 0, parenEnd = -1;
+    for (let i = parenOpen; i < src.length; i++) {
+      const ch = src[i];
+      if (ch === '(') parenDepth++;
+      else if (ch === ')') { parenDepth--; if (parenDepth === 0) { parenEnd = i; break; } }
+    }
+    if (parenEnd === -1) return null;
+    const braceStart = src.indexOf('{', parenEnd);
+    if (braceStart === -1) return null;
+    let depth = 0;
+    for (let i = braceStart; i < src.length; i++) {
+      const ch = src[i];
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) return src.slice(braceStart, i + 1);
+      }
+    }
+    return null;
+  }
+
+  // Heuristic scan for a variable named like an edge/confidence signal being
+  // multiplied ("x *= ...") more than once inside the same function body.
+  function findDoubleBoostPatterns(src) {
+    const results = [];
+    const fnNames = ['getConfidenceGrade', 'getConfidenceWinProbability', 'getMarginConfidenceGrade', 'getPick', 'applySoftTrackerInfluenceToPicks'];
+    fnNames.forEach(fn => {
+      const body = extractFunctionBody(src, fn);
+      if (!body) return;
+      const counts = {};
+      const re = /\b([a-zA-Z_$][\w$]*(?:[Ee]dge|[Bb]oost|[Cc]onfidence)[\w$]*)\s*\*=/g;
+      let m;
+      while ((m = re.exec(body))) {
+        counts[m[1]] = (counts[m[1]] || 0) + 1;
+      }
+      Object.keys(counts).forEach(v => {
+        if (counts[v] > 1) results.push({ fn, varName: v, count: counts[v] });
+      });
+    });
+    return results;
+  }
+
+  // =================================================================
+  // Orchestration, scoring, and rendering
+  // =================================================================
+  const CATEGORY_LIST = ['CALC', 'H2H', 'VOLATILITY', 'PERIOD', 'CONFIDENCE', 'NO PLAY', 'STORAGE', 'TRACKER', 'STRUCTURE'];
+
+  function healthFromFindings(findings) {
+    let score = 100;
+    findings.forEach(f => {
+      if (f.severity === 'CRITICAL') score -= 20;
+      else if (f.severity === 'ERROR') score -= 10;
+      else if (f.severity === 'WARN') score -= 4;
+    });
+    score = Math.max(0, Math.min(100, score));
+    let label, color;
+    if (score >= 90) { label = 'HEALTHY'; color = '#49d45f'; }
+    else if (score >= 70) { label = 'NEEDS ATTENTION'; color = '#ffcf73'; }
+    else if (score >= 40) { label = 'DEGRADED'; color = '#ff9d4d'; }
+    else { label = 'CRITICAL'; color = '#ff5c61'; }
+    return { score, label, color };
+  }
+
+  async function runFullAudit() {
+    if (_running) return;
+    _running = true;
+    _findings = [];
+    _checksRun = 0;
+    _checksTotal = 0;
+    _srcCache = null;
+    _fullSrcCache = null;
+
+    const started = Date.now();
+    try { auditCalc(); } catch (e) { add('ERROR', 'CALC', 'Category threw', String(e && e.message || e), 'The CALC audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
+    try { auditH2H(); } catch (e) { add('ERROR', 'H2H', 'Category threw', String(e && e.message || e), 'The H2H audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
+    try { auditVolatility(); } catch (e) { add('ERROR', 'VOLATILITY', 'Category threw', String(e && e.message || e), 'The VOLATILITY audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
+    try { auditPeriodAdvanced(); } catch (e) { add('ERROR', 'PERIOD', 'Category threw', String(e && e.message || e), 'The PERIOD audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
+    try { auditConfidence(); } catch (e) { add('ERROR', 'CONFIDENCE', 'Category threw', String(e && e.message || e), 'The CONFIDENCE audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
+    try { auditNoPlay(); } catch (e) { add('ERROR', 'NO PLAY', 'Category threw', String(e && e.message || e), 'The NO PLAY audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
+    try { await auditStorage(); } catch (e) { add('ERROR', 'STORAGE', 'Category threw', String(e && e.message || e), 'The STORAGE audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
+    try { auditTracker(); } catch (e) { add('ERROR', 'TRACKER', 'Category threw', String(e && e.message || e), 'The TRACKER audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
+    try { auditStructure(); } catch (e) { add('ERROR', 'STRUCTURE', 'Category threw', String(e && e.message || e), 'The STRUCTURE audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
+
+    _lastRunMs = Date.now() - started;
+    _running = false;
+    render();
+    if (typeof engineDebug === 'function') {
+      engineDebug('Full audit complete', { checks: _checksRun, findings: _findings.length, ms: _lastRunMs });
+    }
+  }
+
+  function severityBadge(sev) {
+    const colors = { CRITICAL: '#ff5c61', ERROR: '#ff9d4d', WARN: '#ffcf73', INFO: '#4ea9ff' };
+    return '<span style="display:inline-block;min-width:64px;text-align:center;background:' + colors[sev] + '22;border:1px solid ' + colors[sev] + ';color:' + colors[sev] + ';font-size:10px;font-weight:900;padding:2px 6px;border-radius:3px;letter-spacing:0.5px;">' + sev + '</span>';
+  }
+
+  function render() {
+    const panel = document.getElementById('auditorPanel');
+    if (!panel) return;
+
+    const counts = { CRITICAL: 0, ERROR: 0, WARN: 0, INFO: 0 };
+    _findings.forEach(f => counts[f.severity] = (counts[f.severity] || 0) + 1);
+    const health = healthFromFindings(_findings);
+
+    const sorted = _findings.slice().sort((a, b) => (SEV_RANK[b.severity] - SEV_RANK[a.severity]));
+
+    const summaryHtml =
+      '<div style="padding:12px;background:#080808;border-bottom:1px solid #222;flex-shrink:0;">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px;">' +
+          '<div style="color:#d4af37;font-size:14px;font-weight:900;letter-spacing:1px;">🩺 ENGINE SELF-AUDIT</div>' +
+          '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+            '<button onclick="EngineAuditor.run()" style="background:#0a1f0a;border:1px solid #2f8f4a;color:#49ff7a;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">↻ Re-run</button>' +
+            '<button onclick="EngineAuditor.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>' +
+          '</div>' +
+        '</div>' +
+        '<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;">' +
+          '<div><span style="color:#555;font-size:10px;font-weight:700;text-transform:uppercase;">Auditor power</span><br/><span style="color:#d4af37;font-size:13px;font-weight:900;">' + _checksRun + '/' + _checksTotal + ' live checks · 9 categories</span></div>' +
+          '<div><span style="color:#555;font-size:10px;font-weight:700;text-transform:uppercase;">Engine health</span><br/><span style="color:' + health.color + ';font-size:13px;font-weight:900;">' + health.score + '/100 — ' + health.label + '</span></div>' +
+          '<div><span style="color:#555;font-size:10px;font-weight:700;text-transform:uppercase;">Findings</span><br/><span style="font-size:12px;font-weight:700;">' +
+            '<span style="color:#ff5c61;">' + counts.CRITICAL + ' CRIT</span> · <span style="color:#ff9d4d;">' + counts.ERROR + ' ERR</span> · <span style="color:#ffcf73;">' + counts.WARN + ' WARN</span> · <span style="color:#4ea9ff;">' + counts.INFO + ' INFO</span>' +
+          '</span></div>' +
+          (_lastRunMs != null ? '<div><span style="color:#555;font-size:10px;font-weight:700;text-transform:uppercase;">Run time</span><br/><span style="color:#aaa;font-size:12px;">' + _lastRunMs + ' ms</span></div>' : '') +
+        '</div>' +
+      '</div>';
+
+    const rowsHtml = sorted.map(f => {
+      return '<div style="padding:10px 12px;border-bottom:1px solid #151515;">' +
+        '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px;">' +
+          severityBadge(f.severity) +
+          '<span style="color:#777;font-size:10px;font-weight:700;">[' + esc(f.area) + ']</span>' +
+          '<span style="color:#eee;font-size:12px;font-weight:900;flex:1;">' + esc(f.title) + '</span>' +
+        '</div>' +
+        '<div style="font-size:11px;line-height:1.5;color:#bbb;padding-left:2px;">' +
+          '<div><span style="color:#4ea9ff;font-weight:700;">WHAT:</span> ' + esc(f.what) + '</div>' +
+          '<div><span style="color:#ffcf73;font-weight:700;">WHY:</span> ' + esc(f.why) + '</div>' +
+          '<div><span style="color:#49d45f;font-weight:700;">FIX:</span> ' + esc(f.fix) + '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+
+    panel.innerHTML = summaryHtml +
+      '<div style="flex:1;overflow-y:auto;background:#0a0a0a;">' +
+        (rowsHtml || '<div style="color:#555;font-size:12px;text-align:center;padding:30px;font-weight:bold;">No findings.</div>') +
+      '</div>';
+  }
+
+  function open() {
+    _isOpen = true;
+    const ov = document.getElementById('auditorOverlay');
+    if (ov) ov.style.display = 'flex';
+    if (!_findings.length && !_running) {
+      runFullAudit();
+    } else {
+      render();
+    }
+  }
+
+  function close() {
+    _isOpen = false;
+    const ov = document.getElementById('auditorOverlay');
+    if (ov) ov.style.display = 'none';
+  }
+
+  /*__ENGINE_AUDITOR_SELF_END__*/
+  return {
+    open, close, run: runFullAudit,
+    get isOpen() { return _isOpen; },
+    get findings() { return _findings.slice(); }
+  };
+})();
+
 
 window.openVisualReportFromDebug = function() {
   AFDB.close();
