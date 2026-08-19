@@ -15477,6 +15477,7 @@ function getConfidenceGrade(params) {
 function getMarginConfidenceGrade(params) {
   const {
     pick, marginEdgePct, marginVolRatio, sampleTier, hasH2H, trap,
+    edge, volLimit,
     league = ""
   } = params || {};
 
@@ -15487,7 +15488,29 @@ function getMarginConfidenceGrade(params) {
   const volRatio = isFinite(marginVolRatio) ? marginVolRatio : 0.5;
   let winProb = getConfidenceWinProbability(null, marginEdgePct, volRatio, sampleTier, hasH2H, !!trap, league);
 
-  // Number.isFinite so null (unfitted logistic) → NaN grade, not silent "D"
+  // Mirror totals path: when logistic is unfitted / thin, use distribution CDF
+  // on the raw margin edge so Winner & handicap still receive A–D grades.
+  try {
+    const _volLimitPts = (isFinite(volLimit) && volLimit > 0)
+      ? volLimit
+      : (getMarketVolLimit(league, params?.marketKey || "ft") || 12);
+    if (isFinite(edge)) {
+      const _distProb = distributionWinProbability(edge, _volLimitPts, volRatio);
+      if (Number.isFinite(_distProb)) {
+        if (Number.isFinite(winProb)) {
+          winProb = clampNumber(0.70 * _distProb + 0.30 * winProb, 0.02, 0.98);
+        } else {
+          winProb = _distProb;
+        }
+        engineDebug("Margin distribution-primary winProb", {
+          league, marketKey: params?.marketKey, distributionWinProb: _distProb, blendedWinProb: winProb
+        });
+      }
+    }
+  } catch (_dpe) {
+    engineDebug("margin distributionWinProbability failed", { error: _dpe?.message || String(_dpe) });
+  }
+
   if (!Number.isFinite(winProb)) {
     engineDebug("getMarginConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
       league, marketKey: params?.marketKey, marginEdgePct, volRatio, sampleTier, hasH2H
@@ -21053,7 +21076,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: ftCalc.ftHasH2H,
       trap: winnerTrap,
       marketKey: "winner",
-      league
+      league,
+      edge: winnerEdge,
+      volLimit: getMarketVolLimit(league, "ft")
     });
 
     const handicapMarginInputs = getMarginConfidenceInputs(handicapEdge, ftCalc.ftProj, combinedMarginVolFT, getMarketVolLimit(league, "ft"));
@@ -21066,7 +21091,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: ftCalc.ftHasH2H,
       trap: handicapTrap,
       marketKey: "handicap",
-      league
+      league,
+      edge: handicapEdge,
+      volLimit: getMarketVolLimit(league, "ft")
     });
 
     const handicapH1MarginInputs = getMarginConfidenceInputs(handicapH1Edge, h1Calc.h1Proj, combinedMarginVolH1, _h1VolLimitForMargin);
@@ -21079,7 +21106,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: h1Calc.h1HasH2H,
       trap: handicapH1Trap,
       marketKey: "handicap_h1",
-      league
+      league,
+      edge: handicapH1Edge,
+      volLimit: _h1VolLimitForMargin
     });
     const handicapH2MarginInputs = getMarginConfidenceInputs(handicapH2Edge, h2Calc.h2Proj, combinedMarginVolH2, _h2VolLimitForMargin);
     const handicapH2Trap = detectMarginTrap(handicapH2Edge, h2Calc.h2Proj, league, "handicap_h2", combinedMarginVolH2, _h2VolLimitForMargin);
@@ -21091,7 +21120,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: h2Calc.h2HasH2H,
       trap: handicapH2Trap,
       marketKey: "handicap_h2",
-      league
+      league,
+      edge: handicapH2Edge,
+      volLimit: _h2VolLimitForMargin
     });
 
     const picks = [
