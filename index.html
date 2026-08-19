@@ -1,4 +1,3 @@
-L
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -24540,7 +24539,7 @@ const EngineAuditor = (function () {
 
     // Honesty: line-scan category covers every product line in chunks; this is exhaustive text coverage, not formal proof of every runtime path.
     tally(); pass();
-    add('INFO', AREA, 'Auditor scope (honest)', 'Category N walks every product source line in resumable chunks. Live probes + regression locks cover critical behavior. Not a formal proof of every runtime branch.', 'Use locks + math tests + full line-scan as the contract.', 'No action needed.', 'EngineAuditor scope');
+    add('INFO', AREA, 'Auditor scope (honest)', 'Category N walks every product HTML/CSS/JS line in resumable chunks with stateful string/block-comment stripping. Live probes + regression locks cover critical behavior. Not a formal proof of every live-network path.', 'Use locks + math tests + full line-scan as the contract.', 'No action needed.', 'EngineAuditor scope');
   }
 
   // =================================================================
@@ -24583,23 +24582,39 @@ const EngineAuditor = (function () {
   }
 
   /** Strip string/template/comment contents so eval( inside a string is not a hit. */
-  function _stripStringsAndComments(line) {
-    let s = line
-      .replace(/\/\*[\s\S]*?\*\//g, ' ')
-      .replace(/\/\/.*$/, ' ');
-    // crude string wipe (handles most single-line cases)
-    s = s.replace(/'(?:\\.|[^'\\])*'/g, "''");
-    s = s.replace(/"(?:\\.|[^"\\])*"/g, '""');
-    s = s.replace(/`(?:\\.|[^`\\])*`/g, '``');
-    return s;
+    function _stripStringsAndCommentsStateful(line, state) {
+    if (!state) state = { inBlockComment: false, inString: null };
+    var out = '';
+    var n = line.length;
+    var i = 0;
+    while (i < n) {
+      var ch = line[i];
+      var next = i + 1 < n ? line[i + 1] : '';
+      if (state.inBlockComment) {
+        if (ch === '*' && next === '/') { out += '  '; i += 2; state.inBlockComment = false; continue; }
+        out += ' '; i++; continue;
+      }
+      if (state.inString) {
+        if (ch === '\\') { out += '  '; i += (i + 1 < n ? 2 : 1); continue; }
+        if (ch === state.inString) { out += ' '; i++; state.inString = null; continue; }
+        out += ' '; i++; continue;
+      }
+      if (ch === '/' && next === '*') { out += '  '; i += 2; state.inBlockComment = true; continue; }
+      if (ch === '/' && next === '/') { while (i < n) { out += ' '; i++; } break; }
+      if (ch === "'" || ch === '"' || ch === '`') { state.inString = ch; out += ' '; i++; continue; }
+      out += ch; i++;
+    }
+    return { code: out, state: state };
   }
 
   function _scanLine(line, lineNo, acc) {
-    const code = _stripStringsAndComments(line);
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('//')) return;
+    if (!acc._stripState) acc._stripState = { inBlockComment: false, inString: null };
+    var stripped = _stripStringsAndCommentsStateful(line, acc._stripState);
+    acc._stripState = stripped.state;
+    var code = stripped.code;
+    var trimmed = line.trim();
+    if (!trimmed || !code.trim()) return;
 
-    // Real dangerous calls only (code side, not strings)
     if (/(?:^|[^\w.$])eval\s*\(/.test(code) && !/\.eval\s*\(/.test(code)) {
       acc.dangerous.push({ line: lineNo, text: trimmed.slice(0, 160) });
     }
@@ -24609,20 +24624,18 @@ const EngineAuditor = (function () {
     if (/document\.write\s*\(/.test(code)) {
       acc.dangerous.push({ line: lineNo, text: trimmed.slice(0, 160), kind: 'document.write' });
     }
-    // console.log in product
     if (/\bconsole\.log\s*\(/.test(code)) {
       acc.consoleLogs.push(lineNo);
     }
-    // Collect getElementById ids for later DOM cross-check
-    const ge = /getElementById\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
-    let m;
+    var ge = /getElementById\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+    var m;
     while ((m = ge.exec(line)) !== null) {
       if (!acc.gebIds[m[1]]) acc.gebIds[m[1]] = [];
       if (acc.gebIds[m[1]].length < 3) acc.gebIds[m[1]].push(lineNo);
     }
   }
 
-  async function auditFullLineScan() {
+async function auditFullLineScan() {
     const AREA = 'FULL_LINE_SCAN';
     // Entire HTML document (markup + <style> + every inline <script>), auditor block stripped.
     // This is the whole page the browser loaded — nothing in the file is left aside except the auditor itself
@@ -24669,7 +24682,10 @@ const EngineAuditor = (function () {
     const acc = {
       dangerous: Array.isArray(progress.dangerous) ? progress.dangerous.slice() : [],
       consoleLogs: Array.isArray(progress.consoleLogs) ? progress.consoleLogs.slice() : [],
-      gebIds: progress.gebIds && typeof progress.gebIds === 'object' ? Object.assign({}, progress.gebIds) : {}
+      gebIds: progress.gebIds && typeof progress.gebIds === 'object' ? Object.assign({}, progress.gebIds) : {},
+      _stripState: progress.stripState && typeof progress.stripState === 'object'
+        ? { inBlockComment: !!progress.stripState.inBlockComment, inString: progress.stripState.inString || null }
+        : { inBlockComment: false, inString: null }
     };
 
     let i = Math.max(0, Number(progress.nextLine) || 0);
@@ -24691,6 +24707,7 @@ const EngineAuditor = (function () {
       progress.dangerous = acc.dangerous;
       progress.consoleLogs = acc.consoleLogs;
       progress.gebIds = acc.gebIds;
+      progress.stripState = acc._stripState ? { inBlockComment: !!acc._stripState.inBlockComment, inString: acc._stripState.inString || null } : null;
       progress.updatedAt = Date.now();
       progress.completed = (i >= total);
       _saveLineScanProgress(progress);
