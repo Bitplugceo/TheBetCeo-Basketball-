@@ -1,4 +1,3 @@
-F
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3210,9 +3209,11 @@ body.dark-mode .tracker-analytics-section-head {
   <div class="actions">
     <button id="runBtn" type="button">Run</button>
     <button id="clearBtn" type="button">Clear</button>
+    <button id="mathTestsBtn" type="button" title="Run golden math tests (no console needed)" style="background: #3a404c !important; color: #fff !important; box-shadow: 0 2px 8px rgba(0,0,0,0.2) !important; font-weight: 700 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">Math tests</button>
     <button id="auditCopyBtn" type="button" title="Copy Audit" style="background: #d4af37 !important; color: #111 !important; box-shadow: 0 2px 8px rgba(212, 175, 55, 0.35) !important; font-weight: 700 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">📋</button>
     <button id="inputsCopyBtn" type="button" title="Copy Inputs &amp; Market Lines" style="background: #d4af37 !important; color: #111 !important; box-shadow: 0 2px 8px rgba(212, 175, 55, 0.35) !important; font-weight: 700 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">🗒️</button>
   </div>
+  <div id="mathTestsPanel" style="display:none; margin: 8px 10px 12px; padding: 10px 12px; border: 1px solid var(--panel-border); background: var(--panel-soft); font-size: 11px; font-weight: 700; line-height: 1.45; white-space: pre-wrap; word-break: break-word;"></div>
 
   <div class="table-wrap">
     <table id="results" style="display:none;">
@@ -3224,18 +3225,6 @@ body.dark-mode .tracker-analytics-section-head {
         <th>Prediction</th>
       </tr>
     </table>
-  </div>
-
-  <div id="parlayBasketPanel" style="display:none; margin: 10px 0 14px; border: 1px solid var(--panel-border); background: var(--panel); box-shadow: var(--shadow);">
-    <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 10px; background:#3a404c; color:#fff; font-weight:900; font-size:12px;">
-      <span>🎯 Parlay Basket <span id="parlayBasketCount" style="opacity:0.85; font-weight:700;">0/8</span></span>
-      <span id="parlayTicketBadge" style="font-size:10px; font-weight:900; padding:3px 8px; border-radius:99px; background:#555;">—</span>
-    </div>
-    <div id="parlayBasketBody" style="padding:8px 10px; font-size:11px; font-weight:700;"></div>
-    <div style="display:flex; gap:8px; padding:0 10px 10px;">
-      <button type="button" id="parlayBasketClearBtn" style="background:#c91920; color:#fff; border:none; padding:6px 12px; font-weight:800; font-size:11px; cursor:pointer;">Clear ticket</button>
-      <button type="button" id="parlayBasketCopyBtn" style="background:#3a404c; color:#fff; border:none; padding:6px 12px; font-weight:800; font-size:11px; cursor:pointer;">Copy legs</button>
-    </div>
   </div>
 
   <div id="trackerModal" class="tracker-modal" aria-hidden="true">
@@ -7501,219 +7490,6 @@ function getLeagueTrustSortRank(level) {
   return 2;
 }
 
-// ─── Living Top-8 Parlay Basket ─────────────────────────────────────────────
-// One locked pick per match. Basket holds up to 8. Stronger legs replace weaker.
-const PARLAY_BASKET_KEY = "BB_PARLAY_BASKET_V1";
-const PARLAY_BASKET_MAX = 8;
-
-function loadParlayBasket() {
-  try {
-    const raw = localStorage.getItem(PARLAY_BASKET_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch (e) { return []; }
-}
-
-function saveParlayBasket(legs) {
-  try {
-    localStorage.setItem(PARLAY_BASKET_KEY, JSON.stringify(Array.isArray(legs) ? legs.slice(0, 24) : []));
-  } catch (e) { /* non-fatal */ }
-}
-
-function parlayMatchKey(pick) {
-  if (pick?.eventId) return "e:" + String(pick.eventId);
-  const home = String(pick?.homeTeam || "").trim().toLowerCase();
-  const away = String(pick?.awayTeam || "").trim().toLowerCase();
-  const date = String(pick?.eventDate || "").slice(0, 10);
-  return "m:" + date + "|" + home + "|" + away;
-}
-
-function scoreParlayLeg(pick) {
-  const grade = String(pick?.confidenceGrade || pick?.confidence || "").toUpperCase();
-  let pts = 0;
-  if (grade === "A") pts = 3;
-  else if (grade === "B") pts = 2;
-  else if (grade === "C") pts = 1;
-  else pts = 0;
-
-  const trust = (typeof getLeagueTrustMeta === "function")
-    ? getLeagueTrustMeta(pick?.league || "")
-    : { level: "advisory" };
-  if (trust.level === "trusted") pts += 1;
-  else if (trust.level === "blocked") pts -= 1;
-
-  const mk = String(pick?.marketKey || "").toLowerCase();
-  const stretch = ["q3", "q4", "q1", "q2", "high_q", "low_q"].includes(mk);
-  if (stretch) pts -= 1;
-
-  return Math.max(0, Math.min(3, pts));
-}
-
-function getParlayTicketConfidence(legs) {
-  const list = Array.isArray(legs) ? legs : [];
-  if (!list.length) return { label: "—", level: "empty", score: 0, detail: "No legs yet" };
-
-  const scores = list.map(scoreParlayLeg);
-  const total = scores.reduce((a, b) => a + b, 0);
-  const hasZero = scores.some(s => s === 0);
-  const thinCount = list.filter(p => {
-    const t = (typeof getLeagueTrustMeta === "function") ? getLeagueTrustMeta(p?.league || "") : { level: "advisory" };
-    return t.level !== "trusted";
-  }).length;
-
-  let level = "weak";
-  let label = "Weak";
-  if (total >= 18 && !hasZero && thinCount <= 1) { level = "strong"; label = "Strong"; }
-  else if (total >= 13 && thinCount <= 2) { level = "medium"; label = "Medium"; }
-  else if (total >= 8) { level = "weak"; label = "Weak"; }
-  else { level = "avoid"; label = "Avoid"; }
-
-  if (hasZero && level === "strong") { level = "medium"; label = "Medium"; }
-  if (thinCount >= 3) { level = "avoid"; label = "Avoid"; }
-
-  return {
-    label,
-    level,
-    score: total,
-    detail: total + " pts · " + thinCount + " non-core league" + (thinCount === 1 ? "" : "s")
-  };
-}
-
-function considerParlayBasketAdd(pick) {
-  if (!pick || pick.pick === "NO PLAY" || pick.predictionText === "NO PLAY") {
-    return { ok: false, reason: "no_play" };
-  }
-  const mk = parlayMatchKey(pick);
-  let legs = loadParlayBasket();
-  const newScore = scoreParlayLeg(pick);
-  const leg = {
-    id: (pick.signature || mk) + "_" + Date.now(),
-    matchKey: mk,
-    eventId: pick.eventId || null,
-    league: pick.league || "",
-    homeTeam: pick.homeTeam || "",
-    awayTeam: pick.awayTeam || "",
-    marketKey: pick.marketKey || "",
-    marketName: pick.marketName || pick.marketKey || "",
-    predictionText: pick.predictionText || pick.pick || "",
-    confidenceGrade: String(pick.confidenceGrade || pick.confidence || "NaN").toUpperCase(),
-    line: pick.line,
-    edge: pick.edge,
-    eventDate: pick.eventDate || pick.createdAt || "",
-    score: newScore,
-    addedAt: new Date().toISOString()
-  };
-
-  const sameIdx = legs.findIndex(l => l.matchKey === mk);
-  if (sameIdx >= 0) {
-    if (newScore > (legs[sameIdx].score || 0)) {
-      legs[sameIdx] = leg;
-      saveParlayBasket(legs);
-      return { ok: true, action: "replaced_same_match", leg };
-    }
-    return { ok: false, reason: "same_match_weaker" };
-  }
-
-  if (legs.length < PARLAY_BASKET_MAX) {
-    legs.push(leg);
-    saveParlayBasket(legs);
-    return { ok: true, action: "added", leg };
-  }
-
-  let weakIdx = 0;
-  for (let i = 1; i < legs.length; i++) {
-    if ((legs[i].score || 0) < (legs[weakIdx].score || 0)) weakIdx = i;
-  }
-  if (newScore > (legs[weakIdx].score || 0)) {
-    const removed = legs[weakIdx];
-    legs[weakIdx] = leg;
-    saveParlayBasket(legs);
-    return { ok: true, action: "replaced_weakest", leg, removed };
-  }
-  return { ok: false, reason: "weaker_than_basket" };
-}
-
-function removeParlayBasketLeg(id) {
-  const legs = loadParlayBasket().filter(l => l.id !== id);
-  saveParlayBasket(legs);
-  renderParlayBasket();
-}
-
-function clearParlayBasket() {
-  saveParlayBasket([]);
-  renderParlayBasket();
-}
-
-function renderParlayBasket() {
-  const panel = document.getElementById("parlayBasketPanel");
-  const body = document.getElementById("parlayBasketBody");
-  const countEl = document.getElementById("parlayBasketCount");
-  const badge = document.getElementById("parlayTicketBadge");
-  if (!panel || !body) return;
-
-  const legs = loadParlayBasket();
-  const conf = getParlayTicketConfidence(legs);
-
-  if (!legs.length) {
-    panel.style.display = "none";
-    return;
-  }
-  panel.style.display = "block";
-  if (countEl) countEl.textContent = legs.length + "/" + PARLAY_BASKET_MAX;
-  if (badge) {
-    badge.textContent = conf.label + (conf.score ? " · " + conf.score + "pts" : "");
-    const colors = { strong: "#3a9c35", medium: "#d4af37", weak: "#e67e22", avoid: "#c91920", empty: "#555" };
-    badge.style.background = colors[conf.level] || "#555";
-    badge.style.color = conf.level === "medium" ? "#111" : "#fff";
-  }
-
-  body.innerHTML = legs.map((l, i) => {
-    const match = [l.homeTeam, l.awayTeam].filter(Boolean).join(" vs ") || "Match";
-    const grade = l.confidenceGrade || "—";
-    return `<div style="display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-bottom:1px solid var(--panel-border); align-items:flex-start;">
-      <div style="flex:1; min-width:0;">
-        <div style="font-weight:900; text-transform:uppercase; font-size:10px; color:var(--muted);">${i + 1}. ${String(l.league || "").toUpperCase()} · ${match}</div>
-        <div style="font-weight:900; margin-top:2px;">${l.predictionText || l.marketName || "—"} <span style="opacity:0.7; font-size:10px;">(${l.marketName || l.marketKey || ""})</span></div>
-        <div style="font-size:10px; margin-top:2px; color:var(--muted);">Grade ${grade} · leg score ${l.score}/3</div>
-      </div>
-      <button type="button" data-parlay-remove="${l.id}" style="background:transparent; border:1px solid #c91920; color:#c91920; font-weight:900; font-size:10px; padding:4px 8px; cursor:pointer; flex-shrink:0;">✕</button>
-    </div>`;
-  }).join("") + `<div style="margin-top:8px; font-size:10px; color:var(--muted); font-weight:700;">${conf.detail} · Max 1 leg per match · Weaker legs get replaced</div>`;
-
-  body.querySelectorAll("[data-parlay-remove]").forEach(btn => {
-    btn.addEventListener("click", () => removeParlayBasketLeg(btn.getAttribute("data-parlay-remove")));
-  });
-}
-
-function initParlayBasketUI() {
-  const clearBtn = document.getElementById("parlayBasketClearBtn");
-  const copyBtn = document.getElementById("parlayBasketCopyBtn");
-  if (clearBtn) clearBtn.onclick = () => { if (confirm("Clear the whole parlay ticket?")) clearParlayBasket(); };
-  if (copyBtn) copyBtn.onclick = () => {
-    const legs = loadParlayBasket();
-    const conf = getParlayTicketConfidence(legs);
-    const text = legs.map((l, i) =>
-      `${i + 1}. [${String(l.league || "").toUpperCase()}] ${l.homeTeam || "A"} vs ${l.awayTeam || "B"} — ${l.predictionText || l.marketName} (${l.confidenceGrade || "—"})`
-    ).join("\n") + `\n\nTicket: ${conf.label} (${conf.detail})`;
-    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text);
-    else prompt("Copy ticket:", text);
-  };
-  renderParlayBasket();
-}
-
-if (typeof window !== "undefined") {
-  window.considerParlayBasketAdd = considerParlayBasketAdd;
-  window.renderParlayBasket = renderParlayBasket;
-  window.loadParlayBasket = loadParlayBasket;
-  window.clearParlayBasket = clearParlayBasket;
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", initParlayBasketUI);
-  } else {
-    setTimeout(initParlayBasketUI, 0);
-  }
-}
-// ─── End Parlay Basket ──────────────────────────────────────────────────────
-
 const LEAGUE_FETCH_RULES = {
     nba: {
     recentSeasons: 2,
@@ -10150,7 +9926,7 @@ function getDateAwareOrFallbackAverage(series, side, marketKey) {
     }
 
     function displayLine(val) {
-  if (val === null || val === undefined || isNaN(val) || !isFinite(val)) return "—";
+  if (val === null || val === undefined || isNaN(val) || !isFinite(val)) return "NaN";
   const rounded = Math.round(val * 2) / 2;
 
   return rounded.toFixed(1);
@@ -11852,9 +11628,6 @@ function renderTrackedPicks() {
     } else {
       const encSig = encodeURIComponent(p.signature);
       statusHtml = `<div class="tracker-settled-edit-btn" data-sig="${encSig}" style="cursor:pointer;" title="Click to edit or revert">${status.toUpperCase()}</div>`;
-      if (p.actualScore) {
-        statusHtml += `<div style="font-size:7px; line-height:1.05; opacity:0.85; margin-top:1px; font-weight:600; letter-spacing:-0.2px;">${safeText(String(p.actualScore))}</div>`;
-      }
       if (p.engineResultStatus && p.engineResultStatus !== status) {
          statusHtml += `<div style="font-size:9px; color:#d91f26; margin-top:2px; font-weight:900;" title="The live in-game calculation disagreed with the final settled result">⚠ MID: ${p.engineResultStatus.toUpperCase()}</div>`;
       }
@@ -11866,7 +11639,7 @@ function renderTrackedPicks() {
         <td style="font-weight:800; text-transform:uppercase; font-size:10px;">${safeText(String(p.league || "—").toUpperCase())}</td>
         <td style="font-weight:900; text-transform:uppercase;">${safeText(((p.homeTeam && p.homeTeam !== "—") ? p.homeTeam : "A") + " vs " + ((p.awayTeam && p.awayTeam !== "—") ? p.awayTeam : "B"))}</td>
         <td style="font-weight:800;">${safeText(String(p.marketName || "—").split('<')[0].trim())}</td>
-        <td>${(String(p.marketKey || "").toLowerCase() === "winner" || String(p.marketName || "").toLowerCase() === "winner") ? (String(p.side || "").toLowerCase() === "away" ? "Away" : String(p.side || "").toLowerCase() === "home" ? "Home" : "—") : (isFinite(p.line) ? safeText(displayLine(p.line)) : "—")}</td>
+        <td>${isFinite(p.line) ? safeText(displayLine(p.line)) : "—"}</td>
         <td style="white-space: nowrap; font-size: 11px;"><span class="tracker-delete-pick-btn" data-sig="${encSig}" style="cursor:pointer;" title="Click to permanently delete this pick">${safeText(p.predictionText || "—")}</span>${p.isLock ? ' <span class="lock">🔒</span>' : ""}</td>
         <td class="conf-none">${safeText(grade)}</td>
         <td class="${statusClass}"><div class="tracker-status-stack">${statusHtml}</div></td>
@@ -14829,6 +14602,43 @@ function getVolatilityRatioForSeries(series, leagueVolLimit) {
 }
 
 
+// --- Golden math self-tests (Phase C seed) ---
+// Run via: window.__BB_RUN_MATH_TESTS__() from console or a "Run math tests" button.
+
+document.addEventListener("DOMContentLoaded", function () {
+  var btn = document.getElementById("mathTestsBtn");
+  if (!btn || btn._mathWired) return;
+  btn._mathWired = true;
+  btn.addEventListener("click", function () {
+    var panel = document.getElementById("mathTestsPanel");
+    var report;
+    try {
+      if (typeof window.__BB_RUN_MATH_TESTS__ !== "function") {
+        report = { ok: false, failCount: 1, fails: ["__BB_RUN_MATH_TESTS__ not found — engine script failed to load"], message: "Harness missing" };
+      } else {
+        report = window.__BB_RUN_MATH_TESTS__();
+      }
+    } catch (e) {
+      report = { ok: false, failCount: 1, fails: [String(e && e.message || e)], message: "Harness threw" };
+    }
+    var lines = [];
+    lines.push(report.ok ? "✅ MATH TESTS PASSED" : "❌ MATH TESTS FAILED (" + (report.failCount || 0) + ")");
+    lines.push(report.message || "");
+    if (report.fails && report.fails.length) {
+      lines.push("---");
+      report.fails.forEach(function (f, i) { lines.push((i + 1) + ". " + f); });
+    }
+    var textOut = lines.join(String.fromCharCode(10));
+    if (panel) {
+      panel.style.display = "block";
+      panel.style.borderColor = report.ok ? "#2f8f4a" : "#c91920";
+      panel.style.color = report.ok ? "#1e6e39" : "#b11a20";
+      panel.textContent = textOut;
+    }
+    try { alert(textOut); } catch (_) {}
+  });
+});
+
 window.__BB_RUN_MATH_TESTS__ = function __BB_RUN_MATH_TESTS__() {
   const fails = [];
   const assert = (cond, msg) => { if (!cond) fails.push(msg); };
@@ -15664,7 +15474,6 @@ function getConfidenceGrade(params) {
 function getMarginConfidenceGrade(params) {
   const {
     pick, marginEdgePct, marginVolRatio, sampleTier, hasH2H, trap,
-    edge, volLimit,
     league = ""
   } = params || {};
 
@@ -15675,29 +15484,7 @@ function getMarginConfidenceGrade(params) {
   const volRatio = isFinite(marginVolRatio) ? marginVolRatio : 0.5;
   let winProb = getConfidenceWinProbability(null, marginEdgePct, volRatio, sampleTier, hasH2H, !!trap, league);
 
-  // Mirror totals path: when logistic is unfitted / thin, use distribution CDF
-  // on the raw margin edge so Winner & handicap still receive A–D grades.
-  try {
-    const _volLimitPts = (isFinite(volLimit) && volLimit > 0)
-      ? volLimit
-      : (getMarketVolLimit(league, params?.marketKey || "ft") || 12);
-    if (isFinite(edge)) {
-      const _distProb = distributionWinProbability(edge, _volLimitPts, volRatio);
-      if (Number.isFinite(_distProb)) {
-        if (Number.isFinite(winProb)) {
-          winProb = clampNumber(0.70 * _distProb + 0.30 * winProb, 0.02, 0.98);
-        } else {
-          winProb = _distProb;
-        }
-        engineDebug("Margin distribution-primary winProb", {
-          league, marketKey: params?.marketKey, distributionWinProb: _distProb, blendedWinProb: winProb
-        });
-      }
-    }
-  } catch (_dpe) {
-    engineDebug("margin distributionWinProbability failed", { error: _dpe?.message || String(_dpe) });
-  }
-
+  // Number.isFinite so null (unfitted logistic) → NaN grade, not silent "D"
   if (!Number.isFinite(winProb)) {
     engineDebug("getMarginConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
       league, marketKey: params?.marketKey, marginEdgePct, volRatio, sampleTier, hasH2H
@@ -20022,10 +19809,7 @@ function buildResultRows({ table, finalPicks, lockIdx, fixtureMeta, league, diag
     row.appendChild(tdPick);
 
     const tdProj = document.createElement("td");
-    const _winnerSide = (p.marketKey === "winner") ? (getPickSideFromText(p.pick) || p.side || "") : "";
-    tdProj.textContent = (p.marketKey === "winner")
-      ? (String(_winnerSide).toLowerCase() === "away" ? "Away" : String(_winnerSide).toLowerCase() === "home" ? "Home" : "—")
-      : displayLine(p.proj);
+    tdProj.textContent = displayLine(p.proj);
     row.appendChild(tdProj);
 
     const tdEdge = document.createElement("td");
@@ -20661,8 +20445,7 @@ if (isFinite(_h2ReconGap) && typeof engineDebug === "function") {
         const winnerEdge = marginProjectionFT;
         g_currentLiveComputeMarket = "winner";
         let winnerPick = getMarginPick(winnerEdge, league, "winner");
-        // Handicap requires a real non-zero market line — no line / 0 → NO PLAY (never fake a pure-margin pick)
-        const handicapEdge = (isFinite(marginProjectionFT) && isFinite(finalLines.handicapLine) && finalLines.handicapLine !== 0)
+        const handicapEdge = (isFinite(marginProjectionFT) && isFinite(finalLines.handicapLine))
           ? marginProjectionFT + finalLines.handicapLine
           : NaN;
         g_currentLiveComputeMarket = "handicap";
@@ -20674,7 +20457,7 @@ if (isFinite(_h2ReconGap) && typeof engineDebug === "function") {
           (h1Calc.aVol1 || 0) * _h1VolLimitForMargin,
           (h1Calc.bVol1 || 0) * _h1VolLimitForMargin
         );
-        const handicapH1Edge = (isFinite(marginProjectionH1) && isFinite(finalLines.handicapH1Line) && finalLines.handicapH1Line !== 0)
+        const handicapH1Edge = (isFinite(marginProjectionH1) && isFinite(finalLines.handicapH1Line))
           ? marginProjectionH1 + finalLines.handicapH1Line
           : NaN;
         g_currentLiveComputeMarket = "handicap_h1";
@@ -20685,7 +20468,7 @@ if (isFinite(_h2ReconGap) && typeof engineDebug === "function") {
           (h2Calc.aVol2 || 0) * _h2VolLimitForMargin,
           (h2Calc.bVol2 || 0) * _h2VolLimitForMargin
         );
-        const handicapH2Edge = (isFinite(marginProjectionH2) && isFinite(finalLines.handicapH2Line) && finalLines.handicapH2Line !== 0)
+        const handicapH2Edge = (isFinite(marginProjectionH2) && isFinite(finalLines.handicapH2Line))
           ? marginProjectionH2 + finalLines.handicapH2Line
           : NaN;
         g_currentLiveComputeMarket = "handicap_h2";
@@ -21264,9 +21047,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: ftCalc.ftHasH2H,
       trap: winnerTrap,
       marketKey: "winner",
-      league,
-      edge: winnerEdge,
-      volLimit: getMarketVolLimit(league, "ft")
+      league
     });
 
     const handicapMarginInputs = getMarginConfidenceInputs(handicapEdge, ftCalc.ftProj, combinedMarginVolFT, getMarketVolLimit(league, "ft"));
@@ -21279,9 +21060,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: ftCalc.ftHasH2H,
       trap: handicapTrap,
       marketKey: "handicap",
-      league,
-      edge: handicapEdge,
-      volLimit: getMarketVolLimit(league, "ft")
+      league
     });
 
     const handicapH1MarginInputs = getMarginConfidenceInputs(handicapH1Edge, h1Calc.h1Proj, combinedMarginVolH1, _h1VolLimitForMargin);
@@ -21294,9 +21073,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: h1Calc.h1HasH2H,
       trap: handicapH1Trap,
       marketKey: "handicap_h1",
-      league,
-      edge: handicapH1Edge,
-      volLimit: _h1VolLimitForMargin
+      league
     });
     const handicapH2MarginInputs = getMarginConfidenceInputs(handicapH2Edge, h2Calc.h2Proj, combinedMarginVolH2, _h2VolLimitForMargin);
     const handicapH2Trap = detectMarginTrap(handicapH2Edge, h2Calc.h2Proj, league, "handicap_h2", combinedMarginVolH2, _h2VolLimitForMargin);
@@ -21308,9 +21085,7 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: h2Calc.h2HasH2H,
       trap: handicapH2Trap,
       marketKey: "handicap_h2",
-      league,
-      edge: handicapH2Edge,
-      volLimit: _h2VolLimitForMargin
+      league
     });
 
     const picks = [
@@ -22300,17 +22075,6 @@ if (trackedToSave.length) {
     trackedToSave: trackedToSave.length,
     trackerStateAfterSave: getTrackerStateDebugScore(g_trackerState)
   });
-  // Living top-8: only the match Lock can enter the parlay basket (one leg per match)
-  try {
-    const lockedPick = trackedToSave.find(p => p && p.isLock);
-    if (lockedPick && typeof considerParlayBasketAdd === "function") {
-      const result = considerParlayBasketAdd(lockedPick);
-      engineDebug("parlay basket update", result);
-      if (typeof renderParlayBasket === "function") renderParlayBasket();
-    }
-  } catch (e) {
-    engineDebug("parlay basket update failed", { error: e?.message || String(e) });
-  }
 } else if (actionablePicks.length) {
   engineDebug("actionable picks were not saved to tracker", { reason: "tracker payload validation rejected every actionable pick" });
 }
@@ -23319,7 +23083,7 @@ const AFDB = (function() {
   return '<div style="padding:8px;border-bottom:1px solid #151515;"><div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;"><span style="color:#555;font-size:9px;min-width:65px;flex-shrink:0;">' + esc(e.ts) + '</span><span style="color:' + def.color + ';font-size:10px;font-weight:900;min-width:75px;flex-shrink:0;">' + icon + ' ' + esc(e.level) + '</span><span style="color:#777;font-size:9px;min-width:80px;flex-shrink:0;">[' + esc(e.section) + ']</span><span style="color:' + def.color + ';font-size:11px;font-weight:700;flex:1;white-space:pre-wrap;">' + esc(e.msg) + '</span></div>' + dataHtml + '</div>';
 }).join('');
 
-const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊 Tracker Report</button><button onclick="window.EngineAuditor&&EngineAuditor.open()" style="background:#0a1f0a;border:1px solid #2f8f4a;color:#49ff7a;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(47,143,74,0.4);">🩺 Full Audit</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
+const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊 Tracker Report</button><button onclick="window.EngineAuditor ? EngineAuditor.open() : alert(`Full Audit did not open: the EngineAuditor script was not found on this page. The auditor module may be missing from this deploy.`)" style="background:#0a1f0a;border:1px solid #2f8f4a;color:#49ff7a;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(47,143,74,0.4);">🩺 Full Audit</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
 
     const emptyMsg = _showOnlyErrors ? 'No suspects arrested. The code is clean.' : 'No log entries yet. Run a fetch.';
     const filterLabel = `\ud83c\udfaf LEVEL: ${_currentLogLevel}`;
