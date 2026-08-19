@@ -1,4 +1,3 @@
-H
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -23516,9 +23515,9 @@ const EngineAuditor = (function () {
         });
       })();
       if (dangerous.length) {
-        add('HIGH', AREA, 'Dangerous dynamic-code patterns found', 'Found: ' + dangerous.join(', ') + ' in the page\'s inline scripts.', 'eval/new Function/document.write can execute attacker-influenced strings as code, a classic XSS vector if any input traces back to fetched or user-controlled data.', 'Locate the exact call site(s) and replace with a non-dynamic-eval alternative (JSON.parse for data, direct DOM APIs for markup).', 'Full inline-script source scan');
+        add('INFO', AREA, 'Quick security scan flagged dynamic-code tokens (verify via Category N)', 'Heuristic found: ' + dangerous.join(', ') + '. Category N (Full Line Scan) strips strings/comments and is authoritative.', 'Avoid acting on this alone — string literals mentioning eval can false-positive.', 'Run/complete Category N full line-scan for call-site truth.', 'Full inline-script source scan → FULL_LINE_SCAN');
       } else {
-        add('INFO', AREA, 'No eval/new Function/document.write found', 'A scan of the page\'s inline scripts found none of these dynamic-code-execution patterns.', 'Removes a whole class of code-injection risk.', 'No action needed.', 'Full inline-script source scan');
+        add('INFO', AREA, 'No eval/new Function/document.write found (quick scan)', 'Quick scan found none; Category N confirms line-by-line.', 'No action needed.', 'No action needed.', 'Full inline-script source scan');
       }
     } else {
       add('LOW', AREA, 'Could not read page source for security scan', 'getConcatenatedScriptSource() returned empty.', 'The dynamic-code and innerHTML checks below were skipped this run.', 'Retry the audit; if this persists, inline <script> tags may not be readable via textContent in this context.', 'getConcatenatedScriptSource()');
@@ -24269,7 +24268,7 @@ const EngineAuditor = (function () {
         if (!idAttrRe.test(fullSrc)) if (id === 'sameId' || id === 'id' || id.length < 2) return; dead.push(id);
       });
       if (dead.length) {
-        add('MEDIUM', AREA, 'getElementById() references with no matching id anywhere in source', dead.slice(0, 15).join(', ') + (dead.length > 15 ? (' … +' + (dead.length - 15) + ' more') : '') + '.', 'A getElementById() call for an id that never appears as id="..." (HTML) or .id="..." (JS-assigned) anywhere will always return null; any code that does not null-check before using it will throw.', 'For each id, either it is built dynamically in a way this scan cannot see, or it is a leftover reference to a removed/renamed element that should be cleaned up.', 'Full-page id reference scan (' + referenced.size + ' ids checked)');
+        add('INFO', AREA, 'getElementById id list (Category N is authoritative for dead-ids)', dead.slice(0, 15).join(', ') + (dead.length > 15 ? (' … +' + (dead.length - 15) + ' more') : '') + '.', 'A getElementById() call for an id that never appears as id="..." (HTML) or .id="..." (JS-assigned) anywhere will always return null; any code that does not null-check before using it will throw.', 'For each id, either it is built dynamically in a way this scan cannot see, or it is a leftover reference to a removed/renamed element that should be cleaned up.', 'Full-page id reference scan (' + referenced.size + ' ids checked)');
       } else {
         add('INFO', AREA, 'No dead getElementById references found', 'Every id passed to getElementById() in the source also appears as an id attribute or JS-assigned id somewhere in the page.', 'Reduces the chance of a silent null-return on an element lookup.', 'No action needed.', 'Full-page id reference scan (' + referenced.size + ' ids checked)');
       }
@@ -24514,10 +24513,208 @@ const EngineAuditor = (function () {
       }
     }
 
-    // Honesty: auditor does not claim letter-by-letter whole-file formal proof
+
+    // Honesty: line-scan category covers every product line in chunks; this is exhaustive text coverage, not formal proof of every runtime path.
     tally(); pass();
-    add('INFO', AREA, 'Auditor scope (honest)', 'Scans full stripped product source + live probes of critical functions. Not a formal line-by-line proof of every branch — regression locks above pin known fixed defects so they cannot silently return under a new name.', 'Use locks + math tests as the contract for fixed issues.', 'No action needed.', 'EngineAuditor scope');
+    add('INFO', AREA, 'Auditor scope (honest)', 'Category N walks every product source line in resumable chunks. Live probes + regression locks cover critical behavior. Not a formal proof of every runtime branch.', 'Use locks + math tests + full line-scan as the contract.', 'No action needed.', 'EngineAuditor scope');
   }
+
+  // =================================================================
+  // N. FULL LINE SCAN — every product line, chunk by chunk, resumable
+  // Progress key: BB_AUDITOR_LINE_SCAN_V1 (survives tab close / reload)
+  // =================================================================
+  const LINE_SCAN_KEY = 'BB_AUDITOR_LINE_SCAN_V1';
+  const LINE_CHUNK = 350; // lines per chunk (yields to UI between chunks)
+
+  function _lineScanHash(src) {
+    const n = src.length;
+    const head = src.slice(0, 120);
+    const tail = src.slice(Math.max(0, n - 120));
+    let h = n;
+    for (let i = 0; i < head.length; i++) h = ((h * 33) ^ head.charCodeAt(i)) >>> 0;
+    for (let i = 0; i < tail.length; i++) h = ((h * 33) ^ tail.charCodeAt(i)) >>> 0;
+    return n + '_' + h.toString(16);
+  }
+
+  function _loadLineScanProgress() {
+    try {
+      const raw = localStorage.getItem(LINE_SCAN_KEY);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (_e) { return null; }
+  }
+
+  function _saveLineScanProgress(state) {
+    try {
+      localStorage.setItem(LINE_SCAN_KEY, JSON.stringify(state));
+    } catch (_e) {
+      if (typeof engineDebug === 'function') engineDebug('Line-scan progress save failed', { error: String(_e && _e.message || _e) });
+    }
+  }
+
+  function _clearLineScanProgress() {
+    try { localStorage.removeItem(LINE_SCAN_KEY); } catch (_e) {}
+  }
+
+  /** Strip string/template/comment contents so eval( inside a string is not a hit. */
+  function _stripStringsAndComments(line) {
+    let s = line
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/\/\/.*$/, ' ');
+    // crude string wipe (handles most single-line cases)
+    s = s.replace(/'(?:\\.|[^'\\])*'/g, "''");
+    s = s.replace(/"(?:\\.|[^"\\])*"/g, '""');
+    s = s.replace(/`(?:\\.|[^`\\])*`/g, '``');
+    return s;
+  }
+
+  function _scanLine(line, lineNo, acc) {
+    const code = _stripStringsAndComments(line);
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('//')) return;
+
+    // Real dangerous calls only (code side, not strings)
+    if (/(?:^|[^\w.$])eval\s*\(/.test(code) && !/\.eval\s*\(/.test(code)) {
+      acc.dangerous.push({ line: lineNo, text: trimmed.slice(0, 160) });
+    }
+    if (/new\s+Function\s*\(/.test(code)) {
+      acc.dangerous.push({ line: lineNo, text: trimmed.slice(0, 160), kind: 'new Function' });
+    }
+    if (/document\.write\s*\(/.test(code)) {
+      acc.dangerous.push({ line: lineNo, text: trimmed.slice(0, 160), kind: 'document.write' });
+    }
+    // console.log in product
+    if (/\bconsole\.log\s*\(/.test(code)) {
+      acc.consoleLogs.push(lineNo);
+    }
+    // Collect getElementById ids for later DOM cross-check
+    const ge = /getElementById\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+    let m;
+    while ((m = ge.exec(line)) !== null) {
+      if (!acc.gebIds[m[1]]) acc.gebIds[m[1]] = [];
+      if (acc.gebIds[m[1]].length < 3) acc.gebIds[m[1]].push(lineNo);
+    }
+  }
+
+  async function auditFullLineScan() {
+    const AREA = 'FULL_LINE_SCAN';
+    const src = getConcatenatedScriptSource() || '';
+    const lines = src.split('\n');
+    const total = lines.length;
+    const hash = _lineScanHash(src);
+
+    let progress = _loadLineScanProgress();
+    if (!progress || progress.hash !== hash) {
+      progress = {
+        hash,
+        nextLine: 0,
+        total,
+        dangerous: [],
+        consoleLogs: [],
+        gebIds: {},
+        completed: false,
+        updatedAt: Date.now()
+      };
+    }
+
+    // Resume: restore accumulators
+    const acc = {
+      dangerous: Array.isArray(progress.dangerous) ? progress.dangerous.slice() : [],
+      consoleLogs: Array.isArray(progress.consoleLogs) ? progress.consoleLogs.slice() : [],
+      gebIds: progress.gebIds && typeof progress.gebIds === 'object' ? Object.assign({}, progress.gebIds) : {}
+    };
+
+    let i = Math.max(0, Number(progress.nextLine) || 0);
+    const startedAt = Date.now();
+
+    tally(); pass();
+    if (i > 0 && !progress.completed) {
+      add('INFO', AREA, 'Resuming full line-scan from checkpoint', 'Continuing at line ' + (i + 1) + ' / ' + total + ' (progress restored from localStorage).', 'Scan survives tab close/reload for the same engine build hash.', 'Leave the page open until complete, or reopen later to resume.', 'BB_AUDITOR_LINE_SCAN_V1');
+    }
+
+    while (i < total) {
+      const end = Math.min(i + LINE_CHUNK, total);
+      for (let ln = i; ln < end; ln++) {
+        _scanLine(lines[ln], ln + 1, acc);
+      }
+      i = end;
+      progress.nextLine = i;
+      progress.total = total;
+      progress.dangerous = acc.dangerous;
+      progress.consoleLogs = acc.consoleLogs;
+      progress.gebIds = acc.gebIds;
+      progress.updatedAt = Date.now();
+      progress.completed = (i >= total);
+      _saveLineScanProgress(progress);
+
+      // Yield so UI stays responsive and user can see progress
+      if (i < total) {
+        if (typeof engineDebug === 'function') {
+          engineDebug('Line-scan chunk', { from: end - LINE_CHUNK + 1, to: end, total, pct: Math.round((i / total) * 100) });
+        }
+        await new Promise(function(r) { setTimeout(r, 0); });
+      }
+    }
+
+    // ---- Report results from full walk ----
+    tally(); pass();
+    add('INFO', AREA, 'Full line-scan complete', 'Walked all ' + total + ' product source lines in chunks of ' + LINE_CHUNK + ' (hash ' + hash + ').', 'Every product line was visited; findings below are from that exhaustive text pass.', 'Progress checkpoint cleared on success.', 'FULL_LINE_SCAN');
+
+    // Dangerous calls
+    tally(); pass();
+    if (acc.dangerous.length) {
+      const sample = acc.dangerous.slice(0, 8).map(function(d) {
+        return 'L' + d.line + ': ' + d.text;
+      }).join(' | ');
+      add('HIGH', AREA, 'Dangerous dynamic-code call site(s) in product source', 'Found ' + acc.dangerous.length + ' line(s) with eval/new Function/document.write after stripping strings/comments. Sample: ' + sample,
+        'These can execute attacker-influenced strings if inputs reach them.',
+        'Replace with JSON.parse / direct DOM APIs; re-run line-scan.',
+        'FULL_LINE_SCAN dangerous-call pass');
+    } else {
+      add('INFO', AREA, 'No eval/new Function/document.write call sites in product lines', 'Line-by-line scan (strings/comments stripped) found none.', 'Previous false positives from matching detection strings are excluded.', 'No action needed.', 'FULL_LINE_SCAN');
+    }
+
+    // console.log
+    tally(); pass();
+    if (acc.consoleLogs.length > 0) {
+      add('LOW', AREA, 'console.log in product source', 'Found ' + acc.consoleLogs.length + ' line(s) with console.log (e.g. L' + acc.consoleLogs.slice(0, 5).join(', L') + ').', 'Prefer engineDebug/trackerDebug.', 'Route or remove.', 'FULL_LINE_SCAN');
+    } else {
+      add('INFO', AREA, 'No console.log on product lines', 'Line-scan found none.', 'No action needed.', 'No action needed.', 'FULL_LINE_SCAN');
+    }
+
+    // Dead ids: cross-check against live DOM + full HTML id="..."
+    tally(); pass();
+    {
+      const fullHtml = (typeof getFullPageSource === 'function' ? getFullPageSource() : '') || (document.documentElement && document.documentElement.outerHTML) || '';
+      const present = {};
+      const idRe = /\bid\s*=\s*["']([^"']+)["']/gi;
+      let im;
+      while ((im = idRe.exec(fullHtml)) !== null) present[im[1]] = true;
+      // Live DOM
+      Object.keys(acc.gebIds).forEach(function(id) {
+        try { if (document.getElementById(id)) present[id] = true; } catch (_e) {}
+      });
+      const dead = Object.keys(acc.gebIds).filter(function(id) {
+        if (id === 'sameId' || id.length < 2) return false;
+        return !present[id];
+      });
+      if (dead.length) {
+        add('MEDIUM', AREA, 'getElementById ids with no matching element in HTML/DOM', dead.slice(0, 20).join(', ') + (dead.length > 20 ? ' … +' + (dead.length - 20) + ' more' : '') + '.',
+          'These lookups always return null unless ids are assigned only at runtime in a way the HTML snapshot missed.',
+          'Null-check call sites or restore the missing elements.',
+          'FULL_LINE_SCAN id cross-check (' + dead.length + ' of ' + Object.keys(acc.gebIds).length + ')');
+      } else {
+        add('INFO', AREA, 'All scanned getElementById ids resolve in HTML or live DOM', 'Cross-checked ' + Object.keys(acc.gebIds).length + ' id(s) from product getElementById calls against markup + document.getElementById.', 'No dead references detected by this pass.', 'No action needed.', 'FULL_LINE_SCAN id cross-check');
+      }
+    }
+
+    _clearLineScanProgress();
+    if (typeof engineDebug === 'function') {
+      engineDebug('Full line-scan finished', { lines: total, ms: Date.now() - startedAt, dangerous: acc.dangerous.length });
+    }
+  }
+
+
 
 
   // =================================================================
@@ -24538,7 +24735,8 @@ const EngineAuditor = (function () {
     { id: 'CODE_QUALITY',        letter: 'J', label: 'Code Quality & Maintainability',       fn: auditCodeQuality,         async: false },
     { id: 'PERFORMANCE',         letter: 'K', label: 'Performance',                          fn: auditPerformance,         async: false },
     { id: 'FEATURE_WALKTHROUGH', letter: 'L', label: 'Feature Completeness Walk-through',    fn: auditFeatureWalkthrough,  async: false },
-    { id: 'REGRESSION_LOCKS',    letter: 'M', label: 'Regression Locks (fixed bugs stay fixed)', fn: auditRegressionLocks,   async: false }
+    { id: 'REGRESSION_LOCKS',    letter: 'M', label: 'Regression Locks (fixed bugs stay fixed)', fn: auditRegressionLocks,   async: false },
+    { id: 'FULL_LINE_SCAN',      letter: 'N', label: 'Full Line Scan (chunked, resumable)',      fn: auditFullLineScan,      async: true }
   ];
 
   function healthFromFindings(findings) {
