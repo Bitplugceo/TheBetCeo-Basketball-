@@ -1,4 +1,3 @@
-K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -23346,7 +23345,22 @@ const EngineAuditor = (function () {
   function getFullPageSource() {
     if (_fullSrcCache !== null) return _fullSrcCache;
     try {
-      const html = (document.documentElement && document.documentElement.outerHTML) || '';
+      // Clone so we can blank out the auditor's own rendered panel before
+      // serializing. #auditorPanel is 100% auditor-generated findings text
+      // (not product code) — marker-based stripSelf() cannot reach it
+      // because the panel <div> lives in the static markup, outside the
+      // auditor <script> block whose content it renders into at runtime.
+      // Without this, a prior findings render (e.g. Lock 5's own wording
+      // "eval(/regex/)") sits in the live DOM and gets re-scanned as if it
+      // were product source on the next Category N pass.
+      const root = document.documentElement;
+      let html = '';
+      if (root) {
+        const clone = root.cloneNode(true);
+        const panelClone = clone.querySelector && clone.querySelector('#auditorPanel');
+        if (panelClone) panelClone.innerHTML = '';
+        html = clone.outerHTML || '';
+      }
       _fullSrcCache = html ? stripSelf(html) : getConcatenatedScriptSource();
       return _fullSrcCache;
     } catch (e) { return getConcatenatedScriptSource(); }
@@ -24274,7 +24288,10 @@ const EngineAuditor = (function () {
       referenced.forEach(id => {
         const escapedId = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const idAttrRe = new RegExp('\\.?id\\s*=\\s*["\']' + escapedId + '["\']');
-        if (!idAttrRe.test(fullSrc)) if (id === 'sameId' || id === 'id' || id.length < 2) return; dead.push(id);
+        if (!idAttrRe.test(fullSrc)) {
+          if (id === 'sameId' || id === 'id' || id.length < 2) return;
+          dead.push(id);
+        }
       });
       if (dead.length) {
         add('INFO', AREA, 'getElementById id list (Category N is authoritative for dead-ids)', dead.slice(0, 15).join(', ') + (dead.length > 15 ? (' … +' + (dead.length - 15) + ' more') : '') + '.', 'A getElementById() call for an id that never appears as id="..." (HTML) or .id="..." (JS-assigned) anywhere will always return null; any code that does not null-check before using it will throw.', 'For each id, either it is built dynamically in a way this scan cannot see, or it is a leftover reference to a removed/renamed element that should be cleaned up.', 'Full-page id reference scan (' + referenced.size + ' ids checked)');
@@ -24537,12 +24554,17 @@ const EngineAuditor = (function () {
 
   function _lineScanHash(src) {
     const n = src.length;
-    const head = src.slice(0, 120);
-    const tail = src.slice(Math.max(0, n - 120));
-    let h = n;
-    for (let i = 0; i < head.length; i++) h = ((h * 33) ^ head.charCodeAt(i)) >>> 0;
-    for (let i = 0; i < tail.length; i++) h = ((h * 33) ^ tail.charCodeAt(i)) >>> 0;
-    return n + '_' + h.toString(16);
+    // Full single-pass hash over the whole document (not just the first/last
+    // 120 chars) so an edit anywhere — not only right at the start or end —
+    // correctly invalidates a stale checkpoint instead of silently resuming
+    // with progress/accumulators computed against a different build.
+    let h1 = 0, h2 = 5381;
+    for (let i = 0; i < n; i++) {
+      const c = src.charCodeAt(i);
+      h1 = (Math.imul(31, h1) + c) | 0;
+      h2 = (Math.imul(33, h2) + c) | 0;
+    }
+    return n + '_' + (h1 >>> 0).toString(16) + (h2 >>> 0).toString(16);
   }
 
   function _loadLineScanProgress() {
