@@ -1,4 +1,3 @@
-D
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -23195,30 +23194,44 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
 })();
 
 // =====================================================================
-// ENGINE SELF-AUDITOR — live, in-app audit suite for the debug page only.
-// Runs real checks against the running engine: golden-math regression,
-// H2H weighting, volatility, period-advanced honesty, confidence
-// train/serve parity, NO PLAY/NaN grade consistency, storage integrity,
-// tracker integrity, and structural/security footguns. Never runs on
-// the home screen — only reachable via AFDB (debug page) → Full Audit.
+// EngineAuditor v2 — full-depth professional audit module for the
+// Basketball Prediction Engine (TheBetCeo / BB Engine).
+//
+// DROP-IN REPLACEMENT for the existing `const EngineAuditor = (function () {...})();`
+// block. Same public API surface (open/close/run/isOpen/findings) plus
+// additions (runCategory/exportJSON/exportText/categories) that are
+// backward compatible — nothing that already calls EngineAuditor.open()/
+// .run()/.close() needs to change.
 // =====================================================================
 const EngineAuditor = (function () {
   /*__ENGINE_AUDITOR_SELF_START__*/
 
-  const SEV_RANK = { CRITICAL: 4, ERROR: 3, WARN: 2, INFO: 1 };
+  // -------------------------------------------------------------
+  // Severity model: CRITICAL > HIGH > MEDIUM > LOW > INFO
+  // -------------------------------------------------------------
+  const SEV_RANK   = { CRITICAL: 5, HIGH: 4, MEDIUM: 3, LOW: 2, INFO: 1 };
+  const SEV_WEIGHT = { CRITICAL: 20, HIGH: 12, MEDIUM: 6, LOW: 2, INFO: 0 };
+  const SEV_COLOR  = { CRITICAL: '#ff5c61', HIGH: '#ff9d4d', MEDIUM: '#ffcf73', LOW: '#8fd3ff', INFO: '#4ea9ff' };
+
   let _findings = [];
   let _checksRun = 0;
   let _checksTotal = 0;
   let _isOpen = false;
   let _lastRunMs = null;
   let _running = false;
+  let _categoryTimings = {};   // { CATEGORY_ID: ms }
+  let _categoryErrors = {};    // { CATEGORY_ID: errorMessage }
+  let _viewMode = 'severity';  // 'severity' | 'category'
+  let _activeFilter = null;    // severity or category id, or null = all
 
-  function add(severity, area, title, what, why, fix) {
-    _findings.push({ severity, area, title, what, why, fix });
+  function add(severity, area, title, what, why, fix, location) {
+    _findings.push({
+      severity, area, title, what, why, fix,
+      location: location || '—'
+    });
   }
-
   function tally() { _checksTotal++; }
-  function pass() { _checksRun++; _checksTotal++; }
+  function pass() { _checksRun++; }
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -23270,669 +23283,9 @@ const EngineAuditor = (function () {
     return { league: 'nba', parsed, lines };
   }
 
-  // =================================================================
-  // CATEGORY: CALC — golden-math regression + projection smoke tests
-  // =================================================================
-  function auditCalc() {
-    const AREA = 'CALC';
-
-    // 1) Delegate to the engine's own golden-math self-test harness.
-    tally();
-    if (typeof window.__BB_RUN_MATH_TESTS__ === 'function') {
-      const r = safeCall(window.__BB_RUN_MATH_TESTS__);
-      if (r.ok && r.value) {
-        pass();
-        if (r.value.ok) {
-          add('INFO', AREA, 'Golden math self-tests passed', 'All built-in regression assertions (period honesty, volatility identity, NaN grade sentinels, sample tiers) passed.', 'These guard the specific bug classes this audit targets, so a clean pass materially raises confidence in CALC/PERIOD/CONFIDENCE correctness.', 'No action needed. Re-run after any change to the projection or grading functions.');
-        } else {
-          (r.value.fails || []).forEach(f => {
-            add('ERROR', AREA, 'Golden math self-test failed', 'window.__BB_RUN_MATH_TESTS__ reported a failed assertion: "' + f + '".', 'This harness encodes previously-fixed regressions (period leak, volatility shrink, fake grades); a failure means one of those bugs has resurfaced.', 'Search the codebase for the assertion text near window.__BB_RUN_MATH_TESTS__ and re-check the function it exercises.');
-          });
-        }
-      } else {
-        add('ERROR', AREA, 'Golden math self-tests threw', 'Calling window.__BB_RUN_MATH_TESTS__() raised an exception: ' + (r.error && r.error.message || r.error) + '.', 'The self-test harness itself is broken, so its usual regression coverage is silently unavailable.', 'Open window.__BB_RUN_MATH_TESTS__ and fix the throwing assertion; check for a function it depends on that no longer exists.');
-      }
-    } else {
-      add('WARN', AREA, 'Golden math self-test harness missing', 'window.__BB_RUN_MATH_TESTS__ is not a function in this build.', 'Without it, the auditor loses its deepest regression coverage for period-advanced honesty, volatility identity, and NaN grade sentinels.', 'Confirm the harness definition (search "__BB_RUN_MATH_TESTS__") was not removed or renamed.');
-    }
-
-    // 2) Projection smoke tests on toy (non-live) inputs.
-    const toy = buildToyInputs();
-    const bands = (typeof getLineSanityBands === 'function') ? safeCall(getLineSanityBands, 'nba') : null;
-    const ftBand = bands && bands.ok ? bands.value.ft : null;
-    const h1Band = bands && bands.ok ? bands.value.h1 : null;
-
-    let ftCalc = null, h1Calc = null, h2Calc = null;
-
-    tally();
-    if (typeof computeFTProjection === 'function') {
-      const r = safeCall(computeFTProjection, { league: toy.league, parsed: toy.parsed, lines: toy.lines, injMultA: 1, injMultB: 1 });
-      if (r.ok) {
-        ftCalc = r.value;
-        const p = ftCalc && ftCalc.ftProj;
-        if (!Number.isFinite(p)) {
-          add('ERROR', AREA, 'FT projection smoke test: non-finite output', 'computeFTProjection(toy 10-game inputs) returned ftProj = ' + p + '.', 'A full-length, well-formed sample should never yield NaN/Infinity; this blocks every downstream pick, edge, and grade for FT.', 'Step through computeFTProjection with the toy inputs above; check anchorProjection/computeVenueBlend for a divide-by-zero or unguarded NaN propagation.');
-        } else if (ftBand && (p < ftBand[0] || p > ftBand[1])) {
-          add('WARN', AREA, 'FT projection outside sane band', 'computeFTProjection(toy inputs) → ftProj = ' + p.toFixed(1) + ', outside the NBA sanity band [' + ftBand[0].toFixed(1) + ', ' + ftBand[1].toFixed(1) + '] from getLineSanityBands.', 'A projection outside the league sanity band on a deliberately mid-range toy sample suggests a scaling or base-rate bug.', 'Check getLeagueScoreBase("nba") and the pace/rating blend in computeFTProjection for a unit or scale mismatch.');
-        } else {
-          pass();
-          add('INFO', AREA, 'FT projection smoke test passed', 'computeFTProjection(toy inputs) → ftProj = ' + p.toFixed(1) + ', finite and inside the NBA sanity band.', 'Confirms the FT projection path runs end-to-end without throwing or fabricating an out-of-range number.', 'No action needed.');
-        }
-      } else {
-        add('ERROR', AREA, 'FT projection smoke test threw', 'computeFTProjection(toy inputs) raised: ' + (r.error && r.error.message || r.error) + '.', 'An exception here means a live user run with a similarly-shaped fixture would also crash instead of returning a NO PLAY/NaN result.', 'Reproduce with the toy inputs in this file and trace the stack to the first unguarded property access.');
-      }
-    } else {
-      add('CRITICAL', AREA, 'computeFTProjection missing', 'computeFTProjection is not defined as a function.', 'This is the core FT projection entry point; without it the engine cannot price the full-game market at all.', 'Check that the function was not renamed or deleted; search for its call sites (computeFTProjection() ) to see what still expects it.');
-    }
-
-    tally();
-    if (typeof compute1HProjection === 'function') {
-      const r = safeCall(compute1HProjection, { league: toy.league, parsed: toy.parsed, lines: toy.lines, injMultA: 1, injMultB: 1 });
-      if (r.ok) {
-        h1Calc = r.value;
-        const p = h1Calc && h1Calc.h1Proj;
-        if (!Number.isFinite(p)) {
-          add('ERROR', AREA, '1H projection smoke test: non-finite output', 'compute1HProjection(toy 10-game inputs) returned h1Proj = ' + p + '.', 'Same-length, well-formed 1H sample should not yield NaN; this would silently block every 1H pick.', 'Trace compute1HProjection with the toy inputs; check the venue-blend and anchorProjection calls near the top of the function.');
-        } else if (h1Band && (p < h1Band[0] || p > h1Band[1])) {
-          add('WARN', AREA, '1H projection outside sane band', 'compute1HProjection(toy inputs) → h1Proj = ' + p.toFixed(1) + ', outside the NBA 1H sanity band [' + h1Band[0].toFixed(1) + ', ' + h1Band[1].toFixed(1) + '].', 'An out-of-band 1H number on mid-range toy data suggests the half-game base (eb/2 scaling) or pace normalization is off.', 'Check leagueBase1H and leaguePaceNorm1H in compute1HProjection for a scale error.');
-        } else {
-          pass();
-          add('INFO', AREA, '1H projection smoke test passed', 'compute1HProjection(toy inputs) → h1Proj = ' + p.toFixed(1) + ', finite and inside the NBA 1H sanity band.', 'Confirms the 1H projection path runs end-to-end and stays in-range.', 'No action needed.');
-        }
-      } else {
-        add('ERROR', AREA, '1H projection smoke test threw', 'compute1HProjection(toy inputs) raised: ' + (r.error && r.error.message || r.error) + '.', 'A throw here means a live 1H run on a comparable fixture would also fail.', 'Reproduce with the toy inputs above and trace the first unguarded access.');
-      }
-    } else {
-      add('CRITICAL', AREA, 'compute1HProjection missing', 'compute1HProjection is not defined as a function.', 'Without it the 1H market cannot be priced at all.', 'Check for a rename/deletion; search call sites expecting compute1HProjection().');
-    }
-
-    tally();
-    if (typeof compute2HProjection === 'function') {
-      const r = safeCall(compute2HProjection, { league: toy.league, parsed: toy.parsed, lines: toy.lines, injMultA: 1, injMultB: 1 });
-      if (r.ok) {
-        h2Calc = r.value;
-        const p = h2Calc && h2Calc.h2Proj;
-        if (!Number.isFinite(p)) {
-          add('ERROR', AREA, '2H projection smoke test: non-finite output', 'compute2HProjection(toy 10-game inputs, via Q3+Q4) returned h2Proj = ' + p + '.', 'A well-formed sample should not yield NaN for 2H; this would silently block every 2H pick.', 'Trace compute2HProjection with the toy Q3/Q4 arrays above.');
-        } else if (h1Band && (p < h1Band[0] * 0.85 || p > h1Band[1] * 1.15)) {
-          add('WARN', AREA, '2H projection far outside 1H-comparable band', '2H (' + p.toFixed(1) + ') should be roughly the same order of magnitude as 1H, but falls well outside a widened 1H sanity band [' + (h1Band[0]*0.85).toFixed(1) + ', ' + (h1Band[1]*1.15).toFixed(1) + '].', 'No dedicated H2 band exists in getLineSanityBands, so this is an approximate cross-check, but a large gap still points at a scale bug.', 'Compare leagueBase2H against leagueBase1H in compute2HProjection.');
-        } else {
-          pass();
-          add('INFO', AREA, '2H projection smoke test passed', 'compute2HProjection(toy inputs) → h2Proj = ' + p.toFixed(1) + ', finite and roughly consistent with the 1H band.', 'Confirms the 2H projection path runs end-to-end without throwing.', 'No action needed.');
-        }
-      } else {
-        add('ERROR', AREA, '2H projection smoke test threw', 'compute2HProjection(toy inputs) raised: ' + (r.error && r.error.message || r.error) + '.', 'A throw here means a live 2H run on a comparable fixture would also fail.', 'Reproduce with the toy inputs above.');
-      }
-    } else {
-      add('CRITICAL', AREA, 'compute2HProjection missing', 'compute2HProjection is not defined as a function.', 'Without it the 2H market cannot be priced at all.', 'Check for a rename/deletion; search call sites expecting compute2HProjection().');
-    }
-
-    // 3) FT ≈ 1H + 2H reconciliation, mirroring the engine's own runtime diagnostic.
-    tally();
-    if (ftCalc && h1Calc && h2Calc && Number.isFinite(ftCalc.ftProj) && Number.isFinite(h1Calc.h1Proj) && Number.isFinite(h2Calc.h2Proj)) {
-      pass();
-      const gap = ftCalc.ftProj - (h1Calc.h1Proj + h2Calc.h2Proj);
-      if (Math.abs(gap) > 10) {
-        add('WARN', AREA, 'FT vs (1H+2H) reconciliation gap', 'On toy inputs, ftProj − (h1Proj + h2Proj) = ' + gap.toFixed(1) + ' pts.', 'FT is supposed to be an independent-but-consistent estimate of the two halves combined; a double-digit gap on synchronized toy data suggests the half-game and full-game models are drifting apart.', 'Compare the venue-blend/anchor logic between computeFTProjection and compute1HProjection/compute2HProjection for a shared assumption that only one of them applies.');
-      } else {
-        add('INFO', AREA, 'FT vs (1H+2H) reconciliation OK', 'ftProj − (h1Proj + h2Proj) = ' + gap.toFixed(1) + ' pts on toy inputs — within a reasonable tolerance.', 'Cross-consistency between the full-game and half-game models is a good sign they share the same underlying assumptions.', 'No action needed.');
-      }
-    }
-
-    // 4) anchorProjection must not fabricate a number from NaN input.
-    tally();
-    if (typeof anchorProjection === 'function') {
-      const r = safeCall(anchorProjection, NaN, 10, 55);
-      if (r.ok) {
-        pass();
-        if (Number.isFinite(r.value)) {
-          add('ERROR', AREA, 'anchorProjection fabricates a value from NaN', 'anchorProjection(NaN, 10, 55) returned ' + r.value + ' instead of passing NaN through.', 'Silently turning a missing/invalid input into a plausible-looking number hides upstream data problems instead of surfacing them as NO PLAY.', 'In anchorProjection, add an explicit "if (!isFinite(proj)) return proj;" guard at the top.');
-        } else {
-          add('INFO', AREA, 'anchorProjection NaN passthrough OK', 'anchorProjection(NaN, 10, 55) correctly stayed non-finite instead of fabricating a value.', 'Confirms invalid inputs propagate as NaN rather than being silently papered over.', 'No action needed.');
-        }
-      }
-    }
-  }
-
-  // =================================================================
-  // CATEGORY: H2H — bounds, sample size, divergence, injury/context
-  // =================================================================
-  function auditH2H() {
-    const AREA = 'H2H';
-    if (typeof getH2HWeight !== 'function') {
-      tally();
-      add('CRITICAL', AREA, 'getH2HWeight missing', 'getH2HWeight is not defined as a function.', 'Without it H2H data cannot be weighted into any projection at all.', 'Check for a rename/deletion of getH2HWeight.');
-      return;
-    }
-    const cap = (typeof getParam === 'function') ? (safeCall(getParam, 'h2hMaxWeight', 'nba').ok ? (getParam('h2hMaxWeight', 'nba') ?? 0.30) : 0.30) : 0.30;
-
-    // Sample-size gate: <2 games each side → weight must be exactly 0.
-    tally();
-    let r = safeCall(getH2HWeight, 1, 5, 'ft', 'full', 0, 'nba');
-    if (r.ok) { pass();
-      if (r.value !== 0) add('ERROR', AREA, 'H2H sample-size gate not enforced', 'getH2HWeight(1, 5, ...) returned ' + r.value + ' instead of 0.', 'Fewer than 2 head-to-head games is not a usable sample; weighting it anyway lets a single fluky game move a pick.', 'Check the "if (minLen < 2) return 0;" guard at the top of getH2HWeight.');
-      else add('INFO', AREA, 'H2H sample-size gate OK', 'getH2HWeight(1, 5, ...) correctly returns 0 when one side has under 2 H2H games.', 'Confirms thin/unusable H2H samples are excluded rather than weighted.', 'No action needed.');
-    }
-
-    // Bounds: weight must never exceed the configured cap, even with a large factor.
-    tally();
-    r = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba', null, 5.0);
-    if (r.ok) { pass();
-      if (r.value > cap + 1e-9 || r.value < 0) add('ERROR', AREA, 'H2H weight bound violated', 'getH2HWeight(10, 10, ..., factor=5.0) returned ' + r.value + ', outside [0, ' + cap + '].', 'The H2H weight caps how much recent head-to-head history can move a projection; an uncapped value lets one lever (factor) override every other safeguard.', 'Confirm "return Math.min(_h2hCap, weight * factor);" is the last line of getH2HWeight and _h2hCap is read before the multiply.');
-      else add('INFO', AREA, 'H2H weight cap holds under large factor', 'getH2HWeight(..., factor=5.0) stayed within [0, ' + cap + '].', 'Confirms the cap is applied after, not before, the factor multiply.', 'No action needed.');
-    }
-
-    // Divergence penalty: a large divergence from baseline should reduce weight vs. divergence=0.
-    tally();
-    const base = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba');
-    const diverged = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 40, 'nba', 100);
-    if (base.ok && diverged.ok) { pass();
-      if (!(diverged.value < base.value)) add('WARN', AREA, 'H2H divergence penalty not reducing weight', 'getH2HWeight with divergence=40 vs baseline=100 (40% relative divergence) returned ' + diverged.value + ', not less than the no-divergence weight ' + base.value + '.', 'When H2H history disagrees sharply with the baseline projection, it should be trusted less, not equally.', 'Check relDiv/divergencePenalty computation and the h2hDivergenceThreshold/Slope params in getH2HWeight.');
-      else add('INFO', AREA, 'H2H divergence penalty active', 'A 40%-divergent H2H sample weighted lower (' + diverged.value.toFixed(4) + ') than a non-divergent one (' + base.value.toFixed(4) + ').', 'Confirms disagreement between H2H and baseline appropriately discounts the H2H weight.', 'No action needed.');
-    }
-
-    // Injury/context penalty: a large injury gap should reduce weight vs. no context.
-    tally();
-    const noCtx = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba', null, 1.0, null);
-    const injCtx = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba', null, 1.0, { injMultA: 1.0, injMultB: 0.5 });
-    if (noCtx.ok && injCtx.ok) { pass();
-      if (!(injCtx.value < noCtx.value)) add('WARN', AREA, 'H2H injury/context penalty not reducing weight', 'getH2HWeight with a large injury gap (injMultA=1.0, injMultB=0.5) returned ' + injCtx.value + ', not less than the no-context weight ' + noCtx.value + '.', 'A significant injury absent from prior H2H meetings should reduce trust in that history, since the matchup context has changed.', 'Check the injuryRisk term inside the context-penalty block of getH2HWeight.');
-      else add('INFO', AREA, 'H2H injury/context penalty active', 'A large injury gap weighted lower (' + injCtx.value.toFixed(4) + ') than no context (' + noCtx.value.toFixed(4) + ').', 'Confirms injury context appropriately discounts stale H2H history.', 'No action needed.');
-    }
-
-    // Monotonicity: more H2H games (holding everything else fixed) should not decrease weight.
-    tally();
-    const small = safeCall(getH2HWeight, 3, 3, 'ft', 'full', 0, 'nba');
-    const large = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba');
-    if (small.ok && large.ok) { pass();
-      if (large.value < small.value - 1e-9) add('WARN', AREA, 'H2H weight not monotonic in sample size', 'getH2HWeight(10,10,...) = ' + large.value + ' is less than getH2HWeight(3,3,...) = ' + small.value + '.', 'All else equal, more head-to-head history should never be trusted less than a thinner sample.', 'Check the log1p(minLen-1) growth curve in getH2HWeight.');
-      else add('INFO', AREA, 'H2H weight monotonic in sample size', 'Weight did not decrease going from 3 to 10 shared H2H games.', 'Confirms the sample-size curve behaves sensibly.', 'No action needed.');
-    }
-  }
-
-  // =================================================================
-  // CATEGORY: VOLATILITY — must widen uncertainty, never shrink mean
-  // =================================================================
-  function auditVolatility() {
-    const AREA = 'VOLATILITY';
-
-    tally();
-    if (typeof applyVolatility === 'function') {
-      const r1 = safeCall(applyVolatility, 100, [90, 100, 110], 12, 'nba');
-      const r2 = safeCall(applyVolatility, 88.5, [], 12, 'ncaa');
-      if (r1.ok && r2.ok) { pass();
-        if (r1.value !== 100 || r2.value !== 88.5) {
-          add('CRITICAL', AREA, 'Volatility is shrinking the projection mean', 'applyVolatility(100, [...], 12, "nba") returned ' + r1.value + ' (expected 100, unchanged); applyVolatility(88.5, [], 12, "ncaa") returned ' + r2.value + ' (expected 88.5).', 'Volatility describes spread (predictive SD), not a discount on the central estimate. Letting it pull the mean toward a baseline conflates "uncertain" with "wrong" and silently biases every projection.', 'applyVolatility should be an identity on its first argument — "return proj;" — with SD/uncertainty handled only in distributionWinProbability/_normalCdf.');
-        } else {
-          add('INFO', AREA, 'Volatility does not shrink the mean', 'applyVolatility is an identity on the projection for both a populated and an empty series.', 'Confirms uncertainty is kept separate from the point estimate, matching the intended design.', 'No action needed.');
-        }
-      } else {
-        add('ERROR', AREA, 'applyVolatility threw on toy input', 'applyVolatility raised: ' + ((r1.ok ? r2.error : r1.error) || {}).message, 'A function this central to every projection should never throw on well-formed input.', 'Trace the exception with the toy args (100, [90,100,110], 12, "nba").');
-      }
-    } else {
-      add('CRITICAL', AREA, 'applyVolatility missing', 'applyVolatility is not defined as a function.', 'Without it there is no defined policy for how volatility interacts with the projection mean.', 'Check for a rename/deletion.');
-    }
-
-    // getVolatilityRatioForSeries: short series should return the neutral 1.0, not NaN.
-    tally();
-    if (typeof getVolatilityRatioForSeries === 'function') {
-      const rShort = safeCall(getVolatilityRatioForSeries, [10, 12], 12);
-      const rLow = safeCall(getVolatilityRatioForSeries, [100, 100, 100, 100, 100], 12);
-      const rHigh = safeCall(getVolatilityRatioForSeries, [70, 130, 60, 140, 80], 12);
-      if (rShort.ok && rLow.ok && rHigh.ok) { pass();
-        if (rShort.value !== 1.0) {
-          add('WARN', AREA, 'Volatility ratio neutral default not returned for short series', 'getVolatilityRatioForSeries([10,12], 12) returned ' + rShort.value + ', expected the neutral 1.0 (series length < 3).', 'With fewer than 3 data points, standard deviation is not meaningful; the function should fall back to a neutral ratio rather than an unstable estimate.', 'Check the "if (cleanSeries.length < 3) return 1.0;" guard.');
-        } else if (!(rHigh.value > rLow.value)) {
-          add('ERROR', AREA, 'Volatility ratio not responsive to spread', 'A high-variance series returned ratio ' + rHigh.value + ', not greater than a flat series\' ratio ' + rLow.value + '.', 'The whole point of this function is to detect when a team\'s scoring is unusually erratic; if it does not respond to spread, downstream confidence grading loses its main volatility signal.', 'Check the stdDev() computation and the division by leagueVolLimit inside getVolatilityRatioForSeries.');
-        } else if (rHigh.value > 2.5) {
-          add('ERROR', AREA, 'Volatility ratio exceeds documented cap', 'getVolatilityRatioForSeries returned ' + rHigh.value + ', above the intended 2.5 cap.', 'Downstream code (e.g. distributionWinProbability) assumes this ratio is bounded; an unbounded value can blow out the predictive SD.', 'Check the "Math.min(2.5, ...)" wrapper is still present.');
-        } else {
-          add('INFO', AREA, 'Volatility ratio behaves sanely', 'Neutral default for short series, and higher ratio for higher-spread series, both hold, within the 2.5 cap.', 'Confirms the volatility signal feeding into confidence grading is trustworthy.', 'No action needed.');
-        }
-      }
-    } else {
-      add('CRITICAL', AREA, 'getVolatilityRatioForSeries missing', 'getVolatilityRatioForSeries is not defined as a function.', 'Without it, volatility-based confidence adjustments have no input signal.', 'Check for a rename/deletion.');
-    }
-  }
-
-  // =================================================================
-  // CATEGORY: PERIOD-ADVANCED — no FT leakage into 1H/2H/quarters
-  // =================================================================
-  function auditPeriodAdvanced() {
-    const AREA = 'PERIOD';
-
-    // derivePeriodAdvanced: thin/zero-fraction inputs must reject (null), not fabricate.
-    tally();
-    if (typeof derivePeriodAdvanced === 'function') {
-      const full = { pace: 100, ortg: 110, drtg: 108, possessions: 100 };
-      const rGood = safeCall(derivePeriodAdvanced, full, 55, 52, 0.5, 'nba');
-      const rThin = safeCall(derivePeriodAdvanced, full, 2, 2, 0.05, 'nba');
-      const rZero = safeCall(derivePeriodAdvanced, full, 55, 52, 0, 'nba');
-      if (rGood.ok && rThin.ok && rZero.ok) { pass();
-        const problems = [];
-        if (!(rGood.value && Number.isFinite(rGood.value.ortg))) problems.push('normal-sample call did not return a finite ORTG');
-        if (rThin.value !== null) problems.push('thin periodPoss (<5) did not reject (expected null)');
-        if (rZero.value !== null) problems.push('zero periodFraction did not reject (expected null)');
-        if (problems.length) {
-          add('ERROR', AREA, 'derivePeriodAdvanced honesty gate broken', problems.join('; ') + '.', 'This function is the single choke point that is supposed to refuse to fabricate a period-specific rating from too little data — if the gate is broken, thin-sample noise can leak into 1H/2H/quarter projections as if it were real signal.', 'Check the possessions>=5 and periodFraction>0 guards at the top of derivePeriodAdvanced.');
-        } else {
-          add('INFO', AREA, 'derivePeriodAdvanced honesty gate OK', 'Normal sample returns a finite rating; thin sample and zero fraction both correctly reject with null.', 'Confirms the engine will not fabricate a period rating from an insufficient sample.', 'No action needed.');
-        }
-      }
-    } else {
-      add('CRITICAL', AREA, 'derivePeriodAdvanced missing', 'derivePeriodAdvanced is not defined as a function.', 'Without it there is no guarded path from full-game box data to period-specific ratings.', 'Check for a rename/deletion.');
-    }
-
-    // getPeriodAdvancedSeries: must not fall back to FT-wide series when the
-    // period-specific series is thin (<5) — even if plenty of FT data exists.
-    tally();
-    if (typeof getPeriodAdvancedSeries === 'function') {
-      const thinCtx = { ortg10_h2: [110, 111, 112], drtg10_h2: [105, 106, 107], pace10_h2: [98, 99, 100], ortg10: [112, 111, 110, 113, 114, 112, 111], drtg10: [108, 107, 106, 109, 108], pace10: [100, 99, 101, 100, 98] };
-      const r = safeCall(getPeriodAdvancedSeries, thinCtx, 'h2');
-      if (r.ok) { pass();
-        if (r.value && r.value.source !== 'none') {
-          add('CRITICAL', AREA, 'FT-wide advanced stats leaking into a sub-period market', 'getPeriodAdvancedSeries(ctx, "h2") returned source="' + (r.value && r.value.source) + '" for a context where the H2-native series only has 3 samples (below the 5-sample floor), even though plenty of FT-wide data (' + thinCtx.ortg10.length + ' games) is present.', 'This is exactly the "FT ORTG leaking into 1H/2H/Q" failure mode: it would let full-game efficiency numbers masquerade as second-half-specific signal, silently biasing the 2H projection toward full-game norms.', 'In getPeriodAdvancedSeries, confirm the branch for a non-FT marketKey never falls back to c.ortg10/c.drtg10/c.pace10 when the period-native arrays are short — it should return {ortg:[],drtg:[],pace:[],source:"none"}.');
-        } else {
-          add('INFO', AREA, 'No FT leakage on thin period sample', 'A thin H2-native sample (3 games) correctly returned source="none" instead of falling back to the FT-wide series.', 'Confirms period-specific advanced stats are held to their own sample-size bar rather than borrowing from full-game data.', 'No action needed.');
-        }
-      }
-    } else {
-      add('CRITICAL', AREA, 'getPeriodAdvancedSeries missing', 'getPeriodAdvancedSeries is not defined as a function.', 'Without it there is no single source of truth for period-native advanced stats, and call sites would have to each reimplement the leak guard themselves.', 'Check for a rename/deletion.');
-    }
-
-    // Source-scan: compare how compute1HProjection and compute2HProjection
-    // source their pace-availability gate (hasRealPace / synPace).
-    tally();
-    pass();
-    const src = getConcatenatedScriptSource();
-    if (src) {
-      const h1Body = extractFunctionBody(src, 'compute1HProjection');
-      const h2Body = extractFunctionBody(src, 'compute2HProjection');
-      if (h1Body && h2Body) {
-        const h1UsesRawFT = /avgPaceA\s*=\s*avgOrNaN\(ctxA\.pace10\)/.test(h1Body);
-        const h2UsesRawFT = /avgPaceA\s*=\s*avgOrNaN\(ctxA\.pace10\)/.test(h2Body);
-        const h1UsesPeriodPace = /avgPaceA\s*=\s*avgOrNaN\(_paceArrA1\)/.test(h1Body);
-        if (h2UsesRawFT && !h1UsesRawFT && h1UsesPeriodPace) {
-          add('WARN', AREA, 'compute2HProjection paces itself off full-game data, unlike compute1HProjection', 'compute2HProjection computes its hasRealPace/synPace gate from the raw full-game series (avgOrNaN(ctxA.pace10) / ctxB.pace10), while compute1HProjection uses only the period-native pace array (_paceArrA1/_paceArrB1) gated to source==="h1". The ORTG/DRTG half of compute2HProjection does correctly call getPeriodAdvancedSeries(ctxA,"h2"), but its pace gate does not go through the same period-native path.', 'This is a policy inconsistency between the two half-game functions: 2H can treat a team\'s full-game pace as if it were 2H-specific pace, which is exactly the "FT stat leaking into a period market" pattern this audit looks for — just on the pace input rather than ORTG/DRTG.', 'In compute2HProjection, replace "avgOrNaN(ctxA.pace10)" / "avgOrNaN(ctxB.pace10)" (and the matching .length >= 5 checks) with the pace arrays already returned by the h2-scoped getPeriodAdvancedSeries call (_advA2.pace / _advB2.pace), mirroring how compute1HProjection builds _paceArrA1/_paceArrB1.');
-        } else {
-          add('INFO', AREA, '2H pace sourcing matches 1H policy', 'Source scan did not find the raw-FT-pace-only-in-2H pattern.', 'Suggests both half-game functions gate their pace input the same way.', 'No action needed.');
-        }
-      } else {
-        add('INFO', AREA, '2H/1H pace source-scan skipped', 'Could not isolate both function bodies from the page source for comparison (function boundary extraction failed).', 'This is a limitation of the static scan, not a finding about the engine.', 'Not applicable.');
-      }
-    }
-  }
-
-  // =================================================================
-  // CATEGORY: CONFIDENCE — train ≠ serve, double boosts, NaN sentinels
-  // =================================================================
-  function auditConfidence() {
-    const AREA = 'CONFIDENCE';
-
-    // NaN sentinel: never fabricate a letter grade from missing data.
-    tally();
-    if (typeof resolveConfidenceGradeFromWinProbability === 'function') {
-      const cases = [
-        [null, 'null'], [undefined, 'undefined'], [NaN, 'NaN'], [-1, '-1 (out of range)'], [1.5, '1.5 (out of range)']
-      ];
-      let bad = [];
-      cases.forEach(([val, label]) => {
-        const r = safeCall(resolveConfidenceGradeFromWinProbability, val, 'nba');
-        if (r.ok && !Number.isFinite(val) && r.value !== 'NaN') bad.push(label + ' → "' + r.value + '"');
-      });
-      pass();
-      if (bad.length) {
-        add('CRITICAL', AREA, 'Fake grade fabricated from invalid win probability', 'resolveConfidenceGradeFromWinProbability returned a real letter grade instead of the "NaN" sentinel for: ' + bad.join('; ') + '.', 'This is the exact null/isFinite(null) trap class this audit targets: isFinite(null) is true in JavaScript, so a naive isFinite() guard would let a null winProb silently pass through and be graded as if it were a real B or D — a confident-looking pick built on no data.', 'Confirm the guard at the top of resolveConfidenceGradeFromWinProbability uses "!Number.isFinite(winProb)" (not the global isFinite) before any threshold comparison.');
-      } else {
-        add('INFO', AREA, 'NaN grade sentinel holds', 'null, undefined, NaN, and out-of-range win probabilities all correctly resolve to the "NaN" grade sentinel rather than a fabricated letter.', 'Confirms Number.isFinite (not the null-permissive global isFinite) guards the grading path.', 'No action needed.');
-      }
-    } else {
-      add('CRITICAL', AREA, 'resolveConfidenceGradeFromWinProbability missing', 'Not defined as a function.', 'Without it there is no single choke point translating win probability into a grade — every call site would need its own NaN guard.', 'Check for a rename/deletion.');
-    }
-
-    // getConfidenceGrade / getMarginConfidenceGrade: NO PLAY / null-line / NaN-edge → NaN.
-    tally();
-    if (typeof getConfidenceGrade === 'function') {
-      const g1 = safeCall(getConfidenceGrade, { pick: 'NO PLAY', line: 220, edge: 5, league: 'nba' });
-      const g2 = safeCall(getConfidenceGrade, { pick: 'OVER', line: null, edge: 5, league: 'nba' });
-      const g3 = safeCall(getConfidenceGrade, { pick: 'OVER', line: 220, edge: NaN, league: 'nba' });
-      pass();
-      const bad = [];
-      if (g1.ok && g1.value !== 'NaN') bad.push('NO PLAY pick → "' + g1.value + '"');
-      if (g2.ok && g2.value !== 'NaN') bad.push('null line → "' + g2.value + '"');
-      if (g3.ok && g3.value !== 'NaN') bad.push('NaN edge → "' + g3.value + '"');
-      if (bad.length) {
-        add('CRITICAL', AREA, 'getConfidenceGrade grades an ungradeable pick', bad.join('; ') + '.', 'A NO PLAY pick, a missing line, or a non-finite edge means there is nothing sound to grade; returning a letter anyway would show the user false confidence on a pick that should not exist.', 'Check the early-return guard at the top of getConfidenceGrade: "if (!pick || pick === \\"NO PLAY\\" || note || line === null || !isFinite(line) || line <= 0 || !isFinite(edge)) return \\"NaN\\";".');
-      } else {
-        add('INFO', AREA, 'getConfidenceGrade guard holds', 'NO PLAY picks, null lines, and NaN edges all correctly resolve to "NaN".', 'Confirms grading never fabricates confidence for an ungradeable pick.', 'No action needed.');
-      }
-    }
-
-    // Train/serve feature parity — same edge expressed as fraction (live) vs
-    // percent (fit/backtest) must normalize to the identical feature vector.
-    tally();
-    if (typeof buildConfidenceFeatures === 'function') {
-      const rLive = safeCall(buildConfidenceFeatures, { edgePct: 0.08, volatilityRatio: 1.2, sampleTier: 'full', hasH2H: true, trap: false, league: 'nba' });
-      const rFit = safeCall(buildConfidenceFeatures, { edgePct: 8.0, godsEyeMemory: { aVol: 14.4, bVol: 14.4, sampleTier: 'full', hasH2H: true, trap: false }, league: 'nba', marketKey: 'ft' });
-      if (rLive.ok && rFit.ok) { pass();
-        const diff = Math.abs(rLive.value.edgePct - rFit.value.edgePct);
-        if (!(diff < 1e-9)) {
-          add('CRITICAL', AREA, 'Confidence model train/serve feature mismatch', 'The live-serve call (edgePct=0.08 fraction) and the training/backtest call (edgePct=8.0 percent) normalized to different edgePct features (Δ=' + diff.toExponential(2) + ') instead of matching exactly.', 'The confidence model is trained on one feature representation and served on another; if they drift apart, the coefficients learned during training no longer mean what the live code assumes, silently corrupting every grade.', 'Check buildConfidenceFeatures\' percent-vs-fraction normalization ("if (Math.abs(edgeFrac) > 1) edgeFrac /= 100;") is applied identically on both the live and fit code paths.');
-        } else {
-          add('INFO', AREA, 'Confidence model train/serve feature parity holds', 'Live (fraction) and fit (percent) inputs normalize to the same edgePct feature (Δ < 1e-9).', 'Confirms the model is trained and served on a consistent feature definition.', 'No action needed.');
-        }
-      }
-    } else {
-      add('WARN', AREA, 'buildConfidenceFeatures missing', 'Not defined as a function.', 'Without a single shared feature-builder, train and serve paths are free to diverge with no automatic check.', 'Check for a rename/deletion.');
-    }
-
-    // Double edge-boost source scan — look for the same edge-like variable
-    // multiplied by a "boost"/"mult" factor more than once in one function.
-    tally();
-    pass();
-    const src = getConcatenatedScriptSource();
-    if (src) {
-      const suspects = findDoubleBoostPatterns(src);
-      if (suspects.length) {
-        suspects.forEach(s => {
-          add('WARN', AREA, 'Possible double edge/confidence boost in ' + s.fn, 'Variable "' + s.varName + '" is reassigned via a "*=" boost/mult-style multiply ' + s.count + ' times inside ' + s.fn + '.', 'Multiplying the same edge or confidence signal by more than one boost factor in the same scope can silently compound — a pick that should get one modest bump instead gets stacked bumps.', 'Open ' + s.fn + ' and confirm each "' + s.varName + ' *= ..." line is gated on a mutually-exclusive condition, not applied unconditionally in sequence.');
-        });
-      } else {
-        add('INFO', AREA, 'No obvious double-boost pattern found', 'Source scan did not find the same edge/confidence variable multiplied by a boost factor more than once within a single function.', 'This is a heuristic scan, not a proof of absence — treat as a first pass, not a guarantee.', 'No action needed from this check alone.');
-      }
-    }
-
-    // isFinite(null) trap regression (JS-level truth this whole category leans on).
-    tally();
-    pass();
-    if (isFinite(null) !== true || Number.isFinite(null) !== false) {
-      add('CRITICAL', AREA, 'JavaScript engine isFinite semantics unexpected', 'isFinite(null) !== true or Number.isFinite(null) !== false in this runtime.', 'Every NaN-grade guard in this codebase is written assuming these exact semantics; if they ever differ, the guards silently stop working.', 'Not an engine bug — re-run in a standard browser/JS runtime.');
-    } else {
-      add('INFO', AREA, 'isFinite(null) trap confirmed present (as expected)', 'isFinite(null) === true and Number.isFinite(null) === false, confirming why every grade/edge guard in this codebase must use Number.isFinite, not the bare global isFinite.', 'This is the mechanism behind every "fake grade from null" finding above — documented here for context.', 'No action needed; this is a JS language fact, not a bug.');
-    }
-  }
-
-  // =================================================================
-  // CATEGORY: NO PLAY / NaN GRADE — consistency between pick and grade
-  // =================================================================
-  function auditNoPlay() {
-    const AREA = 'NO PLAY';
-
-    tally();
-    if (typeof getPick === 'function') {
-      const p1 = safeCall(getPick, NaN, 220, 'nba', 'ft');
-      const p2 = safeCall(getPick, 0, 220, 'nba', 'ft');
-      const p3 = safeCall(getPick, 0.1, 220, 'nba', 'ft');
-      pass();
-      const bad = [];
-      if (p1.ok && p1.value !== 'NO PLAY') bad.push('NaN edge → "' + p1.value + '"');
-      if (p2.ok && p2.value !== 'NO PLAY') bad.push('zero edge → "' + p2.value + '"');
-      if (p3.ok && p3.value !== 'NO PLAY') bad.push('sub-threshold edge (0.1) → "' + p3.value + '"');
-      if (bad.length) {
-        add('ERROR', AREA, 'getPick returns a playable pick for an unplayable edge', bad.join('; ') + '.', 'NaN, zero, and tiny edges should always resolve to NO PLAY; anything else would show the user a confident-looking OVER/UNDER built on no real edge.', 'Check the early guards in getPick: "if (!line || isNaN(edge) || isNaN(line) || line <= 0) return \\"NO PLAY\\";", "if (edge === 0) return \\"NO PLAY\\";", and the absEdge < 0.5 floor.');
-      } else {
-        add('INFO', AREA, 'getPick NO PLAY guards hold', 'NaN edge, zero edge, and a sub-threshold edge all correctly resolve to NO PLAY.', 'Confirms unplayable edges never masquerade as a real pick.', 'No action needed.');
-      }
-
-      // Chain check: a NO PLAY pick must also always grade as NaN.
-      tally();
-      if (typeof getConfidenceGrade === 'function') {
-        const chained = safeCall(getConfidenceGrade, { pick: p1.ok ? p1.value : 'NO PLAY', line: 220, edge: NaN, league: 'nba' });
-        pass();
-        if (chained.ok && chained.value !== 'NaN') {
-          add('CRITICAL', AREA, 'NO PLAY pick graded with a real letter', 'getPick(NaN, 220, "nba", "ft") → "' + (p1.ok ? p1.value : '?') + '", then feeding that into getConfidenceGrade returned "' + chained.value + '" instead of "NaN".', 'This is the exact pick/grade inconsistency this audit targets: a pick the engine itself says not to make should never carry a confidence grade at all.', 'Confirm getConfidenceGrade\'s "pick === \\"NO PLAY\\"" check runs before any win-probability computation.');
-        } else {
-          add('INFO', AREA, 'NO PLAY → NaN grade chain holds', 'Feeding a NO PLAY pick into getConfidenceGrade correctly yields the "NaN" grade sentinel.', 'Confirms pick and grade stay consistent end-to-end for unplayable edges.', 'No action needed.');
-        }
-      }
-    } else {
-      add('CRITICAL', AREA, 'getPick missing', 'getPick is not defined as a function.', 'Without it there is no single choke point deciding OVER/UNDER/NO PLAY — every call site would need to reimplement the NO PLAY thresholds.', 'Check for a rename/deletion.');
-    }
-
-    // Live scan of the user's actual tracked picks for stored inconsistencies.
-    tally();
-    if (typeof getAllTrackedPicksForReport === 'function') {
-      const r = safeCall(getAllTrackedPicksForReport);
-      if (r.ok) { pass();
-        const picks = Array.isArray(r.value) ? r.value : [];
-        let mismatches = 0;
-        picks.forEach(p => {
-          const isNoPlay = String(p.predictionText || p.pick || '').toUpperCase() === 'NO PLAY';
-          const grade = p.confidenceGrade || p.grade;
-          const gradeLooksReal = grade && /^[ABCD]$/.test(String(grade).toUpperCase());
-          if (isNoPlay && gradeLooksReal) mismatches++;
-          const edgeVal = Number(p.edge);
-          if (!isNoPlay && !Number.isFinite(edgeVal) && p.resultStatus && p.resultStatus !== 'pending') mismatches++;
-        });
-        if (mismatches > 0) {
-          add('WARN', AREA, 'Stored tracker picks with pick/grade inconsistency', mismatches + ' out of ' + picks.length + ' tracked pick(s) show a NO PLAY prediction paired with a real letter grade, or a non-NaN edge missing on a settled pick.', 'These are historical records already saved to the tracker; if the inconsistency happened live it may have shown the user false confidence at decision time, and it will also skew win-rate/calibration stats computed from this history.', 'Cross-reference the flagged picks (by matching predictionText/confidenceGrade) against repairMisclassifiedNoPlayTrackedPicks, which exists specifically to repair this class of record.');
-        } else {
-          add('INFO', AREA, 'No pick/grade inconsistency found in tracked picks', 'Scanned ' + picks.length + ' stored tracked pick(s); none show a NO PLAY prediction with a real letter grade or a missing edge on a settled pick.', 'Historical tracker data is internally consistent by this check.', 'No action needed.');
-        }
-      }
-    } else {
-      add('INFO', AREA, 'getAllTrackedPicksForReport unavailable', 'Could not run the live tracked-picks consistency scan.', 'This just means the live-data check was skipped — the direct getPick/getConfidenceGrade checks above still ran.', 'Not applicable.');
-    }
-  }
-
-  // =================================================================
-  // CATEGORY: STORAGE — round-trip integrity, orphaned propose/approve
-  // =================================================================
-  async function auditStorage() {
-    const AREA = 'STORAGE';
-
-    // Live round-trip test through the real storage path, on a disposable key.
-    tally();
-    if (typeof writeAsyncStorage === 'function' && typeof readAsyncStorage === 'function') {
-      const testKey = '__BB_AUDITOR_SELFTEST__';
-      const testVal = { probe: true, ts: Date.now(), nonce: Math.random().toString(36).slice(2) };
-      try {
-        await writeAsyncStorage(testKey, JSON.stringify(testVal));
-        const readBack = await readAsyncStorage(testKey);
-        const parsedBack = typeof readBack === 'string' ? JSON.parse(readBack) : readBack;
-        pass();
-        if (!parsedBack || parsedBack.nonce !== testVal.nonce) {
-          add('ERROR', AREA, 'Storage round-trip failed', 'A test value written via writeAsyncStorage did not read back correctly via readAsyncStorage (nonce mismatch or missing value).', 'If the write/read path is unreliable, tracker state, confidence models, and line memory can silently fail to persist between sessions.', 'Check initBBDatabase()/BB_STORE_NAME and the localStorage fallback branch in readAsyncStorage/writeAsyncStorage.');
-        } else {
-          add('INFO', AREA, 'Storage round-trip OK', 'A disposable test value was written and read back correctly through the live storage path.', 'Confirms the IndexedDB (or localStorage fallback) persistence layer is currently functional.', 'No action needed.');
-        }
-        try { if (typeof indexedDB !== 'undefined') { /* best-effort cleanup below */ } localStorage.removeItem(testKey); } catch (_e) {}
-        try { await writeAsyncStorage(testKey, ''); } catch (_e) {}
-      } catch (e) {
-        pass();
-        add('ERROR', AREA, 'Storage round-trip threw', 'writeAsyncStorage/readAsyncStorage raised: ' + (e && e.message || e) + '.', 'An exception in the core storage path means saves could be failing silently for real users too.', 'Reproduce with a simple string value and trace the IndexedDB transaction and localStorage fallback.');
-      }
-    } else {
-      add('CRITICAL', AREA, 'Storage read/write functions missing', 'writeAsyncStorage and/or readAsyncStorage are not defined as functions.', 'Without them nothing can persist between sessions — tracker history, confidence models, line memory would all be lost on reload.', 'Check for a rename/deletion.');
-    }
-
-    // Orphaned propose/approve residue — a "_PROPOSED" key with no matching
-    // apply, left behind by an interrupted (non-atomic) promote sequence.
-    tally();
-    pass();
-    try {
-      const proposedKeys = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && k.indexOf('BB_') === 0 && k.indexOf('_PROPOSED') !== -1) proposedKeys.push(k);
-      }
-      if (proposedKeys.length) {
-        add('WARN', AREA, 'Pending propose/approve keys present', 'Found ' + proposedKeys.length + ' proposal key(s) awaiting apply: ' + proposedKeys.join(', ') + '.', 'This is expected while a candidate confidence-model config is genuinely pending review, but if it lingers indefinitely it usually means a promote step was interrupted partway (applyConfidenceModelProposal writes several keys with plain sequential localStorage.setItem calls, not a single transaction) and the "_PROPOSED" keys were never cleared.', 'If no proposal review is actually in progress, check applyConfidenceModelProposal — if an earlier setItem call in that sequence threw (e.g. quota exceeded), later cleanup removeItem calls for the "_PROPOSED" keys would never run, leaving this residue.');
-      } else {
-        add('INFO', AREA, 'No orphaned propose/approve keys', 'No "BB_*_PROPOSED" keys currently in localStorage.', 'Either no proposal is pending, or the last promote cycle completed and cleaned up correctly.', 'No action needed.');
-      }
-    } catch (e) {
-      add('WARN', AREA, 'Could not scan localStorage for orphaned proposals', String(e && e.message || e), 'localStorage may be unavailable in this context (e.g. private browsing restrictions).', 'Not applicable.');
-    }
-
-    // JSON integrity of every currently-stored BB_-prefixed key.
-    tally();
-    pass();
-    try {
-      let corrupt = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (!k || k.indexOf('BB_') !== 0) continue;
-        const raw = localStorage.getItem(k);
-        if (raw == null || raw === '') continue;
-        try { JSON.parse(raw); } catch (_pe) {
-          if (!/^-?\d+(\.\d+)?$/.test(raw)) corrupt.push(k);
-        }
-      }
-      if (corrupt.length) {
-        add('ERROR', AREA, 'Corrupted storage value(s) detected', 'The following localStorage key(s) hold a value that is neither valid JSON nor a plain number: ' + corrupt.join(', ') + '.', 'Any code path that does JSON.parse() on these keys without a try/catch will throw the next time it runs, and code that swallows the error will silently fall back to defaults, quietly discarding whatever was there.', 'Inspect the raw value with localStorage.getItem(key) in the console; if it is unrecoverable, remove the key so the engine falls back to its default rather than repeatedly failing to parse it.');
-      } else {
-        add('INFO', AREA, 'All BB_ storage values parse cleanly', 'Every currently-stored "BB_*" localStorage key holds valid JSON (or a plain number).', 'No stored-data corruption detected at this time.', 'No action needed.');
-      }
-    } catch (e) {
-      add('WARN', AREA, 'Could not scan localStorage for corruption', String(e && e.message || e), 'localStorage may be unavailable in this context.', 'Not applicable.');
-    }
-
-    // Structural note: the promote step is several sequential writes, not one transaction.
-    tally();
-    pass();
-    const src = getConcatenatedScriptSource();
-    if (src) {
-      const body = extractFunctionBody(src, 'applyConfidenceModelProposal');
-      if (body) {
-        const setItemCount = (body.match(/localStorage\.setItem\(/g) || []).length;
-        if (setItemCount >= 3) {
-          add('WARN', AREA, 'Confidence model promote step is not atomic', 'applyConfidenceModelProposal performs ' + setItemCount + ' separate localStorage.setItem calls (coeff, Platt calibration, sample sizes, thresholds, grade win-rates) inside one try/catch, then a further sequence of removeItem calls — but a single throw partway through (e.g. a quota error on one of the later keys) leaves the live model in a mixed state: some keys updated to the new values, others still on the old ones, and the "_PROPOSED" keys not cleaned up.', 'A pick graded during that partial-write window could blend old and new model coefficients in a way that was never actually tested or approved.', 'Stage the new values under temporary keys, verify every write succeeded, then do the "_PROPOSED" cleanup — or write a single JSON blob under one key instead of five independent keys, so a failure cannot leave a mixed state.');
-        } else {
-          add('INFO', AREA, 'Promote-step write pattern looks reasonably contained', 'applyConfidenceModelProposal makes ' + setItemCount + ' localStorage.setItem call(s).', 'Fewer sequential writes means less surface area for a partial-failure to leave a mixed state.', 'No action needed.');
-        }
-      }
-    }
-  }
-
-  // =================================================================
-  // CATEGORY: TRACKER — merge-key collisions, missing fields
-  // =================================================================
-  function auditTracker() {
-    const AREA = 'TRACKER';
-
-    tally();
-    if (typeof getAllTrackedPicksForReport === 'function' && typeof makeTrackerActiveMergeKey === 'function') {
-      const r = safeCall(getAllTrackedPicksForReport);
-      if (r.ok) { pass();
-        const picks = Array.isArray(r.value) ? r.value : [];
-        const keyCounts = {};
-        let missingFields = 0;
-        picks.forEach(p => {
-          if (p.resultStatus == null || (p.predictionText == null && p.pick == null)) missingFields++;
-          const mk = safeCall(makeTrackerActiveMergeKey, p);
-          if (mk.ok && mk.value) keyCounts[mk.value] = (keyCounts[mk.value] || 0) + 1;
-        });
-        const dupes = Object.keys(keyCounts).filter(k => keyCounts[k] > 1);
-        if (dupes.length) {
-          add('WARN', AREA, 'Duplicate tracker merge keys detected', dupes.length + ' merge key(s) are shared by more than one stored pick (e.g. "' + dupes[0] + '" × ' + keyCounts[dupes[0]] + ').', 'makeTrackerActiveMergeKey is what the merge logic uses to decide two picks are "the same" across local/server sync; a collision here means two genuinely different picks could get silently merged into one, losing data.', 'Inspect the picks sharing a merge key and check makeTrackerActiveMergeKey for a field combination that is not actually unique per pick (e.g. missing market/side in the key).');
-        } else {
-          add('INFO', AREA, 'No duplicate tracker merge keys', 'Every stored pick\'s merge key is unique across ' + picks.length + ' tracked pick(s).', 'Confirms the local/server merge logic will not silently collapse two distinct picks into one.', 'No action needed.');
-        }
-        if (missingFields > 0) {
-          add('WARN', AREA, 'Tracked picks missing core fields', missingFields + ' out of ' + picks.length + ' tracked pick(s) are missing resultStatus and/or predictionText.', 'Reports and win-rate calculations that assume these fields exist will either crash or silently skip these picks, understating the real sample size.', 'Run these picks through ensureTrackedPickKeys, which exists specifically to backfill missing fields with safe defaults.');
-        } else {
-          add('INFO', AREA, 'Tracked picks have required core fields', 'All ' + picks.length + ' tracked pick(s) carry a resultStatus and a prediction text.', 'Confirms downstream reporting can rely on these fields being present.', 'No action needed.');
-        }
-      }
-    } else {
-      add('INFO', AREA, 'Tracker integrity scan skipped', 'getAllTrackedPicksForReport or makeTrackerActiveMergeKey not available.', 'Skipped, not failed — these functions may simply not be loaded yet this early in page life.', 'Not applicable.');
-    }
-
-    // Storage ceilings the engine's own AFDB raid already warns about — surfaced here too.
-    tally(); pass();
-    try {
-      const active = (typeof g_trackerState !== 'undefined' && Array.isArray(g_trackerState.activePicks)) ? g_trackerState.activePicks : [];
-      const memCount = (typeof g_engineLineMemory !== 'undefined') ? Object.keys(g_engineLineMemory || {}).length : 0;
-      if (active.length > 490 || memCount > 190) {
-        add('WARN', AREA, 'Tracker storage approaching capacity', 'activePicks length = ' + active.length + ' (soft limit 500), line-memory entries = ' + memCount + ' (soft limit 200).', 'Approaching these ceilings risks the automatic pruning logic kicking in and discarding older data sooner than expected.', 'Archive or settle old active picks; confirm the pruning logic in writeAsyncStorage is keeping the most useful history.');
-      } else {
-        add('INFO', AREA, 'Tracker storage well within capacity', 'activePicks = ' + active.length + '/500, line memory = ' + memCount + '/200.', 'No pruning pressure currently.', 'No action needed.');
-      }
-    } catch (_e) {}
-  }
-
-  // =================================================================
-  // CATEGORY: STRUCTURE / SECURITY — footguns, missing DOM nodes
-  // =================================================================
-  function auditStructure() {
-    const AREA = 'STRUCTURE';
-    const src = getConcatenatedScriptSource();
-
-    tally(); pass();
-    if (src) {
-      const dangerous = [];
-      if (/[^.\w]eval\s*\(/.test(src)) dangerous.push('eval(');
-      if (/new\s+Function\s*\(/.test(src)) dangerous.push('new Function(');
-      if (/document\.write\s*\(/.test(src)) dangerous.push('document.write(');
-      if (dangerous.length) {
-        add('ERROR', AREA, 'Dangerous dynamic-code patterns found', 'Found: ' + dangerous.join(', ') + '.', 'eval/new Function/document.write can execute attacker-influenced strings as code, which is a classic XSS vector if any of the input ever traces back to fetched/user-controlled data.', 'Search for the exact call site(s) and replace with a non-dynamic-eval alternative (JSON.parse for data, direct DOM APIs for markup).');
-      } else {
-        add('INFO', AREA, 'No eval/new Function/document.write found', 'A scan of the page\'s inline scripts found none of these dynamic-code-execution patterns.', 'Removes a whole class of code-injection risk.', 'No action needed.');
-      }
-
-      const innerHTMLCount = (src.match(/\.innerHTML\s*=/g) || []).length;
-      const escHelperCount = (src.match(/function\s+esc\s*\(/g) || []).length;
-      if (innerHTMLCount > 5 && escHelperCount <= 1) {
-        add('WARN', AREA, 'HTML-escaping helper not applied consistently', 'Found ' + innerHTMLCount + ' ".innerHTML =" assignment site(s) in the page, but only ' + escHelperCount + ' local esc()-style escaping helper definition(s), scoped to a single module.', 'Any innerHTML assignment that interpolates fetched data (team names, API responses) without escaping is a potential stored-XSS vector if that data can ever contain HTML/script markup — e.g. an unusual team or player name pulled from an external API.', 'Audit the innerHTML call sites that interpolate team/API-derived strings and route them through an escaping helper (or use textContent for plain text) before insertion.');
-      } else {
-        add('INFO', AREA, 'innerHTML/escaping ratio looks reasonable', innerHTMLCount + ' innerHTML site(s), ' + escHelperCount + ' escaping helper definition(s).', 'No immediate red flag from this ratio-based heuristic.', 'No action needed.');
-      }
-    } else {
-      add('WARN', AREA, 'Could not read page source for structural scan', 'getConcatenatedScriptSource() returned empty.', 'Structural/security source-scan checks were skipped this run.', 'Retry the audit; if this persists, inline <script> tags may not be readable via textContent in this context.');
-    }
-
-    // Hardcoded shared identifier — informational, not a vulnerability by itself.
-    tally(); pass();
-    if (typeof TRACKER_FIXED_USER_KEY !== 'undefined' && TRACKER_FIXED_USER_KEY) {
-      add('INFO', AREA, 'Tracker uses a single hardcoded shared key', 'TRACKER_FIXED_USER_KEY is a fixed string constant, so every install of this page shares one tracker state bucket unless a user-specific key is layered on top.', 'Not a vulnerability by itself, but worth knowing: two people running this page share pick history/stats unless something else namespaces them.', 'If per-user separation is intended, confirm TRACKER_FIXED_USER_KEY is meant to be a shared team key rather than a per-user one.');
-    }
-
-    // Missing critical DOM nodes — a curated set that should exist regardless
-    // of which modal/overlay is currently open.
-    tally(); pass();
-    const criticalIds = ['afdbOverlay', 'afdbPanel', 'afdbBtn', 'leagueSelect', 'teamAName', 'teamBName'];
-    const missing = criticalIds.filter(id => !document.getElementById(id));
-    if (missing.length) {
-      add('CRITICAL', AREA, 'Critical DOM node(s) missing', 'document.getElementById() found none of: ' + missing.join(', ') + '.', 'These are core, always-present UI elements the engine and debug tooling both depend on by id; if any is missing, whatever reads it will silently no-op or throw.', 'Confirm the element id was not renamed in the HTML without updating the matching getElementById() call sites.');
-    } else {
-      add('INFO', AREA, 'Critical DOM nodes present', 'All ' + criticalIds.length + ' checked core element ids are present in the current DOM.', 'Confirms the page shell the engine depends on is intact.', 'No action needed.');
-    }
-
-    // Dead getElementById references — an id referenced in script that never
-    // appears anywhere in the page (static HTML attribute, JS .id= assignment,
-    // or template-built markup). Checked against the FULL page source, not
-    // just inline <script> text, since most ids live in plain HTML markup.
-    tally(); pass();
-    if (src) {
-      const fullSrc = getFullPageSource();
-      const referenced = new Set();
-      const re = /getElementById\(\s*['"]([\w-]+)['"]\s*\)/g;
-      let m;
-      while ((m = re.exec(src))) referenced.add(m[1]);
-      const dead = [];
-      referenced.forEach(id => {
-        const escapedId = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        // Matches id="X" / id='X' (HTML attribute, no space) AND
-        // .id = "X" / .id="X" (JS property assignment, optional spaces).
-        const idAttrRe = new RegExp('\\.?id\\s*=\\s*["\']' + escapedId + '["\']');
-        if (!idAttrRe.test(fullSrc)) dead.push(id);
-      });
-      if (dead.length) {
-        add('WARN', AREA, 'getElementById() references with no matching id anywhere in source', dead.slice(0, 15).join(', ') + (dead.length > 15 ? (' … +' + (dead.length - 15) + ' more') : '') + '.', 'A getElementById() call for an id that never appears as id="..." (HTML) or .id="..." (JS-assigned) anywhere will always return null; any code that does not null-check before using it will throw.', 'For each id, either it is built dynamically in a way this scan cannot see (e.g. string-concatenated at runtime — verify by search), or it is a leftover reference to a removed/renamed element that should be cleaned up.');
-      } else {
-        add('INFO', AREA, 'No dead getElementById references found', 'Every id passed to getElementById() in the source also appears as an id attribute or JS-assigned id somewhere in the page.', 'Reduces the chance of a silent null-return on an element lookup.', 'No action needed.');
-      }
-    }
-  }
-
   // ---------------------------------------------------------------
-  // Static-scan helpers
+  // Static-scan helpers (source extraction, self-stripping, pattern scan)
   // ---------------------------------------------------------------
-  // Sentinel markers delimiting the auditor's own source, so its structural/
-  // security self-scans never flag the detection code inside this very
-  // module (e.g. the words "eval(" or "document.write(" appearing inside
-  // this file's own check descriptions and regexes).
   const _AUDITOR_SELF_START = '/*__ENGINE_AUDITOR_SELF_START__*/';
   const _AUDITOR_SELF_END = '/*__ENGINE_AUDITOR_SELF_END__*/';
 
@@ -23959,8 +23312,6 @@ const EngineAuditor = (function () {
     } catch (e) { return ''; }
   }
 
-  // Full page source (script text + surrounding HTML markup), used only for
-  // id-existence lookups where most ids live in plain HTML, not in scripts.
   let _fullSrcCache = null;
   function getFullPageSource() {
     if (_fullSrcCache !== null) return _fullSrcCache;
@@ -23972,9 +23323,6 @@ const EngineAuditor = (function () {
   }
 
   // Extract one top-level `function name(...) { ... }` body via brace counting.
-  // Skips past the parameter list using paren-depth counting first, so a
-  // destructured parameter with a nested object default (e.g. "config = {}")
-  // is not mistaken for the function body's opening brace.
   function extractFunctionBody(src, name) {
     const marker = 'function ' + name + '(';
     const start = src.indexOf(marker);
@@ -23993,13 +23341,13 @@ const EngineAuditor = (function () {
     for (let i = braceStart; i < src.length; i++) {
       const ch = src[i];
       if (ch === '{') depth++;
-      else if (ch === '}') {
-        depth--;
-        if (depth === 0) return src.slice(braceStart, i + 1);
-      }
+      else if (ch === '}') { depth--; if (depth === 0) return src.slice(braceStart, i + 1); }
     }
     return null;
   }
+
+  // Count lines in an extracted function body (for long-function detection).
+  function bodyLineCount(body) { return body ? body.split('\n').length : 0; }
 
   // Heuristic scan for a variable named like an edge/confidence signal being
   // multiplied ("x *= ...") more than once inside the same function body.
@@ -24012,28 +23360,1059 @@ const EngineAuditor = (function () {
       const counts = {};
       const re = /\b([a-zA-Z_$][\w$]*(?:[Ee]dge|[Bb]oost|[Cc]onfidence)[\w$]*)\s*\*=/g;
       let m;
-      while ((m = re.exec(body))) {
-        counts[m[1]] = (counts[m[1]] || 0) + 1;
-      }
-      Object.keys(counts).forEach(v => {
-        if (counts[v] > 1) results.push({ fn, varName: v, count: counts[v] });
-      });
+      while ((m = re.exec(body))) counts[m[1]] = (counts[m[1]] || 0) + 1;
+      Object.keys(counts).forEach(v => { if (counts[v] > 1) results.push({ fn, varName: v, count: counts[v] }); });
     });
     return results;
   }
 
+  // Count occurrences of getElementById('sameId') inside one function body —
+  // a proxy for "should have been cached in a local const".
+  function findRepeatedGetElementByIdInFunction(src, fnName) {
+    const body = extractFunctionBody(src, fnName);
+    if (!body) return [];
+    const counts = {};
+    const re = /getElementById\(\s*['"]([\w-]+)['"]\s*\)/g;
+    let m;
+    while ((m = re.exec(body))) counts[m[1]] = (counts[m[1]] || 0) + 1;
+    return Object.keys(counts).filter(id => counts[id] > 2).map(id => ({ id, count: counts[id] }));
+  }
+
+  // Very rough duplicate-function-body detector: normalizes whitespace/
+  // identifiers-free literals and hashes; flags functions >=8 lines whose
+  // normalized body is identical to another function's. Cheap string hash,
+  // not cryptographic — good enough to surface obvious copy-paste blocks.
+  function hashStr(s) {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) { h = (Math.imul(31, h) + s.charCodeAt(i)) | 0; }
+    return h;
+  }
+  function findDuplicateFunctionBodies(src, maxScan) {
+    const re = /function\s+([A-Za-z_$][\w$]*)\s*\(/g;
+    const names = [];
+    let m;
+    while ((m = re.exec(src)) && names.length < (maxScan || 400)) names.push(m[1]);
+    const seen = {}; // normalizedHash -> [names]
+    const dupGroups = [];
+    const doneNames = new Set();
+    names.forEach(name => {
+      if (doneNames.has(name)) return;
+      doneNames.add(name);
+      const body = extractFunctionBody(src, name);
+      if (!body || bodyLineCount(body) < 8) return;
+      const norm = body.replace(/\s+/g, ' ').replace(/'[^']*'|"[^"]*"/g, 'STR').trim();
+      const h = hashStr(norm);
+      if (!seen[h]) seen[h] = [];
+      seen[h].push(name);
+    });
+    Object.values(seen).forEach(group => {
+      const uniq = [...new Set(group)];
+      if (uniq.length > 1) dupGroups.push(uniq);
+    });
+    return dupGroups;
+  }
+
   // =================================================================
-  // Orchestration, scoring, and rendering
+  // A. ARCHITECTURE & DATA FLOW
   // =================================================================
-  const CATEGORY_LIST = ['CALC', 'H2H', 'VOLATILITY', 'PERIOD', 'CONFIDENCE', 'NO PLAY', 'STORAGE', 'TRACKER', 'STRUCTURE'];
+  function auditArchitecture() {
+    const AREA = 'ARCHITECTURE';
+    const src = getConcatenatedScriptSource();
+
+    // 1) Single-file monolith size.
+    tally(); pass();
+    if (src) {
+      const totalLines = src.split('\n').length;
+      const fnCount = (src.match(/\bfunction\s+[A-Za-z_$][\w$]*\s*\(/g) || []).length;
+      if (totalLines > 15000) {
+        add('LOW', AREA, 'Single-file monolith is very large', 'The inline script content totals roughly ' + totalLines + ' lines across ~' + fnCount + ' named functions, all in one HTML file with no module boundaries.', 'Past a certain size, a single-file architecture makes it hard to reason about ownership (which function belongs to which feature), slows editor tooling, and increases the odds two features accidentally share mutable state.', 'Not urgent to fix by itself. If the codebase keeps growing, consider splitting by feature (projection math, tracker, confidence model, fetch layer, UI) into separate <script> modules or a bundler, even while keeping single-file deployment as the build output.', 'Whole-file line/function count');
+      } else {
+        add('INFO', AREA, 'File size within a manageable single-file range', 'Roughly ' + totalLines + ' lines across ~' + fnCount + ' functions.', 'A single-file architecture is still tractable at this size.', 'No action needed.', 'Whole-file line/function count');
+      }
+    }
+
+    // 2) Global mutable state surface — count top-level `let g_...` / `var ...`.
+    tally(); pass();
+    if (src) {
+      const gPrefixed = (src.match(/^\s*let\s+g_[A-Za-z_$][\w$]*/gm) || []).length;
+      const varGlobals = (src.match(/^\s*var\s+[A-Za-z_$][\w$]*/gm) || []).length;
+      const total = gPrefixed + varGlobals;
+      if (total > 25) {
+        add('LOW', AREA, 'Large global mutable state surface', 'Found roughly ' + gPrefixed + ' top-level "let g_*" globals and ' + varGlobals + ' top-level "var" declarations (≈' + total + ' total) that any function on the page can read or write.', 'A wide global-state surface makes data flow implicit: it becomes hard to know, from reading one function, everything else that might mutate the same state, which is a common source of order-dependent bugs (a feature working only if another ran first).', 'Not a rewrite-everything finding. Where practical, group related globals into a single namespaced object (e.g. everything under g_trackerState instead of a dozen separate g_tracker* variables) so mutations are easier to trace to one owner.', 'Top-level let g_*/var declarations');
+      } else {
+        add('INFO', AREA, 'Global mutable state surface is contained', 'Found ≈' + total + ' top-level mutable globals.', 'A smaller global surface makes data flow easier to trace.', 'No action needed.', 'Top-level let g_*/var declarations');
+      }
+    }
+
+    // 3) g_trackerState mutation sites — how many different functions touch it directly.
+    tally(); pass();
+    if (src && typeof g_trackerState !== 'undefined') {
+      const mutRe = /g_trackerState\s*(?:\.\w+)*\s*=(?!=)/g;
+      const mutCount = (src.match(mutRe) || []).length;
+      if (mutCount > 40) {
+        add('LOW', AREA, 'g_trackerState is mutated from many call sites', 'Found roughly ' + mutCount + ' direct-assignment sites touching g_trackerState (or a property of it) across the file.', 'Central shared state that many unrelated functions write to directly (rather than through a small set of setter functions) is harder to keep consistent — a bug in any one call site can corrupt state that dozens of others depend on.', 'Consider funneling tracker-state writes through a small number of update functions (e.g. setActivePicks(), settlePick()) so invariants like "every pick has a resultStatus" can be enforced in one place instead of at every call site.', 'g_trackerState assignment sites (source scan)');
+      } else {
+        add('INFO', AREA, 'g_trackerState mutation surface is reasonably contained', 'Found ≈' + mutCount + ' direct-assignment sites.', 'No action needed.', 'No action needed.', 'g_trackerState assignment sites (source scan)');
+      }
+    }
+
+    // 4) window.* attachment pattern — confirm the const→window pattern used
+    // for EngineAuditor is also applied consistently for other public entry points.
+    tally(); pass();
+    if (src) {
+      const constFns = (src.match(/^\s*const\s+[A-Z][A-Za-z0-9_]*\s*=\s*\(function/gm) || []).length;
+      const windowAttaches = (src.match(/window\.[A-Za-z0-9_]+\s*=\s*[A-Z][A-Za-z0-9_]*\s*;/g) || []).length;
+      if (constFns > 0 && windowAttaches === 0) {
+        add('MEDIUM', AREA, 'Top-level const module(s) may not be reachable from inline onclick handlers', 'Found ' + constFns + ' top-level "const X = (function(){...})();" module-style declaration(s) but no matching "window.X = X;" attachment.', 'A top-level `const` in a classic <script> does not become a `window` property — inline HTML "onclick=\\"X.method()\\"" handlers that expect X to resolve as a global will throw ReferenceError.', 'For every module meant to be called from inline HTML attributes, add an explicit "window.ModuleName = ModuleName;" line, the same fix already applied for EngineAuditor itself.', 'Top-level const-IIFE modules (source scan)');
+      } else {
+        add('INFO', AREA, 'const-module → window attachment pattern looks consistent', 'Found ' + constFns + ' const-IIFE module(s) and ' + windowAttaches + ' explicit window.* attachment(s).', 'Reduces the chance of a silent ReferenceError from an inline onclick handler.', 'No action needed.', 'Top-level const-IIFE modules (source scan)');
+      }
+    }
+  }
+
+  // =================================================================
+  // B. SECURITY — PIN lock, XSS, storage, secrets, service worker
+  // =================================================================
+  function auditSecurity() {
+    const AREA = 'SECURITY';
+    const src = getConcatenatedScriptSource();
+
+    // 1) Dangerous dynamic-code patterns.
+    tally(); pass();
+    if (src) {
+      const dangerous = [];
+      if (/[^.\w]eval\s*\(/.test(src)) dangerous.push('eval(');
+      if (/new\s+Function\s*\(/.test(src)) dangerous.push('new Function(');
+      if (/document\.write\s*\(/.test(src)) dangerous.push('document.write(');
+      if (dangerous.length) {
+        add('HIGH', AREA, 'Dangerous dynamic-code patterns found', 'Found: ' + dangerous.join(', ') + ' in the page\'s inline scripts.', 'eval/new Function/document.write can execute attacker-influenced strings as code, a classic XSS vector if any input traces back to fetched or user-controlled data.', 'Locate the exact call site(s) and replace with a non-dynamic-eval alternative (JSON.parse for data, direct DOM APIs for markup).', 'Full inline-script source scan');
+      } else {
+        add('INFO', AREA, 'No eval/new Function/document.write found', 'A scan of the page\'s inline scripts found none of these dynamic-code-execution patterns.', 'Removes a whole class of code-injection risk.', 'No action needed.', 'Full inline-script source scan');
+      }
+    } else {
+      add('LOW', AREA, 'Could not read page source for security scan', 'getConcatenatedScriptSource() returned empty.', 'The dynamic-code and innerHTML checks below were skipped this run.', 'Retry the audit; if this persists, inline <script> tags may not be readable via textContent in this context.', 'getConcatenatedScriptSource()');
+    }
+
+    // 2) innerHTML usage vs escaping helper coverage.
+    tally(); pass();
+    if (src) {
+      const innerHTMLCount = (src.match(/\.innerHTML\s*=/g) || []).length;
+      const escHelperCount = (src.match(/function\s+esc\s*\(/g) || []).length;
+      if (innerHTMLCount > 5 && escHelperCount <= 1) {
+        add('MEDIUM', AREA, 'HTML-escaping helper not applied consistently', 'Found ' + innerHTMLCount + ' ".innerHTML =" assignment site(s) but only ' + escHelperCount + ' local esc()-style escaping helper definition(s), scoped to a single module.', 'Any innerHTML assignment that interpolates fetched data (team names, API responses) without escaping is a potential stored-XSS vector if that data can ever contain HTML/script markup — e.g. an unusual team or player name pulled from an external API.', 'Audit innerHTML call sites that interpolate team/API-derived strings and route them through an escaping helper, or use textContent for plain text.', 'Full inline-script source scan (.innerHTML = sites)');
+      } else {
+        add('INFO', AREA, 'innerHTML/escaping ratio looks reasonable', innerHTMLCount + ' innerHTML site(s), ' + escHelperCount + ' escaping helper definition(s).', 'No immediate red flag from this ratio-based heuristic.', 'No action needed.', 'Full inline-script source scan (.innerHTML = sites)');
+      }
+    }
+
+    // 3) PIN lock: presence, hashing, and brute-force backoff.
+    tally(); pass();
+    if (typeof ENGINE_LOCK_PIN_HASH !== 'undefined' && ENGINE_LOCK_PIN_HASH) {
+      const looksHashed = /^[a-f0-9]{64}$/i.test(String(ENGINE_LOCK_PIN_HASH));
+      if (!looksHashed) {
+        add('CRITICAL', AREA, 'Engine lock PIN appears to be stored unhashed', 'ENGINE_LOCK_PIN_HASH does not look like a 64-hex-character SHA-256 digest.', 'If the PIN is stored in plaintext (or a weak encoding) in the page source, anyone with view-source access has the PIN with no effort at all.', 'Store only a salted SHA-256 (or stronger) hash client-side, as a proper 64-char hex digest, never the raw PIN.', 'ENGINE_LOCK_PIN_HASH constant');
+      } else {
+        add('INFO', AREA, 'Engine lock PIN is stored as a salted hash', 'ENGINE_LOCK_PIN_HASH is a 64-character hex digest, consistent with a SHA-256 hash rather than a plaintext PIN.', 'Reduces (but does not eliminate — see below) casual recovery of the PIN from view-source.', 'No action needed here specifically.', 'ENGINE_LOCK_PIN_HASH constant');
+      }
+      // This is a structural limitation, not a bug — always surfaced as MEDIUM context.
+      add('MEDIUM', AREA, 'Client-side PIN lock cannot provide real access control', 'The PIN check (tryUnlock) runs entirely in client-side JavaScript, comparing against a hash that ships in the page.', 'Any client-side gate — hashed or not — is bypassable by anyone who can read/modify JS in the browser (disable the script, patch the comparison, or brute-force the hash offline since there is no server-side rate limit). This is a deterrent/privacy screen, not real authentication.', 'If this needs to be a real access control (not just "keep it off casual view"), the check must happen server-side, where the client cannot inspect or bypass the logic. Document this limitation for anyone relying on it as a security boundary.', 'tryUnlock()');
+    } else {
+      add('INFO', AREA, 'No PIN lock constant found', 'ENGINE_LOCK_PIN_HASH is not defined in this build.', 'Not applicable if a PIN lock is not part of this deployment.', 'Not applicable.', 'ENGINE_LOCK_PIN_HASH constant');
+    }
+
+    tally(); pass();
+    if (src) {
+      const lockBody = extractFunctionBody(src, 'tryUnlock');
+      if (lockBody && /backoff|failState\.n\s*>=/.test(lockBody)) {
+        add('INFO', AREA, 'PIN entry has a failed-attempt backoff', 'tryUnlock() references a failure counter/backoff on repeated wrong PINs.', 'Slows down naive brute-forcing directly against the UI (though not against someone reading the hash out of source and brute-forcing offline).', 'No action needed.', 'tryUnlock()');
+      } else if (lockBody) {
+        add('LOW', AREA, 'PIN entry backoff not detected', 'tryUnlock() body did not match the expected failure-counter/backoff pattern.', 'Without any UI-level throttling, repeated wrong-PIN attempts through the input field are unthrottled (though this is a minor concern given the PIN check is client-side regardless).', 'Confirm whether a backoff was intentionally removed; if not, re-add a short delay/lockout after N wrong attempts.', 'tryUnlock()');
+      }
+    }
+
+    // 4) Worker shared secret exposure — self-documented limitation, surfaced here too.
+    tally(); pass();
+    if (typeof WORKER_SHARED_SECRET !== 'undefined' && WORKER_SHARED_SECRET) {
+      add('MEDIUM', AREA, 'Worker shared secret is visible in client source', 'WORKER_SHARED_SECRET is assembled client-side from an array of hex fragments and sent as an "X-Engine-Secret" header to the Cloudflare Worker proxy.', 'Array-join obfuscation does not add real security — the fully assembled secret is present in memory and in view-source the moment the page runs. Anyone can extract it and replay requests directly against the Worker unless the Worker itself enforces additional controls.', 'Treat Worker-side allowlisting, rate-limiting by IP, and target-host restriction as the mandatory controls (the code already documents this intent) — the client secret should be understood as a low-friction filter, not authentication, and rotated periodically.', 'WORKER_SHARED_SECRET constant / proxyFetch()');
+    }
+
+    // 5) Fetch target allowlisting — confirm arbitrary hosts cannot be proxied.
+    tally(); pass();
+    if (src) {
+      const allowlistPattern = /site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com/;
+      if (allowlistPattern.test(src)) {
+        add('INFO', AREA, 'ESPN fetch targets are allowlisted before proxying', 'Found a host allowlist regex restricting proxyFetch/direct-fetch targets to ESPN domains.', 'Prevents the Worker (or the page itself) from being used as an open relay to fetch arbitrary attacker-chosen URLs.', 'No action needed; keep the allowlist in sync if new data sources are added.', 'proxyFetch() host allowlist regex');
+      } else {
+        add('HIGH', AREA, 'No host allowlist found around fetch/proxy calls', 'Could not find an ESPN-domain allowlist regex near the fetch/proxy logic.', 'Without a target-host allowlist, a proxy endpoint can potentially be used to fetch or relay arbitrary URLs, which is a server-side-request-forgery-style risk for the Worker.', 'Add an explicit allowlist check (protocol + hostname) before any URL is forwarded to the Worker or fetched directly.', 'proxyFetch() / fetchJson()');
+      }
+    }
+
+    // 6) Service worker scope/registration sanity.
+    tally(); pass();
+    if (src) {
+      const swBody = /navigator\.serviceWorker\.register\(([^)]*)\)/.exec(src);
+      if (swBody) {
+        const hasCatch = /register\([^)]*\)[\s\S]{0,120}?\.catch\(/.test(src);
+        if (!hasCatch) {
+          add('LOW', AREA, 'Service worker registration has no visible .catch()', 'navigator.serviceWorker.register(...) was found, but a nearby .catch() handler for registration failure was not detected by this scan.', 'An unhandled promise rejection on registration failure is usually non-fatal, but makes install failures invisible to the user and to debug logs.', 'Confirm a .catch() (or try/await+catch) surrounds registration and logs via engineDebug, as the current code appears to already do — re-run after any change to this block.', 'serviceWorker.register() call');
+        } else {
+          add('INFO', AREA, 'Service worker registration failure is handled', 'A .catch() handler was found around navigator.serviceWorker.register(...).', 'Registration failures are logged rather than surfacing as an unhandled rejection.', 'No action needed.', 'serviceWorker.register() call');
+        }
+      } else {
+        add('INFO', AREA, 'No service worker registration found', 'navigator.serviceWorker.register(...) was not found in the scanned source.', 'Not applicable if this build does not use a service worker.', 'Not applicable.', 'serviceWorker.register() call');
+      }
+    }
+
+    // 7) Hardcoded shared tracker key — informational, not a vulnerability by itself.
+    tally(); pass();
+    if (typeof TRACKER_FIXED_USER_KEY !== 'undefined' && TRACKER_FIXED_USER_KEY) {
+      add('INFO', AREA, 'Tracker uses a single hardcoded shared key', 'TRACKER_FIXED_USER_KEY is a fixed string constant, so every install of this page shares one tracker state bucket unless a user-specific key is layered on top.', 'Not a vulnerability by itself, but worth knowing: two people running this page share pick history/stats unless something else namespaces them.', 'If per-user separation is intended, confirm TRACKER_FIXED_USER_KEY is meant to be a shared team key rather than a per-user one.', 'TRACKER_FIXED_USER_KEY constant');
+    }
+  }
+
+  // =================================================================
+  // C. PROJECTION & MATH CORRECTNESS — FT / 1H / 2H / edge / pick
+  // =================================================================
+  function auditProjectionMath() {
+    const AREA = 'PROJECTION_MATH';
+
+    tally();
+    if (typeof window.__BB_RUN_MATH_TESTS__ === 'function') {
+      const r = safeCall(window.__BB_RUN_MATH_TESTS__);
+      if (r.ok && r.value) {
+        pass();
+        if (r.value.ok) {
+          add('INFO', AREA, 'Golden math self-tests passed', 'All built-in regression assertions (period honesty, volatility identity, NaN grade sentinels, sample tiers) passed.', 'These guard the specific bug classes this audit targets, so a clean pass materially raises confidence in projection/period/confidence correctness.', 'No action needed. Re-run after any change to the projection or grading functions.', 'window.__BB_RUN_MATH_TESTS__()');
+        } else {
+          (r.value.fails || []).forEach(f => {
+            add('HIGH', AREA, 'Golden math self-test failed', 'window.__BB_RUN_MATH_TESTS__ reported a failed assertion: "' + f + '".', 'This harness encodes previously-fixed regressions (period leak, volatility shrink, fake grades); a failure means one of those bugs has resurfaced.', 'Search the codebase for the assertion text near window.__BB_RUN_MATH_TESTS__ and re-check the function it exercises.', 'window.__BB_RUN_MATH_TESTS__()');
+          });
+        }
+      } else {
+        add('HIGH', AREA, 'Golden math self-tests threw', 'Calling window.__BB_RUN_MATH_TESTS__() raised an exception: ' + (r.error && r.error.message || r.error) + '.', 'The self-test harness itself is broken, so its usual regression coverage is silently unavailable.', 'Open window.__BB_RUN_MATH_TESTS__ and fix the throwing assertion; check for a function it depends on that no longer exists.', 'window.__BB_RUN_MATH_TESTS__()');
+      }
+    } else {
+      add('MEDIUM', AREA, 'Golden math self-test harness missing', 'window.__BB_RUN_MATH_TESTS__ is not a function in this build.', 'Without it, the auditor loses its deepest regression coverage for period-advanced honesty, volatility identity, and NaN grade sentinels.', 'Confirm the harness definition (search "__BB_RUN_MATH_TESTS__") was not removed or renamed.', 'window.__BB_RUN_MATH_TESTS__()');
+    }
+
+    const toy = buildToyInputs();
+    const bands = (typeof getLineSanityBands === 'function') ? safeCall(getLineSanityBands, 'nba') : null;
+    const ftBand = bands && bands.ok ? bands.value.ft : null;
+    const h1Band = bands && bands.ok ? bands.value.h1 : null;
+    let ftCalc = null, h1Calc = null, h2Calc = null;
+
+    tally();
+    if (typeof computeFTProjection === 'function') {
+      const r = safeCall(computeFTProjection, { league: toy.league, parsed: toy.parsed, lines: toy.lines, injMultA: 1, injMultB: 1 });
+      if (r.ok) {
+        ftCalc = r.value;
+        const p = ftCalc && ftCalc.ftProj;
+        if (!Number.isFinite(p)) {
+          add('HIGH', AREA, 'FT projection smoke test: non-finite output', 'computeFTProjection(toy 10-game inputs) returned ftProj = ' + p + '.', 'A full-length, well-formed sample should never yield NaN/Infinity; this blocks every downstream pick, edge, and grade for FT.', 'Step through computeFTProjection with the toy inputs; check anchorProjection/computeVenueBlend for a divide-by-zero or unguarded NaN propagation.', 'computeFTProjection()');
+        } else if (ftBand && (p < ftBand[0] || p > ftBand[1])) {
+          add('MEDIUM', AREA, 'FT projection outside sane band', 'computeFTProjection(toy inputs) → ftProj = ' + p.toFixed(1) + ', outside the NBA sanity band [' + ftBand[0].toFixed(1) + ', ' + ftBand[1].toFixed(1) + '] from getLineSanityBands.', 'A projection outside the league sanity band on a deliberately mid-range toy sample suggests a scaling or base-rate bug.', 'Check getLeagueScoreBase("nba") and the pace/rating blend in computeFTProjection for a unit or scale mismatch.', 'computeFTProjection()');
+        } else {
+          pass();
+          add('INFO', AREA, 'FT projection smoke test passed', 'computeFTProjection(toy inputs) → ftProj = ' + p.toFixed(1) + ', finite and inside the NBA sanity band.', 'Confirms the FT projection path runs end-to-end without throwing or fabricating an out-of-range number.', 'No action needed.', 'computeFTProjection()');
+        }
+      } else {
+        add('HIGH', AREA, 'FT projection smoke test threw', 'computeFTProjection(toy inputs) raised: ' + (r.error && r.error.message || r.error) + '.', 'An exception here means a live user run with a similarly-shaped fixture would also crash instead of returning a NO PLAY/NaN result.', 'Reproduce with the toy inputs in this module and trace the stack to the first unguarded property access.', 'computeFTProjection()');
+      }
+    } else {
+      add('CRITICAL', AREA, 'computeFTProjection missing', 'computeFTProjection is not defined as a function.', 'This is the core FT projection entry point; without it the engine cannot price the full-game market at all.', 'Check that the function was not renamed or deleted; search for its call sites.', 'computeFTProjection()');
+    }
+
+    tally();
+    if (typeof compute1HProjection === 'function') {
+      const r = safeCall(compute1HProjection, { league: toy.league, parsed: toy.parsed, lines: toy.lines, injMultA: 1, injMultB: 1 });
+      if (r.ok) {
+        h1Calc = r.value;
+        const p = h1Calc && h1Calc.h1Proj;
+        if (!Number.isFinite(p)) {
+          add('HIGH', AREA, '1H projection smoke test: non-finite output', 'compute1HProjection(toy 10-game inputs) returned h1Proj = ' + p + '.', 'Same-length, well-formed 1H sample should not yield NaN; this would silently block every 1H pick.', 'Trace compute1HProjection with the toy inputs; check the venue-blend and anchorProjection calls near the top of the function.', 'compute1HProjection()');
+        } else if (h1Band && (p < h1Band[0] || p > h1Band[1])) {
+          add('MEDIUM', AREA, '1H projection outside sane band', 'compute1HProjection(toy inputs) → h1Proj = ' + p.toFixed(1) + ', outside the NBA 1H sanity band [' + h1Band[0].toFixed(1) + ', ' + h1Band[1].toFixed(1) + '].', 'An out-of-band 1H number on mid-range toy data suggests the half-game base (eb/2 scaling) or pace normalization is off.', 'Check leagueBase1H and leaguePaceNorm1H in compute1HProjection for a scale error.', 'compute1HProjection()');
+        } else {
+          pass();
+          add('INFO', AREA, '1H projection smoke test passed', 'compute1HProjection(toy inputs) → h1Proj = ' + p.toFixed(1) + ', finite and inside the NBA 1H sanity band.', 'Confirms the 1H projection path runs end-to-end and stays in-range.', 'No action needed.', 'compute1HProjection()');
+        }
+      } else {
+        add('HIGH', AREA, '1H projection smoke test threw', 'compute1HProjection(toy inputs) raised: ' + (r.error && r.error.message || r.error) + '.', 'A throw here means a live 1H run on a comparable fixture would also fail.', 'Reproduce with the toy inputs above and trace the first unguarded access.', 'compute1HProjection()');
+      }
+    } else {
+      add('CRITICAL', AREA, 'compute1HProjection missing', 'compute1HProjection is not defined as a function.', 'Without it the 1H market cannot be priced at all.', 'Check for a rename/deletion; search call sites expecting compute1HProjection().', 'compute1HProjection()');
+    }
+
+    tally();
+    if (typeof compute2HProjection === 'function') {
+      const r = safeCall(compute2HProjection, { league: toy.league, parsed: toy.parsed, lines: toy.lines, injMultA: 1, injMultB: 1 });
+      if (r.ok) {
+        h2Calc = r.value;
+        const p = h2Calc && h2Calc.h2Proj;
+        if (!Number.isFinite(p)) {
+          add('HIGH', AREA, '2H projection smoke test: non-finite output', 'compute2HProjection(toy 10-game inputs, via Q3+Q4) returned h2Proj = ' + p + '.', 'A well-formed sample should not yield NaN for 2H; this would silently block every 2H pick.', 'Trace compute2HProjection with the toy Q3/Q4 arrays above.', 'compute2HProjection()');
+        } else if (h1Band && (p < h1Band[0] * 0.85 || p > h1Band[1] * 1.15)) {
+          add('MEDIUM', AREA, '2H projection far outside 1H-comparable band', '2H (' + p.toFixed(1) + ') should be roughly the same order of magnitude as 1H, but falls well outside a widened 1H sanity band.', 'No dedicated H2 band exists in getLineSanityBands, so this is an approximate cross-check, but a large gap still points at a scale bug.', 'Compare leagueBase2H against leagueBase1H in compute2HProjection.', 'compute2HProjection()');
+        } else {
+          pass();
+          add('INFO', AREA, '2H projection smoke test passed', 'compute2HProjection(toy inputs) → h2Proj = ' + p.toFixed(1) + ', finite and roughly consistent with the 1H band.', 'Confirms the 2H projection path runs end-to-end without throwing.', 'No action needed.', 'compute2HProjection()');
+        }
+      } else {
+        add('HIGH', AREA, '2H projection smoke test threw', 'compute2HProjection(toy inputs) raised: ' + (r.error && r.error.message || r.error) + '.', 'A throw here means a live 2H run on a comparable fixture would also fail.', 'Reproduce with the toy inputs above.', 'compute2HProjection()');
+      }
+    } else {
+      add('CRITICAL', AREA, 'compute2HProjection missing', 'compute2HProjection is not defined as a function.', 'Without it the 2H market cannot be priced at all.', 'Check for a rename/deletion; search call sites expecting compute2HProjection().', 'compute2HProjection()');
+    }
+
+    tally();
+    if (ftCalc && h1Calc && h2Calc && Number.isFinite(ftCalc.ftProj) && Number.isFinite(h1Calc.h1Proj) && Number.isFinite(h2Calc.h2Proj)) {
+      pass();
+      const gap = ftCalc.ftProj - (h1Calc.h1Proj + h2Calc.h2Proj);
+      if (Math.abs(gap) > 10) {
+        add('MEDIUM', AREA, 'FT vs (1H+2H) reconciliation gap', 'On toy inputs, ftProj − (h1Proj + h2Proj) = ' + gap.toFixed(1) + ' pts.', 'FT is supposed to be an independent-but-consistent estimate of the two halves combined; a double-digit gap on synchronized toy data suggests the half-game and full-game models are drifting apart.', 'Compare the venue-blend/anchor logic between computeFTProjection and compute1HProjection/compute2HProjection for a shared assumption that only one of them applies.', 'computeFTProjection() vs compute1HProjection()+compute2HProjection()');
+      } else {
+        add('INFO', AREA, 'FT vs (1H+2H) reconciliation OK', 'ftProj − (h1Proj + h2Proj) = ' + gap.toFixed(1) + ' pts on toy inputs — within a reasonable tolerance.', 'Cross-consistency between the full-game and half-game models is a good sign they share the same underlying assumptions.', 'No action needed.', 'computeFTProjection() vs compute1HProjection()+compute2HProjection()');
+      }
+    }
+
+    tally();
+    if (typeof anchorProjection === 'function') {
+      const r = safeCall(anchorProjection, NaN, 10, 55);
+      if (r.ok) {
+        pass();
+        if (Number.isFinite(r.value)) {
+          add('HIGH', AREA, 'anchorProjection fabricates a value from NaN', 'anchorProjection(NaN, 10, 55) returned ' + r.value + ' instead of passing NaN through.', 'Silently turning a missing/invalid input into a plausible-looking number hides upstream data problems instead of surfacing them as NO PLAY.', 'In anchorProjection, add an explicit "if (!Number.isFinite(proj)) return proj;" guard at the top.', 'anchorProjection()');
+        } else {
+          add('INFO', AREA, 'anchorProjection NaN passthrough OK', 'anchorProjection(NaN, 10, 55) correctly stayed non-finite instead of fabricating a value.', 'Confirms invalid inputs propagate as NaN rather than being silently papered over.', 'No action needed.', 'anchorProjection()');
+        }
+      }
+    }
+  }
+
+  // =================================================================
+  // D. CONFIDENCE MODEL — grades, NaN sentinels, train/serve parity,
+  //    double-boosts, and pick/grade consistency (incl. NO PLAY chain)
+  // =================================================================
+  function auditConfidence() {
+    const AREA = 'CONFIDENCE';
+
+    tally();
+    if (typeof resolveConfidenceGradeFromWinProbability === 'function') {
+      const cases = [null, undefined, NaN, -0.3, 1.7];
+      const bad = [];
+      cases.forEach(c => {
+        const r = safeCall(resolveConfidenceGradeFromWinProbability, c, 'ft', 'nba');
+        if (r.ok && r.value !== 'NaN') bad.push(String(c) + ' → "' + r.value + '"');
+      });
+      pass();
+      if (bad.length) {
+        add('CRITICAL', AREA, 'Fake grade fabricated from invalid win probability', 'resolveConfidenceGradeFromWinProbability returned a real letter grade instead of the "NaN" sentinel for: ' + bad.join('; ') + '.', 'isFinite(null) is true in JavaScript, so a naive isFinite() guard would let a null winProb silently pass through and be graded as if it were a real B or D — a confident-looking pick built on no data.', 'Confirm the guard at the top of resolveConfidenceGradeFromWinProbability uses "!Number.isFinite(winProb)" (not the global isFinite) before any threshold comparison.', 'resolveConfidenceGradeFromWinProbability()');
+      } else {
+        add('INFO', AREA, 'NaN grade sentinel holds', 'null, undefined, NaN, and out-of-range win probabilities all correctly resolve to the "NaN" grade sentinel rather than a fabricated letter.', 'Confirms Number.isFinite (not the null-permissive global isFinite) guards the grading path.', 'No action needed.', 'resolveConfidenceGradeFromWinProbability()');
+      }
+    } else {
+      add('CRITICAL', AREA, 'resolveConfidenceGradeFromWinProbability missing', 'Not defined as a function.', 'Without it there is no single choke point translating win probability into a grade — every call site would need its own NaN guard.', 'Check for a rename/deletion.', 'resolveConfidenceGradeFromWinProbability()');
+    }
+
+    tally();
+    if (typeof getConfidenceGrade === 'function') {
+      const g1 = safeCall(getConfidenceGrade, { pick: 'NO PLAY', line: 220, edge: 5, league: 'nba' });
+      const g2 = safeCall(getConfidenceGrade, { pick: 'OVER', line: null, edge: 5, league: 'nba' });
+      const g3 = safeCall(getConfidenceGrade, { pick: 'OVER', line: 220, edge: NaN, league: 'nba' });
+      pass();
+      const bad = [];
+      if (g1.ok && g1.value !== 'NaN') bad.push('NO PLAY pick → "' + g1.value + '"');
+      if (g2.ok && g2.value !== 'NaN') bad.push('null line → "' + g2.value + '"');
+      if (g3.ok && g3.value !== 'NaN') bad.push('NaN edge → "' + g3.value + '"');
+      if (bad.length) {
+        add('CRITICAL', AREA, 'getConfidenceGrade grades an ungradeable pick', bad.join('; ') + '.', 'A NO PLAY pick, a missing line, or a non-finite edge means there is nothing sound to grade; returning a letter anyway would show the user false confidence on a pick that should not exist.', 'Check the early-return guard at the top of getConfidenceGrade covers pick==="NO PLAY", line===null/non-finite/<=0, and non-finite edge.', 'getConfidenceGrade()');
+      } else {
+        add('INFO', AREA, 'getConfidenceGrade guard holds', 'NO PLAY picks, null lines, and NaN edges all correctly resolve to "NaN".', 'Confirms grading never fabricates confidence for an ungradeable pick.', 'No action needed.', 'getConfidenceGrade()');
+      }
+    }
+
+    tally();
+    if (typeof buildConfidenceFeatures === 'function') {
+      const rLive = safeCall(buildConfidenceFeatures, { edgePct: 0.08, volatilityRatio: 1.2, sampleTier: 'full', hasH2H: true, trap: false, league: 'nba' });
+      const rFit = safeCall(buildConfidenceFeatures, { edgePct: 8.0, godsEyeMemory: { aVol: 14.4, bVol: 14.4, sampleTier: 'full', hasH2H: true, trap: false }, league: 'nba', marketKey: 'ft' });
+      if (rLive.ok && rFit.ok) { pass();
+        const diff = Math.abs(rLive.value.edgePct - rFit.value.edgePct);
+        if (!(diff < 1e-9)) {
+          add('CRITICAL', AREA, 'Confidence model train/serve feature mismatch', 'The live-serve call (edgePct=0.08 fraction) and the training/backtest call (edgePct=8.0 percent) normalized to different edgePct features (Δ=' + diff.toExponential(2) + ') instead of matching exactly.', 'The confidence model is trained on one feature representation and served on another; if they drift apart, the coefficients learned during training no longer mean what the live code assumes, silently corrupting every grade.', 'Check buildConfidenceFeatures\' percent-vs-fraction normalization is applied identically on both the live and fit code paths.', 'buildConfidenceFeatures()');
+        } else {
+          add('INFO', AREA, 'Confidence model train/serve feature parity holds', 'Live (fraction) and fit (percent) inputs normalize to the same edgePct feature (Δ < 1e-9).', 'Confirms the model is trained and served on a consistent feature definition.', 'No action needed.', 'buildConfidenceFeatures()');
+        }
+      }
+    } else {
+      add('MEDIUM', AREA, 'buildConfidenceFeatures missing', 'Not defined as a function.', 'Without a single shared feature-builder, train and serve paths are free to diverge with no automatic check.', 'Check for a rename/deletion.', 'buildConfidenceFeatures()');
+    }
+
+    tally(); pass();
+    const src = getConcatenatedScriptSource();
+    if (src) {
+      const suspects = findDoubleBoostPatterns(src);
+      if (suspects.length) {
+        suspects.forEach(s => {
+          add('MEDIUM', AREA, 'Possible double edge/confidence boost in ' + s.fn, 'Variable "' + s.varName + '" is reassigned via a "*=" boost/mult-style multiply ' + s.count + ' times inside ' + s.fn + '.', 'Multiplying the same edge or confidence signal by more than one boost factor in the same scope can silently compound — a pick that should get one modest bump instead gets stacked bumps.', 'Open ' + s.fn + ' and confirm each "' + s.varName + ' *= ..." line is gated on a mutually-exclusive condition, not applied unconditionally in sequence.', s.fn + '()');
+        });
+      } else {
+        add('INFO', AREA, 'No obvious double-boost pattern found', 'Source scan did not find the same edge/confidence variable multiplied by a boost factor more than once within a single function.', 'This is a heuristic scan, not a proof of absence — treat as a first pass, not a guarantee.', 'No action needed from this check alone.', 'getConfidenceGrade() / getPick() / applySoftTrackerInfluenceToPicks() (source scan)');
+      }
+    }
+
+    tally(); pass();
+    if (isFinite(null) !== true || Number.isFinite(null) !== false) {
+      add('CRITICAL', AREA, 'JavaScript engine isFinite semantics unexpected', 'isFinite(null) !== true or Number.isFinite(null) !== false in this runtime.', 'Every NaN-grade guard in this codebase is written assuming these exact semantics; if they ever differ, the guards silently stop working.', 'Not an engine bug — re-run in a standard browser/JS runtime.', 'Runtime isFinite/Number.isFinite semantics');
+    } else {
+      add('INFO', AREA, 'isFinite(null) trap confirmed present (as expected)', 'isFinite(null) === true and Number.isFinite(null) === false, confirming why every grade/edge guard in this codebase must use Number.isFinite, not the bare global isFinite.', 'This is the mechanism behind every "fake grade from null" finding above — documented here for context.', 'No action needed; this is a JS language fact, not a bug.', 'Runtime isFinite/Number.isFinite semantics');
+    }
+
+    // --- NO PLAY / pick-grade consistency (folded into CONFIDENCE) ---
+    tally();
+    if (typeof getPick === 'function') {
+      const p1 = safeCall(getPick, NaN, 220, 'nba', 'ft');
+      const p2 = safeCall(getPick, 0, 220, 'nba', 'ft');
+      const p3 = safeCall(getPick, 0.1, 220, 'nba', 'ft');
+      pass();
+      const bad = [];
+      if (p1.ok && p1.value !== 'NO PLAY') bad.push('NaN edge → "' + p1.value + '"');
+      if (p2.ok && p2.value !== 'NO PLAY') bad.push('zero edge → "' + p2.value + '"');
+      if (p3.ok && p3.value !== 'NO PLAY') bad.push('sub-threshold edge (0.1) → "' + p3.value + '"');
+      if (bad.length) {
+        add('HIGH', AREA, 'getPick returns a playable pick for an unplayable edge', bad.join('; ') + '.', 'NaN, zero, and tiny edges should always resolve to NO PLAY; anything else would show the user a confident-looking OVER/UNDER built on no real edge.', 'Check the early guards in getPick for NaN/zero line or edge, and the minimum-edge floor.', 'getPick()');
+      } else {
+        add('INFO', AREA, 'getPick NO PLAY guards hold', 'NaN edge, zero edge, and a sub-threshold edge all correctly resolve to NO PLAY.', 'Confirms unplayable edges never masquerade as a real pick.', 'No action needed.', 'getPick()');
+      }
+
+      tally();
+      if (typeof getConfidenceGrade === 'function') {
+        const chained = safeCall(getConfidenceGrade, { pick: p1.ok ? p1.value : 'NO PLAY', line: 220, edge: NaN, league: 'nba' });
+        pass();
+        if (chained.ok && chained.value !== 'NaN') {
+          add('CRITICAL', AREA, 'NO PLAY pick graded with a real letter', 'getPick(NaN, 220, "nba", "ft") → "' + (p1.ok ? p1.value : '?') + '", then feeding that into getConfidenceGrade returned "' + chained.value + '" instead of "NaN".', 'A pick the engine itself says not to make should never carry a confidence grade at all.', 'Confirm getConfidenceGrade\'s "pick === \\"NO PLAY\\"" check runs before any win-probability computation.', 'getPick() → getConfidenceGrade() chain');
+        } else {
+          add('INFO', AREA, 'NO PLAY → NaN grade chain holds', 'Feeding a NO PLAY pick into getConfidenceGrade correctly yields the "NaN" grade sentinel.', 'Confirms pick and grade stay consistent end-to-end for unplayable edges.', 'No action needed.', 'getPick() → getConfidenceGrade() chain');
+        }
+      }
+    } else {
+      add('CRITICAL', AREA, 'getPick missing', 'getPick is not defined as a function.', 'Without it there is no single choke point deciding OVER/UNDER/NO PLAY — every call site would need to reimplement the NO PLAY thresholds.', 'Check for a rename/deletion.', 'getPick()');
+    }
+
+    tally();
+    if (typeof getAllTrackedPicksForReport === 'function') {
+      const r = safeCall(getAllTrackedPicksForReport);
+      if (r.ok) { pass();
+        const picks = Array.isArray(r.value) ? r.value : [];
+        let mismatches = 0;
+        picks.forEach(p => {
+          const isNoPlay = String(p.predictionText || p.pick || '').toUpperCase() === 'NO PLAY';
+          const grade = p.confidenceGrade || p.grade;
+          const gradeLooksReal = grade && /^[ABCD]$/.test(String(grade).toUpperCase());
+          if (isNoPlay && gradeLooksReal) mismatches++;
+          const edgeVal = Number(p.edge);
+          if (!isNoPlay && !Number.isFinite(edgeVal) && p.resultStatus && p.resultStatus !== 'pending') mismatches++;
+        });
+        if (mismatches > 0) {
+          add('MEDIUM', AREA, 'Stored tracker picks with pick/grade inconsistency', mismatches + ' out of ' + picks.length + ' tracked pick(s) show a NO PLAY prediction paired with a real letter grade, or a non-NaN edge missing on a settled pick.', 'These are historical records already saved to the tracker; if the inconsistency happened live it may have shown the user false confidence at decision time, and it will also skew win-rate/calibration stats computed from this history.', 'Cross-reference the flagged picks against repairMisclassifiedNoPlayTrackedPicks, which exists specifically to repair this class of record.', 'getAllTrackedPicksForReport() (live data scan)');
+        } else {
+          add('INFO', AREA, 'No pick/grade inconsistency found in tracked picks', 'Scanned ' + picks.length + ' stored tracked pick(s); none show a NO PLAY prediction with a real letter grade or a missing edge on a settled pick.', 'Historical tracker data is internally consistent by this check.', 'No action needed.', 'getAllTrackedPicksForReport() (live data scan)');
+        }
+      }
+    } else {
+      add('INFO', AREA, 'getAllTrackedPicksForReport unavailable', 'Could not run the live tracked-picks consistency scan.', 'This just means the live-data check was skipped — the direct getPick/getConfidenceGrade checks above still ran.', 'Not applicable.', 'getAllTrackedPicksForReport()');
+    }
+  }
+
+  // =================================================================
+  // E1. H2H — bounds, sample size, divergence, injury/context
+  // =================================================================
+  function auditH2H() {
+    const AREA = 'H2H';
+    if (typeof getH2HWeight !== 'function') {
+      tally();
+      add('CRITICAL', AREA, 'getH2HWeight missing', 'getH2HWeight is not defined as a function.', 'Without it H2H data cannot be weighted into any projection at all.', 'Check for a rename/deletion of getH2HWeight.', 'getH2HWeight()');
+      return;
+    }
+    const cap = (typeof getParam === 'function') ? (safeCall(getParam, 'h2hMaxWeight', 'nba').ok ? (getParam('h2hMaxWeight', 'nba') ?? 0.30) : 0.30) : 0.30;
+
+    tally();
+    let r = safeCall(getH2HWeight, 1, 5, 'ft', 'full', 0, 'nba');
+    if (r.ok) { pass();
+      if (r.value !== 0) add('HIGH', AREA, 'H2H sample-size gate not enforced', 'getH2HWeight(1, 5, ...) returned ' + r.value + ' instead of 0.', 'Fewer than 2 head-to-head games is not a usable sample; weighting it anyway lets a single fluky game move a pick.', 'Check the "if (minLen < 2) return 0;" guard at the top of getH2HWeight.', 'getH2HWeight()');
+      else add('INFO', AREA, 'H2H sample-size gate OK', 'getH2HWeight(1, 5, ...) correctly returns 0 when one side has under 2 H2H games.', 'Confirms thin/unusable H2H samples are excluded rather than weighted.', 'No action needed.', 'getH2HWeight()');
+    }
+
+    tally();
+    r = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba', null, 5.0);
+    if (r.ok) { pass();
+      if (r.value > cap + 1e-9 || r.value < 0) add('HIGH', AREA, 'H2H weight bound violated', 'getH2HWeight(10, 10, ..., factor=5.0) returned ' + r.value + ', outside [0, ' + cap + '].', 'The H2H weight caps how much recent head-to-head history can move a projection; an uncapped value lets one lever (factor) override every other safeguard.', 'Confirm the cap is applied after, not before, the factor multiply.', 'getH2HWeight()');
+      else add('INFO', AREA, 'H2H weight cap holds under large factor', 'getH2HWeight(..., factor=5.0) stayed within [0, ' + cap + '].', 'Confirms the cap is applied after, not before, the factor multiply.', 'No action needed.', 'getH2HWeight()');
+    }
+
+    tally();
+    const base = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba');
+    const diverged = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 40, 'nba', 100);
+    if (base.ok && diverged.ok) { pass();
+      if (!(diverged.value < base.value)) add('MEDIUM', AREA, 'H2H divergence penalty not reducing weight', 'getH2HWeight with divergence=40 vs baseline=100 (40% relative divergence) returned ' + diverged.value + ', not less than the no-divergence weight ' + base.value + '.', 'When H2H history disagrees sharply with the baseline projection, it should be trusted less, not equally.', 'Check the divergence-penalty computation and thresholds in getH2HWeight.', 'getH2HWeight()');
+      else add('INFO', AREA, 'H2H divergence penalty active', 'A 40%-divergent H2H sample weighted lower (' + diverged.value.toFixed(4) + ') than a non-divergent one (' + base.value.toFixed(4) + ').', 'Confirms disagreement between H2H and baseline appropriately discounts the H2H weight.', 'No action needed.', 'getH2HWeight()');
+    }
+
+    tally();
+    const noCtx = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba', null, 1.0, null);
+    const injCtx = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba', null, 1.0, { injMultA: 1.0, injMultB: 0.5 });
+    if (noCtx.ok && injCtx.ok) { pass();
+      if (!(injCtx.value < noCtx.value)) add('MEDIUM', AREA, 'H2H injury/context penalty not reducing weight', 'getH2HWeight with a large injury gap (injMultA=1.0, injMultB=0.5) returned ' + injCtx.value + ', not less than the no-context weight ' + noCtx.value + '.', 'A significant injury absent from prior H2H meetings should reduce trust in that history, since the matchup context has changed.', 'Check the injuryRisk term inside the context-penalty block of getH2HWeight.', 'getH2HWeight()');
+      else add('INFO', AREA, 'H2H injury/context penalty active', 'A large injury gap weighted lower (' + injCtx.value.toFixed(4) + ') than no context (' + noCtx.value.toFixed(4) + ').', 'Confirms injury context appropriately discounts stale H2H history.', 'No action needed.', 'getH2HWeight()');
+    }
+
+    tally();
+    const small = safeCall(getH2HWeight, 3, 3, 'ft', 'full', 0, 'nba');
+    const large = safeCall(getH2HWeight, 10, 10, 'ft', 'full', 0, 'nba');
+    if (small.ok && large.ok) { pass();
+      if (large.value < small.value - 1e-9) add('MEDIUM', AREA, 'H2H weight not monotonic in sample size', 'getH2HWeight(10,10,...) = ' + large.value + ' is less than getH2HWeight(3,3,...) = ' + small.value + '.', 'All else equal, more head-to-head history should never be trusted less than a thinner sample.', 'Check the sample-size growth curve in getH2HWeight.', 'getH2HWeight()');
+      else add('INFO', AREA, 'H2H weight monotonic in sample size', 'Weight did not decrease going from 3 to 10 shared H2H games.', 'Confirms the sample-size curve behaves sensibly.', 'No action needed.', 'getH2HWeight()');
+    }
+  }
+
+  // =================================================================
+  // E2. VOLATILITY — must widen uncertainty, never shrink the mean
+  // =================================================================
+  function auditVolatility() {
+    const AREA = 'VOLATILITY';
+
+    tally();
+    if (typeof applyVolatility === 'function') {
+      const r1 = safeCall(applyVolatility, 100, [90, 100, 110], 12, 'nba');
+      const r2 = safeCall(applyVolatility, 88.5, [], 12, 'ncaa');
+      if (r1.ok && r2.ok) { pass();
+        if (r1.value !== 100 || r2.value !== 88.5) {
+          add('CRITICAL', AREA, 'Volatility is shrinking the projection mean', 'applyVolatility(100, [...], 12, "nba") returned ' + r1.value + ' (expected 100, unchanged); applyVolatility(88.5, [], 12, "ncaa") returned ' + r2.value + ' (expected 88.5).', 'Volatility describes spread (predictive SD), not a discount on the central estimate. Letting it pull the mean toward a baseline conflates "uncertain" with "wrong" and silently biases every projection.', 'applyVolatility should be an identity on its first argument, with SD/uncertainty handled only in distributionWinProbability/_normalCdf.', 'applyVolatility()');
+        } else {
+          add('INFO', AREA, 'Volatility does not shrink the mean', 'applyVolatility is an identity on the projection for both a populated and an empty series.', 'Confirms uncertainty is kept separate from the point estimate, matching the intended design.', 'No action needed.', 'applyVolatility()');
+        }
+      } else {
+        add('HIGH', AREA, 'applyVolatility threw on toy input', 'applyVolatility raised: ' + ((r1.ok ? r2.error : r1.error) || {}).message, 'A function this central to every projection should never throw on well-formed input.', 'Trace the exception with the toy args (100, [90,100,110], 12, "nba").', 'applyVolatility()');
+      }
+    } else {
+      add('CRITICAL', AREA, 'applyVolatility missing', 'applyVolatility is not defined as a function.', 'Without it there is no defined policy for how volatility interacts with the projection mean.', 'Check for a rename/deletion.', 'applyVolatility()');
+    }
+
+    tally();
+    if (typeof getVolatilityRatioForSeries === 'function') {
+      const rShort = safeCall(getVolatilityRatioForSeries, [10, 12], 12);
+      const rLow = safeCall(getVolatilityRatioForSeries, [100, 100, 100, 100, 100], 12);
+      const rHigh = safeCall(getVolatilityRatioForSeries, [70, 130, 60, 140, 80], 12);
+      if (rShort.ok && rLow.ok && rHigh.ok) { pass();
+        if (rShort.value !== 1.0) {
+          add('MEDIUM', AREA, 'Volatility ratio neutral default not returned for short series', 'getVolatilityRatioForSeries([10,12], 12) returned ' + rShort.value + ', expected the neutral 1.0 (series length < 3).', 'With fewer than 3 data points, standard deviation is not meaningful; the function should fall back to a neutral ratio rather than an unstable estimate.', 'Check the "if (cleanSeries.length < 3) return 1.0;" guard.', 'getVolatilityRatioForSeries()');
+        } else if (!(rHigh.value > rLow.value)) {
+          add('HIGH', AREA, 'Volatility ratio not responsive to spread', 'A high-variance series returned ratio ' + rHigh.value + ', not greater than a flat series\' ratio ' + rLow.value + '.', 'The whole point of this function is to detect when a team\'s scoring is unusually erratic; if it does not respond to spread, downstream confidence grading loses its main volatility signal.', 'Check the stdDev() computation and the division by leagueVolLimit inside getVolatilityRatioForSeries.', 'getVolatilityRatioForSeries()');
+        } else if (rHigh.value > 2.5) {
+          add('HIGH', AREA, 'Volatility ratio exceeds documented cap', 'getVolatilityRatioForSeries returned ' + rHigh.value + ', above the intended 2.5 cap.', 'Downstream code (e.g. distributionWinProbability) assumes this ratio is bounded; an unbounded value can blow out the predictive SD.', 'Check the "Math.min(2.5, ...)" wrapper is still present.', 'getVolatilityRatioForSeries()');
+        } else {
+          add('INFO', AREA, 'Volatility ratio behaves sanely', 'Neutral default for short series, and higher ratio for higher-spread series, both hold, within the 2.5 cap.', 'Confirms the volatility signal feeding into confidence grading is trustworthy.', 'No action needed.', 'getVolatilityRatioForSeries()');
+        }
+      }
+    } else {
+      add('CRITICAL', AREA, 'getVolatilityRatioForSeries missing', 'getVolatilityRatioForSeries is not defined as a function.', 'Without it, volatility-based confidence adjustments have no input signal.', 'Check for a rename/deletion.', 'getVolatilityRatioForSeries()');
+    }
+  }
+
+  // =================================================================
+  // E3. PERIOD-ADVANCED — no FT leakage into 1H/2H/quarters
+  // =================================================================
+  function auditPeriodAdvanced() {
+    const AREA = 'PERIOD_ADVANCED';
+
+    tally();
+    if (typeof derivePeriodAdvanced === 'function') {
+      const full = { pace: 100, ortg: 110, drtg: 108, possessions: 100 };
+      const rGood = safeCall(derivePeriodAdvanced, full, 55, 52, 0.5, 'nba');
+      const rThin = safeCall(derivePeriodAdvanced, full, 2, 2, 0.05, 'nba');
+      const rZero = safeCall(derivePeriodAdvanced, full, 55, 52, 0, 'nba');
+      if (rGood.ok && rThin.ok && rZero.ok) { pass();
+        const problems = [];
+        if (!(rGood.value && Number.isFinite(rGood.value.ortg))) problems.push('normal-sample call did not return a finite ORTG');
+        if (rThin.value !== null) problems.push('thin periodPoss (<5) did not reject (expected null)');
+        if (rZero.value !== null) problems.push('zero periodFraction did not reject (expected null)');
+        if (problems.length) {
+          add('HIGH', AREA, 'derivePeriodAdvanced honesty gate broken', problems.join('; ') + '.', 'This function is the single choke point that is supposed to refuse to fabricate a period-specific rating from too little data — if the gate is broken, thin-sample noise can leak into 1H/2H/quarter projections as if it were real signal.', 'Check the possessions>=5 and periodFraction>0 guards at the top of derivePeriodAdvanced.', 'derivePeriodAdvanced()');
+        } else {
+          add('INFO', AREA, 'derivePeriodAdvanced honesty gate OK', 'Normal sample returns a finite rating; thin sample and zero fraction both correctly reject with null.', 'Confirms the engine will not fabricate a period rating from an insufficient sample.', 'No action needed.', 'derivePeriodAdvanced()');
+        }
+      }
+    } else {
+      add('CRITICAL', AREA, 'derivePeriodAdvanced missing', 'derivePeriodAdvanced is not defined as a function.', 'Without it there is no guarded path from full-game box data to period-specific ratings.', 'Check for a rename/deletion.', 'derivePeriodAdvanced()');
+    }
+
+    tally();
+    if (typeof getPeriodAdvancedSeries === 'function') {
+      const thinCtx = { ortg10_h2: [110, 111, 112], drtg10_h2: [105, 106, 107], pace10_h2: [98, 99, 100], ortg10: [112, 111, 110, 113, 114, 112, 111], drtg10: [108, 107, 106, 109, 108], pace10: [100, 99, 101, 100, 98] };
+      const r = safeCall(getPeriodAdvancedSeries, thinCtx, 'h2');
+      if (r.ok) { pass();
+        if (r.value && r.value.source !== 'none') {
+          add('CRITICAL', AREA, 'FT-wide advanced stats leaking into a sub-period market', 'getPeriodAdvancedSeries(ctx, "h2") returned source="' + (r.value && r.value.source) + '" for a context where the H2-native series only has 3 samples (below the 5-sample floor), even though plenty of FT-wide data is present.', 'This is exactly the "FT ORTG leaking into 1H/2H/Q" failure mode: it lets full-game efficiency numbers masquerade as second-half-specific signal, silently biasing the 2H projection toward full-game norms.', 'In getPeriodAdvancedSeries, confirm the non-FT branch never falls back to the full-game arrays when the period-native arrays are short.', 'getPeriodAdvancedSeries()');
+        } else {
+          add('INFO', AREA, 'No FT leakage on thin period sample', 'A thin H2-native sample (3 games) correctly returned source="none" instead of falling back to the FT-wide series.', 'Confirms period-specific advanced stats are held to their own sample-size bar rather than borrowing from full-game data.', 'No action needed.', 'getPeriodAdvancedSeries()');
+        }
+      }
+    } else {
+      add('CRITICAL', AREA, 'getPeriodAdvancedSeries missing', 'getPeriodAdvancedSeries is not defined as a function.', 'Without it there is no single source of truth for period-native advanced stats, and call sites would each have to reimplement the leak guard themselves.', 'Check for a rename/deletion.', 'getPeriodAdvancedSeries()');
+    }
+
+    tally(); pass();
+    const src = getConcatenatedScriptSource();
+    if (src) {
+      const h1Body = extractFunctionBody(src, 'compute1HProjection');
+      const h2Body = extractFunctionBody(src, 'compute2HProjection');
+      if (h1Body && h2Body) {
+        const h1UsesRawFT = /avgPaceA\s*=\s*avgOrNaN\(ctxA\.pace10\)/.test(h1Body);
+        const h2UsesRawFT = /avgPaceA\s*=\s*avgOrNaN\(ctxA\.pace10\)/.test(h2Body);
+        const h1UsesPeriodPace = /avgPaceA\s*=\s*avgOrNaN\(_paceArrA1\)/.test(h1Body);
+        if (h2UsesRawFT && !h1UsesRawFT && h1UsesPeriodPace) {
+          add('MEDIUM', AREA, 'compute2HProjection paces itself off full-game data, unlike compute1HProjection', 'compute2HProjection computes its hasRealPace/synPace gate from the raw full-game pace series, while compute1HProjection uses only the period-native pace array gated to source==="h1".', 'This is a policy inconsistency between the two half-game functions: 2H can treat a team\'s full-game pace as if it were 2H-specific pace, the same "FT stat leaking into a period market" pattern this audit looks for — just on the pace input rather than ORTG/DRTG.', 'In compute2HProjection, replace the raw-FT pace lookups with the pace arrays already returned by the h2-scoped getPeriodAdvancedSeries call, mirroring how compute1HProjection builds its period-native pace arrays.', 'compute2HProjection() vs compute1HProjection()');
+        } else {
+          add('INFO', AREA, '2H pace sourcing matches 1H policy', 'Source scan did not find the raw-FT-pace-only-in-2H pattern.', 'Suggests both half-game functions gate their pace input the same way.', 'No action needed.', 'compute2HProjection() vs compute1HProjection()');
+        }
+      } else {
+        add('INFO', AREA, '2H/1H pace source-scan skipped', 'Could not isolate both function bodies from the page source for comparison.', 'This is a limitation of the static scan, not a finding about the engine.', 'Not applicable.', 'compute2HProjection() vs compute1HProjection()');
+      }
+    }
+  }
+
+  // =================================================================
+  // F. STORAGE & PERSISTENCE — IndexedDB + localStorage integrity
+  // =================================================================
+  async function auditStorage() {
+    const AREA = 'STORAGE';
+
+    tally();
+    if (typeof writeAsyncStorage === 'function' && typeof readAsyncStorage === 'function') {
+      const testKey = '__BB_AUDITOR_SELFTEST__';
+      const testVal = { probe: true, ts: Date.now(), nonce: Math.random().toString(36).slice(2) };
+      try {
+        await writeAsyncStorage(testKey, JSON.stringify(testVal));
+        const readBack = await readAsyncStorage(testKey);
+        const parsedBack = typeof readBack === 'string' ? JSON.parse(readBack) : readBack;
+        pass();
+        if (!parsedBack || parsedBack.nonce !== testVal.nonce) {
+          add('HIGH', AREA, 'Storage round-trip failed', 'A test value written via writeAsyncStorage did not read back correctly via readAsyncStorage (nonce mismatch or missing value).', 'If the write/read path is unreliable, tracker state, confidence models, and line memory can silently fail to persist between sessions.', 'Check initBBDatabase()/BB_STORE_NAME and the localStorage fallback branch in readAsyncStorage/writeAsyncStorage.', 'writeAsyncStorage() / readAsyncStorage()');
+        } else {
+          add('INFO', AREA, 'Storage round-trip OK', 'A disposable test value was written and read back correctly through the live storage path.', 'Confirms the IndexedDB (or localStorage fallback) persistence layer is currently functional.', 'No action needed.', 'writeAsyncStorage() / readAsyncStorage()');
+        }
+        try { localStorage.removeItem(testKey); } catch (_e) {}
+        try { await writeAsyncStorage(testKey, ''); } catch (_e) {}
+      } catch (e) {
+        pass();
+        add('HIGH', AREA, 'Storage round-trip threw', 'writeAsyncStorage/readAsyncStorage raised: ' + (e && e.message || e) + '.', 'An exception in the core storage path means saves could be failing silently for real users too.', 'Reproduce with a simple string value and trace the IndexedDB transaction and localStorage fallback.', 'writeAsyncStorage() / readAsyncStorage()');
+      }
+    } else {
+      add('CRITICAL', AREA, 'Storage read/write functions missing', 'writeAsyncStorage and/or readAsyncStorage are not defined as functions.', 'Without them nothing can persist between sessions — tracker history, confidence models, line memory would all be lost on reload.', 'Check for a rename/deletion.', 'writeAsyncStorage() / readAsyncStorage()');
+    }
+
+    // IndexedDB availability guard.
+    tally(); pass();
+    if (typeof initBBDatabase === 'function') {
+      if (typeof window.indexedDB === 'undefined') {
+        add('MEDIUM', AREA, 'IndexedDB unavailable in this environment', 'window.indexedDB is undefined, so initBBDatabase() cannot use its primary store.', 'Without IndexedDB, the engine should already be falling back to localStorage — worth confirming that fallback path is actually exercised, not just assumed.', 'Manually verify writeAsyncStorage/readAsyncStorage behave correctly with indexedDB deleted/disabled (e.g. private browsing in some browsers).', 'initBBDatabase()');
+      } else {
+        add('INFO', AREA, 'IndexedDB available', 'window.indexedDB is defined; initBBDatabase() can use its primary store.', 'No action needed.', 'No action needed.', 'initBBDatabase()');
+      }
+    } else {
+      add('HIGH', AREA, 'initBBDatabase missing', 'initBBDatabase is not defined as a function.', 'Without it, the IndexedDB store (BB_DB_NAME/BB_STORE_NAME) cannot be opened, forcing every read/write onto the localStorage fallback (if one exists) with its lower capacity.', 'Check for a rename/deletion of initBBDatabase.', 'initBBDatabase()');
+    }
+
+    tally(); pass();
+    try {
+      const proposedKeys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf('BB_') === 0 && k.indexOf('_PROPOSED') !== -1) proposedKeys.push(k);
+      }
+      if (proposedKeys.length) {
+        add('MEDIUM', AREA, 'Pending propose/approve keys present', 'Found ' + proposedKeys.length + ' proposal key(s) awaiting apply: ' + proposedKeys.join(', ') + '.', 'Expected while a candidate confidence-model config is genuinely pending review, but if it lingers indefinitely it usually means a promote step was interrupted partway and the "_PROPOSED" keys were never cleared.', 'If no proposal review is actually in progress, check applyConfidenceModelProposal for an earlier setItem call that threw, leaving later cleanup calls unreached.', 'applyConfidenceModelProposal() / localStorage BB_*_PROPOSED keys');
+      } else {
+        add('INFO', AREA, 'No orphaned propose/approve keys', 'No "BB_*_PROPOSED" keys currently in localStorage.', 'Either no proposal is pending, or the last promote cycle completed and cleaned up correctly.', 'No action needed.', 'localStorage BB_*_PROPOSED keys');
+      }
+    } catch (e) {
+      add('LOW', AREA, 'Could not scan localStorage for orphaned proposals', String(e && e.message || e), 'localStorage may be unavailable in this context (e.g. private browsing restrictions).', 'Not applicable.', 'localStorage scan');
+    }
+
+    tally(); pass();
+    try {
+      let corrupt = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!k || k.indexOf('BB_') !== 0) continue;
+        const raw = localStorage.getItem(k);
+        if (raw == null || raw === '') continue;
+        try { JSON.parse(raw); } catch (_pe) {
+          if (!/^-?\d+(\.\d+)?$/.test(raw)) corrupt.push(k);
+        }
+      }
+      if (corrupt.length) {
+        add('HIGH', AREA, 'Corrupted storage value(s) detected', 'The following localStorage key(s) hold a value that is neither valid JSON nor a plain number: ' + corrupt.join(', ') + '.', 'Any code path that does JSON.parse() on these keys without a try/catch will throw the next time it runs, and code that swallows the error will silently fall back to defaults, quietly discarding whatever was there.', 'Inspect the raw value with localStorage.getItem(key) in the console; if unrecoverable, remove the key so the engine falls back to its default rather than repeatedly failing to parse it.', 'localStorage BB_* keys (JSON validity scan)');
+      } else {
+        add('INFO', AREA, 'All BB_ storage values parse cleanly', 'Every currently-stored "BB_*" localStorage key holds valid JSON (or a plain number).', 'No stored-data corruption detected at this time.', 'No action needed.', 'localStorage BB_* keys (JSON validity scan)');
+      }
+    } catch (e) {
+      add('LOW', AREA, 'Could not scan localStorage for corruption', String(e && e.message || e), 'localStorage may be unavailable in this context.', 'Not applicable.', 'localStorage scan');
+    }
+
+    tally(); pass();
+    const src = getConcatenatedScriptSource();
+    if (src) {
+      const body = extractFunctionBody(src, 'applyConfidenceModelProposal');
+      if (body) {
+        const setItemCount = (body.match(/localStorage\.setItem\(/g) || []).length;
+        if (setItemCount >= 3) {
+          add('MEDIUM', AREA, 'Confidence model promote step is not atomic', 'applyConfidenceModelProposal performs ' + setItemCount + ' separate localStorage.setItem calls inside one try/catch, then a further sequence of removeItem calls — a single throw partway through leaves the live model in a mixed state.', 'A pick graded during that partial-write window could blend old and new model coefficients in a way that was never actually tested or approved.', 'Stage the new values under temporary keys, verify every write succeeded, then do the "_PROPOSED" cleanup — or write a single JSON blob under one key instead of several independent keys, so a failure cannot leave a mixed state.', 'applyConfidenceModelProposal()');
+        } else {
+          add('INFO', AREA, 'Promote-step write pattern looks reasonably contained', 'applyConfidenceModelProposal makes ' + setItemCount + ' localStorage.setItem call(s).', 'Fewer sequential writes means less surface area for a partial-failure to leave a mixed state.', 'No action needed.', 'applyConfidenceModelProposal()');
+        }
+      }
+    }
+  }
+
+  // =================================================================
+  // G. TRACKER — merge keys, missing fields, capacity, settle logic
+  // =================================================================
+  function auditTracker() {
+    const AREA = 'TRACKER';
+
+    tally();
+    if (typeof getAllTrackedPicksForReport === 'function' && typeof makeTrackerActiveMergeKey === 'function') {
+      const r = safeCall(getAllTrackedPicksForReport);
+      if (r.ok) { pass();
+        const picks = Array.isArray(r.value) ? r.value : [];
+        const keyCounts = {};
+        let missingFields = 0;
+        picks.forEach(p => {
+          if (p.resultStatus == null || (p.predictionText == null && p.pick == null)) missingFields++;
+          const mk = safeCall(makeTrackerActiveMergeKey, p);
+          if (mk.ok && mk.value) keyCounts[mk.value] = (keyCounts[mk.value] || 0) + 1;
+        });
+        const dupes = Object.keys(keyCounts).filter(k => keyCounts[k] > 1);
+        if (dupes.length) {
+          add('MEDIUM', AREA, 'Duplicate tracker merge keys detected', dupes.length + ' merge key(s) are shared by more than one stored pick (e.g. "' + dupes[0] + '" × ' + keyCounts[dupes[0]] + ').', 'makeTrackerActiveMergeKey is what the merge logic uses to decide two picks are "the same" across local/server sync; a collision here means two genuinely different picks could get silently merged into one, losing data.', 'Inspect the picks sharing a merge key and check makeTrackerActiveMergeKey for a field combination that is not actually unique per pick (e.g. missing market/side in the key).', 'makeTrackerActiveMergeKey()');
+        } else {
+          add('INFO', AREA, 'No duplicate tracker merge keys', 'Every stored pick\'s merge key is unique across ' + picks.length + ' tracked pick(s).', 'Confirms the local/server merge logic will not silently collapse two distinct picks into one.', 'No action needed.', 'makeTrackerActiveMergeKey()');
+        }
+        if (missingFields > 0) {
+          add('MEDIUM', AREA, 'Tracked picks missing core fields', missingFields + ' out of ' + picks.length + ' tracked pick(s) are missing resultStatus and/or predictionText.', 'Reports and win-rate calculations that assume these fields exist will either crash or silently skip these picks, understating the real sample size.', 'Run these picks through ensureTrackedPickKeys, which exists specifically to backfill missing fields with safe defaults.', 'ensureTrackedPickKeys()');
+        } else {
+          add('INFO', AREA, 'Tracked picks have required core fields', 'All ' + picks.length + ' tracked pick(s) carry a resultStatus and a prediction text.', 'Confirms downstream reporting can rely on these fields being present.', 'No action needed.', 'ensureTrackedPickKeys()');
+        }
+      }
+    } else {
+      add('INFO', AREA, 'Tracker integrity scan skipped', 'getAllTrackedPicksForReport or makeTrackerActiveMergeKey not available.', 'Skipped, not failed — these functions may simply not be loaded yet this early in page life.', 'Not applicable.', 'getAllTrackedPicksForReport() / makeTrackerActiveMergeKey()');
+    }
+
+    tally(); pass();
+    try {
+      const active = (typeof g_trackerState !== 'undefined' && Array.isArray(g_trackerState.activePicks)) ? g_trackerState.activePicks : [];
+      const memCount = (typeof g_engineLineMemory !== 'undefined') ? Object.keys(g_engineLineMemory || {}).length : 0;
+      if (active.length > 490 || memCount > 190) {
+        add('MEDIUM', AREA, 'Tracker storage approaching capacity', 'activePicks length = ' + active.length + ' (soft limit 500), line-memory entries = ' + memCount + ' (soft limit 200).', 'Approaching these ceilings risks the automatic pruning logic kicking in and discarding older data sooner than expected.', 'Archive or settle old active picks; confirm the pruning logic in writeAsyncStorage is keeping the most useful history.', 'g_trackerState.activePicks / g_engineLineMemory');
+      } else {
+        add('INFO', AREA, 'Tracker storage well within capacity', 'activePicks = ' + active.length + '/500, line memory = ' + memCount + '/200.', 'No pruning pressure currently.', 'No action needed.', 'g_trackerState.activePicks / g_engineLineMemory');
+      }
+    } catch (_e) {}
+
+    // Settle-logic self-repair tooling present.
+    tally(); pass();
+    if (typeof repairMisclassifiedNoPlayTrackedPicks === 'function') {
+      add('INFO', AREA, 'NO PLAY misclassification repair tool present', 'repairMisclassifiedNoPlayTrackedPicks is defined.', 'Gives a documented recovery path for the pick/grade inconsistency the CONFIDENCE category checks for, rather than requiring manual data surgery.', 'No action needed.', 'repairMisclassifiedNoPlayTrackedPicks()');
+    } else {
+      add('MEDIUM', AREA, 'NO PLAY misclassification repair tool missing', 'repairMisclassifiedNoPlayTrackedPicks is not defined as a function.', 'If a batch of stored picks is ever found with a NO PLAY prediction paired with a real letter grade, there is no built-in repair path — only manual data editing.', 'Check for a rename/deletion, or add an equivalent repair utility.', 'repairMisclassifiedNoPlayTrackedPicks()');
+    }
+  }
+
+  // =================================================================
+  // H. FETCH LAYER — ESPN auto-fetch, SofaScore, proxy, error handling
+  // =================================================================
+  function auditFetchLayer() {
+    const AREA = 'FETCH';
+    const src = getConcatenatedScriptSource();
+
+    tally(); pass();
+    if (src) {
+      const body = extractFunctionBody(src, 'fetchJson');
+      if (body) {
+        const hasAbort = /AbortController/.test(body);
+        const hasTimeout = /setTimeout/.test(body) && /timeoutMs/.test(body);
+        const hasHttpCheck = /res\.ok/.test(body);
+        const missing = [];
+        if (!hasAbort) missing.push('AbortController (no way to cancel an in-flight request)');
+        if (!hasTimeout) missing.push('timeout (a hung request would wait forever)');
+        if (!hasHttpCheck) missing.push('HTTP-status check (a 4xx/5xx would be silently treated as success)');
+        if (missing.length) {
+          add('MEDIUM', AREA, 'fetchJson missing a resilience control', 'fetchJson is missing: ' + missing.join('; ') + '.', 'Any external API call without a timeout/abort/status-check can hang the UI or silently accept a bad response as if it were real data.', 'Add the missing control(s) to fetchJson so every caller gets the same guarantee automatically.', 'fetchJson()');
+        } else {
+          add('INFO', AREA, 'fetchJson has timeout, abort, and HTTP-status handling', 'Found AbortController-based cancellation, a timeoutMs-driven timeout, and an explicit res.ok check.', 'Callers get consistent, resilient network behavior without having to reimplement it.', 'No action needed.', 'fetchJson()');
+        }
+      } else {
+        add('LOW', AREA, 'fetchJson body could not be located for inspection', 'extractFunctionBody could not isolate fetchJson from the concatenated source.', 'This is a limitation of the static scan (e.g. a differently-shaped function signature), not necessarily a finding about the engine.', 'Not applicable.', 'fetchJson()');
+      }
+    }
+
+    tally(); pass();
+    if (src) {
+      const allowlistPattern = /site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com/;
+      const hasFallbackOrder = /Worker fetch failed, trying direct ESPN/.test(src);
+      if (allowlistPattern.test(src) && hasFallbackOrder) {
+        add('INFO', AREA, 'Proxy → direct-ESPN fallback order confirmed', 'Found both the ESPN host allowlist and the "Worker fetch failed, trying direct ESPN" fallback message, indicating requests try the Cloudflare Worker proxy first and fall back to a direct ESPN call, restricted to allowlisted hosts.', 'A sensible fallback order keeps the app functional if the Worker is briefly down, without opening an unrestricted direct-fetch path.', 'No action needed.', 'proxyFetch()');
+      } else if (!hasFallbackOrder) {
+        add('LOW', AREA, 'Worker→direct-ESPN fallback pattern not found', 'Could not find the expected "Worker fetch failed, trying direct ESPN" fallback path in source.', 'If the fallback was removed, an outage of the Cloudflare Worker would take down ESPN auto-fetch entirely instead of degrading gracefully.', 'Confirm whether the fallback was intentionally removed (e.g. Worker is now mandatory) or should be restored.', 'proxyFetch()');
+      }
+    }
+
+    tally(); pass();
+    if (typeof getEspnLeagueSlug === 'function' && typeof ESPN_LEAGUE_SLUGS !== 'undefined') {
+      const knownLeagues = ['nba', 'wnba', 'ncaa', 'ncaaw'];
+      const resolved = knownLeagues.map(l => ({ l, slug: safeCall(getEspnLeagueSlug, l) }));
+      const unresolved = resolved.filter(r => r.slug.ok && !r.slug.value);
+      if (unresolved.length) {
+        add('LOW', AREA, 'Some expected leagues have no ESPN slug mapping', 'getEspnLeagueSlug returned null for: ' + unresolved.map(u => u.l).join(', ') + '.', 'A league without a slug mapping cannot use ESPN auto-fetch and would silently fall through to manual entry, which may be surprising if the league is expected to be supported.', 'Confirm ESPN_LEAGUE_SLUGS covers every league surfaced in the league selector, or intentionally exclude unsupported ones from the dropdown.', 'getEspnLeagueSlug() / ESPN_LEAGUE_SLUGS');
+      } else {
+        add('INFO', AREA, 'ESPN league slug mapping covers the checked leagues', 'getEspnLeagueSlug resolved a slug for each of: ' + knownLeagues.join(', ') + '.', 'No action needed.', 'No action needed.', 'getEspnLeagueSlug() / ESPN_LEAGUE_SLUGS');
+      }
+    } else {
+      add('INFO', AREA, 'ESPN slug mapping functions unavailable for live check', 'getEspnLeagueSlug or ESPN_LEAGUE_SLUGS not accessible from this scope.', 'Skipped, not failed.', 'Not applicable.', 'getEspnLeagueSlug()');
+    }
+
+    tally(); pass();
+    if (typeof searchSofascorePlayer === 'function' && typeof parseSofascoreIndividual === 'function') {
+      const body = extractFunctionBody(src, 'parseSofascoreIndividual');
+      const hasTryCatch = body ? /try\s*{[\s\S]*catch\s*\(/.test(body) : false;
+      if (body && !hasTryCatch) {
+        add('MEDIUM', AREA, 'parseSofascoreIndividual has no try/catch around parsing', 'The extracted body of parseSofascoreIndividual did not show a try/catch wrapping the JSON parse of pasted SofaScore data.', 'User-pasted JSON is inherently untrusted input; a malformed paste without a catch would throw an unhandled exception instead of showing a friendly error.', 'Wrap the JSON.parse/data-extraction logic in parseSofascoreIndividual in try/catch and surface a clear error via engineDebug or a UI message.', 'parseSofascoreIndividual()');
+      } else if (body) {
+        add('INFO', AREA, 'parseSofascoreIndividual guards against malformed paste', 'Found try/catch around the parsing logic.', 'A bad paste from the user degrades gracefully instead of throwing.', 'No action needed.', 'parseSofascoreIndividual()');
+      }
+    } else {
+      add('INFO', AREA, 'SofaScore manual-entry functions unavailable for live check', 'searchSofascorePlayer or parseSofascoreIndividual not accessible from this scope.', 'Skipped, not failed.', 'Not applicable.', 'searchSofascorePlayer() / parseSofascoreIndividual()');
+    }
+  }
+
+  // =================================================================
+  // I. UI & DOM — critical nodes, dead getElementById, accessibility, theme
+  // =================================================================
+  function auditUIDom() {
+    const AREA = 'UI_DOM';
+    const src = getConcatenatedScriptSource();
+
+    tally(); pass();
+    const criticalIds = ['afdbOverlay', 'afdbPanel', 'afdbBtn', 'leagueSelect', 'teamAName', 'teamBName'];
+    const missing = criticalIds.filter(id => !document.getElementById(id));
+    if (missing.length) {
+      add('CRITICAL', AREA, 'Critical DOM node(s) missing', 'document.getElementById() found none of: ' + missing.join(', ') + '.', 'These are core, always-present UI elements the engine and debug tooling both depend on by id; if any is missing, whatever reads it will silently no-op or throw.', 'Confirm the element id was not renamed in the HTML without updating the matching getElementById() call sites.', 'Critical DOM node presence check');
+    } else {
+      add('INFO', AREA, 'Critical DOM nodes present', 'All ' + criticalIds.length + ' checked core element ids are present in the current DOM.', 'Confirms the page shell the engine depends on is intact.', 'No action needed.', 'Critical DOM node presence check');
+    }
+
+    tally(); pass();
+    if (src) {
+      const fullSrc = getFullPageSource();
+      const referenced = new Set();
+      const re = /getElementById\(\s*['"]([\w-]+)['"]\s*\)/g;
+      let m;
+      while ((m = re.exec(src))) referenced.add(m[1]);
+      const dead = [];
+      referenced.forEach(id => {
+        const escapedId = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const idAttrRe = new RegExp('\\.?id\\s*=\\s*["\']' + escapedId + '["\']');
+        if (!idAttrRe.test(fullSrc)) dead.push(id);
+      });
+      if (dead.length) {
+        add('MEDIUM', AREA, 'getElementById() references with no matching id anywhere in source', dead.slice(0, 15).join(', ') + (dead.length > 15 ? (' … +' + (dead.length - 15) + ' more') : '') + '.', 'A getElementById() call for an id that never appears as id="..." (HTML) or .id="..." (JS-assigned) anywhere will always return null; any code that does not null-check before using it will throw.', 'For each id, either it is built dynamically in a way this scan cannot see, or it is a leftover reference to a removed/renamed element that should be cleaned up.', 'Full-page id reference scan (' + referenced.size + ' ids checked)');
+      } else {
+        add('INFO', AREA, 'No dead getElementById references found', 'Every id passed to getElementById() in the source also appears as an id attribute or JS-assigned id somewhere in the page.', 'Reduces the chance of a silent null-return on an element lookup.', 'No action needed.', 'Full-page id reference scan (' + referenced.size + ' ids checked)');
+      }
+    } else {
+      add('LOW', AREA, 'Could not read page source for dead-id scan', 'getConcatenatedScriptSource() returned empty.', 'This structural check was skipped this run.', 'Retry the audit.', 'getConcatenatedScriptSource()');
+    }
+
+    tally(); pass();
+    if (src) {
+      const fullSrc = getFullPageSource();
+      const inputCount = (fullSrc.match(/<input\b/gi) || []).length;
+      const ariaCount = (fullSrc.match(/aria-label=/gi) || []).length;
+      if (inputCount > 0 && ariaCount < inputCount * 0.5) {
+        add('LOW', AREA, 'Many <input> elements lack an aria-label', 'Found ' + inputCount + ' <input> tag(s) but only ' + ariaCount + ' aria-label attribute(s) in the page markup — well under half.', 'Inputs without an aria-label (and no associated visible <label>) are hard or impossible for screen-reader users to identify, which is both an accessibility and App-Store-review-style concern for a PWA.', 'Add aria-label (or a linked <label for="...">) to inputs that only have a placeholder for identification — placeholders are not a substitute for a label.', 'Full-page markup scan (<input> vs aria-label count)');
+      } else {
+        add('INFO', AREA, 'aria-label coverage on inputs looks reasonable', inputCount + ' <input> tag(s), ' + ariaCount + ' aria-label attribute(s).', 'No immediate accessibility red flag from this ratio-based heuristic.', 'No action needed.', 'Full-page markup scan (<input> vs aria-label count)');
+      }
+    }
+
+    tally(); pass();
+    if (typeof toggleTheme === 'function') {
+      add('INFO', AREA, 'Theme toggle present', 'toggleTheme() is defined and toggles the "dark-mode" class on document.body.', 'Confirms the light/dark theming feature referenced throughout the stylesheet has a working entry point.', 'No action needed.', 'toggleTheme()');
+    } else {
+      add('LOW', AREA, 'Theme toggle function not found', 'toggleTheme is not defined as a function in this scope.', 'The page\'s dark-mode CSS variables would have no way to be triggered if this was removed or renamed.', 'Confirm the theme-toggle button\'s onclick handler still resolves to a real function.', 'toggleTheme()');
+    }
+  }
+
+  // =================================================================
+  // J. CODE QUALITY & MAINTAINABILITY — globals, duplication, dead code
+  // =================================================================
+  function auditCodeQuality() {
+    const AREA = 'CODE_QUALITY';
+    const src = getConcatenatedScriptSource();
+    if (!src) { tally(); add('LOW', AREA, 'Could not read source for code-quality scan', 'getConcatenatedScriptSource() returned empty.', 'All checks in this category were skipped this run.', 'Retry the audit.', 'getConcatenatedScriptSource()'); return; }
+
+    tally(); pass();
+    const consoleLogCount = (src.match(/console\.log\(/g) || []).length;
+    if (consoleLogCount > 0) {
+      add('LOW', AREA, 'Leftover console.log call(s) in production source', 'Found ' + consoleLogCount + ' console.log(...) call(s) in the inline scripts.', 'Debug logging left in shipped code clutters the browser console for end users and can leak internal state; this codebase otherwise routes logging through engineDebug/trackerDebug, which are filterable.', 'Route these through engineDebug/trackerDebug (or remove them) so logging stays consistent and toggleable.', 'console.log( ) call sites');
+    } else {
+      add('INFO', AREA, 'No stray console.log calls found', 'Logging appears to be routed through the engine\'s own debug helpers rather than raw console.log.', 'Keeps production console output clean and filterable.', 'No action needed.', 'console.log( ) call sites');
+    }
+
+    tally(); pass();
+    const dupGroups = findDuplicateFunctionBodies(src, 500);
+    if (dupGroups.length) {
+      dupGroups.slice(0, 5).forEach(group => {
+        add('LOW', AREA, 'Possible duplicated function logic', 'Functions ' + group.join(', ') + ' have near-identical bodies (≥8 lines, matching after whitespace/string-literal normalization).', 'Duplicated logic means a bug fix or behavior change applied to one copy is easy to forget in the other(s), letting them silently drift apart.', 'Review whether ' + group.join(' / ') + ' can share a single implementation, parameterized by whatever currently differs between them.', group.join(', '));
+      });
+      if (dupGroups.length > 5) {
+        add('INFO', AREA, 'Additional possible duplicate groups not listed', (dupGroups.length - 5) + ' more duplicate-body group(s) were found beyond the 5 shown above.', 'Same implication as the listed groups — surfaced separately to avoid an overwhelming findings list.', 'Re-run a manual diff-based duplicate scan across the full function list if a thorough cleanup pass is planned.', 'Function-body duplicate scan');
+      }
+    } else {
+      add('INFO', AREA, 'No obvious duplicate function bodies found', 'A normalized-body hash scan across named functions found no exact-match groups of size ≥8 lines.', 'This is a heuristic (whitespace/string-normalized) match, not a semantic-duplication analysis — treat as a first pass.', 'No action needed from this check alone.', 'Function-body duplicate scan');
+    }
+
+    tally(); pass();
+    const globalAssigns = (src.match(/^\s*(?:let|var)\s+[a-z][A-Za-z0-9]*\s*=/gm) || []);
+    const nonGPrefixed = globalAssigns.filter(l => !/\bg_/.test(l) && !/^\s*(?:let|var)\s+_/.test(l));
+    if (nonGPrefixed.length > 5) {
+      add('LOW', AREA, 'Some top-level mutable state does not follow the g_ naming convention', 'Found ' + nonGPrefixed.length + ' top-level "let"/"var" declaration(s) that neither use the g_ prefix (the convention used for most mutable globals in this file) nor a leading underscore (used for module-private state).', 'Inconsistent naming makes it harder to visually distinguish "shared mutable app state" from "local-ish top-level variable" while reading unfamiliar parts of the file.', 'Where these are genuinely shared application state, rename with the g_ prefix for consistency; where they are meant to be private to a section, consider scoping them inside an IIFE instead of the top level.', 'Top-level let/var declarations (naming-convention scan)');
+    } else {
+      add('INFO', AREA, 'Global naming convention looks consistent', 'Top-level mutable declarations largely follow the g_ (shared state) / _ (private) convention.', 'No action needed.', 'No action needed.', 'Top-level let/var declarations (naming-convention scan)');
+    }
+  }
+
+  // =================================================================
+  // K. PERFORMANCE — repeated lookups, sync storage, heavy JSON ops
+  // =================================================================
+  function auditPerformance() {
+    const AREA = 'PERFORMANCE';
+    const src = getConcatenatedScriptSource();
+    if (!src) { tally(); add('LOW', AREA, 'Could not read source for performance scan', 'getConcatenatedScriptSource() returned empty.', 'All checks in this category were skipped this run.', 'Retry the audit.', 'getConcatenatedScriptSource()'); return; }
+
+    tally(); pass();
+    const hotFns = ['render', 'renderTracker', 'renderResults', 'updateUI', 'copyDebugData', 'copyConfigsData', 'buildTrackerReportText'];
+    const repeatedFindings = [];
+    hotFns.forEach(fn => {
+      const repeats = findRepeatedGetElementByIdInFunction(src, fn);
+      repeats.forEach(r => repeatedFindings.push(fn + '(): "' + r.id + '" × ' + r.count));
+    });
+    if (repeatedFindings.length) {
+      add('LOW', AREA, 'Repeated getElementById() calls for the same id within one function', repeatedFindings.slice(0, 8).join('; ') + (repeatedFindings.length > 8 ? ' …' : '') + '.', 'Each getElementById() call is a live DOM lookup; calling it more than once for the same id within a single function is wasted work that a local const would avoid, and matters most inside frequently-called render paths.', 'Cache the element in a local const at the top of the function and reuse the reference for the rest of the call.', repeatedFindings.length ? repeatedFindings[0].split('():')[0] + '()' : 'render functions');
+    } else {
+      add('INFO', AREA, 'No repeated same-id getElementById() calls found in the checked hot functions', 'Scanned ' + hotFns.length + ' commonly-hot function(s) for repeated getElementById() lookups of the same id.', 'No action needed.', 'No action needed.', 'render()/copy*() functions (source scan)');
+    }
+
+    tally(); pass();
+    const totalGebi = (src.match(/getElementById\(/g) || []).length;
+    if (totalGebi > 300) {
+      add('LOW', AREA, 'Very high total getElementById() call count', 'Found ' + totalGebi + ' getElementById() call sites across the file.', 'Individually cheap, but at this volume it is worth checking whether any run inside loops or frequently-invoked render paths, where caching or a query-once-then-reuse pattern would add up.', 'Not an action item by itself — a useful signal for where to look first if UI responsiveness ever becomes a complaint.', 'Whole-file getElementById() count');
+    } else {
+      add('INFO', AREA, 'getElementById() call volume is unremarkable', 'Found ' + totalGebi + ' call sites total.', 'No action needed.', 'No action needed.', 'Whole-file getElementById() count');
+    }
+
+    tally(); pass();
+    const directLsCalls = (src.match(/(?<!Async)(?:localStorage\.(?:getItem|setItem|removeItem)\()/g) || []).length;
+    if (directLsCalls > 60) {
+      add('LOW', AREA, 'Heavy direct (synchronous) localStorage usage', 'Found roughly ' + directLsCalls + ' direct localStorage.getItem/setItem/removeItem call sites outside the async storage wrapper.', 'localStorage access is synchronous and blocks the main thread; a large volume of direct calls (especially inside render or save loops) can contribute to jank on lower-end devices, unlike the async IndexedDB-backed path.', 'Where a direct localStorage call is on a hot path (e.g. inside a loop or a frequently-called render function), consider batching reads/writes or routing through the async storage layer.', 'localStorage.getItem/setItem/removeItem call sites');
+    } else {
+      add('INFO', AREA, 'Direct localStorage usage volume is unremarkable', 'Found ≈' + directLsCalls + ' direct call site(s).', 'No action needed.', 'No action needed.', 'localStorage.getItem/setItem/removeItem call sites');
+    }
+  }
+
+  // =================================================================
+  // L. FEATURE COMPLETENESS WALK-THROUGH — every major feature, end-to-end
+  // =================================================================
+  function auditFeatureWalkthrough() {
+    const AREA = 'FEATURE_WALKTHROUGH';
+    const features = [
+      { name: 'Engine PIN lock',              fn: 'tryUnlock',                          critical: false },
+      { name: 'ESPN auto-fetch (league slugs)', fn: 'getEspnLeagueSlug',                critical: true },
+      { name: 'ESPN/Worker proxy fetch',       fn: 'fetchJson',                          critical: true },
+      { name: 'SofaScore player search',       fn: 'searchSofascorePlayer',              critical: false },
+      { name: 'SofaScore manual JSON parse',   fn: 'parseSofascoreIndividual',           critical: false },
+      { name: 'FT projection',                 fn: 'computeFTProjection',                critical: true },
+      { name: '1H projection',                 fn: 'compute1HProjection',                critical: true },
+      { name: '2H projection',                 fn: 'compute2HProjection',                critical: true },
+      { name: 'Period-advanced stat derivation', fn: 'derivePeriodAdvanced',             critical: true },
+      { name: 'Period-advanced series sourcing', fn: 'getPeriodAdvancedSeries',          critical: true },
+      { name: 'H2H weighting',                 fn: 'getH2HWeight',                       critical: true },
+      { name: 'Volatility application',        fn: 'applyVolatility',                    critical: true },
+      { name: 'Volatility ratio',               fn: 'getVolatilityRatioForSeries',        critical: true },
+      { name: 'Pick decision (OVER/UNDER/NO PLAY)', fn: 'getPick',                       critical: true },
+      { name: 'Confidence grading',            fn: 'getConfidenceGrade',                 critical: true },
+      { name: 'Win-probability → grade resolution', fn: 'resolveConfidenceGradeFromWinProbability', critical: true },
+      { name: 'Confidence feature builder',    fn: 'buildConfidenceFeatures',            critical: false },
+      { name: 'Confidence model promotion',    fn: 'applyConfidenceModelProposal',       critical: false },
+      { name: 'Coordinate-ascent tuner',       fn: 'runCoordinateAscentTuner',           critical: false },
+      { name: 'Tuner canary checks',           fn: 'checkTunerCanaries',                 critical: false },
+      { name: 'IndexedDB initialization',      fn: 'initBBDatabase',                     critical: true },
+      { name: 'Async storage write',           fn: 'writeAsyncStorage',                  critical: true },
+      { name: 'Async storage read',            fn: 'readAsyncStorage',                   critical: true },
+      { name: 'Tracked-pick key normalization', fn: 'ensureTrackedPickKeys',             critical: true },
+      { name: 'Tracker merge-key generation',  fn: 'makeTrackerActiveMergeKey',          critical: true },
+      { name: 'All tracked picks for reporting', fn: 'getAllTrackedPicksForReport',      critical: true },
+      { name: 'NO PLAY misclassification repair', fn: 'repairMisclassifiedNoPlayTrackedPicks', critical: false },
+      { name: 'Config export (text report)',   fn: 'copyConfigsData',                    critical: false },
+      { name: 'Theme toggle',                  fn: 'toggleTheme',                        critical: false }
+    ];
+
+    tally(); pass();
+    const present = [];
+    const missingCritical = [];
+    const missingNonCritical = [];
+    features.forEach(f => {
+      // Top-level `function name(){}` declarations in a classic <script> attach
+      // to `window` automatically, so this is a safe, non-dynamic-eval check.
+      const exists = typeof window[f.fn] === 'function';
+      if (exists) present.push(f);
+      else if (f.critical) missingCritical.push(f);
+      else missingNonCritical.push(f);
+    });
+    const pct = Math.round((present.length / features.length) * 100);
+
+    if (missingCritical.length) {
+      add('CRITICAL', AREA, 'Critical feature entry point(s) missing', missingCritical.map(f => f.name + ' (' + f.fn + ')').join('; ') + '.', 'These are core, load-bearing entry points for projections, storage, or the tracker. If any is missing (renamed, deleted, or not yet loaded), the whole feature it belongs to is non-functional even if the rest of the page looks fine.', 'Confirm each was not renamed or accidentally deleted; search for its expected call sites to see what still depends on it.', missingCritical.map(f => f.fn + '()').join(', '));
+    }
+    if (missingNonCritical.length) {
+      add('MEDIUM', AREA, 'Non-critical feature entry point(s) missing', missingNonCritical.map(f => f.name + ' (' + f.fn + ')').join('; ') + '.', 'These support secondary workflows (manual data entry, tuning, exports); their absence degrades a specific feature rather than the core engine.', 'Confirm intentional removal vs. accidental — restore or update dependent UI if these were meant to still exist.', missingNonCritical.map(f => f.fn + '()').join(', '));
+    }
+    add('INFO', AREA, 'Feature completeness: ' + pct + '% (' + present.length + '/' + features.length + ')', 'Checked ' + features.length + ' major feature entry points spanning fetch, projection math, confidence, storage, and tracker; ' + present.length + ' resolved as functions in this build.', 'A single completeness number gives a quick read on whether this deploy is a full build or a partial/stripped one.', missingCritical.length || missingNonCritical.length ? 'See the finding(s) above for exactly what is missing.' : 'No action needed — full feature surface detected.', features.length + ' entry points checked');
+  }
+
+  // =================================================================
+  // Orchestration, scoring, roadmap, export, and rendering
+  // =================================================================
+  const CATEGORIES = [
+    { id: 'ARCHITECTURE',        letter: 'A', label: 'Architecture & Data Flow',            fn: auditArchitecture,        async: false },
+    { id: 'SECURITY',            letter: 'B', label: 'Security',                            fn: auditSecurity,            async: false },
+    { id: 'PROJECTION_MATH',     letter: 'C', label: 'Projection & Math Correctness',        fn: auditProjectionMath,      async: false },
+    { id: 'CONFIDENCE',          letter: 'D', label: 'Confidence Model',                     fn: auditConfidence,          async: false },
+    { id: 'H2H',                 letter: 'E', label: 'H2H',                                  fn: auditH2H,                 async: false },
+    { id: 'VOLATILITY',          letter: 'E', label: 'Volatility',                           fn: auditVolatility,          async: false },
+    { id: 'PERIOD_ADVANCED',     letter: 'E', label: 'Period-Advanced Stats',                fn: auditPeriodAdvanced,      async: false },
+    { id: 'STORAGE',             letter: 'F', label: 'Storage & Persistence',                fn: auditStorage,             async: true },
+    { id: 'TRACKER',             letter: 'G', label: 'Tracker',                              fn: auditTracker,             async: false },
+    { id: 'FETCH',               letter: 'H', label: 'Fetch Layer',                          fn: auditFetchLayer,          async: false },
+    { id: 'UI_DOM',              letter: 'I', label: 'UI & DOM',                             fn: auditUIDom,               async: false },
+    { id: 'CODE_QUALITY',        letter: 'J', label: 'Code Quality & Maintainability',       fn: auditCodeQuality,         async: false },
+    { id: 'PERFORMANCE',         letter: 'K', label: 'Performance',                          fn: auditPerformance,         async: false },
+    { id: 'FEATURE_WALKTHROUGH', letter: 'L', label: 'Feature Completeness Walk-through',    fn: auditFeatureWalkthrough,  async: false }
+  ];
 
   function healthFromFindings(findings) {
     let score = 100;
-    findings.forEach(f => {
-      if (f.severity === 'CRITICAL') score -= 20;
-      else if (f.severity === 'ERROR') score -= 10;
-      else if (f.severity === 'WARN') score -= 4;
-    });
+    findings.forEach(f => { score -= (SEV_WEIGHT[f.severity] || 0); });
     score = Math.max(0, Math.min(100, score));
     let label, color;
     if (score >= 90) { label = 'HEALTHY'; color = '#49d45f'; }
@@ -24043,87 +24422,332 @@ const EngineAuditor = (function () {
     return { score, label, color };
   }
 
+  // Prioritized remediation roadmap: every CRITICAL first (in category order),
+  // then every HIGH, deduped by title so a chained finding (e.g. NO PLAY →
+  // NaN grade) doesn't appear twice.
+  function buildRoadmap(findings) {
+    const order = ['CRITICAL', 'HIGH', 'MEDIUM'];
+    const seen = new Set();
+    const roadmap = [];
+    order.forEach(sev => {
+      findings.filter(f => f.severity === sev).forEach(f => {
+        const key = f.area + '::' + f.title;
+        if (seen.has(key)) return;
+        seen.add(key);
+        roadmap.push(f);
+      });
+    });
+    return roadmap.slice(0, 12);
+  }
+
+  async function runCategory(id) {
+    const cat = CATEGORIES.find(c => c.id === id);
+    if (!cat) return;
+    _findings = _findings.filter(f => f.area !== cat.id);
+    _srcCache = null;
+    _fullSrcCache = null;
+    const started = Date.now();
+    try {
+      if (cat.async) { await cat.fn(); } else { cat.fn(); }
+      delete _categoryErrors[cat.id];
+    } catch (e) {
+      const msg = String(e && e.message || e);
+      _categoryErrors[cat.id] = msg;
+      add(cat.id === 'ARCHITECTURE' || cat.id === 'SECURITY' ? 'HIGH' : 'HIGH', cat.id, 'Category threw', msg, 'The ' + cat.label + ' audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.', cat.fn.name + '()');
+    }
+    _categoryTimings[cat.id] = Date.now() - started;
+    render();
+    if (typeof engineDebug === 'function') {
+      engineDebug('Audit category re-run: ' + cat.id, { ms: _categoryTimings[cat.id] });
+    }
+  }
+
   async function runFullAudit() {
     if (_running) return;
     _running = true;
     _findings = [];
     _checksRun = 0;
     _checksTotal = 0;
+    _categoryTimings = {};
+    _categoryErrors = {};
     _srcCache = null;
     _fullSrcCache = null;
 
     const started = Date.now();
-    try { auditCalc(); } catch (e) { add('ERROR', 'CALC', 'Category threw', String(e && e.message || e), 'The CALC audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
-    try { auditH2H(); } catch (e) { add('ERROR', 'H2H', 'Category threw', String(e && e.message || e), 'The H2H audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
-    try { auditVolatility(); } catch (e) { add('ERROR', 'VOLATILITY', 'Category threw', String(e && e.message || e), 'The VOLATILITY audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
-    try { auditPeriodAdvanced(); } catch (e) { add('ERROR', 'PERIOD', 'Category threw', String(e && e.message || e), 'The PERIOD audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
-    try { auditConfidence(); } catch (e) { add('ERROR', 'CONFIDENCE', 'Category threw', String(e && e.message || e), 'The CONFIDENCE audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
-    try { auditNoPlay(); } catch (e) { add('ERROR', 'NO PLAY', 'Category threw', String(e && e.message || e), 'The NO PLAY audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
-    try { await auditStorage(); } catch (e) { add('ERROR', 'STORAGE', 'Category threw', String(e && e.message || e), 'The STORAGE audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
-    try { auditTracker(); } catch (e) { add('ERROR', 'TRACKER', 'Category threw', String(e && e.message || e), 'The TRACKER audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
-    try { auditStructure(); } catch (e) { add('ERROR', 'STRUCTURE', 'Category threw', String(e && e.message || e), 'The STRUCTURE audit category itself failed to complete.', 'Check the browser console for the underlying stack trace.'); }
+    for (const cat of CATEGORIES) {
+      const catStart = Date.now();
+      try {
+        if (cat.async) { await cat.fn(); } else { cat.fn(); }
+        delete _categoryErrors[cat.id];
+      } catch (e) {
+        const msg = String(e && e.message || e);
+        _categoryErrors[cat.id] = msg;
+        add('HIGH', cat.id, 'Category threw', msg, 'The ' + cat.label + ' audit category itself failed to complete — its other checks were skipped.', 'Check the browser console for the underlying stack trace.', cat.fn.name + '()');
+      }
+      _categoryTimings[cat.id] = Date.now() - catStart;
+    }
 
     _lastRunMs = Date.now() - started;
     _running = false;
     render();
     if (typeof engineDebug === 'function') {
-      engineDebug('Full audit complete', { checks: _checksRun, findings: _findings.length, ms: _lastRunMs });
+      engineDebug('Full audit complete', { checks: _checksRun, findings: _findings.length, ms: _lastRunMs, categories: CATEGORIES.length });
     }
   }
 
+  // ---------------------------------------------------------------
+  // Export: structured JSON + human-readable text report
+  // ---------------------------------------------------------------
+  function buildExportPayload() {
+    const health = healthFromFindings(_findings);
+    return {
+      generatedAt: new Date().toISOString(),
+      engine: 'Basketball Prediction Engine (BB Engine)',
+      healthScore: health.score,
+      healthLabel: health.label,
+      checksRun: _checksRun,
+      checksTotal: _checksTotal,
+      lastRunMs: _lastRunMs,
+      categories: CATEGORIES.map(c => ({ id: c.id, letter: c.letter, label: c.label, ms: _categoryTimings[c.id] ?? null, threw: _categoryErrors[c.id] || null })),
+      findings: _findings
+    };
+  }
+
+  function exportJSON() {
+    const payload = buildExportPayload();
+    const json = JSON.stringify(payload, null, 2);
+    triggerDownload(json, 'application/json', 'bb-engine-audit-' + Date.now() + '.json');
+    return json;
+  }
+
+  // Builds the single, complete text report — every category, every
+  // severity, the roadmap, and the summary header — independent of
+  // whatever the overlay's current view/filter happens to be showing.
+  // Used by both exportText() (download) and copyAll() (clipboard).
+  function buildFullReportText() {
+    const health = healthFromFindings(_findings);
+    const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, INFO: 0 };
+    _findings.forEach(f => counts[f.severity] = (counts[f.severity] || 0) + 1);
+
+    const lines = [];
+    lines.push('====================================================');
+    lines.push('  BB ENGINE — FULL AUDIT REPORT');
+    lines.push('====================================================');
+    lines.push('Generated    : ' + new Date().toLocaleString());
+    lines.push('Health       : ' + health.score + '/100 — ' + health.label);
+    lines.push('Checks       : ' + _checksRun + '/' + _checksTotal + ' live checks across ' + CATEGORIES.length + ' categories');
+    lines.push('Findings     : ' + _findings.length + ' total — ' +
+      counts.CRITICAL + ' CRITICAL, ' + counts.HIGH + ' HIGH, ' + counts.MEDIUM + ' MEDIUM, ' + counts.LOW + ' LOW, ' + counts.INFO + ' INFO');
+    if (_lastRunMs != null) lines.push('Run time     : ' + _lastRunMs + ' ms');
+    lines.push('');
+
+    lines.push('--- CATEGORY INDEX (' + CATEGORIES.length + ') ---');
+    CATEGORIES.forEach(cat => {
+      const n = _findings.filter(f => f.area === cat.id).length;
+      const threw = _categoryErrors[cat.id] ? '  [THREW: ' + _categoryErrors[cat.id] + ']' : '';
+      lines.push(cat.letter + '. ' + cat.label + ' (' + cat.id + ') — ' + n + ' finding(s)' + threw);
+    });
+    lines.push('');
+
+    const roadmap = buildRoadmap(_findings);
+    if (roadmap.length) {
+      lines.push('--- PRIORITIZED REMEDIATION ROADMAP (top ' + roadmap.length + ') ---');
+      roadmap.forEach((f, i) => {
+        lines.push((i + 1) + '. [' + f.severity + '] (' + f.area + ') ' + f.title);
+        lines.push('   FIX: ' + f.fix);
+      });
+      lines.push('');
+    }
+
+    lines.push('====================================================');
+    lines.push('  FULL FINDINGS — EVERY CATEGORY, EVERY SEVERITY');
+    lines.push('====================================================');
+    lines.push('');
+
+    CATEGORIES.forEach(cat => {
+      const catFindings = _findings.filter(f => f.area === cat.id);
+      lines.push('--- ' + cat.letter + '. ' + cat.label.toUpperCase() + ' (' + cat.id + ') ---');
+      if (!catFindings.length) {
+        lines.push(_categoryErrors[cat.id] ? '  (category threw: ' + _categoryErrors[cat.id] + ')' : '  (no findings)');
+        lines.push('');
+        return;
+      }
+      catFindings
+        .slice()
+        .sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity])
+        .forEach(f => {
+          lines.push('[' + f.severity + '] ' + f.title);
+          lines.push('  Location: ' + f.location);
+          lines.push('  WHAT: ' + f.what);
+          lines.push('  WHY:  ' + f.why);
+          lines.push('  FIX:  ' + f.fix);
+          lines.push('');
+        });
+    });
+
+    lines.push('====================================================');
+    lines.push('  END OF REPORT — ' + _findings.length + ' finding(s) total');
+    lines.push('====================================================');
+
+    return lines.join('\n');
+  }
+
+  function exportText() {
+    const text = buildFullReportText();
+    triggerDownload(text, 'text/plain', 'bb-engine-audit-' + Date.now() + '.txt');
+    return text;
+  }
+
+  // Copies the ENTIRE report (every category, every severity, summary +
+  // roadmap) to the clipboard in one go — independent of whichever
+  // severity/category view the overlay currently has toggled on-screen.
+  function copyAll() {
+    const text = buildFullReportText();
+    const btn = document.getElementById('auditorCopyAllBtn');
+    const finish = (ok) => {
+      if (!btn) return;
+      const orig = btn.getAttribute('data-orig-label') || btn.textContent;
+      if (!btn.getAttribute('data-orig-label')) btn.setAttribute('data-orig-label', orig);
+      btn.textContent = ok ? '✅ COPIED EVERYTHING' : '❌ COPY FAILED';
+      setTimeout(() => { if (btn) btn.textContent = btn.getAttribute('data-orig-label') || orig; }, 1800);
+    };
+    const fallbackCopy = () => {
+      try {
+        const ta = Object.assign(document.createElement('textarea'), { value: text, style: 'position:fixed;opacity:0' });
+        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+        finish(true);
+      } catch (_e) { finish(false); }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => finish(true)).catch(fallbackCopy);
+    } else {
+      fallbackCopy();
+    }
+    return text;
+  }
+
+  function triggerDownload(content, mime, filename) {
+    try {
+      const blob = new Blob([content], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    } catch (e) {
+      // Fallback: copy to clipboard if download is unavailable in this context.
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(content);
+      } catch (_e) {}
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Rendering
+  // ---------------------------------------------------------------
   function severityBadge(sev) {
-    const colors = { CRITICAL: '#ff5c61', ERROR: '#ff9d4d', WARN: '#ffcf73', INFO: '#4ea9ff' };
-    return '<span style="display:inline-block;min-width:64px;text-align:center;background:' + colors[sev] + '22;border:1px solid ' + colors[sev] + ';color:' + colors[sev] + ';font-size:10px;font-weight:900;padding:2px 6px;border-radius:3px;letter-spacing:0.5px;">' + sev + '</span>';
+    return '<span style="display:inline-block;min-width:64px;text-align:center;background:' + SEV_COLOR[sev] + '22;border:1px solid ' + SEV_COLOR[sev] + ';color:' + SEV_COLOR[sev] + ';font-size:10px;font-weight:900;padding:2px 6px;border-radius:3px;letter-spacing:0.5px;">' + sev + '</span>';
+  }
+
+  function findingRowHtml(f) {
+    return '<div style="padding:10px 12px;border-bottom:1px solid #151515;">' +
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px;">' +
+        severityBadge(f.severity) +
+        '<span style="color:#777;font-size:10px;font-weight:700;">[' + esc(f.area) + ']</span>' +
+        '<span style="color:#eee;font-size:12px;font-weight:900;flex:1;">' + esc(f.title) + '</span>' +
+      '</div>' +
+      '<div style="font-size:11px;line-height:1.5;color:#bbb;padding-left:2px;">' +
+        '<div><span style="color:#4ea9ff;font-weight:700;">WHAT:</span> ' + esc(f.what) + '</div>' +
+        '<div><span style="color:#ffcf73;font-weight:700;">WHY:</span> ' + esc(f.why) + '</div>' +
+        '<div><span style="color:#49d45f;font-weight:700;">FIX:</span> ' + esc(f.fix) + '</div>' +
+        '<div style="color:#666;margin-top:2px;"><span style="color:#888;font-weight:700;">LOCATION:</span> ' + esc(f.location) + '</div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function renderBySeverity(findings) {
+    const order = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];
+    return order.map(sev => {
+      const group = findings.filter(f => f.severity === sev);
+      if (!group.length) return '';
+      return '<div style="padding:6px 12px;background:#0d0d0d;border-bottom:1px solid #1a1a1a;color:' + SEV_COLOR[sev] + ';font-size:11px;font-weight:900;letter-spacing:1px;">' + sev + ' (' + group.length + ')</div>' +
+        group.map(findingRowHtml).join('');
+    }).join('');
+  }
+
+  function renderByCategory(findings) {
+    return CATEGORIES.map(cat => {
+      const group = findings.filter(f => f.area === cat.id).sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]);
+      if (!group.length && !_categoryErrors[cat.id]) return '';
+      const ms = _categoryTimings[cat.id];
+      return '<div style="padding:6px 12px;background:#0d0d0d;border-bottom:1px solid #1a1a1a;display:flex;align-items:center;justify-content:space-between;gap:8px;">' +
+          '<span style="color:#d4af37;font-size:11px;font-weight:900;letter-spacing:1px;">' + cat.letter + '. ' + esc(cat.label.toUpperCase()) + ' (' + group.length + ')' + (ms != null ? ' · ' + ms + 'ms' : '') + '</span>' +
+          '<button onclick="EngineAuditor.runCategory(\'' + cat.id + '\')" style="background:#111;border:1px solid #444;color:#8fd3ff;padding:3px 8px;font-size:10px;font-weight:900;cursor:pointer;border-radius:3px;">↻ re-run</button>' +
+        '</div>' +
+        group.map(findingRowHtml).join('');
+    }).join('');
   }
 
   function render() {
     const panel = document.getElementById('auditorPanel');
     if (!panel) return;
 
-    const counts = { CRITICAL: 0, ERROR: 0, WARN: 0, INFO: 0 };
+    const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, INFO: 0 };
     _findings.forEach(f => counts[f.severity] = (counts[f.severity] || 0) + 1);
     const health = healthFromFindings(_findings);
-
-    const sorted = _findings.slice().sort((a, b) => (SEV_RANK[b.severity] - SEV_RANK[a.severity]));
+    const roadmap = buildRoadmap(_findings);
 
     const summaryHtml =
       '<div style="padding:12px;background:#080808;border-bottom:1px solid #222;flex-shrink:0;">' +
         '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px;">' +
           '<div style="color:#d4af37;font-size:14px;font-weight:900;letter-spacing:1px;">🩺 ENGINE SELF-AUDIT</div>' +
-          '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
-            '<button onclick="EngineAuditor.run()" style="background:#0a1f0a;border:1px solid #2f8f4a;color:#49ff7a;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">↻ Re-run</button>' +
-            '<button onclick="EngineAuditor.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
+            '<button id="auditorCopyAllBtn" onclick="EngineAuditor.copyAll()" title="Copies the full report — every category, every severity, summary + roadmap — regardless of the current view toggle below" style="background:#1a1206;border:1px solid #d4af37;color:#ffd75e;padding:6px 10px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">📋 Copy All</button>' +
+            '<button onclick="EngineAuditor.run()" style="background:#0a1f0a;border:1px solid #2f8f4a;color:#49ff7a;padding:6px 10px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">↻ Re-run All</button>' +
+            '<button onclick="EngineAuditor.exportJSON()" style="background:#0a1420;border:1px solid #2f6f8f;color:#8fd3ff;padding:6px 10px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">⬇ JSON</button>' +
+            '<button onclick="EngineAuditor.exportText()" style="background:#0a1420;border:1px solid #2f6f8f;color:#8fd3ff;padding:6px 10px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">⬇ Text</button>' +
+            '<button onclick="EngineAuditor.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 10px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>' +
           '</div>' +
         '</div>' +
-        '<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;">' +
-          '<div><span style="color:#555;font-size:10px;font-weight:700;text-transform:uppercase;">Auditor power</span><br/><span style="color:#d4af37;font-size:13px;font-weight:900;">' + _checksRun + '/' + _checksTotal + ' live checks · 9 categories</span></div>' +
+        '<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">' +
+          '<div><span style="color:#555;font-size:10px;font-weight:700;text-transform:uppercase;">Auditor power</span><br/><span style="color:#d4af37;font-size:13px;font-weight:900;">' + _checksRun + '/' + _checksTotal + ' live checks · ' + CATEGORIES.length + ' categories</span></div>' +
           '<div><span style="color:#555;font-size:10px;font-weight:700;text-transform:uppercase;">Engine health</span><br/><span style="color:' + health.color + ';font-size:13px;font-weight:900;">' + health.score + '/100 — ' + health.label + '</span></div>' +
           '<div><span style="color:#555;font-size:10px;font-weight:700;text-transform:uppercase;">Findings</span><br/><span style="font-size:12px;font-weight:700;">' +
-            '<span style="color:#ff5c61;">' + counts.CRITICAL + ' CRIT</span> · <span style="color:#ff9d4d;">' + counts.ERROR + ' ERR</span> · <span style="color:#ffcf73;">' + counts.WARN + ' WARN</span> · <span style="color:#4ea9ff;">' + counts.INFO + ' INFO</span>' +
+            '<span style="color:' + SEV_COLOR.CRITICAL + ';">' + counts.CRITICAL + ' CRIT</span> · <span style="color:' + SEV_COLOR.HIGH + ';">' + counts.HIGH + ' HIGH</span> · <span style="color:' + SEV_COLOR.MEDIUM + ';">' + counts.MEDIUM + ' MED</span> · <span style="color:' + SEV_COLOR.LOW + ';">' + counts.LOW + ' LOW</span> · <span style="color:' + SEV_COLOR.INFO + ';">' + counts.INFO + ' INFO</span>' +
           '</span></div>' +
           (_lastRunMs != null ? '<div><span style="color:#555;font-size:10px;font-weight:700;text-transform:uppercase;">Run time</span><br/><span style="color:#aaa;font-size:12px;">' + _lastRunMs + ' ms</span></div>' : '') +
         '</div>' +
-      '</div>';
-
-    const rowsHtml = sorted.map(f => {
-      return '<div style="padding:10px 12px;border-bottom:1px solid #151515;">' +
-        '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px;">' +
-          severityBadge(f.severity) +
-          '<span style="color:#777;font-size:10px;font-weight:700;">[' + esc(f.area) + ']</span>' +
-          '<span style="color:#eee;font-size:12px;font-weight:900;flex:1;">' + esc(f.title) + '</span>' +
-        '</div>' +
-        '<div style="font-size:11px;line-height:1.5;color:#bbb;padding-left:2px;">' +
-          '<div><span style="color:#4ea9ff;font-weight:700;">WHAT:</span> ' + esc(f.what) + '</div>' +
-          '<div><span style="color:#ffcf73;font-weight:700;">WHY:</span> ' + esc(f.why) + '</div>' +
-          '<div><span style="color:#49d45f;font-weight:700;">FIX:</span> ' + esc(f.fix) + '</div>' +
+        '<div style="display:flex;gap:6px;">' +
+          '<button onclick="EngineAuditor.setViewMode(\'severity\')" style="flex:1;background:' + (_viewMode === 'severity' ? '#1a1a1a' : '#0a0a0a') + ';border:1px solid ' + (_viewMode === 'severity' ? '#d4af37' : '#333') + ';color:' + (_viewMode === 'severity' ? '#d4af37' : '#888') + ';padding:6px;font-size:10px;font-weight:900;cursor:pointer;border-radius:4px;letter-spacing:0.5px;">GROUP BY SEVERITY</button>' +
+          '<button onclick="EngineAuditor.setViewMode(\'category\')" style="flex:1;background:' + (_viewMode === 'category' ? '#1a1a1a' : '#0a0a0a') + ';border:1px solid ' + (_viewMode === 'category' ? '#d4af37' : '#333') + ';color:' + (_viewMode === 'category' ? '#d4af37' : '#888') + ';padding:6px;font-size:10px;font-weight:900;cursor:pointer;border-radius:4px;letter-spacing:0.5px;">GROUP BY CATEGORY</button>' +
         '</div>' +
       '</div>';
-    }).join('');
 
-    panel.innerHTML = summaryHtml +
+    const roadmapHtml = roadmap.length
+      ? '<div style="padding:10px 12px;background:#100a06;border-bottom:2px solid #2a1a08;">' +
+          '<div style="color:#ffcf73;font-size:11px;font-weight:900;letter-spacing:1px;margin-bottom:6px;">🛠 PRIORITIZED REMEDIATION ROADMAP (top ' + roadmap.length + ')</div>' +
+          roadmap.map((f, i) => '<div style="font-size:11px;color:#ccc;padding:3px 0;border-top:' + (i === 0 ? 'none' : '1px solid #1a1408') + ';">' +
+            '<span style="color:' + SEV_COLOR[f.severity] + ';font-weight:900;">' + (i + 1) + '. [' + f.severity + ']</span> ' +
+            '<span style="color:#888;">(' + esc(f.area) + ')</span> ' + esc(f.title) +
+          '</div>').join('') +
+        '</div>'
+      : '';
+
+    const bodyHtml = _viewMode === 'category' ? renderByCategory(_findings) : renderBySeverity(_findings);
+
+    panel.innerHTML = summaryHtml + roadmapHtml +
       '<div style="flex:1;overflow-y:auto;background:#0a0a0a;">' +
-        (rowsHtml || '<div style="color:#555;font-size:12px;text-align:center;padding:30px;font-weight:bold;">No findings.</div>') +
+        (bodyHtml || '<div style="color:#555;font-size:12px;text-align:center;padding:30px;font-weight:bold;">No findings.</div>') +
       '</div>';
+  }
+
+  function setViewMode(mode) {
+    if (mode !== 'severity' && mode !== 'category') return;
+    _viewMode = mode;
+    render();
   }
 
   function open() {
@@ -24152,8 +24776,11 @@ const EngineAuditor = (function () {
   /*__ENGINE_AUDITOR_SELF_END__*/
   return {
     open, close, run: runFullAudit,
+    runCategory, setViewMode, exportJSON, exportText, copyAll,
     get isOpen() { return _isOpen; },
-    get findings() { return _findings.slice(); }
+    get findings() { return _findings.slice(); },
+    get categories() { return CATEGORIES.map(c => ({ id: c.id, letter: c.letter, label: c.label })); },
+    get health() { return healthFromFindings(_findings); }
   };
 })();
 // Top-level `const`/`let` do NOT attach to `window` in any browser — only
@@ -24161,6 +24788,7 @@ const EngineAuditor = (function () {
 // (used by the Full Audit button's onclick and its own failure diagnostics)
 // actually resolves instead of always evaluating falsy.
 window.EngineAuditor = EngineAuditor;
+
 
 
 window.openVisualReportFromDebug = function() {
