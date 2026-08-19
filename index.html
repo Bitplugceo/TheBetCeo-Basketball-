@@ -1,4 +1,3 @@
-O
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -14590,10 +14589,7 @@ function getH2HWeight(lenA, lenB, marketType = "ft", sampleTier = "thin", diverg
   // the dead volRatio/baseline computation that used to sit here and never
   // affect the output has been removed rather than left as misleading code.
   function applyVolatility(proj, series, leagueVolLimit, league, baselineOverride) {
-    // *** INTENTIONAL BUG FOR AUDITOR POWER TEST — REMOVE AFTER TEST ***
-    // Shrinks mean toward 100 so Full Audit must flag VOL mean mutation.
-    if (!isFinite(proj)) return proj;
-    return proj * 0.85 + 100 * 0.15;
+    return proj;
   }
 
 function getVolatilityRatioForSeries(series, leagueVolLimit) {
@@ -15421,22 +15417,20 @@ function resolveConfidenceGradeFromWinProbability(winProb, league = "", marketKe
   return "D";
 }
 
-// Single source of truth for live win probability (logistic + distribution blend).
-// Used by getConfidenceGrade AND by pick.winProbability / audit serialization
-// so a graded play never shows winProbability: null while finalGrade is A/B/C.
-function resolveLiveWinProbability(params) {
-  const p = params || {};
+function getConfidenceGrade(params) {
+
   const {
     pick, note, line, edge, sampleTier, hasH2H, volatility, volLimit,
     trap,
+    // NEW/UNCALIBRATED wiring — see getConfidenceWinProbability for how these
+    // are used. Previously computed and passed at every call site, never read.
     paceGapRisk, blowoutGap, lineupQuality, siblingEdge, q4Edge, q2Edge,
     defensiveFloorFlag,
-    league = "",
-    marketKey = ""
-  } = p;
+    league = ""
+  } = params || {};
 
   if (!pick || pick === "NO PLAY" || note || line === null || !isFinite(line) || line <= 0 || !isFinite(edge)) {
-    return null;
+    return "NaN";
   }
 
   const edgePct = Math.abs(edge / line);
@@ -15447,11 +15441,13 @@ function resolveLiveWinProbability(params) {
     defensiveFloorFlag, pickEdge: edge, pickSide: _pickSide
   });
 
-  // Distribution-primary when available; logistic is blend anchor when fitted.
+  // A3: predictive Normal distribution is the primary probability when available.
+  // Logistic model is retained as a calibrated fallback / blend anchor so fitted
+  // coefficients are not discarded. When distribution SD is valid, blend 70/30
+  // toward the CDF so grades reflect P(total beats line) rather than a pure
+  // scalar edge mapping.
   try {
-    const _volLimitPts = (typeof getMarketVolLimit === "function")
-      ? (getMarketVolLimit(league, marketKey || p.marketKey || "ft") || 12)
-      : 12;
+    const _volLimitPts = getMarketVolLimit(league, params?.marketKey || "ft") || 12;
     const _distProb = distributionWinProbability(edge, _volLimitPts, volRatio);
     if (Number.isFinite(_distProb)) {
       if (Number.isFinite(winProb)) {
@@ -15459,32 +15455,20 @@ function resolveLiveWinProbability(params) {
       } else {
         winProb = _distProb;
       }
-    }
-  } catch (_dpe) {
-    if (typeof engineDebug === "function") {
-      engineDebug("resolveLiveWinProbability distribution failed", { error: _dpe?.message || String(_dpe) });
-    }
-  }
-
-  return Number.isFinite(winProb) ? winProb : null;
-}
-
-function getConfidenceGrade(params) {
-  const p = params || {};
-  const winProb = resolveLiveWinProbability(p);
-  // Stash for callers that only received a grade string historically.
-  try { p._resolvedWinProbability = winProb; } catch (_e) {}
-
-  if (!Number.isFinite(winProb)) {
-    if (typeof engineDebug === "function") {
-      engineDebug("getConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
-        league: p.league, marketKey: p.marketKey
+      engineDebug("Distribution-primary winProb", {
+        league, marketKey: params?.marketKey, distributionWinProb: _distProb, blendedWinProb: winProb
       });
     }
+  } catch (_dpe) { engineDebug("distributionWinProbability comparison failed", { error: _dpe?.message || String(_dpe) }); }
+
+  if (!Number.isFinite(winProb)) {
+    engineDebug("getConfidenceGrade: non-finite winProb, forcing NaN sentinel", {
+      league, marketKey: params?.marketKey, edgePct, volRatio, sampleTier, hasH2H
+    });
     return "NaN";
   }
 
-  return resolveConfidenceGradeFromWinProbability(winProb, p.league || "", p.marketKey || "");
+  return resolveConfidenceGradeFromWinProbability(winProb, league, params?.marketKey || "");
 }
 
 function getMarginConfidenceGrade(params) {
@@ -21531,34 +21515,7 @@ applyLeagueTrustToPicks(finalPicksForDisplay, league);
           const hasH2H = p.hasH2H ?? false;
           const trapFlag = p.trap ?? false;
 
-          // Same blend as getConfidenceGrade — never logistic-only (null when unfitted).
-          if (typeof resolveLiveWinProbability === "function") {
-            p.winProbability = resolveLiveWinProbability({
-              pick: p.pick || p.predictionText,
-              note: p.note,
-              line: p.line ?? p.displayLineUsed ?? p.lineAtPick,
-              edge: p.edge,
-              sampleTier: sampleTier,
-              hasH2H: hasH2H,
-              volatility: p.volatility,
-              volLimit: marketVolLimit,
-              trap: trapFlag,
-              league: p.league || league,
-              marketKey: p.marketKey
-            });
-          } else {
-            const _logistic = getConfidenceWinProbability(grade, edgePct, volRatio, sampleTier, hasH2H, trapFlag, league);
-            let _wp = _logistic;
-            try {
-              const _dist = distributionWinProbability(p.edge, marketVolLimit || 12, volRatio);
-              if (Number.isFinite(_dist)) {
-                _wp = Number.isFinite(_logistic)
-                  ? clampNumber(0.70 * _dist + 0.30 * _logistic, 0.02, 0.98)
-                  : _dist;
-              }
-            } catch (_e) {}
-            p.winProbability = Number.isFinite(_wp) ? _wp : null;
-          }
+          p.winProbability = getConfidenceWinProbability(grade, edgePct, volRatio, sampleTier, hasH2H, trapFlag, league);
         }
       });
     }
@@ -22091,7 +22048,7 @@ window.__LAST_AUDIT_STATE = {
         modelGradeC_Threshold: _aud_gradeThresholds.cThresh,
         calculatedWinProbabilities: finalPicksForDisplay.map(p => ({
           market: p.marketKey,
-          winProbability: Number.isFinite(Number(p.winProbability)) ? Number(p.winProbability) : null
+          winProbability: p.winProbability || null
         }))
       }
     };
@@ -23009,451 +22966,6 @@ try {
 <script>
 const _originalEngineDebug = (typeof engineDebug === 'function') ? engineDebug : null;
 const _originalTrackerDebug = (typeof trackerDebug === 'function') ? trackerDebug : null;
-
-// =============================================================================
-// ENGINE AUDITOR v4 — FULL CODE COVERAGE (boot → fetch → math → markets →
-// confidence → tracker → storage → UI → debug). Debug-page only (AFDB).
-// =============================================================================
-window.EngineAuditor = (function () {
-  const NL = String.fromCharCode(10);
-
-  function issue(sev, area, title, what, why, fix) {
-    return { sev: sev, area: area, title: title, what: what || title, why: why || "", fix: fix || "" };
-  }
-  function present(fn) { return typeof fn === "function"; }
-  function presentName(name) {
-    try {
-      // same-script scope
-      return typeof eval(name) === "function";
-    } catch (e) {
-      try { return typeof window[name] === "function"; } catch (e2) { return false; }
-    }
-  }
-
-  // Full-engine domain map: beginning of pipeline → end
-  var DOMAIN_MAP = {
-    BOOT: ["ensureFreshBuild", "getCurrentModelVersion", "getEngineHealthSnapshot", "checkModelHealth", "ENGINE_INTEGRITY_SHIELD"],
-    CONFIG: ["getParam", "getLeagueScoreBase", "getMarketVolLimit", "getLeagueEdgePointThreshold", "getDynamicWeights", "getEffectivePaceClamp", "LEAGUE_BASES", "TUNABLE_PARAM_REGISTRY", "MODEL_TUNING"],
-    INPUT: ["extractInputs", "captureAllInputs", "parseNumberList", "safeArr", "buildLooseParsedState"],
-    FETCH: ["proxyFetch", "fetchESPN", "fetchESPNCore", "fetchScheduleCore", "fetchH2HCore", "searchTeamFromAPI", "fetchNcaaSchedule", "fetchNcaaH2H", "fetchLeagueStandings"],
-    SERIES: ["getFetchedSeries", "getManualSeries", "getManualAllowedSeries", "getOverallSeries", "getH2HSeries", "getDateAwareOrFallbackAverage", "getSampleTier"],
-    VENUE: ["computeVenueBlend", "combineVenueDiag"],
-    ADVANCED: ["calculateAdvancedMetrics", "derivePeriodAdvanced", "getPeriodAdvancedSeries"],
-    PROJECTION: ["computeFTProjection", "compute1HProjection", "compute2HProjection", "computeMarginProjection", "anchorProjection", "avgOrNaN", "clampNumber"],
-    H2H_MATH: ["getH2HWeight", "getH2HSeasonDecayWeight"],
-    VOL: ["applyVolatility", "getVolatilityRatioForSeries", "computeCombinedMarginVolatility"],
-    PICK: ["getPick", "getPickSideFromText", "formatMarginPickForDisplay", "applySmartLineToPick"],
-    TRAP: ["detectTrap", "detectTrapMeta", "detectMarginTrap", "rememberMarketLine"],
-    CONFIDENCE: ["buildConfidenceFeatures", "getConfidenceWinProbability", "resolveLiveWinProbability", "getConfidenceGrade", "getMarginConfidenceGrade", "resolveConfidenceGradeFromWinProbability", "distributionWinProbability", "_normalCdf"],
-    CALIBRATION: ["calibrateConfidenceModel", "applyConfidenceModelProposal", "calculateCalibrationMetrics", "recordMarketECE", "getMarketECE", "refreshAllMarketECEFromTracker"],
-    INTEL: ["computeIntelligencePack", "applyIntelligenceLayerToPicks", "applySoftTrackerInfluenceToPicks", "applyLeagueTrustToPicks", "buildTotalMarketIntelSignal", "buildTeamMarketIntelSignal"],
-    TRACKER: ["addTrackedPicks", "ensureTrackedPickKeys", "createEmptyTrackerState", "buildTrackerDerivedState", "archiveExpiredTrackedPicks", "applyManualSettlementToTrackedPick", "getAllTrackedPicksForReport", "flushTrackerSave", "forceTrackerSaveNow"],
-    UI: ["openTrackerModal", "closeTrackerModal", "buildResultRows", "copyTrackerData", "copyConfigsData", "renderConfigsPanel"],
-    DEBUG: ["engineDebug", "trackerDebug", "AFDB", "__BB_RUN_MATH_TESTS__", "EngineAuditor"],
-    SECURITY: ["WORKER_URL", "WORKER_SHARED_SECRET"]
-  };
-
-  function run() {
-    var issues = [];
-    var notes = [];
-    var push = function (sev, area, title, what, why, fix) {
-      issues.push(issue(sev, area, title, what, why, fix));
-    };
-    var note = function (area, msg) { notes.push({ area: area, msg: msg }); };
-    var checksRun = 0;
-    function tick() { checksRun++; }
-
-    var coverage = { total: 0, present: 0, missing: [] };
-
-    // ========== A. FULL CODE INVENTORY (start → end) ==========
-    tick();
-    Object.keys(DOMAIN_MAP).forEach(function (domain) {
-      DOMAIN_MAP[domain].forEach(function (sym) {
-        coverage.total++;
-        var ok = false;
-        try {
-          if (sym === "AFDB") ok = typeof AFDB !== "undefined";
-          else if (sym === "ENGINE_INTEGRITY_SHIELD") ok = typeof ENGINE_INTEGRITY_SHIELD !== "undefined";
-          else if (sym === "LEAGUE_BASES") ok = typeof LEAGUE_BASES === "object" && !!LEAGUE_BASES;
-          else if (sym === "TUNABLE_PARAM_REGISTRY") ok = typeof TUNABLE_PARAM_REGISTRY === "object" && !!TUNABLE_PARAM_REGISTRY;
-          else if (sym === "MODEL_TUNING") ok = typeof MODEL_TUNING !== "undefined";
-          else if (sym === "WORKER_URL") ok = typeof WORKER_URL === "string" && WORKER_URL.length > 0;
-          else if (sym === "WORKER_SHARED_SECRET") ok = typeof WORKER_SHARED_SECRET === "string";
-          else if (sym === "EngineAuditor") ok = typeof window.EngineAuditor === "object";
-          else if (sym === "__BB_RUN_MATH_TESTS__") ok = typeof window.__BB_RUN_MATH_TESTS__ === "function";
-          else ok = presentName(sym);
-        } catch (e) { ok = false; }
-        if (ok) coverage.present++;
-        else {
-          coverage.missing.push(domain + ":" + sym);
-          // Only CRITICAL for absolute core; WARN for optional NCAA/intel
-          var criticalCore = {
-            computeFTProjection: 1, getPick: 1, getConfidenceGrade: 1, fetchESPN: 1,
-            proxyFetch: 1, addTrackedPicks: 1, getH2HWeight: 1, applyVolatility: 1
-          };
-          if (criticalCore[sym]) {
-            push("CRITICAL", "COVERAGE", domain + " missing " + sym, sym + " not in runtime", "Pipeline segment broken", "Restore " + sym);
-          } else if (domain === "FETCH" && (sym.indexOf("Ncaa") >= 0 || sym.indexOf("Standings") >= 0)) {
-            // soft
-          } else {
-            push("WARN", "COVERAGE", domain + " missing " + sym, sym + " not found", "Optional or renamed symbol — coverage gap", "Confirm rename or restore " + sym);
-          }
-        }
-      });
-    });
-    var covPct = coverage.total ? Math.round(100 * coverage.present / coverage.total) : 0;
-    note("COVERAGE", "Symbol map " + coverage.present + "/" + coverage.total + " (" + covPct + "%) across " + Object.keys(DOMAIN_MAP).length + " domains");
-    if (coverage.missing.length && coverage.missing.length <= 12) {
-      note("COVERAGE", "Missing: " + coverage.missing.join(", "));
-    } else if (coverage.missing.length > 12) {
-      note("COVERAGE", "Missing " + coverage.missing.length + " symbols (first: " + coverage.missing.slice(0, 8).join(", ") + "…)");
-    }
-
-    // Integrity shield
-    tick();
-    try {
-      if (typeof ENGINE_INTEGRITY_SHIELD !== "undefined" && ENGINE_INTEGRITY_SHIELD.audit) {
-        var si = ENGINE_INTEGRITY_SHIELD.audit() || [];
-        si.forEach(function (s) { push("CRITICAL", "BOOT", "Integrity: " + s, String(s), "Boot integrity failed", "Fix shield finding"); });
-        if (!si.length) note("BOOT", "ENGINE_INTEGRITY_SHIELD clean");
-      }
-    } catch (e) {
-      push("ERROR", "BOOT", "Integrity threw", String(e.message || e), "Shield broken", "Inspect ENGINE_INTEGRITY_SHIELD");
-    }
-
-    // ========== B. CONFIG ==========
-    try {
-      tick();
-      if (typeof LEAGUE_BASES === "object" && LEAGUE_BASES) {
-        if (!Number.isFinite(LEAGUE_BASES.nba)) push("ERROR", "CONFIG", "LEAGUE_BASES.nba", "missing", "NBA base total required", "Set LEAGUE_BASES.nba");
-        else note("CONFIG", "NBA base=" + LEAGUE_BASES.nba);
-      }
-      if (present(getParam)) {
-        var tw = getParam("teamWeightBase", "nba");
-        if (tw != null && (Number(tw) < 0.35 || Number(tw) > 0.95)) {
-          push("WARN", "CONFIG", "teamWeightBase unusual", String(tw), "Outside typical band", "Review TUNABLE_PARAM_REGISTRY");
-        }
-      }
-      if (present(getMarketVolLimit)) {
-        ["ft", "h1", "h2", "q1", "team"].forEach(function (mk) {
-          var v = getMarketVolLimit("nba", mk);
-          if (!Number.isFinite(v) || v <= 0) push("ERROR", "CONFIG", "volLimit " + mk, String(v), "Invalid vol limit", "backfillMissingLeagueVolLimits / LEAGUE vol tables");
-        });
-      }
-    } catch (e) {
-      push("ERROR", "CONFIG", "Config checks threw", String(e.message || e), "Config layer unverified", "Inspect getParam / LEAGUE_BASES");
-    }
-
-    // ========== C. VOL / H2H / PERIOD / PICK (math core) ==========
-    try {
-      tick();
-      if (present(applyVolatility)) {
-        [0, 50, 120, 220.5].forEach(function (v) {
-          if (applyVolatility(v, [70, 80, 90, 100], 12, "nba", 90) !== v) {
-            push("ERROR", "VOL", "Mean mutated", "v=" + v, "Vol must not shrink mean", "Identity applyVolatility");
-          }
-        });
-        note("VOL", "identity OK");
-      }
-      tick();
-      if (present(getVolatilityRatioForSeries)) {
-        var short = getVolatilityRatioForSeries([1, 2], 12);
-        var wild = getVolatilityRatioForSeries([40, 160, 50, 150, 100], 12);
-        if (short !== 1.0) push("ERROR", "VOL", "Short default", String(short), "<3 samples → 1.0", "getVolatilityRatioForSeries");
-        if (!Number.isFinite(wild) || wild > 2.5 + 1e-9) push("ERROR", "VOL", "Uncapped ratio", String(wild), "Cap 2.5", "Clamp ratio");
-      }
-      tick();
-      if (present(getH2HWeight)) {
-        var cap = 0.30;
-        try {
-          var pc = Number(getParam && getParam("h2hMaxWeight", "nba"));
-          if (Number.isFinite(pc) && pc > 0 && pc <= 1) cap = pc;
-        } catch (e) {}
-        if (getH2HWeight(0, 0, "ft", "full", 0, "nba", 220, 1, null) !== 0) push("ERROR", "H2H", "Zero sample weight", "non-zero", "Must be 0", "minLen<2→0");
-        if (getH2HWeight(1, 1, "ft", "full", 0, "nba", 220, 1, null) !== 0) push("ERROR", "H2H", "One sample weight", "non-zero", "Must be 0", "minLen<2→0");
-        var wFull = getH2HWeight(10, 10, "ft", "full", 0, "nba", 220, 1, null);
-        var wThin = getH2HWeight(10, 10, "ft", "thin", 0, "nba", 220, 1, null);
-        var wDiv = getH2HWeight(10, 10, "ft", "full", 80, "nba", 220, 1, null);
-        if (!Number.isFinite(wFull) || wFull > cap + 1e-9 || wFull < 0) push("ERROR", "H2H", "Cap breach", "w=" + wFull + " cap=" + cap, "Over h2hMaxWeight", "Clamp");
-        if (!(wFull + 1e-9 >= wThin)) push("ERROR", "H2H", "Tier order", "full/thin", "full≥thin", "tierPenalty");
-        if (!(wDiv < wFull - 0.001)) push("ERROR", "H2H", "Divergence dead", "div not lower", "Must cut weight", "divergencePenalty");
-        note("H2H", "cap=" + cap + " full=" + Number(wFull).toFixed(3));
-      }
-      tick();
-      if (present(getPeriodAdvancedSeries)) {
-        var th = getPeriodAdvancedSeries({ ortg10_h2: [1, 2, 3], drtg10_h2: [1, 2, 3], ortg10: [110], pace10: [100] }, "h2");
-        if (!th || th.source !== "none") push("ERROR", "PERIOD", "H2 thin leak", "source=" + (th && th.source), "FT leak into 2H", "source=none when <5");
-        else note("PERIOD", "H2 thin protected");
-      }
-      tick();
-      if (present(derivePeriodAdvanced)) {
-        var d = derivePeriodAdvanced({ possessions: 100, pace: 100 }, 50, 40, 0.5, "nba");
-        if (!d || Math.abs(d.possessions - 50) > 0.05) push("ERROR", "PERIOD", "periodPoss", String(d && d.possessions), "gamePoss×frac", "derivePeriodAdvanced");
-        if (!d || Math.abs(d.ortg - 100) > 0.1) push("ERROR", "PERIOD", "ORTG", String(d && d.ortg), "100×pts/poss", "derivePeriodAdvanced");
-      }
-      tick();
-      if (present(getPick)) {
-        if (getPick(0, 220, "nba", "ft", {}) !== "NO PLAY") push("ERROR", "PICK", "Zero edge", "not NO PLAY", "Invalid bet", "NO PLAY");
-        if (String(getPick(8, 220, "nba", "ft", {})).indexOf("OVER") !== 0) push("ERROR", "PICK", "OVER sign", "bad", "Sign", "getPick");
-        if (String(getPick(-8, 220, "nba", "ft", {})).indexOf("UNDER") !== 0) push("ERROR", "PICK", "UNDER sign", "bad", "Sign", "getPick");
-        if (getPick(5, null, "nba", "ft", {}) !== "NO PLAY") push("ERROR", "PICK", "Null line", "plays", "No line", "NO PLAY");
-      }
-    } catch (e) {
-      push("ERROR", "MATH", "Core math threw", String(e.message || e), "Math layer failed", "Inspect vol/H2H/period/pick");
-    }
-
-    // ========== D. CONFIDENCE FULL PATH ==========
-    try {
-      tick();
-      if (present(buildConfidenceFeatures)) {
-        var f = buildConfidenceFeatures({ edgePct: 0.09, sampleTier: "full", hasH2H: false, trap: true, volatilityRatio: 1 });
-        if (Math.abs(f.edgePct - 0.03) > 1e-9) push("ERROR", "CONFIDENCE", "Pivot", String(f.edgePct), "Need 0.060 pivot", "buildConfidenceFeatures");
-        if (Math.abs(buildConfidenceFeatures({ edgePct: 9 }).edgePct - 0.03) > 1e-9) push("ERROR", "CONFIDENCE", "Percent norm", "9 not →0.03", "Train≠serve", "/100 when abs>1");
-      }
-      tick();
-      if (present(resolveLiveWinProbability) && present(getConfidenceGrade)) {
-        if (getConfidenceGrade({ pick: "NO PLAY", line: 220, edge: 5, league: "nba" }) !== "NaN") {
-          push("ERROR", "CONFIDENCE", "NO PLAY graded", "letter grade", "Sentinel broken", "Return NaN");
-        }
-        var play = { pick: "OVER 220", line: 220, edge: 8, sampleTier: "full", hasH2H: false, volatility: 12, volLimit: 12, trap: false, league: "nba", marketKey: "ft" };
-        var wp = resolveLiveWinProbability(play);
-        var g = getConfidenceGrade(play);
-        if (!Number.isFinite(wp)) push("ERROR", "CONFIDENCE", "Play without winProb", String(wp), "Audit null risk", "Distribution fallback");
-        else if (g === "NaN") push("ERROR", "CONFIDENCE", "Finite wp NaN grade", "wp=" + wp, "Inconsistent", "resolveConfidenceGradeFromWinProbability");
-        else note("CONFIDENCE", "parity g=" + g + " wp=" + Number(wp).toFixed(3));
-      } else if (!present(resolveLiveWinProbability)) {
-        push("ERROR", "CONFIDENCE", "resolveLiveWinProbability missing", "absent", "Grade/audit split", "Restore helper");
-      }
-      tick();
-      if (present(distributionWinProbability)) {
-        var p0 = distributionWinProbability(0, 12, 1), pB = distributionWinProbability(8, 12, 1);
-        if (!(pB > p0)) push("ERROR", "CONFIDENCE", "CDF non-monotonic", "p0/pB", "Broken", "_normalCdf");
-      }
-      tick();
-      if (present(getMarginConfidenceGrade)) {
-        var mgNo = getMarginConfidenceGrade({ pick: "NO PLAY", marginEdgePct: 0.1, league: "nba" });
-        if (mgNo !== "NaN") push("ERROR", "CONFIDENCE", "Margin NO PLAY graded", mgNo, "Must NaN", "getMarginConfidenceGrade");
-        var mg = getMarginConfidenceGrade({ pick: "HOME", marginEdgePct: 0.12, marginVolRatio: 1, sampleTier: "full", hasH2H: false, trap: false, league: "nba", marketKey: "winner" });
-        if (mg === "NaN") push("WARN", "CONFIDENCE", "Margin solid edge → NaN grade", "0.12 → NaN", "Winner/handicap side with no grade when logistic unfitted", "Margin distribution fallback like totals");
-        else note("CONFIDENCE", "margin grade=" + mg);
-      }
-    } catch (e) {
-      push("ERROR", "CONFIDENCE", "Path threw", String(e.message || e), "Confidence failed", "Inspect grade pipeline");
-    }
-
-    // ========== E. ALL PROJECTION MARKETS SMOKE ==========
-    try {
-      tick();
-      var toyParsed = {
-        aFTScored: [110, 112, 108, 115, 109, 111, 113, 107, 110, 112],
-        bFTScored: [105, 108, 106, 110, 104, 107, 109, 103, 106, 108],
-        aFTAllowed: [105, 108, 106, 110, 104, 107, 109, 103, 106, 108],
-        bFTAllowed: [110, 112, 108, 115, 109, 111, 113, 107, 110, 112],
-        a1HScored: [55, 56, 54, 58, 53, 55, 57, 52, 54, 56],
-        b1HScored: [52, 54, 51, 55, 50, 53, 54, 49, 52, 53],
-        a1HAllowed: [52, 54, 51, 55, 50, 53, 54, 49, 52, 53],
-        b1HAllowed: [55, 56, 54, 58, 53, 55, 57, 52, 54, 56],
-        aQ3Scored: [27, 28, 27, 29, 28, 28, 28, 27, 28, 28],
-        bQ3Scored: [26, 27, 27, 27, 27, 27, 27, 27, 27, 26],
-        aQ4Scored: [28, 28, 27, 28, 28, 28, 28, 28, 28, 28],
-        bQ4Scored: [27, 27, 28, 28, 27, 27, 28, 27, 27, 26],
-        aQ3Allowed: [26, 27, 27, 27, 27, 27, 27, 27, 27, 26],
-        bQ3Allowed: [27, 28, 27, 29, 28, 28, 28, 27, 28, 28],
-        aQ4Allowed: [27, 27, 28, 28, 27, 27, 28, 27, 27, 26],
-        bQ4Allowed: [28, 28, 27, 28, 28, 28, 28, 28, 28, 28]
-      };
-      var toyCtx = {
-        A: { overall: { ftScored10: toyParsed.aFTScored, ftAllowed10: toyParsed.aFTAllowed, h1Scored10: toyParsed.a1HScored, h1Allowed10: toyParsed.a1HAllowed }, venue: {}, ortg10: [], drtg10: [], pace10: [], ortg10_h1: [], drtg10_h1: [], pace10_h1: [], ortg10_h2: [], drtg10_h2: [], pace10_h2: [] },
-        B: { overall: { ftScored10: toyParsed.bFTScored, ftAllowed10: toyParsed.bFTAllowed, h1Scored10: toyParsed.b1HScored, h1Allowed10: toyParsed.b1HAllowed }, venue: {}, ortg10: [], drtg10: [], pace10: [], ortg10_h1: [], drtg10_h1: [], pace10_h1: [], ortg10_h2: [], drtg10_h2: [], pace10_h2: [] }
-      };
-      var ft, h1, h2;
-      if (present(computeFTProjection)) {
-        ft = computeFTProjection({ league: "nba", parsed: toyParsed, lines: { ftLine: 220 }, injMultA: 1, injMultB: 1, config: { teamWeight: 0.65 }, contextData: toyCtx });
-        if (!ft || !Number.isFinite(ft.ftProj) || ft.ftProj < 150 || ft.ftProj > 300) push("ERROR", "PROJECTION", "FT smoke", String(ft && ft.ftProj), "FT broken", "computeFTProjection");
-        else note("PROJECTION", "FT=" + Number(ft.ftProj).toFixed(1));
-      }
-      if (present(compute1HProjection)) {
-        h1 = compute1HProjection({ league: "nba", parsed: toyParsed, lines: { h1Line: 110 }, injMultA: 1, injMultB: 1, config: { teamWeight: 0.65 }, contextData: toyCtx });
-        if (!h1 || !Number.isFinite(h1.h1Proj) || h1.h1Proj < 70 || h1.h1Proj > 160) push("ERROR", "PROJECTION", "1H smoke", String(h1 && h1.h1Proj), "1H broken", "compute1HProjection");
-        else note("PROJECTION", "1H=" + Number(h1.h1Proj).toFixed(1));
-      }
-      if (present(compute2HProjection)) {
-        h2 = compute2HProjection({ league: "nba", parsed: toyParsed, lines: { h2Line: 110 }, injMultA: 1, injMultB: 1, config: { teamWeight: 0.65 }, contextData: toyCtx });
-        if (!h2 || !Number.isFinite(h2.h2Proj)) push("ERROR", "PROJECTION", "2H smoke with Q3+Q4", String(h2 && h2.h2Proj), "2H should use Q3+Q4", "compute2HProjection");
-        else note("PROJECTION", "2H=" + Number(h2.h2Proj).toFixed(1));
-        var h2empty = compute2HProjection({ league: "nba", parsed: { aFTScored: toyParsed.aFTScored, bFTScored: toyParsed.bFTScored }, lines: { h2Line: 110 }, injMultA: 1, injMultB: 1, config: {}, contextData: toyCtx });
-        if (h2empty && Number.isFinite(h2empty.h2Proj)) push("WARN", "PROJECTION", "2H without quarters finite", String(h2empty.h2Proj), "Possible FT→2H invention", "insufficient → NaN");
-        else note("PROJECTION", "2H empty quarters → non-finite OK");
-      }
-      if (ft && h1 && h2 && Number.isFinite(ft.ftProj) && Number.isFinite(h1.h1Proj) && Number.isFinite(h2.h2Proj)) {
-        var gap = Math.abs((h1.h1Proj + h2.h2Proj) - ft.ftProj);
-        if (gap > 25) push("WARN", "PROJECTION", "H1+H2 vs FT gap", gap.toFixed(1), "Reconcile weak on toy", "Check split");
-        else note("PROJECTION", "H1+H2 vs FT gap=" + gap.toFixed(1));
-      }
-      tick();
-      if (present(computeMarginProjection)) {
-        try {
-          var mp = computeMarginProjection({
-            league: "nba", parsed: toyParsed, lines: {}, injMultA: 1, injMultB: 1, config: { teamWeight: 0.65 }, contextData: toyCtx
-          });
-          if (mp && (Number.isFinite(mp.marginProj) || Number.isFinite(mp.projMargin) || Number.isFinite(mp.winnerMargin))) {
-            note("PROJECTION", "margin path returned finite field");
-          } else note("PROJECTION", "margin projection invoked (shape varies)");
-        } catch (me) {
-          push("WARN", "PROJECTION", "Margin threw", String(me.message || me), "Winner/handicap path error", "computeMarginProjection");
-        }
-      }
-    } catch (e) {
-      push("ERROR", "PROJECTION", "Smoke threw", String(e.message || e), "Projection layer failed", "compute*Projection");
-    }
-
-    // ========== F. SERIES HELPERS ==========
-    try {
-      tick();
-      if (present(getSampleTier)) {
-        if (getSampleTier(new Array(10).fill(1), new Array(10).fill(1)) !== "full") push("ERROR", "SERIES", "10≠full", "tier", "Tier map", "getSampleTier");
-        if (getSampleTier(new Array(5).fill(1), new Array(5).fill(1)) !== "thin") push("ERROR", "SERIES", "5≠thin", "tier", "Tier map", "getSampleTier");
-        if (getSampleTier([1], [1]) !== "insufficient") push("ERROR", "SERIES", "1≠insufficient", "tier", "Tier map", "getSampleTier");
-      }
-      if (present(getManualSeries)) {
-        var h2s = getManualSeries("A", "h2", {
-          aQ3Scored: [10, 11, 12, 13, 14], aQ4Scored: [10, 11, 12, 13, 14]
-        });
-        if (!h2s || h2s.length !== 5 || h2s[0] !== 20) push("ERROR", "SERIES", "H2≠Q3+Q4", JSON.stringify(h2s), "H2 series derivation broken", "getManualSeries h2");
-        else note("SERIES", "H2=Q3+Q4 OK");
-      }
-    } catch (e) {
-      push("ERROR", "SERIES", "Helpers threw", String(e.message || e), "Series layer", "getManualSeries/getSampleTier");
-    }
-
-    // ========== G. GOLDEN MATH ==========
-    try {
-      tick();
-      if (typeof window.__BB_RUN_MATH_TESTS__ === "function") {
-        var r = window.__BB_RUN_MATH_TESTS__();
-        if (!r || !r.ok) {
-          push("ERROR", "MATH_TESTS", "Failures", String(r && r.failCount), "Structural regression", "Fix asserts");
-          (r && r.fails || []).slice(0, 12).forEach(function (f) {
-            push("ERROR", "MATH_TESTS", String(f), String(f), "Assert", "Repair");
-          });
-        } else note("MATH_TESTS", "All passed");
-      } else push("WARN", "MATH_TESTS", "Missing harness", "no __BB_RUN_MATH_TESTS__", "No goldens", "Restore");
-    } catch (e) {
-      push("ERROR", "MATH_TESTS", "Threw", String(e.message || e), "Harness crash", "Inspect");
-    }
-
-    // ========== H. STORAGE + TRACKER (end of pipeline) ==========
-    try {
-      tick();
-      if (!window.localStorage) push("CRITICAL", "STORAGE", "No localStorage", "unavailable", "No persistence", "Enable");
-      else {
-        var raw = localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF");
-        if (raw) {
-          try {
-            var m = JSON.parse(raw);
-            if (!m || typeof m !== "object") push("ERROR", "STORAGE", "Coeff type", "bad", "Corrupt", "Clear key");
-            else note("STORAGE", "coeff scopes " + Object.keys(m).length);
-          } catch (e) {
-            push("ERROR", "STORAGE", "Coeff JSON", String(e.message || e), "Corrupt", "Delete key");
-          }
-        } else note("STORAGE", "logistic unfitted");
-        if (localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_N_PROPOSED") && !localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_PROPOSED")) {
-          push("WARN", "STORAGE", "Orphan N proposal", "N without coeffs", "Non-atomic", "Clear or promote");
-        }
-      }
-      tick();
-      if (typeof g_trackerState !== "undefined" && g_trackerState) {
-        var active = g_trackerState.activePicks || [];
-        var arch = g_trackerState.archivedPicks || [];
-        note("TRACKER", "active=" + active.length + " archived=" + arch.length);
-        var bad = 0;
-        active.concat(arch).slice(0, 250).forEach(function (p) {
-          if (!p) return;
-          var g = String(p.confidenceGrade || "");
-          var pick = String(p.predictionText || p.pick || "");
-          if (pick.indexOf("NO PLAY") === -1 && (g === "A" || g === "B" || g === "C" || g === "D") && !Number.isFinite(Number(p.winProbability))) bad++;
-        });
-        if (bad) push("ERROR", "TRACKER", "Graded without winProb", bad + " picks", "Historical grade/null defect", "Live path fixed; history may remain");
-        if (active.length > 450) push("WARN", "TRACKER", "Capacity", String(active.length), "Near 500", "Archive");
-      } else note("TRACKER", "not ready");
-    } catch (e) {
-      push("WARN", "STORAGE", "End-pipeline threw", String(e.message || e), "Storage/tracker", "Inspect");
-    }
-
-    // ========== I. FETCH / SECURITY ==========
-    try {
-      tick();
-      if (typeof WORKER_SHARED_SECRET === "string" && WORKER_SHARED_SECRET.length) {
-        push("WARN", "SECURITY", "Client secret", "in bundle", "Not real auth", "Worker enforce + rotate");
-      }
-      if (typeof WORKER_URL !== "string" || !WORKER_URL) push("WARN", "FETCH", "No WORKER_URL", "empty", "Proxy may fail", "Set URL");
-      else note("FETCH", "WORKER_URL set");
-      if (!presentName("proxyFetch")) push("WARN", "FETCH", "proxyFetch missing", "absent", "Network layer", "Restore");
-      if (!presentName("fetchESPN")) push("WARN", "FETCH", "fetchESPN missing", "absent", "Auto-fetch", "Restore");
-    } catch (e) {}
-
-    // ========== J. UI / DEBUG (tail of app) ==========
-    try {
-      tick();
-      if (typeof AFDB === "undefined") push("WARN", "DEBUG", "AFDB missing", "no debug brain", "Debug page", "Restore AFDB");
-      else note("DEBUG", "AFDB OK");
-      if (typeof window.EngineAuditor !== "object") push("ERROR", "DEBUG", "Auditor missing", "self", "Cannot self-check", "Restore EngineAuditor");
-      // Home critical nodes (existence only)
-      ["leagueSelect", "teamAName", "teamBName", "runBtn"].forEach(function (id) {
-        if (!document.getElementById(id)) push("WARN", "UI", "Missing #" + id, "DOM", "Home control missing", "Restore markup");
-      });
-    } catch (e) {}
-
-    // ========== SCORES ==========
-    var critical = issues.filter(function (x) { return x.sev === "CRITICAL"; }).length;
-    var errors = issues.filter(function (x) { return x.sev === "ERROR"; }).length;
-    var warns = issues.filter(function (x) { return x.sev === "WARN"; }).length;
-    var infos = issues.filter(function (x) { return x.sev === "INFO"; }).length;
-    var health = Math.max(0, Math.min(100, 100 - critical * 25 - errors * 10 - warns * 3));
-    var power = Math.min(200, Math.round(30 + checksRun * 6 + covPct * 0.7 + Math.min(25, notes.length)));
-
-    return {
-      ok: critical === 0 && errors === 0,
-      counts: { critical: critical, error: errors, warn: warns, info: infos, notes: notes.length },
-      issues: issues,
-      notes: notes,
-      checksRun: checksRun,
-      coverage: coverage,
-      coveragePct: covPct,
-      auditorPower: power,
-      engineHealth: health,
-      ts: new Date().toISOString()
-    };
-  }
-
-  function formatReport(report) {
-    var lines = [];
-    lines.push(report.ok ? "FULL ENGINE AUDIT — NO CRITICAL/ERROR" : "FULL ENGINE AUDIT — ISSUES FOUND");
-    lines.push("Auditor power: " + (report.auditorPower != null ? report.auditorPower : "?") + "/200");
-    lines.push("Engine health: " + (report.engineHealth != null ? report.engineHealth : "?") + "/100");
-    lines.push("Code coverage map: " + (report.coveragePct != null ? report.coveragePct : "?") + "% (" + ((report.coverage && report.coverage.present) || "?") + "/" + ((report.coverage && report.coverage.total) || "?") + " symbols)");
-    lines.push("checksRun: " + (report.checksRun || "?"));
-    var c = report.counts || {};
-    lines.push("Critical: " + (c.critical || 0) + " | Error: " + (c.error || 0) + " | Warn: " + (c.warn || 0) + " | Info: " + (c.info || 0));
-    lines.push("---");
-    var order = { CRITICAL: 0, ERROR: 1, WARN: 2, INFO: 3 };
-    (report.issues || []).slice().sort(function (a, b) { return order[a.sev] - order[b.sev]; }).forEach(function (it, i) {
-      lines.push((i + 1) + ". [" + it.sev + "] [" + it.area + "] " + it.title);
-      lines.push("   WHAT: " + (it.what || ""));
-      lines.push("   WHY: " + (it.why || ""));
-      lines.push("   FIX: " + (it.fix || ""));
-      lines.push("");
-    });
-    if (report.notes && report.notes.length) {
-      lines.push("--- NOTES (OK) ---");
-      report.notes.forEach(function (n) { lines.push("• [" + n.area + "] " + n.msg); });
-    }
-    return lines.join(NL);
-  }
-
-  return { run: run, formatReport: formatReport, version: "v4-fullcode", DOMAIN_MAP: DOMAIN_MAP };
-})();
-
 const AFDB = (function() {
   const LOG_LIMIT = 600;
   let _log = [];
@@ -23565,7 +23077,7 @@ const AFDB = (function() {
   return '<div style="padding:8px;border-bottom:1px solid #151515;"><div style="display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;"><span style="color:#555;font-size:9px;min-width:65px;flex-shrink:0;">' + esc(e.ts) + '</span><span style="color:' + def.color + ';font-size:10px;font-weight:900;min-width:75px;flex-shrink:0;">' + icon + ' ' + esc(e.level) + '</span><span style="color:#777;font-size:9px;min-width:80px;flex-shrink:0;">[' + esc(e.section) + ']</span><span style="color:' + def.color + ';font-size:11px;font-weight:700;flex:1;white-space:pre-wrap;">' + esc(e.msg) + '</span></div>' + dataHtml + '</div>';
 }).join('');
 
-const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="AFDB.runFullAudit()" style="background:#1a3a1a;border:1px solid #49d45f;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(73,212,95,0.35);">🩺 Full Audit</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊 Tracker Report</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
+const headerBtns = '<button onclick="AFDB.copy(this)" style="background:#111;border:1px solid #333;color:#49d45f;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📋 Copy Log</button><button onclick="AFDB.clear()" style="background:#111;border:1px solid #333;color:#ff5c61;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">🗑️ Clear</button><button onclick="AFDB.runTestFetch()" style="background:#2a0608;border:1px solid #d91f26;color:#fff;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;box-shadow:0 0 8px rgba(217,31,38,0.4);">🚨 MILITARY RAID</button><button onclick="window.openVisualReportFromDebug()" style="background:#111;border:1px solid #333;color:#d4af37;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">📊 Tracker Report</button><button onclick="AFDB.close()" style="background:#111;border:1px solid #555;color:#ccc;padding:6px 12px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">✕ Close</button>';
 
     const emptyMsg = _showOnlyErrors ? 'No suspects arrested. The code is clean.' : 'No log entries yet. Run a fetch.';
     const filterLabel = `\ud83c\udfaf LEVEL: ${_currentLogLevel}`;
@@ -23672,67 +23184,7 @@ panel.innerHTML = '<div style="background:#080808;border-bottom:1px solid #222;p
 
   }
 
-  function runFullAudit() {
-    var report;
-    try {
-      report = window.EngineAuditor.run();
-    } catch (e) {
-      report = {
-        ok: false,
-        counts: { critical: 1, error: 0, warn: 0, info: 0 },
-        issues: [{ sev: "CRITICAL", area: "AUDIT", title: "Auditor crashed", what: String(e && e.message || e), why: "Self-audit failed to execute", fix: "Inspect EngineAuditor.run stack" }],
-        notes: [],
-        auditorPower: 0,
-        engineHealth: 0
-      };
-    }
-    var textOut = window.EngineAuditor.formatReport(report);
-    try {
-      log(report.ok ? "ENGINE" : "ERROR", "AUDIT", "Full audit finished", {
-        power: report.auditorPower,
-        health: report.engineHealth,
-        counts: report.counts
-      });
-    } catch (e2) {}
-    // Show full report inside AFDB panel as a sticky block at top of log area
-    try {
-      var existing = document.getElementById("afdbAuditReport");
-      if (existing) existing.remove();
-      var host = document.getElementById("afdbPanel") || document.querySelector("[id*='afdb'], .afdb-panel");
-      // AFDB panel is often the last fixed overlay — find by content
-      var panels = document.querySelectorAll("div");
-      var target = null;
-      for (var i = 0; i < panels.length; i++) {
-        if (panels[i].textContent && panels[i].textContent.indexOf("AUTO-FETCH DEBUG BRAIN") !== -1 && panels[i].style && (panels[i].style.position === "fixed" || panels[i].style.zIndex)) {
-          target = panels[i];
-          break;
-        }
-      }
-      var block = document.createElement("div");
-      block.id = "afdbAuditReport";
-      block.style.cssText = "margin:10px 12px;padding:12px;border:1px solid " + (report.ok ? "#2f8f4a" : "#c91920") + ";background:#0d0d0d;color:" + (report.ok ? "#49d45f" : "#ff8a8a") + ";font-size:11px;font-weight:700;line-height:1.45;white-space:pre-wrap;word-break:break-word;max-height:45vh;overflow-y:auto;border-radius:4px;";
-      block.textContent = textOut;
-      if (target) {
-        // insert after header
-        var header = target.firstChild;
-        if (header && header.nextSibling) target.insertBefore(block, header.nextSibling);
-        else target.appendChild(block);
-      } else {
-        // fallback: append to body fixed
-        block.style.position = "fixed";
-        block.style.left = "8px";
-        block.style.right = "8px";
-        block.style.bottom = "8px";
-        block.style.zIndex = "99999";
-        document.body.appendChild(block);
-      }
-    } catch (domErr) {
-      try { alert(textOut.slice(0, 1500)); } catch (_) {}
-    }
-    return report;
-  }
-
-  return { log, clear, copy, toggleFilter, open, close, runTestFetch, runFullAudit, get isOpen() { return _isOpen; }, get logs() { return _log; } };
+  return { log, clear, copy, toggleFilter, open, close, runTestFetch, get isOpen() { return _isOpen; }, get logs() { return _log; } };
 })();
 
 window.openVisualReportFromDebug = function() {
