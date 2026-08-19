@@ -1,3 +1,4 @@
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2722,7 +2723,7 @@ body.dark-mode .tracker-analytics-section-head {
   <span class="brand-name">TheBetCeo ⚡️</span>
 
 <span class="header-center">
-  <button class="header-error-btn" type="button" id="headerErrorBtn" title="Show fetch/input issues">⚠️</button>
+  <button class="header-error-btn" type="button" id="headerErrorBtn" title="Show fetch/input issues" style="display:none !important; opacity:0; pointer-events:none;">⚠️</button>
 </span>
 
   <span class="brand-right">
@@ -3209,11 +3210,9 @@ body.dark-mode .tracker-analytics-section-head {
   <div class="actions">
     <button id="runBtn" type="button">Run</button>
     <button id="clearBtn" type="button">Clear</button>
-    <button id="mathTestsBtn" type="button" title="Run golden math tests (no console needed)" style="background: #3a404c !important; color: #fff !important; box-shadow: 0 2px 8px rgba(0,0,0,0.2) !important; font-weight: 700 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">Math tests</button>
     <button id="auditCopyBtn" type="button" title="Copy Audit" style="background: #d4af37 !important; color: #111 !important; box-shadow: 0 2px 8px rgba(212, 175, 55, 0.35) !important; font-weight: 700 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">📋</button>
     <button id="inputsCopyBtn" type="button" title="Copy Inputs &amp; Market Lines" style="background: #d4af37 !important; color: #111 !important; box-shadow: 0 2px 8px rgba(212, 175, 55, 0.35) !important; font-weight: 700 !important; border: none !important; padding: 5px 14px !important; font-size: 12px !important; cursor: pointer !important; width: auto !important; min-width: 0 !important;">🗒️</button>
   </div>
-  <div id="mathTestsPanel" style="display:none; margin: 8px 10px 12px; padding: 10px 12px; border: 1px solid var(--panel-border); background: var(--panel-soft); font-size: 11px; font-weight: 700; line-height: 1.45; white-space: pre-wrap; word-break: break-word;"></div>
 
   <div class="table-wrap">
     <table id="results" style="display:none;">
@@ -8660,18 +8659,21 @@ let g_engineAlertNeedsReview = false;
 let g_engineAlertLastLine = "";
 
 function applyGlobalEngineAlertState() {
-  document.body.classList.toggle("engine-alert", !!AppState.ui.alertNeedsReview && !isTrackerDebugView());
+  document.body.classList.remove("engine-alert");
+  AppState.ui.alertNeedsReview = false;
   renderHeaderErrorState();
   updateTrackerInsightsButton();
 }
 
 function triggerGlobalEngineAlert(line = "") {
+  // UI alerts disabled — still record last line for debug panels only; never pulse/alert the user.
   if (line) AppState.ui.alertLastLine = String(line);
-  if (!isTrackerDebugView()) {
-    AppState.ui.alertNeedsReview = true;
-  }
-  applyGlobalEngineAlertState();
-
+  AppState.ui.alertNeedsReview = false;
+  try {
+    document.body.classList.remove("engine-alert");
+    const btn = document.getElementById("headerErrorBtn");
+    if (btn) btn.classList.remove("active");
+  } catch (_e) {}
 }
 
 function acknowledgeGlobalEngineAlert() {
@@ -8701,6 +8703,12 @@ function triggerTrackerMilitaryRaid() {
 function getDebugSeverity(line) {
   const text = String(line || "").toLowerCase();
   if (!text) return "";
+  // Expected recovery paths — not errors
+  if (text.includes("normal fallback") || text.includes("worker path unavailable") ||
+      text.includes("using direct espn") || text.includes("worker fetch failed, trying direct") ||
+      text.includes("trying direct espn")) {
+    return "ok";
+  }
   if (/\b(critical|fatal|fail|failed|failure|error|mismatch|rejected|runtime|uncaught|exception|invalid state|invalid operation|missing competition data)\b/.test(text)) {
     return "error";
   }
@@ -8763,7 +8771,11 @@ function isIgnoredEngineWatchLine(line = "") {
   const text = String(line || "").toLowerCase().trim();
   if (!text) return false;
 
-  return text.includes("validation failed") ||
+  return text.includes("worker path unavailable") ||
+    text.includes("trying direct espn") ||
+    text.includes("normal fallback") ||
+    text.includes("worker fetch failed") ||
+    text.includes("validation failed") ||
     text.includes("run blocked missing league") ||
     text.includes("run blocked duplicate teams") ||
     text.includes("finished with no tracker changes") ||
@@ -9011,12 +9023,10 @@ let g_fetchAuditIssues = [];
 function renderHeaderErrorState() {
   const btn = document.getElementById("headerErrorBtn");
   if (!btn) return;
-
-  const hasIssues = AppState.ui.inputErrors.length > 0 || AppState.ui.auditIssues.length > 0 || AppState.ui.alertNeedsReview;
-  btn.classList.toggle("active", hasIssues);
-  btn.title = AppState.ui.alertNeedsReview
-    ? "Engine alert active. Open Debug to inspect the latest error."
-    : "Show fetch/input issues";
+  // User-facing error badge/popups disabled
+  btn.classList.remove("active");
+  btn.style.display = "none";
+  btn.title = "";
 }
 
 function setFetchInputErrors(errors = []) {
@@ -9603,7 +9613,17 @@ _proxyFetchCache.delete(cacheKey);
     _proxyFetchCache.set(cacheKey, { data: workerData, timestamp: Date.now() });
     return workerData;
   } catch (workerErr) {
-    engineDebug("Worker fetch failed, trying direct ESPN", { request: fetchLabel, error: workerErr?.message || String(workerErr) });
+    // Worker miss is expected often (SW null response / offline worker). Direct ESPN is the normal recovery path —
+    // do NOT log as ERROR per request (spams debug + false alarms). One quiet note per page load max.
+    try {
+      if (!window.__BB_WORKER_FALLBACK_NOTED__) {
+        window.__BB_WORKER_FALLBACK_NOTED__ = true;
+        engineDebug("Worker path unavailable; using direct ESPN for allowlisted hosts (normal fallback)", {
+          sampleRequest: fetchLabel,
+          note: "Further worker misses this session are silent unless direct ESPN also fails"
+        });
+      }
+    } catch (_noteErr) {}
     try {
       // Direct fallback only for ESPN hosts — never open-relay arbitrary URLs.
       if (!/site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com/i.test(String(url || ""))) {
@@ -14614,39 +14634,7 @@ function getVolatilityRatioForSeries(series, leagueVolLimit) {
 // --- Golden math self-tests (Phase C seed) ---
 // Run via: window.__BB_RUN_MATH_TESTS__() from console or a "Run math tests" button.
 
-document.addEventListener("DOMContentLoaded", function () {
-  var btn = document.getElementById("mathTestsBtn");
-  if (!btn || btn._mathWired) return;
-  btn._mathWired = true;
-  btn.addEventListener("click", function () {
-    var panel = document.getElementById("mathTestsPanel");
-    var report;
-    try {
-      if (typeof window.__BB_RUN_MATH_TESTS__ !== "function") {
-        report = { ok: false, failCount: 1, fails: ["__BB_RUN_MATH_TESTS__ not found — engine script failed to load"], message: "Harness missing" };
-      } else {
-        report = window.__BB_RUN_MATH_TESTS__();
-      }
-    } catch (e) {
-      report = { ok: false, failCount: 1, fails: [String(e && e.message || e)], message: "Harness threw" };
-    }
-    var lines = [];
-    lines.push(report.ok ? "✅ MATH TESTS PASSED" : "❌ MATH TESTS FAILED (" + (report.failCount || 0) + ")");
-    lines.push(report.message || "");
-    if (report.fails && report.fails.length) {
-      lines.push("---");
-      report.fails.forEach(function (f, i) { lines.push((i + 1) + ". " + f); });
-    }
-    var textOut = lines.join(String.fromCharCode(10));
-    if (panel) {
-      panel.style.display = "block";
-      panel.style.borderColor = report.ok ? "#2f8f4a" : "#c91920";
-      panel.style.color = report.ok ? "#1e6e39" : "#b11a20";
-      panel.textContent = textOut;
-    }
-    try { alert(textOut); } catch (_) {}
-  });
-});
+
 
 window.__BB_RUN_MATH_TESTS__ = function __BB_RUN_MATH_TESTS__() {
   const fails = [];
@@ -15486,7 +15474,10 @@ function getConfidenceGrade(params) {
 function getMarginConfidenceGrade(params) {
   const {
     pick, marginEdgePct, marginVolRatio, sampleTier, hasH2H, trap,
-    league = ""
+    league = "",
+    // Point margin edge (projA - projB or vs handicap line) for distribution CDF — same role as total edge
+    marginEdgePts = null,
+    volLimitPts = null
   } = params || {};
 
   if (!pick || pick === "NO PLAY" || !isFinite(marginEdgePct)) {
@@ -15495,6 +15486,30 @@ function getMarginConfidenceGrade(params) {
 
   const volRatio = isFinite(marginVolRatio) ? marginVolRatio : 0.5;
   let winProb = getConfidenceWinProbability(null, marginEdgePct, volRatio, sampleTier, hasH2H, !!trap, league);
+
+  // Parity with getConfidenceGrade: when logistic is unfitted/null, still grade via Normal CDF on point margin.
+  try {
+    const edgePts = isFinite(marginEdgePts) ? marginEdgePts : (isFinite(marginEdgePct) ? marginEdgePct : NaN);
+    // Prefer explicit point edge; if only pct was passed historically, distribution still needs a scale — skip pct-only
+    const _volLim = (isFinite(volLimitPts) && volLimitPts > 0)
+      ? volLimitPts
+      : (typeof getMarketVolLimit === "function" ? (getMarketVolLimit(league, params?.marketKey || "winner") || getMarketVolLimit(league, "ft") || 12) : 12);
+    if (isFinite(marginEdgePts) && isFinite(_volLim)) {
+      const _distProb = distributionWinProbability(marginEdgePts, _volLim, volRatio);
+      if (Number.isFinite(_distProb)) {
+        if (Number.isFinite(winProb)) {
+          winProb = clampNumber(0.70 * _distProb + 0.30 * winProb, 0.02, 0.98);
+        } else {
+          winProb = _distProb;
+        }
+        engineDebug("Margin distribution-primary winProb", {
+          league, marketKey: params?.marketKey, distributionWinProb: _distProb, blendedWinProb: winProb, marginEdgePts
+        });
+      }
+    }
+  } catch (_dpe) {
+    engineDebug("getMarginConfidenceGrade distribution fallback failed", { error: _dpe?.message || String(_dpe) });
+  }
 
   // Number.isFinite so null (unfitted logistic) → NaN grade, not silent "D"
   if (!Number.isFinite(winProb)) {
@@ -21068,7 +21083,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: ftCalc.ftHasH2H,
       trap: winnerTrap,
       marketKey: "winner",
-      league
+      league,
+      marginEdgePts: winnerEdge,
+      volLimitPts: getMarketVolLimit(league, "ft")
     });
 
     const handicapMarginInputs = getMarginConfidenceInputs(handicapEdge, ftCalc.ftProj, combinedMarginVolFT, getMarketVolLimit(league, "ft"));
@@ -21081,7 +21098,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: ftCalc.ftHasH2H,
       trap: handicapTrap,
       marketKey: "handicap",
-      league
+      league,
+      marginEdgePts: handicapEdge,
+      volLimitPts: getMarketVolLimit(league, "ft")
     });
 
     const handicapH1MarginInputs = getMarginConfidenceInputs(handicapH1Edge, h1Calc.h1Proj, combinedMarginVolH1, _h1VolLimitForMargin);
@@ -21094,7 +21113,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: h1Calc.h1HasH2H,
       trap: handicapH1Trap,
       marketKey: "handicap_h1",
-      league
+      league,
+      marginEdgePts: handicapH1Edge,
+      volLimitPts: _h1VolLimitForMargin
     });
     const handicapH2MarginInputs = getMarginConfidenceInputs(handicapH2Edge, h2Calc.h2Proj, combinedMarginVolH2, _h2VolLimitForMargin);
     const handicapH2Trap = detectMarginTrap(handicapH2Edge, h2Calc.h2Proj, league, "handicap_h2", combinedMarginVolH2, _h2VolLimitForMargin);
@@ -21106,7 +21127,9 @@ const ftNote = ftCalc.ftNote || ftCalc.ftProjectionNote || null;
       hasH2H: h2Calc.h2HasH2H,
       trap: handicapH2Trap,
       marketKey: "handicap_h2",
-      league
+      league,
+      marginEdgePts: handicapH2Edge,
+      volLimitPts: _h2VolLimitForMargin
     });
 
     const picks = [
@@ -22439,24 +22462,10 @@ const isWnba = leagueVal === "wnba" || leagueVal === "wnba_pre";
 
 const headerErrorBtn = document.getElementById("headerErrorBtn");
 if (headerErrorBtn) {
-  headerErrorBtn.addEventListener("click", () => {
-    const issues = [];
-    if (g_fetchInputErrors.length) {
-      issues.push("Input errors:\n• " + g_fetchInputErrors.join("\n• "));
-    }
-    if (g_fetchAuditIssues.length) {
-      issues.push("Fetch warnings:\n• " + g_fetchAuditIssues.join("\n• "));
-    }
-    if (g_engineAlertNeedsReview) {
-      issues.push("Engine alert: " + g_engineAlertLastLine);
-    }
-    if (issues.length) {
-      alert("⚠️ Issues detected:\n\n" + issues.join("\n\n"));
-    } else {
-      alert("✅ No issues detected.");
-    }
-    acknowledgeGlobalEngineAlert();
-  });
+  headerErrorBtn.style.display = "none";
+  headerErrorBtn.classList.remove("active");
+  // Pop-up alerts disabled — errors stay in debug logs only
+}
 }
 
       const trackerToggleBtn = document.getElementById("trackerToggleBtn");
