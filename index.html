@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10173,15 +10174,6 @@ function buildSettledPickRecord(items = []) {
   base.winPct = base.settled ? (winEq / base.settled) * 100 : NaN;
   base.netWins = Number((base.wins - base.losses).toFixed(2));
   return base;
-}
-
-function getTrackedPickEdgeAbsPoints(pick = {}) {
-  const edge = Number(pick?.edge);
-  if (isFinite(edge)) return Math.abs(edge);
-  const line = Number(pick?.lineAtPick ?? pick?.line);
-  const pct = Number(pick?.edgePct);
-  if (isFinite(pct) && isFinite(line) && line > 0) return Math.abs(pct / 100 * line);
-  return NaN;
 }
 
 function getBestPickShadowSortScore(pick = {}) {
@@ -22465,7 +22457,6 @@ if (headerErrorBtn) {
   headerErrorBtn.classList.remove("active");
   // Pop-up alerts disabled — errors stay in debug logs only
 }
-}
 
       const trackerToggleBtn = document.getElementById("trackerToggleBtn");
       if (trackerToggleBtn) trackerToggleBtn.addEventListener("click", withErrorBoundary(openTrackerModal, "openTrackerModal"));
@@ -23251,7 +23242,6 @@ const EngineAuditor = (function () {
   let _categoryTimings = {};   // { CATEGORY_ID: ms }
   let _categoryErrors = {};    // { CATEGORY_ID: errorMessage }
   let _viewMode = 'severity';  // 'severity' | 'category'
-  let _activeFilter = null;    // severity or category id, or null = all
 
   function add(severity, area, title, what, why, fix, location) {
     _findings.push({
@@ -23459,6 +23449,22 @@ const EngineAuditor = (function () {
   function auditArchitecture() {
     const AREA = 'ARCHITECTURE';
     const src = getConcatenatedScriptSource();
+
+    // 0) Engine boot sanity gate — must run before any live-probe check that calls
+    // into product functions. A parse-time SyntaxError anywhere in the main script
+    // prevents the ENTIRE script from executing (not just the broken line), so every
+    // downstream function-call probe would throw/misreport independently with no
+    // single clear cause. window.__BETCEO_ENGINE_BOOT_SEEN is set false by the page's
+    // crash watchdog and flipped true as the first statement the main script runs, so
+    // it is false at audit time if and only if the main script failed to execute at all.
+    tally(); pass();
+    if (typeof window !== 'undefined' && window.__BETCEO_ENGINE_BOOT_SEEN === false) {
+      add('CRITICAL', AREA, 'ENGINE FAILED TO BOOT — main script did not execute', 'window.__BETCEO_ENGINE_BOOT_SEEN is still false. The main engine script never ran at all, most likely because of a JavaScript parse error (a SyntaxError anywhere in that script prevents the whole script from executing, not just the broken statement).', 'Every other category below that calls into product functions (CONFIDENCE, H2H, VOLATILITY, PERIOD_ADVANCED, REGRESSION_LOCKS, FEATURE_WALKTHROUGH) is checking behavior of code that is not currently running. Their results are not meaningful until this is fixed — treat any findings from those categories as noise until BOOT_SEEN is confirmed true.', 'Open the browser console for the actual "Uncaught SyntaxError" message and line number, or run each inline <script> block through a syntax checker (e.g. `node --check`) to isolate the broken one.', 'window.__BETCEO_ENGINE_BOOT_SEEN');
+    } else if (typeof window !== 'undefined' && window.__BETCEO_ENGINE_BOOT_SEEN === true) {
+      add('INFO', AREA, 'Engine booted successfully', 'window.__BETCEO_ENGINE_BOOT_SEEN is true — the main script executed at least as far as its own boot marker.', 'Confirms downstream live-probe categories are exercising code that is actually running, not silently checking a dead script.', 'No action needed.', 'window.__BETCEO_ENGINE_BOOT_SEEN');
+    } else {
+      add('LOW', AREA, 'Could not read engine boot marker', 'window.__BETCEO_ENGINE_BOOT_SEEN was not found as a boolean on window.', 'If the boot-marker mechanism itself was removed or renamed, this gate can no longer catch a full parse-time failure before it cascades into confusing per-category noise.', 'Confirm the boot-marker mechanism (set false by the crash watchdog, true as the first statement of the main script) is still present.', 'window.__BETCEO_ENGINE_BOOT_SEEN');
+    }
 
     // 1) Single-file monolith size.
     tally(); pass();
@@ -24222,11 +24228,14 @@ const EngineAuditor = (function () {
     tally(); pass();
     if (src) {
       const allowlistPattern = /site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com/;
-      const hasFallbackOrder = /Worker fetch failed, trying direct ESPN/.test(src);
+      // Structural marker, not a log-message string: "DirectESPN" is the literal
+      // label passed to fetchJson() on the direct-fetch fallback call site itself,
+      // so it tracks the actual behavior even if surrounding log text is reworded.
+      const hasFallbackOrder = /fetchJson\s*\(\s*url\s*,\s*["']DirectESPN["']/.test(src) || /["']DirectESPN["']/.test(src);
       if (allowlistPattern.test(src) && hasFallbackOrder) {
-        add('INFO', AREA, 'Proxy → direct-ESPN fallback order confirmed', 'Found both the ESPN host allowlist and the "Worker fetch failed, trying direct ESPN" fallback message, indicating requests try the Cloudflare Worker proxy first and fall back to a direct ESPN call, restricted to allowlisted hosts.', 'A sensible fallback order keeps the app functional if the Worker is briefly down, without opening an unrestricted direct-fetch path.', 'No action needed.', 'proxyFetch()');
+        add('INFO', AREA, 'Proxy → direct-ESPN fallback order confirmed', 'Found both the ESPN host allowlist and a direct-ESPN fallback call site (labeled "DirectESPN"), indicating requests try the Cloudflare Worker proxy first and fall back to a direct ESPN call, restricted to allowlisted hosts.', 'A sensible fallback order keeps the app functional if the Worker is briefly down, without opening an unrestricted direct-fetch path.', 'No action needed.', 'proxyFetch()');
       } else if (!hasFallbackOrder) {
-        add('LOW', AREA, 'Worker→direct-ESPN fallback pattern not found', 'Could not find the expected "Worker fetch failed, trying direct ESPN" fallback path in source.', 'If the fallback was removed, an outage of the Cloudflare Worker would take down ESPN auto-fetch entirely instead of degrading gracefully.', 'Confirm whether the fallback was intentionally removed (e.g. Worker is now mandatory) or should be restored.', 'proxyFetch()');
+        add('LOW', AREA, 'Worker→direct-ESPN fallback pattern not found', 'Could not find a direct-ESPN fallback call site (expected a fetchJson(url, "DirectESPN") call) in source.', 'If the fallback was removed, an outage of the Cloudflare Worker would take down ESPN auto-fetch entirely instead of degrading gracefully.', 'Confirm whether the fallback was intentionally removed (e.g. Worker is now mandatory) or should be restored.', 'proxyFetch()');
       }
     }
 
@@ -24346,6 +24355,27 @@ const EngineAuditor = (function () {
       }
     } else {
       add('INFO', AREA, 'No obvious duplicate function bodies found', 'A normalized-body hash scan across named functions found no exact-match groups of size ≥8 lines.', 'This is a heuristic (whitespace/string-normalized) match, not a semantic-duplication analysis — treat as a first pass.', 'No action needed from this check alone.', 'Function-body duplicate scan');
+    }
+
+    tally(); pass();
+    // Exact-name duplicate declarations are a distinct failure mode from near-duplicate
+    // bodies above: findDuplicateFunctionBodies() dedupes by name before comparing bodies,
+    // and extractFunctionBody() only ever finds the FIRST match for a given name — so if the
+    // exact same function name is declared twice, the second (silently-winning, via hoisting)
+    // copy is structurally invisible to that check. This scan catches that case independently.
+    const topLevelFnNames = [];
+    const topLevelFnRe = /^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm;
+    let tlm;
+    while ((tlm = topLevelFnRe.exec(src)) !== null) topLevelFnNames.push(tlm[1]);
+    const nameCounts = {};
+    topLevelFnNames.forEach(n => { nameCounts[n] = (nameCounts[n] || 0) + 1; });
+    const exactDupNames = Object.keys(nameCounts).filter(n => nameCounts[n] > 1);
+    if (exactDupNames.length) {
+      exactDupNames.forEach(name => {
+        add('MEDIUM', AREA, 'Duplicate top-level function declaration: ' + name, 'Found ' + nameCounts[name] + ' unindented top-level "function ' + name + '(" declarations in the inline scripts. In non-strict script code the later declaration silently wins via hoisting, so the earlier copy becomes unreachable dead code.', 'This is the exact same name declared twice, so any future edit to the losing copy has zero effect at runtime — easy to miss and a real time-waster to debug. It is checked separately from the near-duplicate-body scan above because that scan structurally cannot see a second same-named declaration.', 'Remove or rename the redundant declaration, keeping whichever copy is intended to be authoritative.', name + '() (duplicate declaration)');
+      });
+    } else {
+      add('INFO', AREA, 'No duplicate top-level function names found', 'Scanned ' + Object.keys(nameCounts).length + ' unindented top-level function declaration(s); no name was declared more than once.', 'A same-name redeclaration would silently override the earlier copy at runtime with no error, so this runs as its own check rather than folding into the near-duplicate-body scan above.', 'No action needed.', 'Top-level function declarations (exact-name scan)');
     }
 
     tally(); pass();
@@ -24607,6 +24637,36 @@ const EngineAuditor = (function () {
     return { code: out, state: state };
   }
 
+  /** Strip comment contents only (block + line comments), preserving string literal
+   *  contents intact. Used for id-bearing calls like getElementById('foo') where the
+   *  id text itself lives inside the string and must survive the strip, while a
+   *  getElementById() mentioned only inside a comment must not be picked up as live. */
+  function _stripCommentsOnlyStateful(line, state) {
+    if (!state) state = { inBlockComment: false, inString: null };
+    var out = '';
+    var n = line.length;
+    var i = 0;
+    while (i < n) {
+      var ch = line[i];
+      var next = i + 1 < n ? line[i + 1] : '';
+      if (state.inBlockComment) {
+        if (ch === '*' && next === '/') { out += '  '; i += 2; state.inBlockComment = false; continue; }
+        out += ' '; i++; continue;
+      }
+      if (state.inString) {
+        out += ch;
+        if (ch === '\\') { i++; if (i < n) { out += line[i]; i++; } continue; }
+        if (ch === state.inString) { state.inString = null; }
+        i++; continue;
+      }
+      if (ch === '/' && next === '*') { out += '  '; i += 2; state.inBlockComment = true; continue; }
+      if (ch === '/' && next === '/') { while (i < n) { out += ' '; i++; } break; }
+      if (ch === "'" || ch === '"' || ch === '`') { state.inString = ch; out += ch; i++; continue; }
+      out += ch; i++;
+    }
+    return { code: out, state: state };
+  }
+
   function _scanLine(line, lineNo, acc) {
     if (!acc._stripState) acc._stripState = { inBlockComment: false, inString: null };
     var stripped = _stripStringsAndCommentsStateful(line, acc._stripState);
@@ -24627,9 +24687,12 @@ const EngineAuditor = (function () {
     if (/\bconsole\.log\s*\(/.test(code)) {
       acc.consoleLogs.push(lineNo);
     }
+    if (!acc._commentStripState) acc._commentStripState = { inBlockComment: false, inString: null };
+    var idScan = _stripCommentsOnlyStateful(line, acc._commentStripState);
+    acc._commentStripState = idScan.state;
     var ge = /getElementById\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
     var m;
-    while ((m = ge.exec(line)) !== null) {
+    while ((m = ge.exec(idScan.code)) !== null) {
       if (!acc.gebIds[m[1]]) acc.gebIds[m[1]] = [];
       if (acc.gebIds[m[1]].length < 3) acc.gebIds[m[1]].push(lineNo);
     }
@@ -24685,6 +24748,9 @@ async function auditFullLineScan() {
       gebIds: progress.gebIds && typeof progress.gebIds === 'object' ? Object.assign({}, progress.gebIds) : {},
       _stripState: progress.stripState && typeof progress.stripState === 'object'
         ? { inBlockComment: !!progress.stripState.inBlockComment, inString: progress.stripState.inString || null }
+        : { inBlockComment: false, inString: null },
+      _commentStripState: progress.commentStripState && typeof progress.commentStripState === 'object'
+        ? { inBlockComment: !!progress.commentStripState.inBlockComment, inString: progress.commentStripState.inString || null }
         : { inBlockComment: false, inString: null }
     };
 
@@ -24708,6 +24774,7 @@ async function auditFullLineScan() {
       progress.consoleLogs = acc.consoleLogs;
       progress.gebIds = acc.gebIds;
       progress.stripState = acc._stripState ? { inBlockComment: !!acc._stripState.inBlockComment, inString: acc._stripState.inString || null } : null;
+      progress.commentStripState = acc._commentStripState ? { inBlockComment: !!acc._commentStripState.inBlockComment, inString: acc._commentStripState.inString || null } : null;
       progress.updatedAt = Date.now();
       progress.completed = (i >= total);
       _saveLineScanProgress(progress);
