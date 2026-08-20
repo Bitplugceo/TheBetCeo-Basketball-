@@ -1,4 +1,3 @@
-S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3183,8 +3182,8 @@ body.dark-mode .tracker-analytics-section-head {
   </div>
   <div class="section" id="sofascoreManualSection" style="display: none">
     <h3>
-      🔍 Player Lookup
-      <span style="font-size: 11px; color: #aaa">(Manual leagues — SofaScore)</span>
+      🔍 SofaScore Auto-Fetch
+      <span style="font-size: 11px; color: #aaa">(Manual leagues — auto like ESPN · paste still works as fallback)</span>
     </h3>
 
     <div
@@ -3220,6 +3219,28 @@ body.dark-mode .tracker-analytics-section-head {
         />
         <button
           type="button"
+          id="ssAutoBtnA"
+          onclick="autoFetchSofascoreSide('A')"
+          style="
+            background: #1f6feb;
+            color: #fff;
+            border: none;
+            margin: 0;
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 800;
+            line-height: 1;
+            width: auto;
+            flex-shrink: 0;
+            cursor: pointer;
+            border-radius: 4px;
+          "
+          title="Auto-search team + fetch last events via worker"
+        >
+          ⚡ Auto
+        </button>
+        <button
+          type="button"
           onclick="searchSofascorePlayer('A')"
           style="
             background: #3a404c;
@@ -3231,7 +3252,7 @@ body.dark-mode .tracker-analytics-section-head {
             flex-shrink: 0;
             cursor: pointer;
           "
-          title="Search basketball team"
+          title="Open SofaScore search JSON in new tab (manual)"
         >
           🔍
         </button>
@@ -3313,6 +3334,28 @@ body.dark-mode .tracker-analytics-section-head {
         />
         <button
           type="button"
+          id="ssAutoBtnB"
+          onclick="autoFetchSofascoreSide('B')"
+          style="
+            background: #1f6feb;
+            color: #fff;
+            border: none;
+            margin: 0;
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 800;
+            line-height: 1;
+            width: auto;
+            flex-shrink: 0;
+            cursor: pointer;
+            border-radius: 4px;
+          "
+          title="Auto-search team + fetch last events via worker"
+        >
+          ⚡ Auto
+        </button>
+        <button
+          type="button"
           onclick="searchSofascorePlayer('B')"
           style="
             background: #3a404c;
@@ -3324,7 +3367,7 @@ body.dark-mode .tracker-analytics-section-head {
             flex-shrink: 0;
             cursor: pointer;
           "
-          title="Search basketball team"
+          title="Open SofaScore search JSON in new tab (manual)"
         >
           🔍
         </button>
@@ -3435,6 +3478,29 @@ body.dark-mode .tracker-analytics-section-head {
           style="font-size: 10px; font-weight: 800; color: var(--muted)"
         ></span>
       </div>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px;">
+      <button
+        type="button"
+        id="ssAutoFetchBothBtn"
+        onclick="autoFetchSofascoreBoth()"
+        style="
+          background: linear-gradient(135deg,#1f6feb,#238636);
+          color: #fff;
+          border: none;
+          margin: 0;
+          padding: 8px 14px;
+          font-size: 12px;
+          font-weight: 900;
+          cursor: pointer;
+          border-radius: 6px;
+          letter-spacing: 0.2px;
+        "
+        title="Resolve both teams on SofaScore and pull last events through the worker"
+      >
+        ⚡ Auto Fetch Both Teams
+      </button>
+      <span style="font-size:10px;color:var(--muted);">Uses worker → api.sofascore.com · paste JSON still works as fallback</span>
     </div>
     <div id="ssFetchStatus" style="font-size: 10px; min-height: 16px; margin-top: 6px"></div>
   </div>
@@ -4633,9 +4699,328 @@ function searchSofascorePlayer(side) {
   if (st) {
     st.style.color = "#d98a00";
     st.textContent =
-      "🔍 Basketball-only search opened for " +
+      "🔍 Manual search opened for " +
       side +
-      " — find the team ID in the JSON and paste it above.";
+      " — or use ⚡ Auto to fetch without pasting.";
+  }
+}
+
+function ssSetStatus(msg, tone) {
+  const st = document.getElementById("ssFetchStatus");
+  if (!st) return;
+  st.style.color =
+    tone === "ok" ? "#2f8f4a" : tone === "err" ? "#d92d2a" : tone === "warn" ? "#d98a00" : "#9aa4b2";
+  st.textContent = msg || "";
+}
+
+function ssIsWomenLeagueSelected() {
+  const leagueSelect = document.getElementById("leagueSelect")?.value || "";
+  return (
+    leagueSelect.endsWith("_w") || leagueSelect === "wnba" || leagueSelect === "wnba_pre"
+  );
+}
+
+function ssNormalizeName(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function ssScoreTeamCandidate(entity, query, isWomenLeague) {
+  const team = entity?.entity || entity || {};
+  const name = ssNormalizeName(team.name || team.shortName || team.slug || "");
+  const q = ssNormalizeName(query);
+  if (!name || !q) return -1;
+  let score = 0;
+  if (name === q) score += 120;
+  else if (name.startsWith(q) || q.startsWith(name)) score += 80;
+  else if (name.includes(q) || q.includes(name)) score += 55;
+  else {
+    const qParts = q.split(" ").filter(Boolean);
+    const hits = qParts.filter((p) => name.includes(p)).length;
+    if (!hits) return -1;
+    score += hits * 12;
+  }
+  const sportSlug = String(team.sport?.slug || team.sport?.name || "").toLowerCase();
+  if (sportSlug.includes("basket")) score += 40;
+  else if (sportSlug && !sportSlug.includes("basket")) score -= 50;
+  const genderBlob = [
+    team.name,
+    team.shortName,
+    team.slug,
+    team.teamGender,
+    team.gender,
+    team.tournament?.name,
+  ]
+    .map((x) => String(x || "").toLowerCase())
+    .join(" ");
+  const looksWomen = /women|woman|w\.|femen|ladies|女|여자/.test(genderBlob);
+  if (isWomenLeague) score += looksWomen ? 30 : -25;
+  else if (looksWomen) score -= 45;
+  if (team.userCount) score += Math.min(20, Number(team.userCount) / 5000);
+  return score;
+}
+
+function ssPickBestTeamFromSearch(data, query, isWomenLeague) {
+  const results = Array.isArray(data?.results)
+    ? data.results
+    : Array.isArray(data)
+      ? data
+      : [];
+  let best = null;
+  let bestScore = -1;
+  results.forEach((row) => {
+    const entity = row?.entity || row?.team || row;
+    if (!entity) return;
+    const sc = ssScoreTeamCandidate(row, query, isWomenLeague);
+    if (sc > bestScore) {
+      bestScore = sc;
+      best = entity.entity || entity;
+    }
+  });
+  if (!best || bestScore < 20) return null;
+  return {
+    id: best.id != null ? String(best.id) : "",
+    name: best.name || best.shortName || query,
+    score: bestScore,
+    raw: best,
+  };
+}
+
+async function ssFetchTeamSearch(query) {
+  const url =
+    "https://api.sofascore.com/api/v1/search/teams?q=" +
+    encodeURIComponent(query) +
+    "&sport=basketball";
+  return proxyFetch(url, 15000);
+}
+
+async function ssFetchTeamEventsPage(teamId, page) {
+  const url =
+    "https://api.sofascore.com/api/v1/team/" +
+    encodeURIComponent(String(teamId)) +
+    "/events/last/" +
+    String(page);
+  return proxyFetch(url, 15000);
+}
+
+async function ssFetchTeamEventsMerged(teamId, maxPages) {
+  const pages = Math.max(1, Math.min(4, maxPages || 2));
+  const merged = new Map();
+  for (let p = 0; p < pages; p++) {
+    try {
+      const data = await ssFetchTeamEventsPage(teamId, p);
+      const events = Array.isArray(data?.events) ? data.events : [];
+      if (!events.length) break;
+      events.forEach((ev) => {
+        if (ev && ev.id != null) merged.set(ev.id, ev);
+      });
+      if (events.length < 10) break;
+    } catch (err) {
+      if (p === 0) throw err;
+      engineDebug("ssFetchTeamEventsMerged page failed", {
+        teamId,
+        page: p,
+        error: err?.message || String(err),
+      });
+      break;
+    }
+  }
+  return Array.from(merged.values()).sort(
+    (a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0),
+  );
+}
+
+function ssApplyFetchedEvents(side, events, teamId, teamName) {
+  if (!events || !events.length) throw new Error("No events returned for team " + side);
+
+  const leagueSelect = document.getElementById("leagueSelect")?.value || "";
+  const isWomenLeague = ssIsWomenLeagueSelected();
+  const firstEvent = events[0];
+  const tournamentName = firstEvent?.tournament?.name || "";
+  const isWomenEvent = String(tournamentName).toLowerCase().includes("women");
+  const _leagueLabel = (() => {
+    const sel = document.getElementById("leagueSelect");
+    return sel && sel.selectedIndex >= 0
+      ? (sel.options[sel.selectedIndex]?.text || leagueSelect).trim()
+      : leagueSelect;
+  })();
+  if (!isWomenLeague && isWomenEvent) {
+    throw new Error(
+      "Rejected: fetched data looks women's, but dropdown is: " + _leagueLabel,
+    );
+  }
+  if (isWomenLeague && !isWomenEvent) {
+    throw new Error(
+      "Rejected: fetched data looks men's, but dropdown is: " + _leagueLabel,
+    );
+  }
+
+  const prevEvents = side === "A" ? window.__lastEventsA || [] : window.__lastEventsB || [];
+  const mergedMap = new Map();
+  [...prevEvents, ...events].forEach((ev) => {
+    if (ev && ev.id != null) mergedMap.set(ev.id, ev);
+  });
+  const mergedEvents = Array.from(mergedMap.values()).sort(
+    (a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0),
+  );
+  if (side === "A") window.__lastEventsA = mergedEvents;
+  else window.__lastEventsB = mergedEvents;
+
+  const idEl = document.getElementById(side === "A" ? "ssTeamAId" : "ssTeamBId");
+  if (idEl && teamId) {
+    idEl.value = String(teamId);
+    updateSofascoreLinks(side);
+  }
+  const nameEl = document.getElementById(side === "A" ? "ssTeamAName" : "ssTeamBName");
+  if (nameEl && teamName && !(nameEl.value || "").trim()) {
+    nameEl.value = teamName;
+  }
+  const mainInput = document.getElementById(side === "A" ? "teamAName" : "teamBName");
+  const displayName = (nameEl?.value || teamName || "").trim();
+  if (mainInput && displayName) mainInput.value = displayName;
+
+  if (getFixtureTournamentId() == null) {
+    const _evA = window.__lastEventsA || [];
+    const _evB = window.__lastEventsB || [];
+    if (_evA.length > 0 && _evB.length > 0) {
+      const _candidates = detectTournamentIdIntersection(_evA, _evB);
+      if (_candidates && _candidates.length) {
+        const top = _candidates[0];
+        window.__fixtureTournamentId = top.id;
+        const _tidEl = document.getElementById("ssTournamentId");
+        const _tNameEl = document.getElementById("ssTournamentName");
+        if (_tidEl && !(_tidEl.value || "").trim()) _tidEl.value = String(top.id);
+        if (_tNameEl && top.name) _tNameEl.textContent = "(" + top.name + ")";
+      }
+    } else {
+      const primary = detectPrimaryTournamentForEvents(mergedEvents);
+      if (primary && primary.id) {
+        window.__fixtureTournamentId = primary.id;
+        const _tidEl = document.getElementById("ssTournamentId");
+        const _tNameEl = document.getElementById("ssTournamentName");
+        if (_tidEl && !(_tidEl.value || "").trim()) _tidEl.value = String(primary.id);
+        if (_tNameEl && primary.name) _tNameEl.textContent = "(" + primary.name + ")";
+      }
+    }
+  }
+
+  reprocessBothTeamsFromEvents();
+  openSection("marketSection");
+  openSection("teamASection");
+  openSection("teamBSection");
+  invalidateFetchedAudit();
+  return mergedEvents.length;
+}
+
+async function autoFetchSofascoreSide(side) {
+  const btn = document.getElementById(side === "A" ? "ssAutoBtnA" : "ssAutoBtnB");
+  const nameEl = document.getElementById(side === "A" ? "ssTeamAName" : "ssTeamBName");
+  const idEl = document.getElementById(side === "A" ? "ssTeamAId" : "ssTeamBId");
+  const mainNameEl = document.getElementById(side === "A" ? "teamAName" : "teamBName");
+  let rawName = (nameEl?.value || "").trim();
+  if (!rawName) rawName = (mainNameEl?.value || "").trim();
+  if (!rawName && !(idEl?.value || "").trim()) {
+    ssSetStatus("Enter Team " + side + " name (or ID) first.", "err");
+    return false;
+  }
+  const searchName = rawName.split(",")[0].trim();
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "…";
+  }
+  try {
+    ssSetStatus("⚡ Auto-fetching Team " + side + " from SofaScore…", "warn");
+    let teamId = (idEl?.value || "").trim();
+    let teamName = searchName || ("Team " + side);
+
+    if (!teamId || !/^\d+$/.test(teamId)) {
+      if (!searchName) throw new Error("Need a team name to search SofaScore.");
+      const searchData = await ssFetchTeamSearch(searchName);
+      const picked = ssPickBestTeamFromSearch(
+        searchData,
+        searchName,
+        ssIsWomenLeagueSelected(),
+      );
+      if (!picked || !picked.id) {
+        throw new Error(
+          "No SofaScore basketball team match for \"" +
+            searchName +
+            "\". Try a clearer name or paste JSON.",
+        );
+      }
+      teamId = String(picked.id);
+      teamName = picked.name || teamName;
+      if (idEl) {
+        idEl.value = teamId;
+        updateSofascoreLinks(side);
+      }
+      if (nameEl && !(nameEl.value || "").trim()) nameEl.value = teamName;
+      ssSetStatus(
+        "Found " +
+          teamName +
+          " (ID " +
+          teamId +
+          ") — pulling events…",
+        "warn",
+      );
+    }
+
+    const events = await ssFetchTeamEventsMerged(teamId, 3);
+    const n = ssApplyFetchedEvents(side, events, teamId, teamName);
+    ssSetStatus(
+      "✅ Team " +
+        side +
+        " auto-loaded (" +
+        n +
+        " events) · " +
+        teamName +
+        " [" +
+        teamId +
+        "]",
+      "ok",
+    );
+    return true;
+  } catch (err) {
+    const msg = err?.message || String(err);
+    ssSetStatus("❌ Auto-fetch Team " + side + " failed: " + msg, "err");
+    engineDebug("autoFetchSofascoreSide failed", { side, error: msg });
+    return false;
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "⚡ Auto";
+    }
+  }
+}
+
+async function autoFetchSofascoreBoth() {
+  const bothBtn = document.getElementById("ssAutoFetchBothBtn");
+  if (bothBtn) {
+    bothBtn.disabled = true;
+    bothBtn.textContent = "⚡ Fetching…";
+  }
+  try {
+    ssSetStatus("⚡ Auto-fetching both teams from SofaScore…", "warn");
+    const okA = await autoFetchSofascoreSide("A");
+    const okB = await autoFetchSofascoreSide("B");
+    if (okA && okB) {
+      ssSetStatus(
+        "✅ Both teams auto-loaded from SofaScore. Enter market lines and Run.",
+        "ok",
+      );
+    } else if (okA || okB) {
+      ssSetStatus(
+        "⚠️ Partial auto-fetch — one side failed. Check name/ID or paste JSON for the failed side.",
+        "warn",
+      );
+    }
+  } finally {
+    if (bothBtn) {
+      bothBtn.disabled = false;
+      bothBtn.textContent = "⚡ Auto Fetch Both Teams";
+    }
   }
 }
 
@@ -12463,7 +12848,9 @@ async function proxyFetch(url, timeoutMs = 12000) {
     // D2: only proxy allowlisted sports hosts through the worker.
     var _uCheck = String(url || "");
     var _allowedHost =
-      /site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com/i.test(_uCheck);
+      /site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com|api\.sofascore\.com|(?:^|\/\/)(?:[\w.-]+\.)?sofascore\.com/i.test(
+        _uCheck,
+      );
     if (!_allowedHost && /https?:\/\//i.test(_uCheck)) {
       engineDebug("proxyFetch blocked non-allowlisted host", { request: fetchLabel });
       throw new Error("proxyFetch: target host not allowlisted");
@@ -12497,7 +12884,7 @@ async function proxyFetch(url, timeoutMs = 12000) {
     try {
       // Direct fallback only for ESPN hosts — never open-relay arbitrary URLs.
       if (
-        !/site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com/i.test(
+        !/site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com|api\.sofascore\.com|(?:^|\/\/)(?:[\w.-]+\.)?sofascore\.com/i.test(
           String(url || ""),
         )
       ) {
