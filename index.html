@@ -9403,8 +9403,13 @@ function derivePeriodAdvanced(fullAdv, ptsMine, ptsOpp, periodFraction, league) 
   };
 }
 
-    function logDebug(...args) {
-      if (DEBUG) console.log("[BB Engine]", ...args);
+    function logDebug(message, extra) {
+      // Was: DEBUG-gated raw console.log. DEBUG is const false (see above),
+      // so this was a silent, permanent no-op for all 10 call sites that use
+      // it. Routed through engineDebug so these fetch-failure logs actually
+      // land in the in-app debug panel (filterable, visible), consistent
+      // with how the rest of the codebase logs.
+      if (typeof engineDebug === "function") engineDebug(message, extra);
     }
 
     function cacheSet(map, key, val) {
@@ -14744,7 +14749,6 @@ window.__BB_RUN_MATH_TESTS__ = function __BB_RUN_MATH_TESTS__() {
     message: fails.length === 0 ? "All golden math tests passed" : (fails.length + " golden math test(s) failed")
   };
   if (typeof engineDebug === "function") engineDebug("MATH_TESTS", report);
-  try { console.log("[BB Engine] MATH_TESTS", report); } catch (_c) {}
   try {
     var panel = document.getElementById("mathTestsPanel");
     if (panel) {
@@ -23662,7 +23666,11 @@ const EngineAuditor = (function () {
     if (src) {
       const swBody = /navigator\.serviceWorker\.register\(([^)]*)\)/.exec(src);
       if (swBody) {
-        const hasCatch = /register\([^)]*\)[\s\S]{0,120}?\.catch\(/.test(src);
+        // Window widened from 120 -> 500: the real registration block has a
+        // .then() handler between register(...) and .catch(...), which is
+        // ~250 chars on its own. The old 120-char window could never reach
+        // the catch and permanently false-flagged this finding as missing.
+        const hasCatch = /register\([^)]*\)[\s\S]{0,500}?\.catch\(/.test(src);
         if (!hasCatch) {
           add('LOW', AREA, 'Service worker registration has no visible .catch()', 'navigator.serviceWorker.register(...) was found, but a nearby .catch() handler for registration failure was not detected by this scan.', 'An unhandled promise rejection on registration failure is usually non-fatal, but makes install failures invisible to the user and to debug logs.', 'Confirm a .catch() (or try/await+catch) surrounds registration and logs via engineDebug, as the current code appears to already do — re-run after any change to this block.', 'serviceWorker.register() call');
         } else {
@@ -25103,17 +25111,117 @@ async function auditFullLineScan() {
     return text;
   }
 
-  // Copies the ENTIRE report (every category, every severity, summary +
-  // roadmap) to the clipboard in one go — independent of whichever
-  // severity/category view the overlay currently has toggled on-screen.
-  function copyAll() {
-    const text = buildFullReportText();
-    const btn = document.getElementById('auditorCopyAllBtn');
+  // ---------------------------------------------------------------
+  // View-scoped copy text (Group by Severity tab / Info tab)
+  // ---------------------------------------------------------------
+  // Shared "page header" — the summary strip + roadmap block. This part of
+  // the on-screen panel is identical no matter which tab (_viewMode) is
+  // currently toggled, so both view-scoped builders below reuse it as-is.
+  function buildHeaderLines() {
+    const health = healthFromFindings(_findings);
+    const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, INFO: 0 };
+    _findings.forEach(f => counts[f.severity] = (counts[f.severity] || 0) + 1);
+
+    const lines = [];
+    lines.push('====================================================');
+    lines.push('  BB ENGINE — AUDIT REPORT');
+    lines.push('====================================================');
+    lines.push('Generated    : ' + new Date().toLocaleString());
+    lines.push('Health       : ' + health.score + '/100 — ' + health.label);
+    lines.push('Checks       : ' + _checksRun + '/' + _checksTotal + ' live checks across ' + CATEGORIES.length + ' categories');
+    lines.push('Findings     : ' + _findings.length + ' total — ' +
+      counts.CRITICAL + ' CRITICAL, ' + counts.HIGH + ' HIGH, ' + counts.MEDIUM + ' MEDIUM, ' + counts.LOW + ' LOW, ' + counts.INFO + ' INFO');
+    if (_lastRunMs != null) lines.push('Run time     : ' + _lastRunMs + ' ms');
+    lines.push('');
+
+    const roadmap = buildRoadmap(_findings);
+    if (roadmap.length) {
+      lines.push('--- PRIORITIZED REMEDIATION ROADMAP (top ' + roadmap.length + ') ---');
+      roadmap.forEach((f, i) => {
+        lines.push((i + 1) + '. [' + f.severity + '] (' + f.area + ') ' + f.title);
+        lines.push('   FIX: ' + f.fix);
+      });
+      lines.push('');
+    }
+    return lines;
+  }
+
+  function findingTextLines(f) {
+    return [
+      '[' + f.severity + '] ' + f.title,
+      '  Location: ' + f.location,
+      '  WHAT: ' + f.what,
+      '  WHY:  ' + f.why,
+      '  FIX:  ' + f.fix,
+      ''
+    ];
+  }
+
+  // GROUP BY SEVERITY tab copy: header + the actionable CRITICAL/HIGH/
+  // MEDIUM/LOW groups exactly as shown on screen in this view, with the
+  // INFO findings appended afterward for reference (the on-screen severity
+  // view itself hides INFO rows, but the copy should not lose them).
+  function buildSeverityViewText() {
+    const lines = buildHeaderLines();
+    lines.push('====================================================');
+    lines.push('  GROUP BY SEVERITY');
+    lines.push('====================================================');
+    lines.push('');
+    const order = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
+    let any = false;
+    order.forEach(sev => {
+      const group = _findings.filter(f => f.severity === sev);
+      if (!group.length) return;
+      any = true;
+      lines.push('--- ' + sev + ' (' + group.length + ') ---');
+      group.forEach(f => lines.push.apply(lines, findingTextLines(f)));
+    });
+    if (!any) { lines.push('No CRITICAL / HIGH / MEDIUM / LOW findings.'); lines.push(''); }
+
+    const infoFindings = _findings.filter(f => f.severity === 'INFO');
+    lines.push('====================================================');
+    lines.push('  INFO (' + infoFindings.length + ') — added for reference');
+    lines.push('====================================================');
+    lines.push('');
+    infoFindings.forEach(f => lines.push.apply(lines, findingTextLines(f)));
+
+    return lines.join('\n');
+  }
+
+  // INFO tab copy: header + ONLY the INFO findings, grouped by category
+  // exactly as shown on screen in this view. Deliberately excludes the
+  // CRITICAL/HIGH/MEDIUM/LOW "Group by Severity" content.
+  function buildInfoViewText() {
+    const lines = buildHeaderLines();
+    lines.push('====================================================');
+    lines.push('  INFO');
+    lines.push('====================================================');
+    lines.push('');
+    const infoFindings = _findings.filter(f => f.severity === 'INFO');
+    CATEGORIES.forEach(cat => {
+      const group = infoFindings.filter(f => f.area === cat.id);
+      if (!group.length) return;
+      lines.push('--- ' + cat.letter + '. ' + cat.label.toUpperCase() + ' (' + group.length + ') ---');
+      group.forEach(f => lines.push.apply(lines, findingTextLines(f)));
+    });
+    if (!infoFindings.length) { lines.push('No INFO findings.'); lines.push(''); }
+
+    return lines.join('\n');
+  }
+
+  // Copies whatever is CURRENTLY ON SCREEN: the header/roadmap plus either
+  // the Group by Severity content (+ INFO appended) or the Info content
+  // alone, depending on _viewMode. This replaces the old copyAll(), which
+  // always copied the full report regardless of the toggled view.
+  function copyCurrentView() {
+    const text = _viewMode === 'info' ? buildInfoViewText() : buildSeverityViewText();
+    const btn = document.getElementById('auditorCopyViewBtn');
+    const label = _viewMode === 'info' ? '✅ COPIED INFO VIEW' : '✅ COPIED SEVERITY VIEW';
     const finish = (ok) => {
       if (!btn) return;
       const orig = btn.getAttribute('data-orig-label') || btn.textContent;
       if (!btn.getAttribute('data-orig-label')) btn.setAttribute('data-orig-label', orig);
-      btn.textContent = ok ? '✅ COPIED EVERYTHING' : '❌ COPY FAILED';
+      btn.textContent = ok ? label : '❌ COPY FAILED';
       setTimeout(() => { if (btn) btn.textContent = btn.getAttribute('data-orig-label') || orig; }, 1800);
     };
     const fallbackCopy = () => {
@@ -25130,6 +25238,19 @@ async function auditFullLineScan() {
     }
     return text;
   }
+
+  // Kept as an explicit escape hatch (not wired to any button): copies the
+  // true full report — every category, every severity — regardless of
+  // view. copyAll() is aliased to this for anyone/anything still calling
+  // EngineAuditor.copyAll() directly (e.g. from the console).
+  function copyFullReport() {
+    const text = buildFullReportText();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {});
+    }
+    return text;
+  }
+  const copyAll = copyFullReport;
 
   function triggerDownload(content, mime, filename) {
     try {
@@ -25219,7 +25340,7 @@ async function auditFullLineScan() {
         '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px;">' +
           '<div style="color:#d4af37;font-size:14px;font-weight:900;letter-spacing:1px;">🩺 ENGINE SELF-AUDIT</div>' +
           '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
-            '<button id="auditorCopyAllBtn" onclick="EngineAuditor.copyAll()" title="Copies the full report — every category, every severity, summary + roadmap — regardless of the current view toggle below" style="background:#1a1206;border:1px solid #d4af37;color:#ffd75e;padding:6px 10px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">📋 Copy All</button>' +
+            '<button id="auditorCopyViewBtn" onclick="EngineAuditor.copyCurrentView()" title="' + (_viewMode === 'info' ? 'Copies the header + only the INFO findings shown in this Info view. Excludes CRITICAL/HIGH/MEDIUM/LOW (Group by Severity) findings.' : 'Copies the header + the CRITICAL/HIGH/MEDIUM/LOW findings shown in this Group by Severity view, with INFO findings appended for reference.') + '" style="background:#1a1206;border:1px solid #d4af37;color:#ffd75e;padding:6px 10px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">' + (_viewMode === 'info' ? '📋 Copy Info' : '📋 Copy Severity View') + '</button>' +
             '<button onclick="EngineAuditor.run()" style="background:#0a1f0a;border:1px solid #2f8f4a;color:#49ff7a;padding:6px 10px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">↻ Re-run All</button>' +
             '<button onclick="EngineAuditor.exportJSON()" style="background:#0a1420;border:1px solid #2f6f8f;color:#8fd3ff;padding:6px 10px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">⬇ JSON</button>' +
             '<button onclick="EngineAuditor.exportText()" style="background:#0a1420;border:1px solid #2f6f8f;color:#8fd3ff;padding:6px 10px;font-size:11px;font-weight:900;cursor:pointer;border-radius:4px;">⬇ Text</button>' +
@@ -25290,7 +25411,7 @@ async function auditFullLineScan() {
   /*__ENGINE_AUDITOR_SELF_END__*/
   return {
     open, close, run: runFullAudit,
-    runCategory, setViewMode, exportJSON, exportText, copyAll,
+    runCategory, setViewMode, exportJSON, exportText, copyAll, copyCurrentView, copyFullReport,
     get isOpen() { return _isOpen; },
     get findings() { return _findings.slice(); },
     get categories() { return CATEGORIES.map(c => ({ id: c.id, letter: c.letter, label: c.label })); },
