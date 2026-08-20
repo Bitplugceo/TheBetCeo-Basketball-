@@ -1,3 +1,4 @@
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -23232,6 +23233,24 @@ const EngineAuditor = (function () {
   const SEV_WEIGHT = { CRITICAL: 20, HIGH: 12, MEDIUM: 6, LOW: 2, INFO: 0 };
   const SEV_COLOR  = { CRITICAL: '#ff5c61', HIGH: '#ff9d4d', MEDIUM: '#ffcf73', LOW: '#8fd3ff', INFO: '#4ea9ff' };
 
+  // -------------------------------------------------------------
+  // Accepted design decisions — findings the team has knowingly reviewed
+  // and decided NOT to act on. Once a key is present here, its matching
+  // check reports the finding as INFO (documented + accepted) instead of
+  // an actionable severity — so it stops costing health-score points and
+  // stops showing up on the actionable view. It still shows up under the
+  // INFO tab so the decision stays visible/auditable, it just isn't
+  // treated as a to-do anymore.
+  // To revisit a decision later, delete its key below and the underlying
+  // check goes back to flagging normally.
+  // -------------------------------------------------------------
+  const ACCEPTED_DESIGN_DECISIONS = {
+    SINGLE_FILE_MONOLITH: {
+      decidedOn: '2026-08-20',
+      note: 'Single-file deployment is a deliberate choice for this project, not an oversight — do not re-flag as actionable.'
+    }
+  };
+
   let _findings = [];
   let _checksRun = 0;
   let _checksTotal = 0;
@@ -23240,7 +23259,7 @@ const EngineAuditor = (function () {
   let _running = false;
   let _categoryTimings = {};   // { CATEGORY_ID: ms }
   let _categoryErrors = {};    // { CATEGORY_ID: errorMessage }
-  let _viewMode = 'severity';  // 'severity' | 'category'
+  let _viewMode = 'severity';  // 'severity' | 'info'
 
   function add(severity, area, title, what, why, fix, location) {
     _findings.push({
@@ -23477,7 +23496,10 @@ const EngineAuditor = (function () {
     if (src) {
       const totalLines = src.split('\n').length;
       const fnCount = (src.match(/\bfunction\s+[A-Za-z_$][\w$]*\s*\(/g) || []).length;
-      if (totalLines > 15000) {
+      if (totalLines > 15000 && ACCEPTED_DESIGN_DECISIONS.SINGLE_FILE_MONOLITH) {
+        const dec = ACCEPTED_DESIGN_DECISIONS.SINGLE_FILE_MONOLITH;
+        add('INFO', AREA, 'Single-file monolith size (accepted design choice)', 'The inline script content totals roughly ' + totalLines + ' lines across ~' + fnCount + ' named functions, all in one HTML file with no module boundaries.', 'This has already been reviewed and knowingly accepted, on ' + dec.decidedOn + ', as the intended architecture rather than something to fix. ' + dec.note, 'No action needed. Remove the SINGLE_FILE_MONOLITH key from ACCEPTED_DESIGN_DECISIONS near the top of EngineAuditor if this decision is ever revisited.', 'Whole-file line/function count');
+      } else if (totalLines > 15000) {
         add('LOW', AREA, 'Single-file monolith is very large', 'The inline script content totals roughly ' + totalLines + ' lines across ~' + fnCount + ' named functions, all in one HTML file with no module boundaries.', 'Past a certain size, a single-file architecture makes it hard to reason about ownership (which function belongs to which feature), slows editor tooling, and increases the odds two features accidentally share mutable state.', 'Not urgent to fix by itself. If the codebase keeps growing, consider splitting by feature (projection math, tracker, confidence model, fetch layer, UI) into separate <script> modules or a bundler, even while keeping single-file deployment as the build output.', 'Whole-file line/function count');
       } else {
         add('INFO', AREA, 'File size within a manageable single-file range', 'Roughly ' + totalLines + ' lines across ~' + fnCount + ' functions.', 'A single-file architecture is still tractable at this size.', 'No action needed.', 'Whole-file line/function count');
@@ -25135,8 +25157,12 @@ async function auditFullLineScan() {
     '</div>';
   }
 
+  // Actionable / main view. INFO findings are "good news, nothing to do"
+  // items — they carry zero health-score weight (SEV_WEIGHT.INFO === 0)
+  // and are deliberately left out here so this view only ever shows things
+  // actually worth a human's attention. INFO items live in renderInfoView.
   function renderBySeverity(findings) {
-    const order = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];
+    const order = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
     return order.map(sev => {
       const group = findings.filter(f => f.severity === sev);
       if (!group.length) return '';
@@ -25145,10 +25171,15 @@ async function auditFullLineScan() {
     }).join('');
   }
 
-  function renderByCategory(findings) {
+  // INFO view. Holds every INFO-severity finding (checks that passed /
+  // confirmations / accepted design decisions) grouped by category purely
+  // for reference — none of this is actionable and none of it affects the
+  // health score, so it's kept off the main/actionable view entirely.
+  function renderInfoView(findings) {
+    const infoFindings = findings.filter(f => f.severity === 'INFO');
     return CATEGORIES.map(cat => {
-      const group = findings.filter(f => f.area === cat.id).sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]);
-      if (!group.length && !_categoryErrors[cat.id]) return '';
+      const group = infoFindings.filter(f => f.area === cat.id);
+      if (!group.length) return '';
       const ms = _categoryTimings[cat.id];
       return '<div style="padding:6px 12px;background:#0d0d0d;border-bottom:1px solid #1a1a1a;display:flex;align-items:center;justify-content:space-between;gap:8px;">' +
           '<span style="color:#d4af37;font-size:11px;font-weight:900;letter-spacing:1px;">' + cat.letter + '. ' + esc(cat.label.toUpperCase()) + ' (' + group.length + ')' + (ms != null ? ' · ' + ms + 'ms' : '') + '</span>' +
@@ -25189,7 +25220,7 @@ async function auditFullLineScan() {
         '</div>' +
         '<div style="display:flex;gap:6px;">' +
           '<button onclick="EngineAuditor.setViewMode(\'severity\')" style="flex:1;background:' + (_viewMode === 'severity' ? '#1a1a1a' : '#0a0a0a') + ';border:1px solid ' + (_viewMode === 'severity' ? '#d4af37' : '#333') + ';color:' + (_viewMode === 'severity' ? '#d4af37' : '#888') + ';padding:6px;font-size:10px;font-weight:900;cursor:pointer;border-radius:4px;letter-spacing:0.5px;">GROUP BY SEVERITY</button>' +
-          '<button onclick="EngineAuditor.setViewMode(\'category\')" style="flex:1;background:' + (_viewMode === 'category' ? '#1a1a1a' : '#0a0a0a') + ';border:1px solid ' + (_viewMode === 'category' ? '#d4af37' : '#333') + ';color:' + (_viewMode === 'category' ? '#d4af37' : '#888') + ';padding:6px;font-size:10px;font-weight:900;cursor:pointer;border-radius:4px;letter-spacing:0.5px;">GROUP BY CATEGORY</button>' +
+          '<button onclick="EngineAuditor.setViewMode(\'info\')" style="flex:1;background:' + (_viewMode === 'info' ? '#1a1a1a' : '#0a0a0a') + ';border:1px solid ' + (_viewMode === 'info' ? '#d4af37' : '#333') + ';color:' + (_viewMode === 'info' ? '#d4af37' : '#888') + ';padding:6px;font-size:10px;font-weight:900;cursor:pointer;border-radius:4px;letter-spacing:0.5px;">INFO (' + counts.INFO + ')</button>' +
         '</div>' +
       '</div>';
 
@@ -25203,7 +25234,7 @@ async function auditFullLineScan() {
         '</div>'
       : '';
 
-    const bodyHtml = _viewMode === 'category' ? renderByCategory(_findings) : renderBySeverity(_findings);
+    const bodyHtml = _viewMode === 'info' ? renderInfoView(_findings) : renderBySeverity(_findings);
 
     panel.innerHTML = summaryHtml + roadmapHtml +
       '<div style="flex:1;overflow-y:auto;background:#0a0a0a;">' +
@@ -25212,7 +25243,7 @@ async function auditFullLineScan() {
   }
 
   function setViewMode(mode) {
-    if (mode !== 'severity' && mode !== 'category') return;
+    if (mode !== 'severity' && mode !== 'info') return;
     _viewMode = mode;
     render();
   }
