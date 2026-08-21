@@ -1,3 +1,4 @@
+K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -19164,17 +19165,47 @@ function selectLock(markets) {
       isFinite(volatility) && isFinite(volLimit) && volLimit > 0 ? volatility / volLimit : 0.5;
 
     const league = m?.league || "";
-    return Number(
-      getConfidenceWinProbability(
-        m?.confidenceGrade || m?.confidence || null,
-        edgePct,
-        volRatio,
-        m?.sampleTier || "thin",
-        !!m?.hasH2H,
-        !!m?.trap,
-        league,
-      ),
+    let _reconstructed = getConfidenceWinProbability(
+      m?.confidenceGrade || m?.confidence || null,
+      edgePct,
+      volRatio,
+      m?.sampleTier || "thin",
+      !!m?.hasH2H,
+      !!m?.trap,
+      league,
     );
+
+    // FIX: same distribution-primary blend as getConfidenceGrade/getConfidenceWinProbability
+    // call sites elsewhere. Without this, the fallback returns NaN whenever the
+    // logistic model is unfitted, and every candidate becomes ineligible.
+    try {
+      const _fallbackVolLimit = isFinite(volLimit) ? volLimit : 12;
+      const _fallbackEdgePts = marginMarket
+        ? isFinite(m?.marginEdgePts)
+          ? Number(m.marginEdgePts)
+          : isFinite(Number(m?.edge))
+            ? Number(m.edge)
+            : NaN
+        : isFinite(Number(m?.edge))
+          ? Number(m.edge)
+          : NaN;
+      const _fallbackDistProb = distributionWinProbability(
+        _fallbackEdgePts,
+        _fallbackVolLimit,
+        volRatio,
+      );
+      if (Number.isFinite(_fallbackDistProb)) {
+        _reconstructed = Number.isFinite(_reconstructed)
+          ? clampNumber(0.7 * _fallbackDistProb + 0.3 * _reconstructed, 0.02, 0.98)
+          : _fallbackDistProb;
+      }
+    } catch (_fallbackBlendErr) {
+      engineDebug("selectLock fallback distribution blend failed", {
+        error: _fallbackBlendErr?.message || String(_fallbackBlendErr),
+      });
+    }
+
+    return Number(_reconstructed);
   }
 
   const valid = candidates.filter(
@@ -19571,9 +19602,36 @@ function isConfidenceCoeffFitted(league) {
     const leagueGroup =
       league === "nba" ? "nba" : league === "ncaa" || league === "ncaaw" ? "ncaa" : "other";
     const tierKey = "tier_" + getLeagueTrustMeta(league).level;
-    const coeff = models[league] || models[leagueGroup] || models[tierKey] || models["global"];
+    let _resolvedScope = "global";
+    let coeff;
+    if (models[league]) {
+      coeff = models[league];
+      _resolvedScope = league;
+    } else if (models[leagueGroup]) {
+      coeff = models[leagueGroup];
+      _resolvedScope = leagueGroup;
+    } else if (models[tierKey]) {
+      coeff = models[tierKey];
+      _resolvedScope = tierKey;
+    } else {
+      coeff = models["global"];
+      _resolvedScope = "global";
+    }
     const _requiredCoeffKeys = ["intercept", "edgePct", "volRatio", "sampleFull", "h2h", "trap"];
-    return !!(coeff && _requiredCoeffKeys.every((k) => Number.isFinite(coeff[k])));
+    const _keysFitted = !!(coeff && _requiredCoeffKeys.every((k) => Number.isFinite(coeff[k])));
+    if (!_keysFitted) return false;
+    // FIX: previously this omitted the sample-size floor that
+    // getConfidenceWinProbability enforces (N>=40), so the A-grade cap could
+    // lift ("fitted") while the probability call still returned null for the
+    // same scope. Both checks must now agree on what "fitted" means.
+    let _coeffN = 0;
+    try {
+      const nMap = JSON.parse(localStorage.getItem("BB_CONFIDENCE_MODEL_COEFF_N") || "{}");
+      _coeffN = Number(nMap[_resolvedScope] || nMap.global || 0);
+    } catch (_e) {
+      _coeffN = 0;
+    }
+    return _coeffN >= 40;
   } catch (e) {
     engineDebug("isConfidenceCoeffFitted failed", { league, error: e?.message || String(e) });
     return false;
@@ -28060,7 +28118,7 @@ async function runEngine() {
           const hasH2H = p.hasH2H ?? false;
           const trapFlag = p.trap ?? false;
 
-          p.winProbability = getConfidenceWinProbability(
+          let _lockWinProb = getConfidenceWinProbability(
             grade,
             edgePct,
             volRatio,
@@ -28069,6 +28127,41 @@ async function runEngine() {
             trapFlag,
             league,
           );
+
+          // FIX: mirror getConfidenceGrade's distribution-primary blend here.
+          // Previously this stored the raw logistic-only probability, which is
+          // null until the model is calibrated (>=150 settled picks, then a
+          // manual promote). selectLock() only trusts m.winProbability directly,
+          // so a null here made every pick ineligible and Lock could never fire.
+          try {
+            const _lockVolLimitPts = isFinite(marketVolLimit) ? marketVolLimit : 12;
+            const _lockEdgePts = _isMarginMarketForWinProb
+              ? isFinite(p.marginEdgePts)
+                ? p.marginEdgePts
+                : isFinite(p.edge)
+                  ? p.edge
+                  : NaN
+              : isFinite(p.edge)
+                ? p.edge
+                : NaN;
+            const _lockDistProb = distributionWinProbability(
+              _lockEdgePts,
+              _lockVolLimitPts,
+              volRatio,
+            );
+            if (Number.isFinite(_lockDistProb)) {
+              _lockWinProb = Number.isFinite(_lockWinProb)
+                ? clampNumber(0.7 * _lockDistProb + 0.3 * _lockWinProb, 0.02, 0.98)
+                : _lockDistProb;
+            }
+          } catch (_lockBlendErr) {
+            engineDebug("Lock winProbability distribution blend failed", {
+              error: _lockBlendErr?.message || String(_lockBlendErr),
+              marketKey: p.marketKey,
+            });
+          }
+
+          p.winProbability = _lockWinProb;
         }
       });
     }
@@ -28769,7 +28862,7 @@ async function runEngine() {
       confidenceBuild: {
         gradeThresholds: _aud_gradeThresholds,
         scoringFormula:
-          "score += 2.0 (fullModel+fullSample), +1.0 (fullModel or fullSample), -2 (thin) / -4 (insufficient), -1.0 (projectionOnly), +clamp((edgePct-0.050)/0.03,-1,2), +0.40*|q4EdgeNorm| and +0.75 if q4 agrees with ft side (ft only), +0.20*|q2EdgeNorm| (h1 only), +1.0 H2H else -0.15, then threshold: score>=aThresh->A, >=bThresh->B, >=cThresh->C else D. Trap penalty and isH2 branch were removed (FIX #26/#33) and no longer apply.",
+          "STALE-STRING FIX: the additive score system previously documented here (score += 2.0/1.0/-2/-4/-1.0, clamp(edgePct...), q4EdgeNorm, etc.) does not exist in the live code and never ran during this build. Actual live grading (getConfidenceGrade / resolveConfidenceGradeFromWinProbability): winProb = 0.7*distributionWinProbability(edge, marketVolLimit, volRatio) + 0.3*getConfidenceWinProbability(logistic) when both are finite, else whichever is finite, else NaN sentinel (NO PLAY). getConfidenceWinProbability itself returns null until BB_CONFIDENCE_MODEL_COEFF is fitted for the resolved scope AND that scope has >=40 settled picks (BB_CONFIDENCE_MODEL_COEFF_N) — so distribution CDF is the sole driver until then. Grade A is unreachable (capped at B) while isConfidenceCoeffFitted(league) is false, i.e. before calibration. Thresholds: winProb>=aThresh->A, >=bThresh->B, >=cThresh->C, else D; an ECE-based cap (D13) can further cap to B/C for poorly-calibrated market/league scopes with n>=30 tracked outcomes.",
         markets: {
           FT: {
             pick: ftPick,
