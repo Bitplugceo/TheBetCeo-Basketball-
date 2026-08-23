@@ -172,7 +172,17 @@ body {
   padding: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: Segoe UI, -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "SF Pro Text",
+    "Segoe UI",
+    Roboto,
+    Helvetica,
+    Arial,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   -webkit-text-size-adjust: 100%;
   min-height: 100vh;
   min-height: -webkit-fill-available;
@@ -946,7 +956,24 @@ body.dark-mode #trackedPicksTable th {
   background: #1a1a1a !important;
   color: #ffffff !important;
 }
-body.dark-mode .track-pending {
+/* Status colors must beat #trackedPicksTable td in BOTH themes */
+#trackedPicksTable td.track-win,
+body.dark-mode #trackedPicksTable td.track-win {
+  background: #3a9c35 !important;
+  color: #fff !important;
+}
+#trackedPicksTable td.track-loss,
+body.dark-mode #trackedPicksTable td.track-loss {
+  background: #c91920 !important;
+  color: #fff !important;
+}
+#trackedPicksTable td.track-push,
+body.dark-mode #trackedPicksTable td.track-push {
+  background: #3a404c !important;
+  color: #fff !important;
+}
+#trackedPicksTable td.track-pending,
+body.dark-mode #trackedPicksTable td.track-pending {
   background: #eceff3 !important;
   color: #2a2f38 !important;
 }
@@ -955,9 +982,6 @@ body.dark-mode .conf-b { background: #4aa346 !important; color: #fff !important;
 body.dark-mode .conf-c { background: #d98a00 !important; color: #fff !important; }
 body.dark-mode .conf-d { background: #c91920 !important; color: #fff !important; }
 body.dark-mode .conf-none { background: #0f0f0f !important; color: #9a9a9a !important; }
-body.dark-mode .track-win { background: #3a9c35 !important; color: #fff !important; }
-body.dark-mode .track-loss { background: #c91920 !important; color: #fff !important; }
-body.dark-mode .track-push { background: #3a404c !important; color: #fff !important; }
 .tracker-summary {
   font-size: 12px !important;
   font-weight: 800 !important;
@@ -8942,6 +8966,30 @@ function getPhase2ActivationState() {
   };
 }
 
+function getLeagueUnderBlockRatio(league) {
+  const map = {
+    nba: 0.82,
+    ncaa: 0.75,
+    ncaaw: 0.75,
+    wnba: 0.8,
+    wnba_pre: 0.8,
+    nba_gl: 0.82,
+    euroleague: 0.9,
+    eurocup: 0.88,
+    champions_league: 0.88,
+    acb: 0.87,
+    lba: 0.87,
+    bbl: 0.85,
+    turkey_bsl: 0.86,
+    ausnbl: 0.83,
+    bleague: 0.84,
+    united_league: 0.86,
+    proa: 0.85,
+  };
+
+  return map[String(league || "").toLowerCase()] || 0.82;
+}
+
 const LEAGUE_EDGE_POINT_THRESHOLDS = {
   nba: {
     ft: 5.5,
@@ -12697,7 +12745,10 @@ function applySmartLineToPick(pickRow, rawInput, league) {
   }
 
   const baseThresh = Number(getLeagueEdgePointThreshold(league, pickRow.marketKey)) || 0;
-  const thresh = baseThresh;
+  const _underFactor =
+    (typeof getParam === "function" ? getParam("underEdgeFactor", league) : null) ??
+    (typeof UNDER_EDGE_FACTOR !== "undefined" ? UNDER_EDGE_FACTOR : 1.2);
+  const thresh = side === "under" ? baseThresh * _underFactor : baseThresh;
   const halfWidth = (meta.high - meta.low) / 2;
   const widthCap = Math.max(thresh * 2, 6);
 
@@ -14853,7 +14904,7 @@ function renderTrackedPicks() {
           const encSig = encodeURIComponent(p.signature);
           statusHtml = `<div class="tracker-settled-edit-btn" data-sig="${encSig}" style="cursor:pointer;" title="Click to edit or revert">${status.toUpperCase()}</div>`;
           if (p.actualScore) {
-            statusHtml += `<div style="font-size:6px; font-weight:800; line-height:1.1; margin-top:1px; color:#fff;">${safeText(String(p.actualScore))}</div>`;
+            statusHtml += `<div class="tracker-status-score" style="font-size:9px; font-weight:800; line-height:1.15; margin-top:2px; color:inherit; opacity:0.95;">${safeText(String(p.actualScore))}</div>`;
           }
           if (p.engineResultStatus && p.engineResultStatus !== status) {
             statusHtml += `<div style="font-size:9px; color:#d91f26; margin-top:2px; font-weight:900;" title="The live in-game calculation disagreed with the final settled result">⚠ MID: ${p.engineResultStatus.toUpperCase()}</div>`;
@@ -19076,6 +19127,11 @@ function getPick(edge, line, league, marketKey, context = {}) {
   if (absEdge < 0.5) return "NO PLAY";
 
   let pointThreshold = getLeagueEdgePointThreshold(league, marketKey);
+  const _underEdgeFactor = isFinite(context?.underEdgeFactorOverride)
+    ? Number(context.underEdgeFactorOverride)
+    : (getParam("underEdgeFactor", league) ?? UNDER_EDGE_FACTOR);
+
+  if (edge < 0) pointThreshold *= _underEdgeFactor;
 
   // NEW/UNCALIBRATED: blowoutGap was computed and passed in context at the
   // FT/team_a/team_b call sites but never read. Reusing the existing
@@ -19333,17 +19389,6 @@ function selectLock(markets) {
     }
 
     // Championship tie-breakers only. These do not override probability.
-
-    // Market-tier fallback: quarter markets (Q1-Q4) run on a much smaller
-    // sample (one quarter of play) than FT/1H/2H/team/handicap markets, so
-    // they're inherently noisier. On an otherwise exact tie, prefer the
-    // sturdier main market and only fall back to a quarter pick.
-    const champIsQuarter = /^q[1-4]$/.test(String(champion.marketKey || "").toLowerCase());
-    const challIsQuarter = /^q[1-4]$/.test(String(challenger.marketKey || "").toLowerCase());
-    if (champIsQuarter !== challIsQuarter) {
-      return challIsQuarter ? champion : challenger;
-    }
-
     if (!!challenger.fullModel !== !!champion.fullModel)
       return challenger.fullModel ? challenger : champion;
     if (!!challenger.hasH2H !== !!champion.hasH2H) return challenger.hasH2H ? challenger : champion;
@@ -28054,20 +28099,17 @@ async function runEngine() {
       h2: 2.5,
       team_a: 3,
       team_b: 4,
-      h1_team_a: 5,
-      h1_team_b: 6,
+      q1: 5,
+      q2: 6,
+      q3: 7,
+      q4: 8,
+      h1_team_a: 9,
+      h1_team_b: 10,
 
       winner: 1.5,
       handicap: 4.5,
       handicap_h1: 4.6,
       handicap_h2: 4.7,
-
-      // Quarters fall back after every main/derivative market — noisier
-      // sample size (one quarter vs a full half/game), so they're last.
-      q1: 7,
-      q2: 8,
-      q3: 9,
-      q4: 10,
     };
     finalPicks.sort((a, b) => (mktOrderMap[a.marketKey] || 99) - (mktOrderMap[b.marketKey] || 99));
 
@@ -28399,10 +28441,16 @@ async function runEngine() {
     window.__lastRunLeague = league;
     window.__lastRunFixtureMeta = fixtureMeta;
 
+    const _aud_underEdgeFactorLive = getParam("underEdgeFactor", league) ?? UNDER_EDGE_FACTOR;
+    const _aud_underRatio = getLeagueUnderBlockRatio(league);
     const _aud_ftThO = getLeagueEdgePointThreshold(league, "ft");
+    const _aud_ftThU = _aud_ftThO * _aud_underEdgeFactorLive;
     const _aud_h1ThO = getLeagueEdgePointThreshold(league, "h1");
+    const _aud_h1ThU = _aud_h1ThO * _aud_underEdgeFactorLive;
     const _aud_tmThO = getLeagueEdgePointThreshold(league, "team_a");
+    const _aud_tmThU = _aud_tmThO * _aud_underEdgeFactorLive;
     const _aud_qThO = getLeagueEdgePointThreshold(league, "q1");
+    const _aud_qThU = _aud_qThO * _aud_underEdgeFactorLive;
     const _aud_aFTRaw = getOverallSeries("A", 10);
     const _aud_bFTRaw = getOverallSeries("B", 10);
     const _aud_aFTAll = getManualAllowedSeries("A", "ft", parsed);
@@ -28625,11 +28673,13 @@ async function runEngine() {
         leaguePaceBase: _aud_lPaceBase,
         leagueRatingBase: _aud_lRatingBase,
         leagueVolLimit: _aud_volLimit,
+        underEdgeFactor: _aud_underEdgeFactorLive,
+        underBlockRatio: _aud_underRatio,
         edgeThresholds: {
-          ft: _aud_ftThO,
-          h1: _aud_h1ThO,
-          team: _aud_tmThO,
-          q: _aud_qThO,
+          ft: { over: _aud_ftThO, under: _aud_ftThU },
+          h1: { over: _aud_h1ThO, under: _aud_h1ThU },
+          team: { over: _aud_tmThO, under: _aud_tmThU },
+          q: { over: _aud_qThO, under: _aud_qThU },
         },
         leagueEdgePointThresholds: LEAGUE_EDGE_POINT_THRESHOLDS,
         modelConfig: MODEL_CONFIG,
