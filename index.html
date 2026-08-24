@@ -17721,7 +17721,13 @@ function isPickPeriodComplete(
   const p = Number(currentPeriod || 0);
   const isNCAAStyle = regulationPeriods === 2;
   if (isNCAAStyle) {
-    if (marketKey === "h1" || marketKey === "h1_team_a" || marketKey === "h1_team_b")
+    // 1H markets (total, team totals, handicap) settle as soon as half ends
+    if (
+      marketKey === "h1" ||
+      marketKey === "h1_team_a" ||
+      marketKey === "h1_team_b" ||
+      marketKey === "handicap_h1"
+    )
       return p >= 2 || isHalfTime;
     return isGameFinal;
   }
@@ -17735,6 +17741,9 @@ function isPickPeriodComplete(
     case "h1":
     case "h1_team_a":
     case "h1_team_b":
+    case "handicap_h1":
+      // 1H total / 1H team totals / 1H handicap settle immediately at halftime
+      // (period advances to 3 at start of Q3, or status is HALFTIME)
       return p >= 3 || isHalfTime;
     case "q3":
       return p >= 4;
@@ -17879,17 +17888,29 @@ function settleTrackedPickFromCompetition(pick, competition, allowPartialSettlem
     pick.engineResultStatus = isWin ? "win" : "loss";
     return isWin ? "win" : "loss";
   } else if (market === "handicap" || market === "handicap_h1" || market === "handicap_h2") {
+    // Line is always HOME-SIGNED (UI: "Handicap (Home, signed)").
+    // Example: Toronto (home) +7.5 → marketLine = +7.5
+    // Cover rule: adjusted = (homeScore - awayScore) + marketLine
+    //   adjusted > 0 → home covers
+    //   adjusted < 0 → away covers
+    //   adjusted = 0 → push
+    // So home +7.5 on a 39-43 (margin -4): -4 + 7.5 = +3.5 → home covers → WIN.
     let marginActual;
     let scoreHome = sHome;
     let scoreAway = sAway;
     if (market === "handicap") {
       marginActual = sHome - sAway;
     } else if (market === "handicap_h1") {
+      // Require real 1H linescores before grading (avoid 0-0 false settles mid-Q1)
+      if (!(lsHome.length >= 2 && lsAway.length >= 2) && !(h1Home || h1Away))
+        return "pending";
       marginActual = h1Home - h1Away;
       scoreHome = h1Home;
       scoreAway = h1Away;
     } else {
       // 2H margin = full-game margin minus 1H margin
+      if (!(lsHome.length >= 2 && lsAway.length >= 2) && !(h1Home || h1Away))
+        return "pending";
       marginActual = sHome - sAway - (h1Home - h1Away);
       scoreHome = sHome - h1Home;
       scoreAway = sAway - h1Away;
@@ -17897,17 +17918,12 @@ function settleTrackedPickFromCompetition(pick, competition, allowPartialSettlem
     if (!isFinite(marginActual) || !isFinite(marketLine)) return "pending";
     actual = marginActual;
     const pickSide = String(pick.side || "").toLowerCase();
+    const adjusted = marginActual + marketLine;
     let engineGrade = "push";
-    if (actual > marketLine) engineGrade = pickSide === "home" ? "win" : "loss";
-    else if (actual < marketLine) engineGrade = pickSide === "away" ? "win" : "loss";
-    // Human-readable result: "87-80 · Home by +7" / "87-88 · Away by +1"
-    const absM = Math.abs(marginActual);
-    let marginLabel;
-    if (marginActual > 0) marginLabel = "Home by +" + absM;
-    else if (marginActual < 0) marginLabel = "Away by +" + absM;
-    else marginLabel = "Tie";
-    pick.actualScore =
-      Math.round(scoreHome) + "-" + Math.round(scoreAway) + " · " + marginLabel;
+    if (adjusted > 0) engineGrade = pickSide === "home" ? "win" : "loss";
+    else if (adjusted < 0) engineGrade = pickSide === "away" ? "win" : "loss";
+    // Status shows the period score only (e.g. "39-43"), no "Away by +4" suffix
+    pick.actualScore = Math.round(scoreHome) + "-" + Math.round(scoreAway);
     pick.engineResultStatus = engineGrade;
     return engineGrade;
   } else if (market === "h1") {
@@ -18274,6 +18290,7 @@ async function refreshTrackedPickResults() {
               "q1_team_b",
               "h1_team_a",
               "h1_team_b",
+              "handicap_h1",
             ].includes(pick.marketKey);
             if (_periodDone && _isPeriodMarket) {
               const midSettled = settleTrackedPickFromCompetition(pick, competition, true);
