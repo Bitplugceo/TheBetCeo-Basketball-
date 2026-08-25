@@ -1,4 +1,3 @@
-K
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -35496,6 +35495,676 @@ const EngineAuditor = (function () {
     }
   }
 
+  // =====================================================================
+  // O. FORENSIC CORE — source-complete coverage + generated static/dynamic
+  // verification.  This layer is deliberately separate from the hand-written
+  // regression checks above.  It inventories the entire deployed source,
+  // walks every source line, builds a best-effort function/call graph,
+  // discovers calculation sites, attacks high-risk patterns, and executes
+  // independent property probes against the live calculation functions.
+  //
+  // IMPORTANT: a line being scanned is a coverage event, not proof that the
+  // line is mathematically correct. Findings are generated independently.
+  // The auditor source itself is INCLUDED in coverage accounting but is
+  // excluded from product-defect heuristics to avoid self-referential noise.
+  // =====================================================================
+  const _FORENSIC_PRIMARY = [
+    "computeFTProjection",
+    "compute1HProjection",
+    "compute2HProjection",
+    "derivePeriodAdvanced",
+    "getPeriodAdvancedSeries",
+    "getH2HWeight",
+    "applyVolatility",
+    "getVolatilityRatioForSeries",
+    "getPick",
+    "getConfidenceGrade",
+    "resolveConfidenceGradeFromWinProbability",
+    "buildConfidenceFeatures",
+  ];
+  const _FORENSIC_CALC_RE = /(?:Math\.(?:sqrt|log|log1p|exp|pow|abs|min|max|round|floor|ceil|hypot)\s*\()|(?:^|[^/])\/(?:[^/*]|$)|\b(?:avg|mean|average|variance|std|stdev|pace|ortg|drtg|edge|probability|confidence|shrink|weight|blend|volatility|projection)\b/i;
+  const _FORENSIC_CORE_NAME_RE = /(?:compute|projection|project|derive|h2h|volatility|confidence|probability|edge|pace|ortg|drtg|pick|market|settle|anchor|blend|average|avg|stddev|variance|shrink)/i;
+  const _FORENSIC_BUILTINS = new Set([
+    "if","for","while","switch","catch","with","function","return","typeof","instanceof","new",
+    "Math","Date","Number","String","Boolean","Object","Array","JSON","Promise","Set","Map",
+    "console","parseFloat","parseInt","isFinite","isNaN","decodeURIComponent","encodeURIComponent",
+    "setTimeout","setInterval","clearTimeout","clearInterval","requestAnimationFrame","fetch",
+  ]);
+  let _forensicState = {
+    sourceMode: "none",
+    sourceUrl: "",
+    sourceHash: null,
+    totalLines: 0,
+    visitedLines: 0,
+    productLines: 0,
+    auditorLines: 0,
+    functions: [],
+    callEdges: [],
+    calculationSites: 0,
+    staticChecks: 0,
+    dynamicChecks: 0,
+    dynamicPassed: 0,
+    findingsGenerated: 0,
+    startedAt: null,
+    finishedAt: null,
+    coverageComplete: false,
+    scanPercent: 0,
+    lastLine: 0,
+    errors: [],
+  };
+  let _forensicRawCache = null;
+  let _forensicRawPromise = null;
+  let _forensicLineStarts = [0];
+  let _forensicBracePairs = null;
+
+  function forensicHash(text) {
+    let h = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(16).padStart(8, "0");
+  }
+
+  async function forensicGetRawSource() {
+    if (_forensicRawCache) return _forensicRawCache;
+    if (_forensicRawPromise) return _forensicRawPromise;
+    _forensicRawPromise = (async function () {
+      const candidates = [];
+      try {
+        if (typeof location !== "undefined" && location.href) candidates.push(location.href.split("#")[0]);
+      } catch (_e) {}
+      let best = "";
+      let mode = "none";
+      for (const url of candidates) {
+        try {
+          const r = await fetch(url, { cache: "no-store", credentials: "same-origin" });
+          if (r && r.ok) {
+            const text = await r.text();
+            if (text && text.length > best.length) {
+              best = text;
+              mode = "RAW_FETCH";
+            }
+          }
+        } catch (_e) {}
+      }
+      if (!best) {
+        try {
+          best = document.documentElement?.outerHTML || "";
+          mode = best ? "DOM_FALLBACK" : "none";
+        } catch (_e) {}
+      }
+      if (!best) throw new Error("Unable to obtain deployed source via same-origin fetch or DOM fallback.");
+      _forensicRawCache = { text: best, mode };
+      return _forensicRawCache;
+    })().finally(function () {
+      _forensicRawPromise = null;
+    });
+    return _forensicRawPromise;
+  }
+
+  function forensicPrepareLineStarts(text) {
+    _forensicLineStarts = [0];
+    for (let i = 0; i < text.length; i++) {
+      if (text.charCodeAt(i) === 10) _forensicLineStarts.push(i + 1);
+    }
+  }
+
+  function forensicLineNumber(text, index) {
+    if (!text || index < 0) return 0;
+    let lo = 0, hi = _forensicLineStarts.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (_forensicLineStarts[mid] <= index) lo = mid + 1;
+      else hi = mid;
+    }
+    return Math.max(1, lo);
+  }
+
+  function forensicExactLine(lines, lineNo) {
+    return lines[Math.max(0, lineNo - 1)] || "";
+  }
+
+  function forensicAdd(severity, title, what, why, fix, lineNo, code, extra) {
+    const location = lineNo ? "index.html:L" + lineNo : "FORENSIC_CORE";
+    const payload = Object.assign({}, extra || {}, {
+      line: lineNo || null,
+      code: code || (lineNo ? forensicExactLine((_forensicState._lines || []), lineNo).trim() : ""),
+      ruleId: (extra && extra.ruleId) || "FORENSIC",
+    });
+    add(severity, "FORENSIC_CORE", title, what, why, fix, location);
+    const f = _findings[_findings.length - 1];
+    if (f) {
+      f.line = payload.line;
+      f.code = payload.code;
+      f.ruleId = payload.ruleId;
+      if (payload.functionName) f.functionName = payload.functionName;
+      if (payload.expected !== undefined) f.expected = payload.expected;
+      if (payload.observed !== undefined) f.observed = payload.observed;
+      if (payload.path) f.path = payload.path;
+    }
+    _forensicState.findingsGenerated++;
+  }
+
+  function forensicStripForScanLine(line, state) {
+    const st = state || { inBlockComment: false, inString: null };
+    if (typeof _stripStringsAndCommentsStateful === "function") {
+      const r = _stripStringsAndCommentsStateful(line, st);
+      if (r && r.state) {
+        st.inBlockComment = !!r.state.inBlockComment;
+        st.inString = r.state.inString || null;
+      }
+      return r.code;
+    }
+    return String(line || "").replace(/\/\/.*$/g, "").replace(/(['"]).*?\1/g, "STR");
+  }
+
+  function forensicBuildBracePairs(src) {
+    const pairs = new Map();
+    const stack = [];
+    let quote = null, template = false, lineComment = false, blockComment = false;
+    for (let i = 0; i < src.length; i++) {
+      const c = src[i], n = src[i + 1];
+      if (lineComment) { if (c === "\n") lineComment = false; continue; }
+      if (blockComment) { if (c === "*" && n === "/") { blockComment = false; i++; } continue; }
+      if (quote) { if (c === "\\") { i++; continue; } if (c === quote) quote = null; continue; }
+      if (template) { if (c === "\\") { i++; continue; } if (c === "`") template = false; continue; }
+      if (c === "/" && n === "/") { lineComment = true; i++; continue; }
+      if (c === "/" && n === "*") { blockComment = true; i++; continue; }
+      if (c === "\"" || c === "'") { quote = c; continue; }
+      if (c === "`") { template = true; continue; }
+      if (c === "{") stack.push(i);
+      else if (c === "}") {
+        const open = stack.pop();
+        if (open != null) { pairs.set(open, i); pairs.set(i, open); }
+      }
+    }
+    return pairs;
+  }
+
+  function forensicFindMatchingBrace(src, openIndex) {
+    if (!_forensicBracePairs) _forensicBracePairs = forensicBuildBracePairs(src);
+    return _forensicBracePairs.get(openIndex) ?? -1;
+  }
+
+  function forensicInventoryFunctions(src) {
+    const out = [];
+    const seen = new Set();
+    const addFn = (name, start, brace, kind) => {
+      if (!name || seen.has(start + ":" + name)) return;
+      const end = forensicFindMatchingBrace(src, brace);
+      if (end < 0) return;
+      const startLine = forensicLineNumber(src, start);
+      const endLine = forensicLineNumber(src, end);
+      seen.add(start + ":" + name);
+      out.push({ name, start, end, brace, startLine, endLine, lines: endLine - startLine + 1, kind });
+    };
+    let m;
+    const fnRe = /(?:^|[;\n}])\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g;
+    while ((m = fnRe.exec(src))) {
+      const open = src.indexOf("{", fnRe.lastIndex);
+      if (open >= 0) addFn(m[1], m.index, open, "function");
+    }
+    const arrowRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^\n]*\)|[A-Za-z_$][\w$]*)\s*=>\s*{/g;
+    while ((m = arrowRe.exec(src))) addFn(m[1], m.index, src.indexOf("{", arrowRe.lastIndex - 1), "arrow");
+    return out.sort((a, b) => a.start - b.start);
+  }
+
+  function forensicContainingFunction(functions, lineNo) {
+    let best = null;
+    for (const fn of functions) {
+      if (lineNo >= fn.startLine && lineNo <= fn.endLine) {
+        if (!best || fn.lines < best.lines) best = fn;
+      }
+    }
+    return best;
+  }
+
+  function forensicCallGraph(src, functions) {
+    const names = new Set(functions.map((f) => f.name));
+    const edges = [];
+    const edgeSet = new Set();
+    const callRe = /\b([A-Za-z_$][\w$]*)\s*\(/g;
+    for (const fn of functions) {
+      const body = src.slice(fn.brace + 1, fn.end);
+      let m;
+      while ((m = callRe.exec(body))) {
+        const callee = m[1];
+        if (!names.has(callee) || _FORENSIC_BUILTINS.has(callee)) continue;
+        const key = fn.name + "→" + callee;
+        if (!edgeSet.has(key)) {
+          edgeSet.add(key);
+          edges.push({ from: fn.name, to: callee });
+        }
+      }
+    }
+    return edges;
+  }
+
+  function forensicFunctionIsAuditor(fn, auditStartLine, auditEndLine) {
+    return !!fn && fn.startLine >= auditStartLine && fn.endLine <= auditEndLine;
+  }
+
+  function forensicSwapParsed(parsed) {
+    const out = Object.assign({}, parsed || {});
+    const keys = Object.keys(out);
+    const swapped = new Set();
+    keys.forEach((k) => {
+      if (!/^a/.test(k)) return;
+      const b = "b" + k.slice(1);
+      if (!Object.prototype.hasOwnProperty.call(out, b) || swapped.has(k) || swapped.has(b)) return;
+      const v = out[k]; out[k] = out[b]; out[b] = v;
+      swapped.add(k); swapped.add(b);
+    });
+    return out;
+  }
+
+  function forensicSwapLines(lines) {
+    const out = Object.assign({}, lines || {});
+    const pairs = [
+      ["aLine", "bLine"], ["h1aLine", "h1bLine"], ["h2aLine", "h2bLine"],
+      ["q1aLine", "q1bLine"], ["q2aLine", "q2bLine"], ["q3aLine", "q3bLine"], ["q4aLine", "q4bLine"],
+    ];
+    pairs.forEach(([a, b]) => { const t = out[a]; out[a] = out[b]; out[b] = t; });
+    return out;
+  }
+
+  function forensicSwapContext(ctx) {
+    const out = Object.assign({}, ctx || {});
+    const t = out.A; out.A = out.B; out.B = t;
+    return out;
+  }
+
+  function forensicToyContext() {
+    const mk = (v) => Array(10).fill(v);
+    return {
+      A: {
+        pace10: mk(100), ortg10: mk(110), drtg10: mk(108),
+      },
+      B: {
+        pace10: mk(100), ortg10: mk(109), drtg10: mk(111),
+      },
+      h2hToggleSnapshot: false,
+      fixtureMeta: { homeId: "", awayId: "", homeTeam: "", awayTeam: "" },
+    };
+  }
+
+  function forensicAssert(ok, title, what, why, fix, details) {
+    _forensicState.dynamicChecks++;
+    tally();
+    if (ok) {
+      pass();
+      _forensicState.dynamicPassed++;
+      return true;
+    }
+    forensicAdd(
+      (details && details.severity) || "HIGH",
+      title,
+      what,
+      why,
+      fix,
+      details && details.line,
+      details && details.code,
+      Object.assign({ ruleId: (details && details.ruleId) || "DYNAMIC_PROPERTY" }, details || {}),
+    );
+    return false;
+  }
+
+  function forensicRunHelperProbes() {
+    const run = (name, fn) => {
+      try { return { ok: true, value: fn() }; }
+      catch (e) { return { ok: false, error: e }; }
+    };
+
+    if (typeof stdDev === "function") {
+      const r = run("stdDev", () => stdDev([1, 2, 3]));
+      forensicAssert(r.ok && Number.isFinite(r.value) && Math.abs(r.value - 1) < 1e-9,
+        "stdDev reference identity failed", "stdDev([1,2,3]) did not return sample SD = 1.",
+        "A variance/denominator error here propagates directly into volatility and confidence.",
+        "Reconcile stdDev against the intended sample/population convention.", { ruleId: "MATH_STDDEV" });
+    }
+
+    if (typeof getSampleQuality === "function") {
+      const q2 = getSampleQuality([1,2]);
+      const q5 = getSampleQuality([1,2,3,4,5]);
+      const q12 = getSampleQuality(Array(12).fill(1));
+      forensicAssert(Number.isFinite(q2) && Number.isFinite(q5) && Number.isFinite(q12) && q2 <= q5 && q5 <= q12 && q12 <= 1,
+        "Sample-quality monotonicity failed", "Sample quality is not monotone/nonnegative across increasing sample sizes.",
+        "Shrinkage can reverse direction and make more data reduce trust.", "Make sample-quality mapping monotone and bounded [0,1].",
+        { ruleId: "SAMPLE_QUALITY_MONOTONIC" });
+    }
+
+    if (typeof anchorProjection === "function") {
+      const a0 = anchorProjection(100, 0, 80);
+      const a10 = anchorProjection(100, 10, 80);
+      forensicAssert(Number.isFinite(a0) && Math.abs(a0 - 80) < 1e-9 && Number.isFinite(a10) && Math.abs(a10 - 100) < 1e-9,
+        "Anchor endpoints failed", "anchorProjection does not map n=0 to the prior and n>=10 to the raw projection.",
+        "This changes the intended small-sample shrinkage geometry.", "Enforce exact endpoint invariants.", { ruleId: "ANCHOR_ENDPOINTS" });
+    }
+
+    if (typeof getVenueBlendWeights === "function") {
+      const ws = [0, 1, 6, 10, 20].map((n) => run("venueWeight", () => getVenueBlendWeights(n)));
+      const ok = ws.every((r) => r.ok && Number.isFinite(r.value.wVenue) && Number.isFinite(r.value.wOverall) &&
+        r.value.wVenue >= 0 && r.value.wVenue <= 1 && Math.abs(r.value.wVenue + r.value.wOverall - 1) < 1e-9);
+      forensicAssert(ok, "Venue blend weights violate probability-like bounds", "Venue and overall weights are not finite, bounded, or summing to one.",
+        "Projection blends can exceed the convex hull or double-count the venue component.", "Constrain weights to [0,1] and force wVenue+wOverall=1.", { ruleId: "VENUE_WEIGHT_INVARIANT" });
+    }
+
+    if (typeof distributionWinProbability === "function") {
+      const p0 = distributionWinProbability(0, 12, 1);
+      const p5 = distributionWinProbability(5, 12, 1);
+      const p20 = distributionWinProbability(20, 12, 1);
+      const pn = distributionWinProbability(-5, 12, 1);
+      forensicAssert([p0,p5,p20,pn].every(Number.isFinite) && p0 <= p5 && p5 <= p20 && Math.abs(p5 - pn) < 1e-12,
+        "Distribution probability invariants failed", "Probability is not bounded/monotone/symmetric in absolute selected-side edge.",
+        "Confidence grading can invert or misstate the selected side's probability.", "Preserve |edge| symmetry and monotonicity around zero.", { ruleId: "DISTRIBUTION_MONOTONIC" });
+    }
+
+    if (typeof getVolatilityRatioForSeries === "function") {
+      const thin = getVolatilityRatioForSeries([100, 101], 12);
+      const full = getVolatilityRatioForSeries([90,100,110], 12);
+      forensicAssert(Number.isFinite(thin) && Number.isFinite(full) && thin > 0 && full > 0 && thin <= 2.5 && full <= 2.5,
+        "Volatility ratio bounds failed", "Volatility ratio returned non-finite or out-of-bound uncertainty.",
+        "Variance is later used as a probability scale; invalid ratios can produce impossible confidence.", "Clamp or fail closed on invalid volatility ratios.", { ruleId: "VOL_RATIO_BOUNDS" });
+    }
+
+    if (typeof applyVolatility === "function") {
+      const r1 = run("applyVolatility", () => applyVolatility(100, [90,100,110], 12, "nba"));
+      const r2 = run("applyVolatility", () => applyVolatility(88.5, [], 12, "nba"));
+      forensicAssert(r1.ok && r2.ok && r1.value === 100 && r2.value === 88.5,
+        "applyVolatility is not projection-mean identity", "Volatility changed the point mean instead of only uncertainty.",
+        "Mean shrinkage conflates uncertainty with directional bias.", "Keep volatility in predictive variance, not the point projection.", { ruleId: "VOLATILITY_MEAN_IDENTITY" });
+    }
+
+    if (typeof getH2HWeight === "function") {
+      const w2 = run("h2h", () => getH2HWeight(2,2,"ft","thin",0,"nba",224,1, null));
+      const w5 = run("h2h", () => getH2HWeight(5,5,"ft","thin",0,"nba",224,1, null));
+      const w10 = run("h2h", () => getH2HWeight(10,10,"ft","full",0,"nba",224,1, null));
+      const vals = [w2,w5,w10].map((x) => x.ok ? Number(x.value) : NaN);
+      const cap = typeof getParam === "function" ? Number(getParam("h2hMaxWeight", "nba") ?? 0.3) : 0.3;
+      forensicAssert(vals.every(Number.isFinite) && vals[0] <= vals[1] + 1e-12 && vals[1] <= vals[2] + 1e-12 && vals.every((v) => v >= 0 && v <= cap + 1e-9),
+        "H2H weight monotonicity/bounds failed", "H2H weight does not increase monotonically with usable sample or exceed its configured cap.",
+        "H2H can become stronger with less evidence or exceed the intended blend ceiling.", "Enforce monotonic sample weighting and hard cap after all multipliers.", { ruleId: "H2H_WEIGHT_MONOTONIC" });
+    }
+
+    if (typeof getPick === "function") {
+      const over = run("getPick", () => getPick(100, 100, "nba", "ft", {}));
+      const under = run("getPick", () => getPick(-100, 100, "nba", "ft", {}));
+      const bad1 = run("getPick", () => getPick(NaN, 100, "nba", "ft", {}));
+      const bad2 = run("getPick", () => getPick(Infinity, 100, "nba", "ft", {}));
+      const no = run("getPick", () => getPick(0, 100, "nba", "ft", {}));
+      forensicAssert(over.ok && /^OVER /.test(String(over.value)) && under.ok && /^UNDER /.test(String(under.value)) &&
+        bad1.ok && bad1.value === "NO PLAY" && bad2.ok && bad2.value === "NO PLAY" && no.ok && no.value === "NO PLAY",
+        "getPick sign/invalid-input invariants failed", "Extreme valid edges do not map to the correct side or invalid edges are not NO PLAY.",
+        "A sign inversion or invalid-input leak directly changes the wager side.", "Keep edge sign, finiteness, and zero-edge semantics explicit.", { ruleId: "GET_PICK_INVARIANTS" });
+    }
+
+    if (typeof buildConfidenceFeatures === "function") {
+      const base = { league: "nba", marketKey: "ft", volatilityRatio: 1.2, sampleTier: "full", hasH2H: true, trap: false };
+      const f1 = run("features", () => buildConfidenceFeatures(Object.assign({}, base, { edgePct: 0.08 })));
+      const f2 = run("features", () => buildConfidenceFeatures(Object.assign({}, base, { edgePct: 8 })));
+      forensicAssert(f1.ok && f2.ok && JSON.stringify(f1.value) === JSON.stringify(f2.value),
+        "Confidence train/serve edge-unit parity failed", "8% and 0.08 did not produce the same normalized feature vector.",
+        "The fitted coefficient would represent different quantities in training and serving.", "Normalize edge representation once and identically on both paths.", { ruleId: "CONFIDENCE_UNIT_PARITY" });
+    }
+
+    if (typeof resolveConfidenceGradeFromWinProbability === "function") {
+      const badA = resolveConfidenceGradeFromWinProbability(-0.3, "nba", "ft");
+      const badB = resolveConfidenceGradeFromWinProbability(1.7, "nba", "ft");
+      const nan = resolveConfidenceGradeFromWinProbability(NaN, "nba", "ft");
+      forensicAssert(badA === "NaN" && badB === "NaN" && nan === "NaN",
+        "Confidence invalid-probability guard failed", "Out-of-range/non-finite win probabilities were not converted to the explicit NaN sentinel.",
+        "Invalid probabilities can be silently graded as legitimate A-D confidence.", "Fail closed on probability outside [0,1] or non-finite values.", { ruleId: "CONFIDENCE_PROB_BOUNDS" });
+    }
+
+    // Pure projection-mean symmetry test. Venue/H2H are disabled in the fixture.
+    const required = ["computeFTProjection","compute1HProjection","compute2HProjection"];
+    const missing = required.filter((n) => typeof window[n] !== "function" && typeof globalThis[n] !== "function");
+    if (!missing.length && typeof buildToyInputs === "function") {
+      const toy = buildToyInputs();
+      const ctx = forensicToyContext();
+      const p = forensicSwapParsed(toy.parsed);
+      const c = forensicSwapContext(ctx);
+      const l = forensicSwapLines(toy.lines);
+      for (const name of required) {
+        const fn = (typeof window[name] === "function" ? window[name] : globalThis[name]);
+        const args = { league: toy.league, parsed: toy.parsed, lines: toy.lines, injMultA: 1, injMultB: 1, config: {}, contextData: ctx };
+        const args2 = { league: toy.league, parsed: p, lines: l, injMultA: 1, injMultB: 1, config: {}, contextData: c };
+        const a = run(name, () => fn(args));
+        const b = run(name, () => fn(args2));
+        const ok = a.ok && b.ok && a.value && b.value &&
+          Number.isFinite(Number(a.value[name === "computeFTProjection" ? "ftProj" : name === "compute1HProjection" ? "h1Proj" : "h2Proj"])) &&
+          Math.abs(Number(a.value[name === "computeFTProjection" ? "ftProj" : name === "compute1HProjection" ? "h1Proj" : "h2Proj"]) - Number(b.value[name === "computeFTProjection" ? "ftProj" : name === "compute1HProjection" ? "h1Proj" : "h2Proj"])) < 1e-7;
+        forensicAssert(ok, name + " team-swap total symmetry failed", name + " changed its total projection when Team A and Team B inputs were swapped under a symmetric fixture.",
+          "A side-identity/home-away wiring error can systematically bias one side of the market.", "Make Team A/B transformations symmetric unless an explicit venue/home feature is enabled.", { ruleId: "PROJECTION_SWAP_SYMMETRY" });
+      }
+    } else {
+      forensicAssert(false, "Primary projection functions are not runtime-discoverable", "The live page does not expose all three primary projection functions to the forensic runtime harness.",
+        "The auditor cannot execute its independent projection property tests.", "Expose the production functions to the test harness or add an explicit test adapter.", { severity: "HIGH", ruleId: "PRIMARY_RUNTIME_DISCOVERY" });
+    }
+  }
+
+  async function auditForensicCore() {
+    const AREA = "FORENSIC_CORE";
+    _forensicState = Object.assign({}, _forensicState, {
+      sourceMode: "none", sourceUrl: "", sourceHash: null, totalLines: 0, visitedLines: 0,
+      productLines: 0, auditorLines: 0, functions: [], callEdges: [], calculationSites: 0,
+      staticChecks: 0, dynamicChecks: 0, dynamicPassed: 0, findingsGenerated: 0,
+      startedAt: Date.now(), finishedAt: null, coverageComplete: false, scanPercent: 0,
+      lastLine: 0, errors: [], _lines: [],
+    });
+
+    let rawObj;
+    try { rawObj = await forensicGetRawSource(); }
+    catch (e) {
+      _forensicState.errors.push(String(e && e.message ? e.message : e));
+      tally();
+      add("CRITICAL", AREA, "FORENSIC SOURCE ACQUISITION FAILED", String(e && e.message ? e.message : e),
+        "The auditor cannot prove source coverage without obtaining the deployed source.",
+        "Fix same-origin source acquisition or provide a test adapter that supplies the exact deployed HTML.", "FORENSIC_CORE source acquisition");
+      return;
+    }
+
+    const raw = rawObj.text;
+    forensicPrepareLineStarts(raw);
+    _forensicBracePairs = forensicBuildBracePairs(raw);
+    const lines = raw.split("\n");
+    _forensicState._lines = lines;
+    _forensicState.sourceMode = rawObj.mode;
+    try { _forensicState.sourceUrl = location.href.split("#")[0]; } catch (_e) {}
+    _forensicState.sourceHash = forensicHash(raw);
+    _forensicState.totalLines = lines.length;
+
+    const markerStart = raw.indexOf(_AUDITOR_SELF_START);
+    const markerEnd = raw.lastIndexOf(_AUDITOR_SELF_END);
+    let auditStartLine = 0, auditEndLine = 0;
+    if (markerStart >= 0 && markerEnd > markerStart) {
+      auditStartLine = forensicLineNumber(raw, markerStart);
+      auditEndLine = forensicLineNumber(raw, markerEnd) + 1;
+      _forensicState.auditorLines = Math.max(0, auditEndLine - auditStartLine + 1);
+    }
+    _forensicState.productLines = Math.max(0, _forensicState.totalLines - _forensicState.auditorLines);
+
+    // Complete function inventory and call graph are built before line scanning
+    // so each calculation line can be attributed to its containing function.
+    const functions = forensicInventoryFunctions(raw);
+    _forensicState.functions = functions;
+    _forensicState.callEdges = forensicCallGraph(raw, functions);
+
+    // Source-wide coverage: every single physical source line is visited.  This
+    // is intentionally counted as a check event, but a finding is independent of
+    // the coverage counter.
+    let scanState = { inBlockComment: false, inString: null };
+    const calcSites = [];
+    const seenRuleLine = new Set();
+    const CHUNK = 250;
+    for (let start = 0; start < lines.length; start += CHUNK) {
+      const end = Math.min(lines.length, start + CHUNK);
+      for (let i = start; i < end; i++) {
+        const lineNo = i + 1;
+        const original = lines[i];
+        const code = forensicStripForScanLine(original, scanState);
+        tally(); pass();
+        _forensicState.visitedLines++;
+        _forensicState.lastLine = lineNo;
+        if (_FORENSIC_CALC_RE.test(code)) {
+          _forensicState.calculationSites++;
+          calcSites.push(lineNo);
+        }
+        if (!code.trim()) continue;
+        const fn = forensicContainingFunction(functions, lineNo);
+        if (fn && forensicFunctionIsAuditor(fn, auditStartLine, auditEndLine)) continue;
+        const fnName = fn ? fn.name : "<top-level>";
+
+        const emitOnce = (key, severity, title, what, why, fix) => {
+          const k = key + "@" + lineNo;
+          if (seenRuleLine.has(k)) return;
+          seenRuleLine.add(k);
+          forensicAdd(severity, title, what, why, fix, lineNo, original.trim(), { ruleId: key, functionName: fnName });
+        };
+
+        if (/\bMath\.random\s*\(/.test(code) && _FORENSIC_CORE_NAME_RE.test(fnName)) {
+          emitOnce("RANDOM_IN_CALC", "HIGH", "Uncontrolled randomness in calculation path",
+            fnName + " contains Math.random() on this line.",
+            "Predictions become nondeterministic and cannot be reproduced or independently audited.",
+            "Remove randomness from deterministic production calculations or inject a seeded test-only RNG explicitly.");
+        }
+        if (/\b(?:eval|Function)\s*\(/.test(code) && !/EngineAuditor|forensic/i.test(original)) {
+          emitOnce("DYNAMIC_CODE", "HIGH", "Dynamic code execution in product source",
+            "Executable source is being constructed/evaluated dynamically.",
+            "This can bypass static guarantees and makes source-to-runtime behavior difficult to prove.",
+            "Replace with explicit data parsing/dispatch and keep production calculation code statically bound.");
+        }
+        if (/\bDate\.now\s*\(|\bnew\s+Date\s*\(/.test(code) && _FORENSIC_CORE_NAME_RE.test(fnName) &&
+            !/log|debug|render|display|export|report|tracker|save|storage|timestamp|cache/i.test(fnName)) {
+          emitOnce("CLOCK_IN_CALC", "HIGH", "Wall-clock dependency inside calculation path",
+            fnName + " reads the current wall clock on this line.",
+            "Historical replay can change as time passes and future/current time can leak into calculations.",
+            "Pass an explicit prediction/reference timestamp into the calculation and make replay use the snapshot timestamp.");
+        }
+        if (/\blocalStorage\.(?:getItem|setItem|removeItem)\s*\(/.test(code) && _FORENSIC_CORE_NAME_RE.test(fnName) &&
+            /compute|projection|confidence|probability|h2h|volatility|pick/i.test(fnName)) {
+          emitOnce("MUTABLE_STORAGE_IN_CALC", "MEDIUM", "Mutable localStorage read/write in calculation path",
+            fnName + " directly touches localStorage on this line.",
+            "The mathematical result can depend on mutable browser state that is not necessarily part of the prediction snapshot.",
+            "Materialize required model state into an immutable calculation context and version-lock it before projection.");
+        }
+        if (/\bAppState\b/.test(code) && /^compute(?:FT|1H|2H)Projection$/.test(fnName)) {
+          emitOnce("GLOBAL_STATE_IN_PROJECTION", "MEDIUM", "Global AppState dependency inside primary projection",
+            fnName + " references AppState directly.",
+            "Live/replay parity can break if AppState differs from the historical snapshot.",
+            "Use explicit contextData for every production dependency; retain AppState only at the adapter boundary.");
+        }
+        if (/\/\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?\.length\b/.test(code) &&
+            !/Math\.max\s*\([^)]*\.length|\.length\s*[><=]|if\s*\([^)]*\.length/.test(code) &&
+            _FORENSIC_CORE_NAME_RE.test(fnName)) {
+          emitOnce("LENGTH_DENOMINATOR", "MEDIUM", "Potential zero-length denominator",
+            fnName + " divides by an array/object length without an obvious local guard on this line.",
+            "Empty or filtered series can create Infinity/NaN and contaminate downstream projection/confidence.",
+            "Guard the denominator or fail closed when effective sample size is zero.");
+        }
+        if (/\b(?:winProb|probability|confidence)\w*\s*=/.test(code) &&
+            !/clamp|Math\.min|Math\.max|Number\.isFinite|isFinite/.test(code) &&
+            _FORENSIC_CORE_NAME_RE.test(fnName)) {
+          emitOnce("UNBOUNDED_PROBABILITY_CANDIDATE", "LOW", "Probability/confidence assignment lacks a local bound",
+            fnName + " assigns a probability-like variable without an obvious same-line bound check.",
+            "Probabilities outside [0,1] can invert confidence grading or create impossible EV calculations.",
+            "Verify the containing expression is bounded [0,1] before it reaches grading/settlement.");
+        }
+        if (/\b(?:edge|volatility|variance|sd|stdDev|pace|ortg|drtg|projection|weight)\w*\s*\/\s*/i.test(code) &&
+            _FORENSIC_CORE_NAME_RE.test(fnName) && !/Math\.max|Math\.min|clamp|safe|guard|denom|baseline/i.test(code)) {
+          // Candidate only: no claim that the line is definitely wrong.
+          emitOnce("CALC_DIVISION_CANDIDATE", "LOW", "Unprotected calculation division candidate",
+            fnName + " contains a calculation division without an obvious same-line denominator guard.",
+            "A zero/non-finite denominator can contaminate an entire prediction path; this requires contextual verification.",
+            "Prove the denominator is strictly positive/non-zero on every reachable path or fail closed.");
+        }
+      }
+      _forensicState.scanPercent = Math.round((_forensicState.visitedLines / Math.max(1, lines.length)) * 1000) / 10;
+      if (_isOpen) render();
+      if (start + CHUNK < lines.length) await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    _forensicState.coverageComplete = _forensicState.visitedLines === _forensicState.totalLines;
+    _forensicState.scanPercent = _forensicState.coverageComplete ? 100 : _forensicState.scanPercent;
+    _forensicState.staticChecks = _forensicState.visitedLines;
+
+    const productFns = functions.filter((f) => !forensicFunctionIsAuditor(f, auditStartLine, auditEndLine));
+    const missingPrimary = _FORENSIC_PRIMARY.filter((name) => !productFns.some((f) => f.name === name));
+    if (missingPrimary.length) {
+      forensicAdd("CRITICAL", "Primary calculation function inventory incomplete",
+        "The source inventory did not discover: " + missingPrimary.join(", ") + ".",
+        "A primary function that cannot be located cannot be included in a code-level audit or runtime harness.",
+        "Restore explicit function declarations or add a parser-backed discovery adapter; do not claim complete coverage.", null, "", { ruleId: "PRIMARY_FUNCTION_INVENTORY" });
+    } else {
+      forensicAdd("INFO", "All primary calculation functions discovered",
+        _FORENSIC_PRIMARY.length + " named primary functions were found in the deployed source.",
+        "The requested projection/H2H/volatility/pick/confidence surface is present in the inventory.",
+        "No action needed.", null, "", { ruleId: "PRIMARY_FUNCTION_INVENTORY" });
+    }
+
+    // Report the full source accounting. This is deliberately INFO: it proves
+    // coverage, not correctness.
+    forensicAdd(_forensicState.coverageComplete ? "INFO" : "CRITICAL",
+      _forensicState.coverageComplete ? "100% source-line coverage achieved" : "Source-line coverage incomplete",
+      "Visited " + _forensicState.visitedLines + " / " + _forensicState.totalLines +
+        " physical source lines. Product lines: " + _forensicState.productLines +
+        "; auditor lines: " + _forensicState.auditorLines +
+        "; calculation-site candidates: " + _forensicState.calculationSites +
+        "; source hash: " + _forensicState.sourceHash + ".",
+      "A complete line walk is required before claiming that the entire deployed file was inspected.",
+      _forensicState.coverageComplete ? "No action needed." : "Resolve source acquisition/scanning failure and rerun until every line is visited.",
+      null, "", { ruleId: "SOURCE_COVERAGE" });
+
+    // Function inventory / call graph integrity.
+    const functionNames = new Set(productFns.map((f) => f.name));
+    const incoming = new Map(productFns.map((f) => [f.name, 0]));
+    _forensicState.callEdges.forEach((e) => { if (incoming.has(e.to)) incoming.set(e.to, incoming.get(e.to) + 1); });
+    const orphanPrimary = _FORENSIC_PRIMARY.filter((n) => functionNames.has(n) && (incoming.get(n) || 0) === 0 &&
+      !/computeFTProjection|compute1HProjection|compute2HProjection/.test(n));
+    if (orphanPrimary.length) {
+      forensicAdd("HIGH", "Primary helper appears unreachable from the discovered call graph",
+        orphanPrimary.join(", ") + " has no discovered incoming call edge.",
+        "A disconnected helper can be mathematically perfect but never actually influence production output, or the call graph may be incomplete.",
+        "Trace the production caller path and confirm the helper is wired into the live calculation.", null, "", { ruleId: "ORPHAN_PRIMARY_HELPER" });
+    }
+
+    // Explicit function-size findings: very large functions are not automatically
+    // wrong, but they are high-risk because branch interactions become difficult
+    // to exhaustively reason about.
+    productFns.filter((f) => f.lines > 900 && _FORENSIC_CORE_NAME_RE.test(f.name)).forEach((f) => {
+      forensicAdd("MEDIUM", "Very large calculation function requires path-level review",
+        f.name + " spans " + f.lines + " source lines.",
+        "Large stateful calculation bodies create branch/path combinations that fixed smoke tests rarely exhaust.",
+        "Use the generated function inventory and call graph to review every branch and downstream dependency.", f.startLine,
+        forensicExactLine(lines, f.startLine).trim(), { ruleId: "LARGE_CALC_FUNCTION", functionName: f.name });
+    });
+
+    // Dynamic/property probes run only after the source census so a runtime
+    // failure is reported alongside the exact source coverage state.
+    try { forensicRunHelperProbes(); }
+    catch (e) {
+      forensicAdd("CRITICAL", "Forensic runtime probe harness threw",
+        String(e && e.message ? e.message : e),
+        "Independent property tests did not complete.",
+        "Fix the test harness/runtime adapter and rerun; never interpret a partial run as clean.", null, "", { ruleId: "FORENSIC_HARNESS_THROW" });
+    }
+
+    _forensicState.finishedAt = Date.now();
+    if (_isOpen) render();
+    if (typeof engineDebug === "function") {
+      engineDebug("Forensic core complete", {
+        sourceMode: _forensicState.sourceMode,
+        lines: _forensicState.visitedLines,
+        totalLines: _forensicState.totalLines,
+        functions: productFns.length,
+        edges: _forensicState.callEdges.length,
+        calculations: _forensicState.calculationSites,
+        findings: _forensicState.findingsGenerated,
+      });
+    }
+  }
+
   // =================================================================
   // Orchestration, scoring, roadmap, export, and rendering
   // =================================================================
@@ -35550,6 +36219,13 @@ const EngineAuditor = (function () {
       label: "Regression Locks (fixed bugs stay fixed)",
       fn: auditRegressionLocks,
       async: false,
+    },
+    {
+      id: "FORENSIC_CORE",
+      letter: "O",
+      label: "Forensic Core — Entire Source + Generated Tests",
+      fn: auditForensicCore,
+      async: true,
     },
     {
       id: "FULL_LINE_SCAN",
@@ -35702,6 +36378,22 @@ const EngineAuditor = (function () {
       checksRun: _checksRun,
       checksTotal: _checksTotal,
       lastRunMs: _lastRunMs,
+      forensicCoverage: {
+        sourceMode: _forensicState.sourceMode,
+        sourceUrl: _forensicState.sourceUrl,
+        sourceHash: _forensicState.sourceHash,
+        totalLines: _forensicState.totalLines,
+        visitedLines: _forensicState.visitedLines,
+        coveragePercent: _forensicState.scanPercent,
+        productLines: _forensicState.productLines,
+        auditorLines: _forensicState.auditorLines,
+        functionCount: _forensicState.functions.length,
+        callEdgeCount: _forensicState.callEdges.length,
+        calculationSiteCount: _forensicState.calculationSites,
+        dynamicChecks: _forensicState.dynamicChecks,
+        dynamicPassed: _forensicState.dynamicPassed,
+        coverageComplete: _forensicState.coverageComplete,
+      },
       categories: CATEGORIES.map((c) => ({
         id: c.id,
         letter: c.letter,
@@ -35760,6 +36452,10 @@ const EngineAuditor = (function () {
         " INFO",
     );
     if (_lastRunMs != null) lines.push("Run time     : " + _lastRunMs + " ms");
+    if (_forensicState.totalLines) {
+      lines.push("Forensic     : " + _forensicState.visitedLines + "/" + _forensicState.totalLines + " lines (" + _forensicState.scanPercent + "%) · " + _forensicState.functions.length + " functions · " + _forensicState.calculationSites + " calculation-site candidates");
+      lines.push("Source hash  : " + (_forensicState.sourceHash || "—") + " · Mode: " + _forensicState.sourceMode);
+    }
     lines.push("");
 
     lines.push("--- CATEGORY INDEX (" + CATEGORIES.length + ") ---");
@@ -35805,6 +36501,9 @@ const EngineAuditor = (function () {
         .forEach((f) => {
           lines.push("[" + f.severity + "] " + f.title);
           lines.push("  Location: " + f.location);
+          if (f.line) lines.push("  CODE: " + f.code);
+          if (f.functionName) lines.push("  FUNCTION: " + f.functionName);
+          if (f.ruleId) lines.push("  RULE: " + f.ruleId);
           lines.push("  WHAT: " + f.what);
           lines.push("  WHY:  " + f.why);
           lines.push("  FIX:  " + f.fix);
@@ -36044,6 +36743,9 @@ const EngineAuditor = (function () {
       '<div style="color:#666;margin-top:2px;"><span style="color:#888;font-weight:700;">LOCATION:</span> ' +
       esc(f.location) +
       "</div>" +
+      (f.line ? '<div style="margin-top:6px;padding:6px 8px;background:#050505;border:1px solid #202020;border-radius:3px;font-family:monospace;font-size:10px;color:#d7d7d7;white-space:pre-wrap;overflow-wrap:anywhere;"><span style="color:#d4af37;font-weight:900;">L' + f.line + ':</span> ' + esc(f.code || "") + '</div>' : "") +
+      (f.functionName ? '<div style="color:#777;margin-top:3px;font-size:10px;"><span style="color:#888;font-weight:700;">FUNCTION:</span> ' + esc(f.functionName) + '</div>' : "") +
+      (f.ruleId ? '<div style="color:#555;margin-top:2px;font-size:9px;"><span style="color:#666;font-weight:700;">RULE:</span> ' + esc(f.ruleId) + '</div>' : "") +
       "</div>" +
       "</div>"
     );
@@ -36193,6 +36895,16 @@ const EngineAuditor = (function () {
       ")</button>" +
       "</div>" +
       "</div>";
+
+    if (_forensicState.totalLines) {
+      summaryHtml += '<div style="margin:8px 12px;padding:7px 9px;background:#050505;border:1px solid #1d1d1d;border-radius:4px;font-size:10px;color:#aaa;display:flex;gap:12px;flex-wrap:wrap;">' +
+        '<span><b style="color:#d4af37;">SOURCE</b> ' + _forensicState.visitedLines + '/' + _forensicState.totalLines + ' lines (' + _forensicState.scanPercent + '%)</span>' +
+        '<span><b style="color:#8fd3ff;">FUNCTIONS</b> ' + _forensicState.functions.length + '</span>' +
+        '<span><b style="color:#8fd3ff;">CALC SITES</b> ' + _forensicState.calculationSites + '</span>' +
+        '<span><b style="color:#8fd3ff;">DYNAMIC TESTS</b> ' + _forensicState.dynamicPassed + '/' + _forensicState.dynamicChecks + '</span>' +
+        '<span><b style="color:#777;">HASH</b> ' + esc(_forensicState.sourceHash || '—') + '</span>' +
+        '</div>';
+    }
 
     const roadmapHtml = roadmap.length
       ? '<div style="padding:10px 12px;background:#100a06;border-bottom:2px solid #2a1a08;">' +
