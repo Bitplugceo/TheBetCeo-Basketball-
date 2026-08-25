@@ -1,3 +1,4 @@
+Z
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2974,6 +2975,15 @@ body.dark-mode .tracker-analytics-section-head {
   font-size: 14px;
   cursor: pointer;
 }
+.engine-lock-btn.faceid {
+  background: #1a1a1e;
+  border: 1px solid #3a3a40;
+  margin-bottom: 10px;
+}
+.engine-lock-btn.faceid:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .engine-lock-error {
   color: #ff5c61;
   font-size: 12px;
@@ -3001,9 +3011,10 @@ body.dark-mode .tracker-analytics-section-head {
 <div id="engineLockOverlay">
   <div class="engine-lock-card">
     <div class="engine-lock-title">🔒 TheBetCeo ⚡</div>
-    <div class="engine-lock-sub">Enter PIN to unlock</div>
+    <div class="engine-lock-sub" id="engineLockSub">Enter PIN to unlock</div>
+    <button type="button" class="engine-lock-btn faceid" id="engineFaceIdBtn" style="display: none">Unlock with Face ID</button>
     <input type="tel" inputmode="numeric" autocomplete="off" maxlength="6" id="engineLockInput" class="engine-lock-input" placeholder="••••" aria-label="Engine access PIN">
-    <button type="button" class="engine-lock-btn" id="engineLockBtn">Unlock</button>
+    <button type="button" class="engine-lock-btn" id="engineLockBtn">Unlock with PIN</button>
     <div class="engine-lock-error" id="engineLockError"></div>
   </div>
 </div>
@@ -3011,22 +3022,128 @@ body.dark-mode .tracker-analytics-section-head {
   // D1: still client-side only — not real access control. Mitigations added:
   // salted hash comparison, progressive lockout after failures, short session TTL.
   // Server-side auth is required for true protection.
+  // Face ID / Touch ID via WebAuthn platform authenticator (optional UX layer).
   var ENGINE_LOCK_PIN_HASH = "7c7f619c8613ce8933cf6ae0263c321c156f87da3d6cb7e7dc99283d8388f50c";
   var ENGINE_LOCK_SALT = "bb_engine_lock_v1";
+  var WEBAUTHN_CRED_KEY = "engineWebAuthnCredId";
   var overlay = document.getElementById("engineLockOverlay");
   var LOCKOUT_KEY = "engineLockFails";
   var UNLOCK_TS_KEY = "engineUnlockedAt";
   var SESSION_TTL_MS = 12 * 60 * 60 * 1000;
   var unlockedAt = parseInt(localStorage.getItem(UNLOCK_TS_KEY) || "0", 10);
-  if (
+  var sessionAlreadyOpen =
     localStorage.getItem("engineUnlocked") === "yes" &&
     unlockedAt &&
-    Date.now() - unlockedAt < SESSION_TTL_MS
-  ) {
+    Date.now() - unlockedAt < SESSION_TTL_MS;
+  if (sessionAlreadyOpen) {
     overlay.classList.add("hidden");
   } else {
     localStorage.removeItem("engineUnlocked");
     localStorage.removeItem(UNLOCK_TS_KEY);
+  }
+  function _b64urlFromBuf(buf) {
+    var bytes = new Uint8Array(buf);
+    var s = "";
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function _bufFromB64url(str) {
+    var s = String(str || "").replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    var bin = atob(s);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out.buffer;
+  }
+  function webAuthnSupported() {
+    return !!(
+      window.isSecureContext &&
+      window.PublicKeyCredential &&
+      navigator.credentials &&
+      typeof navigator.credentials.create === "function" &&
+      typeof navigator.credentials.get === "function"
+    );
+  }
+  function hasWebAuthnCred() {
+    return !!localStorage.getItem(WEBAUTHN_CRED_KEY);
+  }
+  function markUnlocked() {
+    localStorage.setItem("engineUnlocked", "yes");
+    localStorage.setItem(UNLOCK_TS_KEY, String(Date.now()));
+    localStorage.removeItem(LOCKOUT_KEY);
+    overlay.classList.add("hidden");
+    var errEl = document.getElementById("engineLockError");
+    if (errEl) errEl.textContent = "";
+  }
+  function updateLockUi() {
+    var sub = document.getElementById("engineLockSub");
+    var faceBtn = document.getElementById("engineFaceIdBtn");
+    if (!sub || !faceBtn) return;
+    if (webAuthnSupported() && hasWebAuthnCred()) {
+      sub.textContent = "Face ID or PIN to unlock";
+      faceBtn.style.display = "block";
+    } else if (webAuthnSupported()) {
+      sub.textContent = "Enter PIN — Face ID available after first unlock";
+      faceBtn.style.display = "none";
+    } else {
+      sub.textContent = "Enter PIN to unlock";
+      faceBtn.style.display = "none";
+    }
+  }
+  async function enrollWebAuthn() {
+    if (!webAuthnSupported()) return false;
+    try {
+      var challenge = crypto.getRandomValues(new Uint8Array(32));
+      var userId = crypto.getRandomValues(new Uint8Array(16));
+      var rpId = location.hostname || "localhost";
+      var cred = await navigator.credentials.create({
+        publicKey: {
+          challenge: challenge,
+          rp: { name: "TheBetCeo", id: rpId },
+          user: {
+            id: userId,
+            name: "engine-owner",
+            displayName: "TheBetCeo",
+          },
+          pubKeyCredParams: [
+            { type: "public-key", alg: -7 },
+            { type: "public-key", alg: -257 },
+          ],
+          authenticatorSelection: {
+            authenticatorAttachment: "platform",
+            userVerification: "required",
+            residentKey: "preferred",
+          },
+          timeout: 60000,
+          attestation: "none",
+        },
+      });
+      if (cred && cred.rawId) {
+        localStorage.setItem(WEBAUTHN_CRED_KEY, _b64urlFromBuf(cred.rawId));
+        return true;
+      }
+    } catch (_e) {}
+    return false;
+  }
+  async function unlockWithWebAuthn() {
+    var id = localStorage.getItem(WEBAUTHN_CRED_KEY);
+    if (!id || !webAuthnSupported()) return false;
+    var challenge = crypto.getRandomValues(new Uint8Array(32));
+    var assertion = await navigator.credentials.get({
+      publicKey: {
+        challenge: challenge,
+        timeout: 60000,
+        userVerification: "required",
+        allowCredentials: [
+          {
+            type: "public-key",
+            id: _bufFromB64url(id),
+            transports: ["internal"],
+          },
+        ],
+      },
+    });
+    return !!(assertion && assertion.rawId);
   }
   async function _sha256Hex(str) {
     var buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
@@ -3052,11 +3169,13 @@ body.dark-mode .tracker-analytics-section-head {
     var salted = await _sha256Hex(ENGINE_LOCK_SALT + ":" + val);
     var plain = await _sha256Hex(val);
     if (plain === ENGINE_LOCK_PIN_HASH || salted === ENGINE_LOCK_PIN_HASH) {
-      localStorage.setItem("engineUnlocked", "yes");
-      localStorage.setItem(UNLOCK_TS_KEY, String(Date.now()));
-      localStorage.removeItem(LOCKOUT_KEY);
-      overlay.classList.add("hidden");
-      err.textContent = "";
+      markUnlocked();
+      // First successful PIN on a biometric device: enroll Face ID / Touch ID.
+      if (webAuthnSupported() && !hasWebAuthnCred()) {
+        try {
+          await enrollWebAuthn();
+        } catch (_enrollErr) {}
+      }
     } else {
       failState.n = (failState.n || 0) + 1;
       var backoff = Math.min(300000, 1000 * Math.pow(2, Math.min(8, failState.n)));
@@ -3069,10 +3188,41 @@ body.dark-mode .tracker-analytics-section-head {
       document.getElementById("engineLockInput").value = "";
     }
   }
+  async function tryFaceIdUnlock() {
+    var err = document.getElementById("engineLockError");
+    var faceBtn = document.getElementById("engineFaceIdBtn");
+    if (!err) return;
+    if (!webAuthnSupported() || !hasWebAuthnCred()) {
+      err.textContent = "Face ID not set up — unlock with PIN first";
+      return;
+    }
+    if (faceBtn) faceBtn.disabled = true;
+    err.textContent = "";
+    try {
+      var ok = await unlockWithWebAuthn();
+      if (ok) {
+        markUnlocked();
+      } else {
+        err.textContent = "Face ID failed — use PIN";
+      }
+    } catch (_e) {
+      err.textContent = "Face ID cancelled — use PIN";
+    }
+    if (faceBtn) faceBtn.disabled = false;
+  }
   document.getElementById("engineLockBtn").addEventListener("click", tryUnlock);
   document.getElementById("engineLockInput").addEventListener("keydown", function (e) {
     if (e.key === "Enter") tryUnlock();
   });
+  var faceBtnEl = document.getElementById("engineFaceIdBtn");
+  if (faceBtnEl) faceBtnEl.addEventListener("click", tryFaceIdUnlock);
+  updateLockUi();
+  // Auto-prompt Face ID when session expired and a platform credential exists.
+  if (!sessionAlreadyOpen && webAuthnSupported() && hasWebAuthnCred()) {
+    setTimeout(function () {
+      tryFaceIdUnlock();
+    }, 350);
+  }
 })();
 </script><header class="app-header">
   <span class="brand-name">TheBetCeo ⚡️</span>
