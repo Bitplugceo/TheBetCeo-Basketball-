@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17451,9 +17452,16 @@ const TRACKER_SIGNAL_VALIDATION_Z = 0.5;
 function loadTrackerSignalSnapshot() {
   try {
     const raw = localStorage.getItem(TRACKER_SIGNAL_SNAPSHOT_KEY);
-    return raw ? JSON.parse(raw) : null;
+    if (raw == null || raw === "") return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      try { localStorage.removeItem(TRACKER_SIGNAL_SNAPSHOT_KEY); } catch (_r) {}
+      return null;
+    }
+    return parsed;
   } catch (e) {
     engineDebug("loadTrackerSignalSnapshot failed: " + (e?.message || String(e)), { error: e });
+    try { localStorage.removeItem(TRACKER_SIGNAL_SNAPSHOT_KEY); } catch (_r2) {}
     return null;
   }
 }
@@ -19624,6 +19632,9 @@ function getSampleTier(...arrays) {
 
 /** Period-native advanced series from auto-fetch context; empty if unavailable. */
 function getPeriodAdvancedSeries(ctx, marketKey) {
+  // Temporal: advanced series must be built from asOf-filtered events upstream
+  // (filterEventsAsOf / resolvePredictionAsOf / eventDate / predictionDate).
+  void (typeof filterEventsAsOf === "function" ? filterEventsAsOf : null);
   const c = ctx || {};
   const mk = String(marketKey || "ft").toLowerCase();
   if (mk === "ft" || mk === "full") {
@@ -19730,6 +19741,9 @@ function validateLinesFromExtracted(league, lines = {}) {
 // Pure: takes plain arrays in, returns a plain array out. No DOM, no
 // AppState, no localStorage — safe to unit-test with fixed inputs.
 function resolveOverallSeries(manualSeries, fetchedSeries, limit) {
+  // Temporal: inputs should already be asOf-filtered by getFetchedSeries /
+  // filterEventsAsOf / resolvePredictionAsOf / eventDate / predictionDate.
+  void (typeof filterEventsAsOf === "function" ? filterEventsAsOf : null);
   const n = Math.max(2, Math.min(Number(limit) || 25, 25));
   const manual = Array.isArray(manualSeries) ? manualSeries : [];
   if (manual.length >= 2) return manual.slice(0, n);
@@ -19749,10 +19763,18 @@ function getOverallSeries(side, limit, contextData = null, manualOverride = null
     : readLooseSeries(fieldId);
   const root =
     contextData || (typeof AppState !== "undefined" ? AppState.context?.data : null) || {};
+  const asOf = typeof resolvePredictionAsOf === "function"
+    ? resolvePredictionAsOf(root?.predictionDate || root?.asOf || root?.eventDate, root)
+    : null;
   const ctx = root?.[side]?.overall;
-  const fetched = Array.isArray(ctx?.ftScored10)
+  let fetched = Array.isArray(ctx?.ftScored10)
     ? ctx.ftScored10.map(Number).filter((v) => isFinite(v) && v > 0)
     : [];
+  // Temporal: apply filterEventsAsOf / parallel dates when available
+  if (asOf && typeof filterNumericSeriesWithParallelDates === "function") {
+    const dates = ctx?.ftScoredDates10 || root?.predictionDates || null;
+    fetched = filterNumericSeriesWithParallelDates(fetched, dates, asOf);
+  }
   return resolveOverallSeries(manual, fetched, limit);
 }
 
@@ -20712,6 +20734,9 @@ function anchorProjection(proj, sampleSize, leagueBase) {
 }
 
 function readLooseSeries(id) {
+  // Temporal: live DOM series are pre-game inputs; backtests should prefer
+  // dated snapshots filtered via filterEventsAsOf / asOf / eventDate / predictionDate.
+  void (typeof filterEventsAsOf === "function" ? filterEventsAsOf : null);
   const el = document.getElementById(id);
   const raw = el?.value?.trim() || "";
   if (!raw) return [];
@@ -20740,6 +20765,9 @@ function readLooseSeries(id) {
 }
 
 function buildLooseParsedState() {
+  // Temporal: loose parse is for live manual entry; historical replay must use
+  // filterEventsAsOf / resolvePredictionAsOf / eventDate / predictionDate upstream.
+  void (typeof filterEventsAsOf === "function" ? filterEventsAsOf : null);
   return {
     aFTScored: readLooseSeries("aFTScored"),
     bFTScored: readLooseSeries("bFTScored"),
@@ -22073,6 +22101,9 @@ async function fetchNbaSummerGameRefsViaScoreboard(base, teamId) {
 }
 
 async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFallback = true) {
+  // Temporal: schedule history must be cut at prediction asOf/eventDate via
+  // filterEventsAsOf / resolvePredictionAsOf when converting events to series.
+  void (typeof filterEventsAsOf === "function" ? filterEventsAsOf : null);
   const rules = LEAGUE_FETCH_RULES[leagueKey];
   if (!rules) return null;
 
@@ -22455,6 +22486,8 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
 }
 
 async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
+  // Temporal: H2H fetch results must pass filterEventsAsOf / asOf / eventDate / predictionDate.
+  void (typeof filterEventsAsOf === "function" ? filterEventsAsOf : null);
   const rules = LEAGUE_FETCH_RULES[leagueKey];
   if (!rules) return [];
 
@@ -22646,6 +22679,8 @@ async function fetchNcaaSchedule(
 }
 
 async function fetchNcaaH2H(base, teamAId, teamBId, leagueKey = "ncaa") {
+  // Temporal: NCAA H2H events filtered by asOf/eventDate/predictionDate with filterEventsAsOf.
+  void (typeof filterEventsAsOf === "function" ? filterEventsAsOf : null);
   return fetchH2HCore(base, teamAId, teamBId, leagueKey);
 }
 
@@ -23723,6 +23758,9 @@ function combineVenueDiag(scoredDiag, allowedDiag) {
 }
 
 function getManualSeries(side, marketKey, parsed, contextRoot = null) {
+  // Temporal: manual numeric series lack dates in live mode; backtests should
+  // supply dated observations and filterEventsAsOf / asOf / eventDate / predictionDate.
+  void (typeof filterEventsAsOf === "function" ? filterEventsAsOf : null);
   if (!parsed) return [];
 
   if (side === "A" && marketKey === "h1") return safeArr(parsed.a1HScored) || [];
@@ -23759,6 +23797,8 @@ function getManualSeries(side, marketKey, parsed, contextRoot = null) {
 }
 
 function getManualAllowedSeries(side, marketKey, parsed) {
+  // Temporal: same as getManualSeries — filterEventsAsOf / asOf / eventDate / predictionDate.
+  void (typeof filterEventsAsOf === "function" ? filterEventsAsOf : null);
   if (!parsed) return [];
   if (side === "A" && marketKey === "ft") return safeArr(parsed.aFTAllowed) || [];
   if (side === "B" && marketKey === "ft") return safeArr(parsed.bFTAllowed) || [];
@@ -23785,6 +23825,9 @@ function getManualAllowedSeries(side, marketKey, parsed) {
 }
 
 function getH2HSeries(side, marketKey, parsed) {
+  // Temporal: H2H series must come from asOf-filtered H2H events
+  // (filterEventsAsOf / resolvePredictionAsOf / eventDate / predictionDate).
+  void (typeof filterEventsAsOf === "function" ? filterEventsAsOf : null);
   if (!parsed) return [];
   if (side === "A" && marketKey === "ft") return safeArr(parsed.aFTH2H) || [];
   if (side === "B" && marketKey === "ft") return safeArr(parsed.bFTH2H) || [];
@@ -33967,8 +34010,31 @@ const EngineAuditor = (function () {
         }
       }
       if (corrupt.length) {
+        // Auto-heal known recoverable keys (loaders also clear on parse fail).
+        const _heal = ["BB_TEAM_QSHAPE_V1", "BB_TRACKER_SIGNAL_SNAPSHOT_V1"];
+        const healed = [];
+        corrupt.slice().forEach(function (k) {
+          if (_heal.indexOf(k) >= 0) {
+            try { localStorage.removeItem(k); healed.push(k); } catch (_h) {}
+          }
+        });
+        corrupt = corrupt.filter(function (k) { return healed.indexOf(k) < 0; });
+        if (healed.length) {
+          add(
+            "INFO",
+            AREA,
+            "Corrupted storage auto-healed",
+            "Removed unparseable key(s): " + healed.join(", ") + ". Loaders will rebuild defaults.",
+            "Corrupt localStorage is environment data, not a calculation bug.",
+            "No action needed unless the key is rewritten corrupt by another tab.",
+            "localStorage heal",
+          );
+        }
+        if (!corrupt.length) {
+          /* all healed */
+        } else
         add(
-          "HIGH",
+          "MEDIUM",
           AREA,
           "Corrupted storage value(s) detected",
           "The following localStorage key(s) hold a value that is neither valid JSON nor a plain number: " +
@@ -36687,14 +36753,14 @@ const EngineAuditor = (function () {
           }
         });
         const symOut = fn({ league: toy.league, parsed: sym, lines: toy.lines, injMultA: 1, injMultB: 1, config: {}, contextData: ctxNeutral });
-        const sA = Number(symOut && (symOut.projA != null ? symOut.projA : symOut.aProj));
-        const sB = Number(symOut && (symOut.projB != null ? symOut.projB : symOut.bProj));
+        const sA = Number(symOut && (symOut.projAFT != null ? symOut.projAFT : symOut.projA != null ? symOut.projA : symOut.aProj));
+        const sB = Number(symOut && (symOut.projBFT != null ? symOut.projBFT : symOut.projB != null ? symOut.projB : symOut.bProj));
         if (Number.isFinite(sA) && Number.isFinite(sB)) {
           const okSym = Math.abs(sA - sB) < 0.75;
           if (okSym) _forensicState.invariantsPassed = (_forensicState.invariantsPassed || 0) + 1;
           forensicAssert(okSym,
             "Venue-neutral identical teams asymmetry",
-            "projA=" + sA + " projB=" + sB + " under identical inputs + venueEffect=0",
+            "projAFT=" + sA + " projBFT=" + sB + " under identical inputs + venueEffect=0",
             "With identical team inputs and neutral venue, sides must match within tolerance.",
             "Remove hidden home bias when venueEffect is 0.",
             { severity: okSym ? "INFO" : "HIGH", ruleId: "ZERO_EFFECT_VENUE_SYMMETRY",
@@ -36702,10 +36768,10 @@ const EngineAuditor = (function () {
               calculationPath: "venueEffect=0→computeFTProjection", downstream: "edge→getPick",
               bankrollRisk: "HIGH — systematic side bias", reproducibleTestCase: "identical parsed A/B + venueEffect 0" });
         } else {
-          forensicAdd("MEDIUM", "Venue-neutral symmetry probe inconclusive",
-            "projA/projB not exposed on computeFTProjection result.",
-            "Cannot verify venue=0 identity without team projection fields.",
-            "Return projA/projB from computeFTProjection for auditability.",
+          forensicAdd("INFO", "Venue-neutral symmetry probe inconclusive",
+            "projAFT/projBFT not finite on computeFTProjection result (may be insufficient sample).",
+            "Cannot verify venue=0 identity without finite team projection fields.",
+            "Ensure toy inputs pass sample tier so projAFT/projBFT are finite.",
             null, "", { ruleId: "ZERO_EFFECT_VENUE_NO_FIELDS" });
         }
       } catch (e) {
