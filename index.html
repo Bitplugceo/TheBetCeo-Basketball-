@@ -1,3 +1,4 @@
+V
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -35596,6 +35597,8 @@ const EngineAuditor = (function () {
   let _forensicRawPromise = null;
   let _forensicLineStarts = [0];
   let _forensicBracePairs = null;
+  let _forensicCurrentLayerKey = null;
+  let _forensicLayerFailFlags = {};
 
   function forensicHash(text) {
     let h = 2166136261;
@@ -35704,10 +35707,17 @@ const EngineAuditor = (function () {
       f.status = f.status || "UNRESOLVED";
     }
     _forensicState.findingsGenerated++;
+    if (_forensicCurrentLayerKey && severity !== "INFO") {
+      _forensicLayerFailFlags[_forensicCurrentLayerKey] = true;
+    }
     // Immediate UI push when auditor is open (mid-scan stream)
     if (_isOpen && (severity === "CRITICAL" || severity === "HIGH")) {
       try { render(); } catch (_r) {}
     }
+  }
+
+  function forensicLayerResult(key) {
+    return _forensicLayerFailFlags[key] ? "FAILED" : "PASSED";
   }
 
   function forensicStripForScanLine(line, state) {
@@ -35931,6 +35941,7 @@ const EngineAuditor = (function () {
   }
 
   function forensicStaticProgramAnalysis(src, functions, auditStartLine, auditEndLine) {
+    _forensicCurrentLayerKey = "STATIC_PROGRAM_ANALYSIS";
     const text = String(src || "");
     const tokens = forensicLex(text);
     _forensicState.lexicalTokens = tokens.length;
@@ -36022,7 +36033,7 @@ const EngineAuditor = (function () {
     _forensicState.calculationInventoryComplete = _forensicState.calculationSites >= 0;
     _forensicState.staticAnalysisComplete = true;
     _forensicState.staticFunctionCoveragePercent = Math.round(coverage * 100) / 100;
-    _forensicState.layerStatus.STATIC_PROGRAM_ANALYSIS = "PASSED";
+    _forensicState.layerStatus.STATIC_PROGRAM_ANALYSIS = forensicLayerResult("STATIC_PROGRAM_ANALYSIS");
     forensicAdd("INFO", "Program-wide lexical/control-flow/data-flow inventory complete",
       "Tokenized " + tokens.length + " source tokens; discovered " + _forensicState.branchSites + " branch sites, " + _forensicState.assignmentSites + " assignment sites, " + _forensicState.arithmeticSites + " arithmetic/comparison operators and " + productFns.length + " product functions.",
       "The auditor now inventories the complete program rather than treating the 72 regression checks as source coverage.",
@@ -36130,6 +36141,9 @@ const EngineAuditor = (function () {
       ["UNDER", 100, 99, "ft_total", "win"], ["UNDER", 100, 101, "ft_total", "loss"], ["UNDER", 100, 100, "ft_total", "push"],
       ["HOME", -3.5, 4, "handicap", "win"], ["HOME", -3.5, 3, "handicap", "loss"],
       ["HOME", -3, 3, "handicap", "push"], ["AWAY", -3.5, 4, "handicap", "loss"],
+      // Regression guard for the away-side netCover sign bug: home lost
+      // outright (A=-2) while laying -3.5, so away must win (and cover).
+      ["AWAY", -3.5, -2, "handicap", "win"],
     ];
     let ok = true;
     cases.forEach(function (r) {
@@ -36287,6 +36301,7 @@ const EngineAuditor = (function () {
   // FORENSIC LAYERS 1–42 — extended static + dynamic + mathematical + proof-gated suite
   // ------------------------------------------------------------------
   function forensicLayerReconciliation() {
+    _forensicCurrentLayerKey = "RECONCILIATION";
     const run = (fn) => { try { return { ok: true, value: fn() }; } catch (e) { return { ok: false, error: e }; } };
     if (typeof buildToyInputs !== "function") return;
     const required = ["computeFTProjection", "compute1HProjection", "compute2HProjection"];
@@ -36326,12 +36341,13 @@ const EngineAuditor = (function () {
       }
     }
     _forensicState.layerStatus = _forensicState.layerStatus || {};
-    _forensicState.layerStatus.RECONCILIATION = "PASSED";
+    _forensicState.layerStatus.RECONCILIATION = forensicLayerResult("RECONCILIATION");
     _forensicState.invariantsTested = (_forensicState.invariantsTested || 0) + 2;
 
   }
 
   function forensicLayerZeroEffects() {
+    _forensicCurrentLayerKey = "ZERO_EFFECTS";
     _forensicState.invariantsTested = (_forensicState.invariantsTested || 0) + 6;
     _forensicState.layerStatus = _forensicState.layerStatus || {};
     if (typeof applyVolatility === "function") {
@@ -36467,10 +36483,11 @@ const EngineAuditor = (function () {
           "Could not verify injury/venue zero paths.", "Expose computeFTProjection.", { severity: "MEDIUM", ruleId: "ZERO_EFFECT_SUITE_THROW" });
       }
     }
-    _forensicState.layerStatus.ZERO_EFFECTS = "PASSED";
+    _forensicState.layerStatus.ZERO_EFFECTS = forensicLayerResult("ZERO_EFFECTS");
   }
 
   function forensicLayerAdversarial() {
+    _forensicCurrentLayerKey = "ADVERSARIAL";
     const run = (fn) => { try { return { ok: true, value: fn() }; } catch (e) { return { ok: false, error: e }; } };
     let casesRun = 0;
     // Expanded pathological getPick matrix
@@ -36632,7 +36649,7 @@ const EngineAuditor = (function () {
       });
     }
     _forensicState.layerStatus = _forensicState.layerStatus || {};
-    _forensicState.layerStatus.ADVERSARIAL = "PASSED";
+    _forensicState.layerStatus.ADVERSARIAL = forensicLayerResult("ADVERSARIAL");
     _forensicState.edgeCasesTested = (_forensicState.edgeCasesTested || 0) + casesRun;
     _forensicState.edgeCasesPassed = (_forensicState.edgeCasesPassed || 0) + casesRun;
   }
@@ -36643,6 +36660,7 @@ const EngineAuditor = (function () {
       _forensicState.layerStatus.NO_PLAY = "SKIPPED";
       return;
     }
+    _forensicCurrentLayerKey = "NO_PLAY";
     const run = (fn) => { try { return { ok: true, value: fn() }; } catch (e) { return { ok: false, error: e }; } };
     const matrix = [
       { edge: 12, line: 160, expectPlay: true, label: "strong edge" },
@@ -36691,11 +36709,12 @@ const EngineAuditor = (function () {
       "Treat |edge| below threshold as NO PLAY.",
       { ruleId: "NO_PLAY_ZERO_EDGE", severity: "HIGH" });
     _forensicState.layerStatus = _forensicState.layerStatus || {};
-    _forensicState.layerStatus.NO_PLAY = "PASSED";
+    _forensicState.layerStatus.NO_PLAY = forensicLayerResult("NO_PLAY");
     _forensicState.edgeCasesTested = (_forensicState.edgeCasesTested || 0) + matrix.length + 1;
   }
 
   function forensicLayerUnitScale() {
+    _forensicCurrentLayerKey = "UNIT_CONSISTENCY";
     _forensicState.layerStatus = _forensicState.layerStatus || {};
     const UNIT_REGISTRY = [
       { variable: "edge", unit: "points", scale: "absolute", range: [-80, 80], producer: "projection-line", consumers: ["getPick", "confidence"] },
@@ -36773,7 +36792,7 @@ const EngineAuditor = (function () {
           ruleId: "UNIT_TRAP_WINPROB_PERCENT", inputs: { winProb: 65 }, observed: g65,
           calculationPath: "resolveConfidenceGradeFromWinProbability", bankrollRisk: "CRITICAL" });
     }
-    _forensicState.layerStatus.UNIT_CONSISTENCY = "PASSED";
+    _forensicState.layerStatus.UNIT_CONSISTENCY = forensicLayerResult("UNIT_CONSISTENCY");
   }
 
   function forensicIndependentSettle(side, line, actual, marketKind) {
@@ -36802,8 +36821,14 @@ const EngineAuditor = (function () {
         return "push";
       }
       if (s.indexOf("away") >= 0 || s === "b") {
-        if (-A + L > 0) return "win"; // mirror
-        if (-A + L < 0) return "loss";
+        // FIX CRITICAL: away side must use the same signed netCover as home
+        // (A + L), not a separately-derived "-A + L" formula. The two are
+        // only equivalent when L is 0; for any nonzero line they diverge and
+        // can invert the settlement (verified against the production
+        // netCover formula in settleTrackedPickFromCompetition). Away covers
+        // iff A + L < 0 (the exact mirror of the home win/loss condition).
+        if (A + L < 0) return "win";
+        if (A + L > 0) return "loss";
         return "push";
       }
     }
@@ -36815,6 +36840,7 @@ const EngineAuditor = (function () {
   }
 
   function forensicLayerSettlementParity() {
+    _forensicCurrentLayerKey = "SETTLEMENT_PARITY";
     // Synthetic independent settlement oracle for multiple markets
     const synthetic = [
       { side: "OVER", line: 163.5, actual: 170, kind: "ft_total", expect: "win" },
@@ -36874,7 +36900,7 @@ const EngineAuditor = (function () {
         { severity: "MEDIUM", ruleId: "SETTLEMENT_PARITY_THROW" });
     }
     _forensicState.layerStatus = _forensicState.layerStatus || {};
-    _forensicState.layerStatus.SETTLEMENT_PARITY = "PASSED";
+    _forensicState.layerStatus.SETTLEMENT_PARITY = forensicLayerResult("SETTLEMENT_PARITY");
   }
 
   function forensicLayerTemporalLeakage(src) {
@@ -37076,6 +37102,7 @@ const EngineAuditor = (function () {
   }
 
   function forensicLayerOTParity(src) {
+    _forensicCurrentLayerKey = "OT_PARITY";
     _forensicState.layerStatus = _forensicState.layerStatus || {};
     const textSrc = String(src || "");
     const mentionsOT = /\bOT\b|overtime|double\s*OT|regulation/i.test(textSrc);
@@ -37164,10 +37191,11 @@ const EngineAuditor = (function () {
         "Match book OT rules for team totals.",
         { ruleId: "OT_TEAM_TOTAL", expected: expectTeam, observed: teamOver, inputs: g });
     });
-    _forensicState.layerStatus.OT_PARITY = "PASSED";
+    _forensicState.layerStatus.OT_PARITY = forensicLayerResult("OT_PARITY");
   }
 
   function forensicLayerDeadAndDoubleCount(src, functions) {
+    _forensicCurrentLayerKey = "DEAD_DOUBLE_COUNT";
     _forensicState.layerStatus = _forensicState.layerStatus || {};
     const textSrc = String(src || "");
     const suspects = ["travelPenalty", "netVenueEffect", "unusedShrink", "deadWeight", "legacyEdgeBoost", "unusedPaceAdj", "debugOnlyFactor"];
@@ -37240,11 +37268,12 @@ const EngineAuditor = (function () {
       "Duplicated feature paths can inflate edge.",
       "Maintain this lineage map as code evolves.",
       { severity: "INFO", ruleId: "DOUBLE_COUNT_LAYER" });
-    _forensicState.layerStatus.FEATURE_LINEAGE = "PASSED";
-    _forensicState.layerStatus.DOUBLE_COUNTING = "PASSED";
+    _forensicState.layerStatus.FEATURE_LINEAGE = forensicLayerResult("DEAD_DOUBLE_COUNT");
+    _forensicState.layerStatus.DOUBLE_COUNTING = forensicLayerResult("DEAD_DOUBLE_COUNT");
   }
 
   function forensicLayerTrainServeParity() {
+    _forensicCurrentLayerKey = "TRAIN_SERVE";
     _forensicState.layerStatus = _forensicState.layerStatus || {};
     // Compare buildConfidenceFeatures availability and purity
     if (typeof buildConfidenceFeatures === "function") {
@@ -37296,7 +37325,7 @@ const EngineAuditor = (function () {
         { severity: mono ? "INFO" : "CRITICAL", ruleId: "TRAIN_SERVE_GRADE_MONO",
           observed: grades.join(","), calculationPath: "resolveConfidenceGradeFromWinProbability" });
     }
-    _forensicState.layerStatus.TRAIN_SERVE = "PASSED";
+    _forensicState.layerStatus.TRAIN_SERVE = forensicLayerResult("TRAIN_SERVE");
   }
 
   function forensicLayerProjectionBounds() {
@@ -37310,6 +37339,7 @@ const EngineAuditor = (function () {
       _forensicState.layerStatus.PROJECTION_BOUNDS = "SKIPPED";
       return;
     }
+    _forensicCurrentLayerKey = "PROJECTION_BOUNDS";
     let out;
     try {
       const toy = buildToyInputs();
@@ -37339,7 +37369,7 @@ const EngineAuditor = (function () {
         "Derive FT from team projections.",
         { severity: Math.abs(ftp - (a + b)) <= 1.5 ? "INFO" : "CRITICAL", ruleId: "PROJ_BOUNDS_SUM" });
     }
-    _forensicState.layerStatus.PROJECTION_BOUNDS = "PASSED";
+    _forensicState.layerStatus.PROJECTION_BOUNDS = forensicLayerResult("PROJECTION_BOUNDS");
   }
 
   function forensicLayerAutoGeneratedProbes(functions) {
@@ -37839,6 +37869,8 @@ const EngineAuditor = (function () {
     const proofLayerKeys = [
       "RECONCILIATION","SETTLEMENT_PARITY","UNIT_CONSISTENCY","LIVE_REPLAY",
       "TRAIN_SERVE","TEMPORAL_PROOF","MARKET_ORACLE","STATIC_PROGRAM_ANALYSIS",
+      "ZERO_EFFECTS","ADVERSARIAL","NO_PLAY","OT_PARITY",
+      "FEATURE_LINEAGE","DOUBLE_COUNTING","PROJECTION_BOUNDS","TEMPORAL_LEAKAGE",
     ];
     const failedProof = proofLayerKeys.filter(k => {
       const st = (_forensicState.layerStatus || {})[k];
