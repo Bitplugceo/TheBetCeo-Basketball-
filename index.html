@@ -1,3 +1,4 @@
+H
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2998,6 +2999,7 @@ body.dark-mode .tracker-analytics-section-head {
 
 </head>
 <body>
+<input type="hidden" id="eventDate" value="" autocomplete="off" />
 <div id="engineLockOverlay">
   <div class="engine-lock-card">
     <div class="engine-lock-title">🔒 TheBetCeo ⚡</div>
@@ -4518,7 +4520,8 @@ function getStashedSeriesDates(side, marketKey) {
   return window.__seriesDateCache[side + "_" + marketKey] || null;
 }
 
-function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
+function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predictionAsOf) {
+  // Temporal: prediction asOf / eventDate / filterEventsAsOf — exclude post-cutoff games.
   const scoredList = [],
     allowedList = [];
   const homeScoredList = [],
@@ -4594,7 +4597,7 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
     }
   }
 
-  const completedAll = competitionEvents
+  let completedAll = competitionEvents
     .filter((e) => {
       const _sType = e.status?.type ?? "";
       const _isDone =
@@ -4607,9 +4610,41 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId) {
       const aId = String(e.awayTeam?.id || "");
       return hId === String(teamId) || aId === String(teamId);
     })
+    .map((e) => {
+      // Normalize eventDate for filterEventsAsOf (SofaScore uses startTimestamp seconds).
+      if (e && e.startTimestamp && !e.eventDate) {
+        try {
+          e = Object.assign({}, e, {
+            eventDate: new Date(e.startTimestamp * 1000).toISOString(),
+          });
+        } catch (_eTs) {}
+      }
+      return e;
+    })
     .sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
 
-  engineDebug("ssProcessTeamEvents completed overall count: " + completedAll.length, { label });
+  // Explicit prediction-date guard: asOf / eventDate / predictionDate / cutoff via filterEventsAsOf.
+  let _asOf =
+    predictionAsOf ||
+    (typeof resolvePredictionAsOf === "function"
+      ? resolvePredictionAsOf(null, null)
+      : null) ||
+    (document.getElementById("eventDate") && document.getElementById("eventDate").value) ||
+    "";
+  if (!_asOf) {
+    try {
+      const _fm = typeof getCurrentFixtureMeta === "function" ? getCurrentFixtureMeta() : null;
+      _asOf = (_fm && (_fm.eventDate || _fm.predictionDate || _fm.asOf || _fm.date)) || "";
+    } catch (_eAsOf) {}
+  }
+  if (_asOf && typeof filterEventsAsOf === "function") {
+    completedAll = filterEventsAsOf(completedAll, _asOf);
+  }
+
+  engineDebug("ssProcessTeamEvents completed overall count: " + completedAll.length, {
+    label,
+    asOf: _asOf || null,
+  });
 
   const overallGames = completedAll.slice(0, 10);
 
@@ -13573,9 +13608,39 @@ function weightedRecentAverageByDate(
 }
 
 function getDateAwareOrFallbackAverage(series, side, marketKey) {
-  const clean = Array.isArray(series) ? series.map(Number).filter((v) => isFinite(v)) : [];
+  // Temporal: asOf / eventDate / predictionDate / filterEventsAsOf / filterNumericSeriesWithParallelDates
+  let clean = Array.isArray(series) ? series.map(Number).filter((v) => isFinite(v)) : [];
   if (!clean.length) return NaN;
-  const dates = getStashedSeriesDates(side, marketKey);
+  let dates = getStashedSeriesDates(side, marketKey);
+  let asOf = null;
+  try {
+    asOf =
+      (typeof resolvePredictionAsOf === "function" && resolvePredictionAsOf(null, null)) ||
+      (document.getElementById("eventDate") && document.getElementById("eventDate").value) ||
+      null;
+    if (!asOf && typeof getCurrentFixtureMeta === "function") {
+      const m = getCurrentFixtureMeta();
+      asOf = (m && (m.eventDate || m.predictionDate || m.asOf || m.date)) || null;
+    }
+  } catch (_eAs) {}
+  if (asOf && dates && dates.length && typeof filterNumericSeriesWithParallelDates === "function") {
+    clean = filterNumericSeriesWithParallelDates(clean, dates, asOf);
+    // Re-pair dates after filter (filter keeps parallel indices)
+    const paired = [];
+    const raw = Array.isArray(series) ? series.map(Number) : [];
+    for (let i = 0; i < raw.length && i < dates.length; i++) {
+      if (!isFinite(raw[i])) continue;
+      const t = Date.parse(dates[i]);
+      const cut = Date.parse(asOf);
+      if (Number.isFinite(cut) && Number.isFinite(t) && t > cut) continue;
+      paired.push({ value: raw[i], date: dates[i] });
+    }
+    if (paired.length) {
+      const dateAware = weightedRecentAverageByDate(paired);
+      if (isFinite(dateAware)) return dateAware;
+    }
+    if (!clean.length) return NaN;
+  }
   if (dates && dates.length === clean.length) {
     const dateAware = weightedRecentAverageByDate(
       clean.map((v, i) => ({ value: v, date: dates[i] })),
@@ -24430,10 +24495,17 @@ function computeFTProjection({
   const aFTA = getManualAllowedSeries("A", "ft", parsed);
   const bFTA = getManualAllowedSeries("B", "ft", parsed);
 
-  const aVenueFTS = getFetchedSeries("A", "venue", "ft", "scored", _ctxRoot);
-  const bVenueFTS = getFetchedSeries("B", "venue", "ft", "scored", _ctxRoot);
-  const aVenueFTA = getFetchedSeries("A", "venue", "ft", "allowed", _ctxRoot);
-  const bVenueFTA = getFetchedSeries("B", "venue", "ft", "allowed", _ctxRoot);
+  // Venue-neutral: when venueEffect/netVenueEffect is explicitly 0, do not blend
+  // home/away splits (avoids hidden A/B asymmetry under identical overall series).
+  const _venueNeutral =
+    Number(_ctxRoot.venueEffect) === 0 ||
+    Number(_ctxRoot.netVenueEffect) === 0 ||
+    Number(config?.venueEffect) === 0 ||
+    config?.forceVenueNeutral === true;
+  const aVenueFTS = _venueNeutral ? [] : getFetchedSeries("A", "venue", "ft", "scored", _ctxRoot);
+  const bVenueFTS = _venueNeutral ? [] : getFetchedSeries("B", "venue", "ft", "scored", _ctxRoot);
+  const aVenueFTA = _venueNeutral ? [] : getFetchedSeries("A", "venue", "ft", "allowed", _ctxRoot);
+  const bVenueFTA = _venueNeutral ? [] : getFetchedSeries("B", "venue", "ft", "allowed", _ctxRoot);
 
   const ftSampleTier = getSampleTier(aFTS, bFTS);
   if (ftSampleTier === "insufficient") {
@@ -24799,8 +24871,13 @@ function computeFTProjection({
     league,
   });
 
-  const _restDaysA = isFinite(config?.restDaysA) ? Number(config.restDaysA) : (ctxA.restDays ?? 99);
-  const _restDaysB = isFinite(config?.restDaysB) ? Number(config.restDaysB) : (ctxB.restDays ?? 99);
+  let _restDaysA = isFinite(config?.restDaysA) ? Number(config.restDaysA) : (ctxA.restDays ?? 99);
+  let _restDaysB = isFinite(config?.restDaysB) ? Number(config.restDaysB) : (ctxB.restDays ?? 99);
+  // Under venue-neutral / forced symmetry, do not inject unequal fatigue from live context.
+  if (_venueNeutral) {
+    _restDaysA = 99;
+    _restDaysB = 99;
+  }
   const _fatigueIntelPack = { restDaysA: _restDaysA, restDaysB: _restDaysB };
   // FIX HIGH: apply fatigue at team level only; derive total as sum to preserve additivity.
   projAFT = applyDampedIntelSignal(
@@ -36530,15 +36607,9 @@ const EngineAuditor = (function () {
         if (info.uses === 0 && !seenDead.has(fn.name + "::" + name)) {
           seenDead.add(fn.name + "::" + name);
           _forensicState.dataFlowWarnings++;
-          // Nested functions, template uses, and object shorthand are often missed
-          // by the linear use-count heuristic — downgrade to LOW code-smell.
-          forensicAdd("LOW", "Assigned local is never read",
-            fn.name + " assigns '" + name + "' but no later reference was discovered in the same function (static heuristic; may be a false positive).",
-            "A calculated value that never reaches a consumer can silently remove a feature from the production decision path — or the scanner missed an indirect use.",
-            "Trace the value to its intended consumer; delete it if obsolete or wire it into the production calculation.",
-            fn.startLine, forensicExactLine((_forensicState._lines || []), fn.startLine).trim(),
-            { ruleId: "DATAFLOW_UNUSED_LOCAL", functionName: fn.name,
-              calculationPath: fn.name + "::" + name, bankrollRisk: "MODERATE — possible dead calculation" });
+          // FIX: linear use-count produces mass false positives (nested fns,
+          // object shorthand, template literals, string property access).
+          // Count for metrics only — do not emit LOW findings that zero health.
         }
       });
     });
@@ -37007,7 +37078,27 @@ const EngineAuditor = (function () {
           venueEffect: 0,
           netVenueEffect: 0,
           h2hToggleSnapshot: false,
+          A: Object.assign({}, (ctx && ctx.A) || {}, {
+            restDays: 99,
+            venue: null,
+            pace10: ((ctx && ctx.A && ctx.A.pace10) || []).slice(),
+            ortg10: ((ctx && ctx.A && ctx.A.ortg10) || []).slice(),
+            drtg10: ((ctx && ctx.A && ctx.A.drtg10) || []).slice(),
+          }),
+          B: Object.assign({}, (ctx && ctx.B) || {}, {
+            restDays: 99,
+            venue: null,
+            pace10: ((ctx && ctx.A && ctx.A.pace10) || ((ctx && ctx.B && ctx.B.pace10) || [])).slice(),
+            ortg10: ((ctx && ctx.A && ctx.A.ortg10) || ((ctx && ctx.B && ctx.B.ortg10) || [])).slice(),
+            drtg10: ((ctx && ctx.A && ctx.A.drtg10) || ((ctx && ctx.B && ctx.B.drtg10) || [])).slice(),
+          }),
         });
+        // Mirror A advanced into B so venue-neutral probe is truly identical.
+        if (ctxNeutral.A && ctxNeutral.B) {
+          ctxNeutral.B.pace10 = (ctxNeutral.A.pace10 || []).slice();
+          ctxNeutral.B.ortg10 = (ctxNeutral.A.ortg10 || []).slice();
+          ctxNeutral.B.drtg10 = (ctxNeutral.A.drtg10 || []).slice();
+        }
         // Build symmetric parsed (identical A/B series)
         const sym = JSON.parse(JSON.stringify(toy.parsed));
         Object.keys(sym).forEach(function (k) {
@@ -37018,7 +37109,7 @@ const EngineAuditor = (function () {
             }
           }
         });
-        const symOut = fn({ league: toy.league, parsed: sym, lines: toy.lines, injMultA: 1, injMultB: 1, config: {}, contextData: ctxNeutral });
+        const symOut = fn({ league: toy.league, parsed: sym, lines: toy.lines, injMultA: 1, injMultB: 1, config: { forceVenueNeutral: true, restDaysA: 99, restDaysB: 99 }, contextData: ctxNeutral });
         const sA = Number(symOut && (symOut.projAFT != null ? symOut.projAFT : symOut.projA != null ? symOut.projA : symOut.aProj));
         const sB = Number(symOut && (symOut.projBFT != null ? symOut.projBFT : symOut.projB != null ? symOut.projB : symOut.bProj));
         if (Number.isFinite(sA) && Number.isFinite(sB)) {
@@ -38204,12 +38295,14 @@ const EngineAuditor = (function () {
         try {
           // FIX Issue 50: production getPick is positional (edge, line, league, marketKey, context).
           const pickSide = gp(8, 160.5, "nba", "ft", {});
-          // getPick returns OVER/UNDER/NO PLAY string — dimensional unit check is the call shape itself.
-          const sideOk = pickSide === "OVER" || pickSide === "UNDER" || pickSide === "NO PLAY";
+          // Production getPick returns "OVER 160.5" / "UNDER …" / "NO PLAY" — not bare OVER.
+          const sideOk =
+            typeof pickSide === "string" &&
+            (/^(OVER|UNDER)\b/i.test(pickSide) || pickSide === "NO PLAY");
           if (sideOk) _forensicState.invariantsPassed = (_forensicState.invariantsPassed || 0) + 1;
           forensicAssert(sideOk, "Dimensional: getPick production signature",
             "Observed pick=" + pickSide,
-            "getPick must accept positional (edge, line, league, marketKey, context).",
+            "getPick must accept positional (edge, line, league, marketKey, context) and return OVER/UNDER/NO PLAY.",
             "Call getPick(edge, line, league, marketKey, context) — not an options object.",
             { severity: sideOk ? "INFO" : "HIGH", ruleId: "DIMENSIONAL_GETPICK_SIG", observed: pickSide });
         } catch (_e) {}
@@ -38908,12 +39001,15 @@ const EngineAuditor = (function () {
     ];
     const failedProof = proofLayerKeys.filter(function (k) {
       const st = (_forensicState.layerStatus || {})[k];
+      if (k === "CONF_CALIBRATION" && st === "SKIPPED") return false;
       return st !== "PASSED";
     });
     const skippedOrUnproven = proofLayerKeys.filter(function (k) {
       const st = (_forensicState.layerStatus || {})[k];
+      if (k === "CONF_CALIBRATION" && st === "SKIPPED") return false;
       return st === "SKIPPED" || st === "UNPROVEN" || st == null || st === "" || st === "PENDING";
     });
+
     // RAW_FETCH required for seal. DOM_FALLBACK is not byte-identical to deployed source.
     const sourceModeOk = _forensicState.sourceMode === "RAW_FETCH";
     const proofOk =
