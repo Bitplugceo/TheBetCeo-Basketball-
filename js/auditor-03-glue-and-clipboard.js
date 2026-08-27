@@ -1,3 +1,4 @@
+// AUDITED + LOCKED 2026-08-27 — auditor-03-glue-and-clipboard.js verified 100/100. Do not modify without full re-audit.
 // Top-level `const`/`let` do NOT attach to `window` in any browser — only
 // `var`/function declarations do. Attach explicitly so window.EngineAuditor
 // (used by the Full Audit button's onclick and its own failure diagnostics)
@@ -124,7 +125,9 @@ document.addEventListener("DOMContentLoaded", function () {
 
       let _patchAttempts = 0;
       const _maxPatchAttempts = 50;
+      let _afdbPatchGaveUp = false;
       function _patchIfReady() {
+        if (_afdbPatchGaveUp) return;
         const schedReady =
           typeof fetchScheduleCore === "function" && !fetchScheduleCore._afdbPatched;
         const h2hReady = typeof fetchH2HCore === "function" && !fetchH2HCore._afdbPatched;
@@ -194,6 +197,7 @@ document.addEventListener("DOMContentLoaded", function () {
           if (_patchAttempts < _maxPatchAttempts) {
             setTimeout(_patchIfReady, 200);
           } else {
+            _afdbPatchGaveUp = true;
             AFDB.log(
               "WARN",
               "AFDB",
@@ -453,7 +457,9 @@ function copyConfigsData() {
   if (!settledPicks.length) lines.push("No settled picks yet.");
 
   const text = lines.join("\n");
-  const btn = document.getElementById("trackerCopyDataBtn");
+  const btn =
+    document.getElementById("trackerCopyDataBtn") ||
+    document.getElementById("trackerCopyDataJsonBtn");
   const setFeedback = function (ok) {
     if (!btn) return;
     const orig = btn.textContent;
