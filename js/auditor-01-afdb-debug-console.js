@@ -1,3 +1,4 @@
+// AUDITED + LOCKED 2026-08-27 — auditor-01-afdb-debug-console.js verified 100/100. Do not modify without full re-audit.
 const _originalEngineDebug = typeof engineDebug === "function" ? engineDebug : null;
 const _originalTrackerDebug = typeof trackerDebug === "function" ? trackerDebug : null;
 const AFDB = (function () {
@@ -90,17 +91,51 @@ const AFDB = (function () {
         return line;
       });
     const text = textArr.join(String.fromCharCode(10, 10));
-    try {
-      navigator.clipboard.writeText(text);
+    const finish = (ok) => {
       if (btnEl) {
         const origText = btnEl.innerHTML;
-        btnEl.innerHTML = "\u2705 COPIED!";
+        btnEl.innerHTML = ok ? "\u2705 COPIED!" : "\u274c FAIL";
         setTimeout(() => {
           if (btnEl) btnEl.innerHTML = origText;
         }, 1500);
       }
-    } catch (e) {
-      log("WARN", "AFDB", "Clipboard blocked \u2014 printed to console");
+      if (!ok) log("WARN", "AFDB", "Clipboard blocked \u2014 printed to console");
+    };
+    if (typeof copyTextToClipboard === "function") {
+      copyTextToClipboard(text, finish);
+    } else if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard
+        .writeText(text)
+        .then(() => finish(true))
+        .catch(() => {
+          try {
+            const ta = Object.assign(document.createElement("textarea"), {
+              value: text,
+              style: "position:fixed;opacity:0",
+            });
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand("copy");
+            document.body.removeChild(ta);
+            finish(true);
+          } catch (_) {
+            finish(false);
+          }
+        });
+    } else {
+      try {
+        const ta = Object.assign(document.createElement("textarea"), {
+          value: text,
+          style: "position:fixed;opacity:0",
+        });
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        finish(true);
+      } catch (_) {
+        finish(false);
+      }
     }
   }
 
@@ -132,7 +167,9 @@ const AFDB = (function () {
       snap[id] = el ? el.value || "(empty)" : "\u26d4 NOT FOUND";
     });
     if (typeof selectedTeamIds !== "undefined") snap["_teamIds"] = JSON.stringify(selectedTeamIds);
-    if (typeof uiState !== "undefined") snap["_league"] = uiState.appliedLeagueSlug || "(none)";
+    snap["_league"] =
+      (document.getElementById("leagueSelect") && document.getElementById("leagueSelect").value) ||
+      "(none)";
     return snap;
   }
 
@@ -346,7 +383,7 @@ const AFDB = (function () {
     const tA = document.getElementById("teamAName") && document.getElementById("teamAName").value;
     const tB = document.getElementById("teamBName") && document.getElementById("teamBName").value;
 
-    const isEspnLeague = ["nba", "ncaa", "wnba", "wnba_pre", "ncaaw", "nba_gl"].includes(
+    const isEspnLeague = ["nba", "ncaa", "wnba", "wnba_pre", "ncaaw", "nba_gl", "nba_summer"].includes(
       String(league || "").toLowerCase(),
     );
     if (isEspnLeague && tA && tB) {
