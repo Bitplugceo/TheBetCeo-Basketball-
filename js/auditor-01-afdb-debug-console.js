@@ -4,6 +4,18 @@ const _originalTrackerDebug = typeof trackerDebug === "function" ? trackerDebug 
 const AFDB = (function () {
   const LOG_LIMIT = 600;
   let _log = [];
+  // FIX: seed from g_engineDebugLog so calls made before this file loads (all
+  // of engine-01..10's boot-time diagnostics, including ENGINE_INTEGRITY_SHIELD's
+  // result in engine-10) are not silently invisible in this console.
+  if (typeof g_engineDebugLog !== "undefined" && Array.isArray(g_engineDebugLog)) {
+    _log = g_engineDebugLog.slice(0, LOG_LIMIT).map((line) => ({
+      ts: "",
+      level: "BOOT",
+      section: "PRE-BOOT",
+      msg: String(line),
+      data: null,
+    }));
+  }
   let _isOpen = false;
   let _showOnlyErrors = true;
   let _currentLogLevel = "ERROR";
@@ -316,8 +328,8 @@ const AFDB = (function () {
         : [];
     const memCount =
       typeof g_engineLineMemory !== "undefined" ? Object.keys(g_engineLineMemory || {}).length : 0;
-    if (memCount > 190) {
-      log("ERROR", "STORAGE", "Line memory nearing maximum capacity (200). Pruning imminent.");
+    if (memCount > 490) {
+      log("ERROR", "STORAGE", "Line memory nearing maximum capacity (500). Pruning imminent.");
       totalSuspects++;
     }
     if (active.length > 490) {
