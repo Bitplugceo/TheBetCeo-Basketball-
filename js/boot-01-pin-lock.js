@@ -3,7 +3,7 @@
   // D1: still client-side only — not real access control. Mitigations added:
   // salted hash comparison, progressive lockout after failures, short session TTL.
   // Server-side auth is required for true protection.
-  var ENGINE_LOCK_PIN_HASH = "var ENGINE_LOCK_PIN_HASH = "dc69839a54b801d7badf5c5d5a64ad5800f49c2cb4cca4f99a1767940240b711";
+  var ENGINE_LOCK_PIN_HASH = "dc69839a54b801d7badf5c5d5a64ad5800f49c2cb4cca4f99a1767940240b711";
   var ENGINE_LOCK_SALT = "bb_engine_lock_v1";
   var overlay = document.getElementById("engineLockOverlay");
   var LOCKOUT_KEY = "engineLockFails";
