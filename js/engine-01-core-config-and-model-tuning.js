@@ -2,6 +2,17 @@ window.__BETCEO_ENGINE_BOOT_SEEN = true;
 window.__BETCEO_ENGINE_PARSE_OK = true;
 window.__BETCEO_SESSION_ID = "sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 9);
 
+// Moved up from engine-05: clampNumber is used starting in this file (and in
+// engine-02/engine-03's own top-level init code), but engine-05 loads much
+// later. Calling it before it existed threw "clampNumber is not defined" and
+// aborted engine-03's initialization partway through — which is what left
+// AppState, g_engineDebugLog, g_refreshTrackedPicksInFlight and engineDebug()
+// itself undefined for the rest of the app. Definition kept in engine-05 too
+// (harmless duplicate) so nothing else needs to change.
+function clampNumber(val, min, max) {
+  return Math.max(min, Math.min(max, val));
+}
+
 const ENGINE_INTEGRITY_SHIELD = {
   expectedFingerprints: {
     math: "v1_calibrated",
