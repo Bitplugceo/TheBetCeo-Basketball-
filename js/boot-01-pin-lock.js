@@ -54,7 +54,7 @@
       err.textContent = "";
     } else {
       failState.n = (failState.n || 0) + 1;
-      var backoff = Math.min(300000, 1000 * Math.pow(2, Math.min(8, failState.n)));
+      var backoff = Math.min(300000, 1000 * Math.pow(2, Math.min(9, failState.n)));
       if (failState.n >= 5) failState.until = Date.now() + backoff;
       try {
         localStorage.setItem(LOCKOUT_KEY, JSON.stringify(failState));
