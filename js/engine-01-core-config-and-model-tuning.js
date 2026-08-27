@@ -186,16 +186,32 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
   let competitionEvents = basketballEvents;
   if (fixtureTournamentId != null) {
     const tidStr = String(fixtureTournamentId);
-    competitionEvents = basketballEvents.filter((ev) => {
+    const filtered = basketballEvents.filter((ev) => {
       const evTid = ev?.tournament?.uniqueTournament?.id;
       return evTid != null && String(evTid) === tidStr;
     });
-    const crossBlocked = basketballEvents.length - competitionEvents.length;
-    if (crossBlocked > 0) {
-      engineDebug("ssProcessTeamEvents: blocked " + crossBlocked + " cross-competition events", {
+
+    // For national-team / multi-competition pastes the strict filter often
+    // leaves almost nothing. If the result is too thin, ignore the filter
+    // and use all basketball games instead.
+    const MIN_GAMES_FOR_TOURNAMENT_FILTER = 8;
+    if (filtered.length >= MIN_GAMES_FOR_TOURNAMENT_FILTER) {
+      competitionEvents = filtered;
+      const crossBlocked = basketballEvents.length - filtered.length;
+      if (crossBlocked > 0) {
+        engineDebug("ssProcessTeamEvents: blocked " + crossBlocked + " cross-competition events", {
+          label,
+          fixtureTournamentId,
+          kept: filtered.length,
+        });
+      }
+    } else {
+      competitionEvents = basketballEvents;
+      engineDebug("ssProcessTeamEvents: tournament filter skipped (too thin)", {
         label,
         fixtureTournamentId,
-        kept: competitionEvents.length,
+        matched: filtered.length,
+        fallback: basketballEvents.length,
       });
     }
   }
