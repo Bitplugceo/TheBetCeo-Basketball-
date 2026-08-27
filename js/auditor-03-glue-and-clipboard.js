@@ -261,8 +261,7 @@ function copyTrackerData() {
   lines.push(`Model Version: ${currentVersion}`);
   lines.push(`Overall Score: ${stats.wins || 0}W - ${stats.losses || 0}L (Win Rate: ${winRate})`);
   lines.push(`Settled Picks: ${settled}`);
-  lines.push('      It is the sentinel for "no pick was made" (NO PLAY / no valid line) —');
-  lines.push("      it is never a real letter grade.");
+  lines.push('(Grade "NaN" = NO PLAY / no valid line — this is expected, by design.)');
   lines.push("");
 
   lines.push("--- MARKET PERFORMANCE ---");
@@ -323,7 +322,10 @@ function copyTrackerData() {
     const pace = diag.pace ? diag.pace.toFixed(1) : "—";
     const nA = diag.netA != null ? (diag.netA > 0 ? "+" : "") + diag.netA.toFixed(1) : "—";
     const nB = diag.netB != null ? (diag.netB > 0 ? "+" : "") + diag.netB.toFixed(1) : "—";
-    const vol = diag.aVol != null ? `A:${diag.aVol.toFixed(1)}/B:${diag.bVol.toFixed(1)}` : "—";
+    const vol =
+      diag.aVol != null && diag.bVol != null
+        ? `A:${diag.aVol.toFixed(1)}/B:${diag.bVol.toFixed(1)}`
+        : "—";
 
     lines.push(`${i + 1}. [${date}] ${match}`);
     lines.push(`   ${market} | ${resultDisplay} | ${pickText} (Line: ${formatPickLine(p)})`);
@@ -353,8 +355,6 @@ function copyConfigsData() {
   lines.push("   BB ENGINE: CONFIG LAB FULL EXPORT     ");
   lines.push("==========================================");
   lines.push("Generated: " + new Date().toLocaleString());
-  lines.push('      DESIGN CHOICE, not a bug — it is the sentinel for "no pick was made"');
-  lines.push("      (NO PLAY / no valid line), never a real letter grade.");
   lines.push("");
 
   lines.push("--- VERIFIED CONFIGS (LOCKED & ACTIVE) ---");
