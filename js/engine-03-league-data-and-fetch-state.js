@@ -2140,7 +2140,16 @@ function renderTrackerDebugPanel() {
 const ENGINE_DEBUG_LIMIT = 180;
 let g_engineDebugLog = [];
 
-const AppState = {
+// Hoisted before AppState so getters/setters never hit TDZ on these names
+var g_trackerSaveFailureCount = 0;
+var g_fetchInputErrors = [];
+var g_fetchAuditIssues = [];
+var g_engineAlertNeedsReview = false;
+var g_engineAlertLastLine = "";
+
+// Split-safe: var (not const/let) avoids TDZ across multi-file scripts.
+// const AppState caused: "Cannot access 'AppState' before initialization"
+var AppState = {
   debug: {
     get engineLog() {
       return g_engineDebugLog;
@@ -2350,8 +2359,7 @@ window.getRollingMeanError =
     return sample.reduce((s, e) => s + e.error, 0) / sample.length;
   };
 
-let g_engineAlertNeedsReview = false;
-let g_engineAlertLastLine = "";
+// g_engineAlertNeedsReview / g_engineAlertLastLine declared earlier (before AppState)
 
 function applyGlobalEngineAlertState() {
   document.body.classList.remove("engine-alert");
