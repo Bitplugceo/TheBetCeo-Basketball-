@@ -36,10 +36,8 @@ function toggleTrackerHealthView() {
   else setTrackerModalView("health");
 }
 
-let g_trackerSaveFailureCount = 0;
-let g_fetchInputErrors = [];
-
-let g_fetchAuditIssues = [];
+// g_trackerSaveFailureCount / g_fetchInputErrors / g_fetchAuditIssues
+// are declared in engine-03 (before AppState) to avoid TDZ after the split.
 
 function renderHeaderErrorState() {
   const btn = document.getElementById("headerErrorBtn");
