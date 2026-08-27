@@ -2518,15 +2518,8 @@ async function fetchESPN() {
   g_activeFetchController = new AbortController();
   window.__abortSignal = g_activeFetchController.signal;
 
-  const espnLeagues = new Set(["nba", "wnba", "wnba_pre", "ncaa", "ncaaw", "nba_gl", "nba_summer"]);
-  if (espnLeagues.has(league)) {
-    await fetchESPNCore(league, teamAName, teamBName);
-  } else {
-    setStatusText(
-      "This league uses manual entry. Enter team stats in the fields below, then click Run.",
-      "ok",
-    );
-  }
+  // league is guaranteed to be in TRUE_BIG5 here (early-returned above otherwise).
+  await fetchESPNCore(league, teamAName, teamBName);
 
   const _cooldownBtn = document.getElementById("fetchBtn");
   if (_cooldownBtn) {
