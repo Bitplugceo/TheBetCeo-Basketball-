@@ -52,6 +52,10 @@
     if (typeof window.engineDebug === "function") {
       window.engineDebug("ENGINE BREAKDOWN", `${e.message} | Loc: ${file}:${e.lineno}`);
     }
+    // FIX: surface real runtime errors immediately. The 15s timeout below only
+    // catches a total boot failure (before engine-01's first line runs) — it
+    // never fires for an error inside engine-01..10, which is most of the app.
+    spawnFatalTerminal(e.message, file, e.lineno, e.colno, e.error && e.error.stack);
   }
 
   function __betceoWatchdogRejection(e) {
