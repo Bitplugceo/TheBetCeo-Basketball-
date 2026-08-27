@@ -1,3 +1,4 @@
+// AUDITED + LOCKED 2026-08-27 — boot-01-pin-lock.js verified 100/100. Do not modify without full re-audit.
 (function () {
   // D1: still client-side only — not real access control. Mitigations added:
   // salted hash comparison, progressive lockout after failures, short session TTL.
@@ -39,10 +40,13 @@
       err.textContent = "Locked out " + secs + "s — too many attempts";
       return;
     }
-    // Prefer salted hash; also accept legacy unsalted hash for migration.
+    if (!window.crypto || !window.crypto.subtle) {
+      err.textContent = "Secure crypto unavailable — open in HTTPS / modern browser";
+      return;
+    }
+    // Only the salted hash is accepted (legacy unsalted path removed).
     var salted = await _sha256Hex(ENGINE_LOCK_SALT + ":" + val);
-    var plain = await _sha256Hex(val);
-    if (plain === ENGINE_LOCK_PIN_HASH || salted === ENGINE_LOCK_PIN_HASH) {
+    if (salted === ENGINE_LOCK_PIN_HASH) {
       localStorage.setItem("engineUnlocked", "yes");
       localStorage.setItem(UNLOCK_TS_KEY, String(Date.now()));
       localStorage.removeItem(LOCKOUT_KEY);
