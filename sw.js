@@ -30,7 +30,7 @@ function isAppShellRequest(request) {
     const url = new URL(request.url);
     if (url.origin !== self.location.origin) return false;
     const path = url.pathname || "";
-    return path.endsWith("manifest.json") || path.endsWith("/manifest.json");
+    return path.endsWith("/manifest.json");
   } catch (_) {
     return false;
   }
