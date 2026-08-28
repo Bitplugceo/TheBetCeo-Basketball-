@@ -1,7 +1,8 @@
+J
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <!-- SEAL BATCH 2026-08-28e — PREDICTIONS header; single clampNumber. -->
+  <!-- SEAL BATCH 2026-08-28g — H2 lock silo + H2 recency phase. -->
   <meta charset="UTF-8" />
   <meta
     name="viewport"
@@ -6842,9 +6843,9 @@ function getTunableParam(key, league, market) {
     team_b: "ft",
     winner: "ft",
     h1: "h1",
-    h2: "h1",
     handicap_h1: "h1",
-    handicap_h2: "h1",
+    h2: "h2",
+    handicap_h2: "h2",
   };
   const rawMarket =
     market != null && market !== ""
@@ -6855,6 +6856,14 @@ function getTunableParam(key, league, market) {
   const effectiveMarket = _LOCK_BUCKET[rawMarket.toLowerCase()] || null;
   if (league && effectiveMarket && hasLockedConfig(league, effectiveMarket)) {
     const lockedVal = getLockedParam(key, league, effectiveMarket);
+    if (lockedVal !== undefined) {
+      return lockedVal;
+    }
+  }
+  // H2 lock missing: inherit H1 lock rather than silently using unlocked defaults
+  // while H1 is promoted. Do not inherit FT into H2.
+  if (league && effectiveMarket === "h2" && hasLockedConfig(league, "h1")) {
+    const lockedVal = getLockedParam(key, league, "h1");
     if (lockedVal !== undefined) {
       return lockedVal;
     }
@@ -18784,7 +18793,12 @@ function isPickPeriodComplete(
   const p = Number(currentPeriod || 0);
   const isNCAAStyle = regulationPeriods === 2;
   if (isNCAAStyle) {
-    if (marketKey === "h1" || marketKey === "h1_team_a" || marketKey === "h1_team_b")
+    if (
+      marketKey === "h1" ||
+      marketKey === "h1_team_a" ||
+      marketKey === "h1_team_b" ||
+      marketKey === "handicap_h1"
+    )
       return p >= 2 || isHalfTime;
     return isGameFinal;
   }
@@ -18798,6 +18812,7 @@ function isPickPeriodComplete(
     case "h1":
     case "h1_team_a":
     case "h1_team_b":
+    case "handicap_h1":
       return p >= 3 || isHalfTime;
     case "q3":
       return p >= 4;
@@ -21552,10 +21567,12 @@ function computeIntelligencePack(league, lines = {}, parsedInput = null) {
   const ctxA = g_massacreFetchContext?.A || {};
   const ctxB = g_massacreFetchContext?.B || {};
   const restDaysA =
-    ctxA.restDays != null && isFinite(Number(ctxA.restDays)) ? Number(ctxA.restDays) : 99;
+    ctxA.restDays != null && isFinite(Number(ctxA.restDays)) ? Number(ctxA.restDays) : null;
   const restDaysB =
-    ctxB.restDays != null && isFinite(Number(ctxB.restDays)) ? Number(ctxB.restDays) : 99;
-  const backToBack = restDaysA < 1 || restDaysB < 1;
+    ctxB.restDays != null && isFinite(Number(ctxB.restDays)) ? Number(ctxB.restDays) : null;
+  const backToBack =
+    (Number.isFinite(restDaysA) && restDaysA < 1) ||
+    (Number.isFinite(restDaysB) && restDaysB < 1);
   const travelMilesResult = computeTravelMilesForCurrentFixture(league);
   return {
     restDaysA,
@@ -27939,9 +27956,13 @@ async function runEngine() {
     typeof hasLockedConfig === "function" && currentLeagueForRun
       ? hasLockedConfig(currentLeagueForRun, "h1")
       : false;
-  window.__liveLockActive = { league: currentLeagueForRun, ft: _lockFt, h1: _lockH1 };
+  const _lockH2 =
+    typeof hasLockedConfig === "function" && currentLeagueForRun
+      ? hasLockedConfig(currentLeagueForRun, "h2")
+      : false;
+  window.__liveLockActive = { league: currentLeagueForRun, ft: _lockFt, h1: _lockH1, h2: _lockH2 };
 
-  if (_lockFt || _lockH1) {
+  if (_lockFt || _lockH1 || _lockH2) {
     const _lockFtWeights =
       _lockFt && typeof getLockedParam === "function"
         ? getLockedParam("recencyWeights", currentLeagueForRun, "ft")
@@ -27950,6 +27971,10 @@ async function runEngine() {
       _lockH1 && typeof getLockedParam === "function"
         ? getLockedParam("recencyWeights", currentLeagueForRun, "h1")
         : null;
+    const _lockH2Weights =
+      _lockH2 && typeof getLockedParam === "function"
+        ? getLockedParam("recencyWeights", currentLeagueForRun, "h2")
+        : null;
     window.__phase2FTRecencyWeights = Array.isArray(_lockFtWeights) && _lockFtWeights.length
       ? _lockFtWeights
       : null;
@@ -27957,6 +27982,9 @@ async function runEngine() {
     window.__phase2H1RecencyWeights = Array.isArray(_lockH1Weights) && _lockH1Weights.length
       ? _lockH1Weights
       : window.__phase2FTRecencyWeights;
+    window.__phase2H2RecencyWeights = Array.isArray(_lockH2Weights) && _lockH2Weights.length
+      ? _lockH2Weights
+      : window.__phase2H1RecencyWeights;
     if (typeof engineDebug === "function") {
       engineDebug("PHASE 7: using Lock Store", {
         league: currentLeagueForRun,
@@ -28292,6 +28320,8 @@ async function runEngine() {
       _h2VolRatio,
       league,
     );
+    const _runH2Weights = window.__phase2H2RecencyWeights || _runH1Weights;
+    MODEL_TUNING.recencyWeights = _runH2Weights;
     const h2Calc = compute2HProjection({
       league,
       parsed,
@@ -28300,6 +28330,7 @@ async function runEngine() {
       injMultB: AppState.injuries.B.scoringMult,
       config: { teamWeight: _dynWeightsH2.teamWeight, oppWeight: _dynWeightsH2.oppWeight },
     });
+    MODEL_TUNING.recencyWeights = _runFTWeights;
 
     const _h2ReconFT = isFinite(ftCalc.ftProj) ? ftCalc.ftProj : NaN;
     const _h2ReconH1 = isFinite(h1Calc.h1Proj) ? h1Calc.h1Proj : NaN;
