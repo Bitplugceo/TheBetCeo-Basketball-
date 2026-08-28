@@ -1,10 +1,10 @@
-// BB Engine service worker — fixed for Issues 47 & 48
-// - Network-first for navigations / index.html (never freeze the engine)
-// - Cache name bumped with engine release
-// - Only shell static assets may be cache-first
-// - skipWaiting + clients.claim so updates apply
+// BB Engine service worker — v23_seal_20260828
+// Network-first for navigations / index.html (never freeze the engine)
+// Cache name matches APP_BUILD_VERSION
+// Only shell static assets may be cache-first
+// skipWaiting + clients.claim so updates apply
 
-const CACHE_NAME = "bb-engine-v23-seal-batch1";
+const CACHE_NAME = "bb-engine-v23_seal_20260828";
 const APP_SHELL = ["./manifest.json"];
 
 self.addEventListener("install", (e) => {
@@ -40,7 +40,6 @@ self.addEventListener("fetch", (e) => {
   const req = e.request;
   if (req.method !== "GET") return;
 
-  // Navigations / HTML document: always network-first (Issue 47)
   if (req.mode === "navigate" || (req.headers.get("accept") || "").includes("text/html")) {
     e.respondWith(
       fetch(req)
@@ -50,14 +49,10 @@ self.addEventListener("fetch", (e) => {
     return;
   }
 
-  // Only precached shell may use cache-first (Issue 48)
   if (isAppShellRequest(req)) {
     e.respondWith(
       caches.match(req).then((cached) => cached || fetch(req).then((res) => res))
     );
     return;
   }
-
-  // Everything else (ESPN, proxy, APIs): network only — do not intercept into cache
-  // Let the browser handle it by not calling respondWith for non-shell requests.
 });
