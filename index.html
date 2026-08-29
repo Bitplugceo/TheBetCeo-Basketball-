@@ -4101,6 +4101,22 @@ body.dark-mode .tracker-analytics-section-head {
   <input id="aHitIntel" aria-label="aHitIntel" /><input id="bHitIntel" aria-label="bHitIntel" />
 </div>
 
+<div class="section" id="wnbaBacktestSection">
+  <h3>WNBA score backtest</h3>
+  <p style="font-size:11px;color:var(--muted);margin:0 0 8px;line-height:1.45">
+    Projection vs actual scores only — no betting lines. Paste games JSON, search params, then Seal winners into live WNBA.
+    This is MAE/RMSE, not ROI. Do not call a seal “100% trusted.”
+  </p>
+  <textarea id="wnbaBtJson" rows="8" style="width:100%;font-size:11px;font-family:ui-monospace,monospace" placeholder='{"league":"wnba","games":[{"date":"2026-08-01","aFTScored":[88,81,90,77,84,92,79,83,86,80],"aFTAllowed":[80,76,84,72,79,88,70,83,85,75],"bFTScored":[75,82,70,79,77,81,74,78,72,80],"bFTAllowed":[90,84,88,79,85,91,83,87,80,86],"actual":{"ft":162,"h1":84,"h2":78,"team_a":88,"team_b":74}}]}'></textarea>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;align-items:center">
+    <label style="font-size:11px">Trials <input id="wnbaBtTrials" type="number" min="20" max="8000" value="400" style="width:72px" /></label>
+    <button type="button" id="wnbaBtRunBtn">Run search</button>
+    <button type="button" id="wnbaBtSealBtn">Seal best to WNBA</button>
+    <button type="button" id="wnbaBtClearSealBtn">Clear WNBA seal</button>
+  </div>
+  <pre id="wnbaBtOut" style="white-space:pre-wrap;font-size:11px;max-height:240px;overflow:auto;background:var(--panel-soft);padding:8px"></pre>
+</div>
+
 <div class="actions">
   <button id="runBtn" type="button">Run</button>
   <button id="clearBtn" type="button">Clear</button>
@@ -6856,6 +6872,9 @@ window.getLockedConfigMeta = getLockedConfigMeta;
 window.clearLockedConfig = clearLockedConfig;
 
 function getTunableParam(key, league, market) {
+  if (window.__btParamOverride && Object.prototype.hasOwnProperty.call(window.__btParamOverride, key)) {
+    return window.__btParamOverride[key];
+  }
   const entry = TUNABLE_PARAM_REGISTRY[key];
   if (!entry) {
     engineDebug("getTunableParam: unknown key '" + key + "' — check TUNABLE_PARAM_REGISTRY", {
@@ -8322,7 +8341,192 @@ function runCalculationBacktest() {
   }
   return report;
 }
+
 window.runCalculationBacktest = runCalculationBacktest;
+
+function btNumSeries(v) {
+  if (Array.isArray(v)) return v.map(Number).filter(Number.isFinite);
+  if (v == null || v === "") return [];
+  return String(v).split(",").map(function (x) { return Number(String(x).trim()); }).filter(Number.isFinite);
+}
+
+function btBuildParsed(g) {
+  return {
+    aFTScored: btNumSeries(g.aFTScored || g.a && g.a.ft),
+    aFTAllowed: btNumSeries(g.aFTAllowed || g.a && g.a.ftAllowed),
+    bFTScored: btNumSeries(g.bFTScored || g.b && g.b.ft),
+    bFTAllowed: btNumSeries(g.bFTAllowed || g.b && g.b.ftAllowed),
+    a1HScored: btNumSeries(g.a1HScored || g.a && g.a.h1),
+    a1HAllowed: btNumSeries(g.a1HAllowed || g.a && g.a.h1Allowed),
+    b1HScored: btNumSeries(g.b1HScored || g.b && g.b.h1),
+    b1HAllowed: btNumSeries(g.b1HAllowed || g.b && g.b.h1Allowed),
+    aQ1Scored: btNumSeries(g.aQ1Scored),
+    bQ1Scored: btNumSeries(g.bQ1Scored),
+    aQ2Scored: btNumSeries(g.aQ2Scored),
+    bQ2Scored: btNumSeries(g.bQ2Scored),
+    aQ3Scored: btNumSeries(g.aQ3Scored),
+    bQ3Scored: btNumSeries(g.bQ3Scored),
+    aQ4Scored: btNumSeries(g.aQ4Scored),
+    bQ4Scored: btNumSeries(g.bQ4Scored),
+  };
+}
+
+function btEmptyLines() {
+  return {
+    ftLine: null, h1Line: null, h2Line: null,
+    aLine: null, bLine: null,
+    q1aLine: null, q2aLine: null, q3aLine: null, q4aLine: null,
+    handicapLine: null, handicapH1Line: null, handicapH2Line: null,
+    h1aLine: null, h1bLine: null,
+  };
+}
+
+function btScoreGame(game, league, cfg) {
+  const parsed = btBuildParsed(game);
+  const lines = btEmptyLines();
+  const config = { forceVenueNeutral: !!(cfg && cfg.forceVenueNeutral) };
+  const act = game.actual || {};
+  const out = { err: {} };
+  try {
+    const ft = computeFTProjection({ league: league, parsed: parsed, lines: lines, config: config });
+    out.ft = ft && ft.ftProj;
+    out.team_a = ft && ft.projAFT;
+    out.team_b = ft && ft.projBFT;
+    if (Number.isFinite(out.ft) && Number.isFinite(Number(act.ft))) out.err.ft = out.ft - Number(act.ft);
+    if (Number.isFinite(out.team_a) && Number.isFinite(Number(act.team_a))) out.err.team_a = out.team_a - Number(act.team_a);
+    if (Number.isFinite(out.team_b) && Number.isFinite(Number(act.team_b))) out.err.team_b = out.team_b - Number(act.team_b);
+  } catch (e) { out.ftError = String(e && e.message || e); }
+  try {
+    if (typeof compute1HProjection === "function" && (btNumSeries(game.a1HScored).length >= 4 || act.h1 != null)) {
+      const h1 = compute1HProjection({ league: league, parsed: parsed, lines: lines, config: config });
+      out.h1 = h1 && (h1.h1Proj || h1.proj);
+      if (Number.isFinite(out.h1) && Number.isFinite(Number(act.h1))) out.err.h1 = out.h1 - Number(act.h1);
+    }
+  } catch (e2) { out.h1Error = String(e2 && e2.message || e2); }
+  try {
+    if (typeof compute2HProjection === "function" && act.h2 != null) {
+      const h2 = compute2HProjection({ league: league, parsed: parsed, lines: lines, config: config });
+      out.h2 = h2 && (h2.h2Proj || h2.proj);
+      if (Number.isFinite(out.h2) && Number.isFinite(Number(act.h2))) out.err.h2 = out.h2 - Number(act.h2);
+    }
+  } catch (e3) { out.h2Error = String(e3 && e3.message || e3); }
+  return out;
+}
+
+function btMae(errs) {
+  if (!errs.length) return null;
+  return errs.reduce(function (s, x) { return s + Math.abs(x); }, 0) / errs.length;
+}
+
+function btSampleCfg(rng) {
+  const pick = function (arr) { return arr[Math.floor(rng() * arr.length)]; };
+  return {
+    h2hMaxWeight: pick([0.12, 0.2, 0.28, 0.35, 0.45]),
+    h2hFactor: pick([0.55, 0.75, 0.9, 1.0]),
+    recencyScale: pick([0.7, 0.85, 1.0, 1.2, 1.4]),
+    forceVenueNeutral: rng() < 0.35,
+  };
+}
+
+function btMulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function runWnbaScoreSearch(payload, trials) {
+  const league = String((payload && payload.league) || "wnba").toLowerCase();
+  const games = (payload && payload.games) || [];
+  if (!games.length) return { error: "No games[] in JSON" };
+  trials = Math.max(20, Math.min(8000, Number(trials) || 400));
+  const rng = btMulberry32(20260829);
+  let best = null;
+  const baselineCfg = { h2hMaxWeight: 0.3, h2hFactor: 1, recencyScale: 1, forceVenueNeutral: false };
+  function evalCfg(cfg) {
+    window.__btParamOverride = cfg;
+    const bag = { ft: [], h1: [], h2: [], team_a: [], team_b: [] };
+    games.forEach(function (g) {
+      const r = btScoreGame(g, league, cfg);
+      Object.keys(bag).forEach(function (k) {
+        if (Number.isFinite(r.err[k])) bag[k].push(r.err[k]);
+      });
+    });
+    const mae = {
+      ft: btMae(bag.ft), h1: btMae(bag.h1), h2: btMae(bag.h2),
+      team_a: btMae(bag.team_a), team_b: btMae(bag.team_b),
+    };
+    const parts = [mae.ft, mae.h1, mae.h2].filter(Number.isFinite);
+    const score = parts.length ? parts.reduce(function (s, x) { return s + x; }, 0) / parts.length : 999;
+    return { cfg: cfg, mae: mae, n: { ft: bag.ft.length, h1: bag.h1.length, h2: bag.h2.length, team_a: bag.team_a.length, team_b: bag.team_b.length }, score: score };
+  }
+  const base = evalCfg(baselineCfg);
+  for (let i = 0; i < trials; i++) {
+    const row = evalCfg(btSampleCfg(rng));
+    if (!best || row.score < best.score) best = row;
+  }
+  window.__btParamOverride = null;
+  const report = {
+    league: league,
+    games: games.length,
+    trials: trials,
+    baseline: base,
+    best: best,
+    note: "Minimized mean |proj-actual| on FT/H1/H2. Not a betting backtest. Seal writes locked params for live WNBA only.",
+  };
+  try { localStorage.setItem("BB_WNBA_BT_LAST", JSON.stringify(report)); } catch (_e) {}
+  window.__wnbaBtLast = report;
+  return report;
+}
+
+function sealWnbaFromBacktest() {
+  const r = window.__wnbaBtLast;
+  if (!r || !r.best || !r.best.cfg) return "Run search first.";
+  const params = {
+    h2hMaxWeight: r.best.cfg.h2hMaxWeight,
+    h2hFactor: r.best.cfg.h2hFactor,
+  };
+  const meta = { source: "wnba-score-search", mae: r.best.mae, games: r.games, trials: r.trials, recencyScale: r.best.cfg.recencyScale, forceVenueNeutral: r.best.cfg.forceVenueNeutral };
+  ["ft", "h1", "h2"].forEach(function (mk) {
+    saveLockedConfig("wnba", mk, params, meta);
+  });
+  try { localStorage.setItem("BB_WNBA_SEAL", JSON.stringify({ params: params, meta: meta, at: new Date().toISOString() })); } catch (_e) {}
+  return "Sealed WNBA ft/h1/h2 locks from best MAE config.";
+}
+
+function bindWnbaBacktestUi() {
+  const run = document.getElementById("wnbaBtRunBtn");
+  const out = document.getElementById("wnbaBtOut");
+  if (!run || run.__bound) return;
+  run.__bound = true;
+  run.addEventListener("click", function () {
+    let payload;
+    try { payload = JSON.parse(document.getElementById("wnbaBtJson").value || "{}"); }
+    catch (e) { if (out) out.textContent = "Invalid JSON: " + e.message; return; }
+    const trials = Number(document.getElementById("wnbaBtTrials").value || 400);
+    if (out) out.textContent = "Searching " + trials + " configs on " + ((payload.games || []).length) + " games…";
+    setTimeout(function () {
+      const report = runWnbaScoreSearch(payload, trials);
+      if (out) out.textContent = JSON.stringify(report, null, 2);
+    }, 30);
+  });
+  const seal = document.getElementById("wnbaBtSealBtn");
+  if (seal) seal.addEventListener("click", function () {
+    const msg = sealWnbaFromBacktest();
+    if (out) out.textContent = (out.textContent || "") + "\n\n" + msg;
+  });
+  const clr = document.getElementById("wnbaBtClearSealBtn");
+  if (clr) clr.addEventListener("click", function () {
+    clearLockedConfig("wnba");
+    try { localStorage.removeItem("BB_WNBA_SEAL"); } catch (_e) {}
+    if (out) out.textContent = "Cleared WNBA locked configs.";
+  });
+}
+document.addEventListener("DOMContentLoaded", bindWnbaBacktestUi);
+if (document.readyState !== "loading") bindWnbaBacktestUi();
+
 
 function updateEnginePerformanceScore() {
   try {
@@ -10282,6 +10486,11 @@ function getLeagueRecencyDefaults(league) {
     Array.isArray(learned) && learned.length ? learned : configured || MODEL_TUNING.recencyWeights;
   const isFlat = activeRecencyWeights.every((w) => w === 1);
   if (isFlat) return [1.35, 1.2, 1.0, 0.85, 0.7, 0.56, 0.44, 0.33, 0.24, 0.16];
+  const scale = window.__btParamOverride && Number(window.__btParamOverride.recencyScale);
+  if (Number.isFinite(scale) && scale > 0 && scale !== 1) {
+    const mid = 0.7;
+    return activeRecencyWeights.map(function (w) { return Math.max(0.05, mid + (w - mid) * scale); });
+  }
   return activeRecencyWeights;
 }
 
