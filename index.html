@@ -4569,7 +4569,12 @@ const ENGINE_INTEGRITY_SHIELD = {
   },
 };
 
-const APP_BUILD_VERSION = "v23_seal_20260829k";
+const APP_BUILD_VERSION = "v23_seal_20260829_bt";
+const MARKET_SEMANTICS = {
+  total: "Both teams combined. ft includes OT. h1=Q1+Q2 (or period 1 if regulationPeriods=2). h2=Q3+Q4 both teams, OT excluded.",
+  handicap: "Signed home minus away on the same period window as the matching total. Empty line = NO PLAY.",
+};
+window.MARKET_SEMANTICS = MARKET_SEMANTICS;
 const STANDALONE_BUILD_MARKER = "bb_engine_standalone_build";
 const WORKER_URL = "https://thebetceo-engine.ridwantunde636.workers.dev/";
 // D2: Client-visible shared secret is NOT real auth by itself. The Cloudflare
@@ -8242,6 +8247,83 @@ function refreshAllMarketECEFromTracker() {
   }
 }
 
+function runCalculationBacktest() {
+  const picks = (typeof getAllTrackedPicksForReport === "function" ? getAllTrackedPicksForReport() : [])
+    .filter(function (p) {
+      const s = String(p.resultStatus || "").toLowerCase();
+      return s === "win" || s === "loss";
+    });
+  const report = {
+    generated: new Date().toISOString(),
+    build: typeof APP_BUILD_VERSION === "string" ? APP_BUILD_VERSION : "",
+    n: picks.length,
+    byGrade: {},
+    byMarket: {},
+    brier: null,
+    ece: null,
+    monotonic: null,
+    notes: [],
+  };
+  function bucket(map, key) {
+    if (!map[key]) map[key] = { n: 0, w: 0, l: 0 };
+    return map[key];
+  }
+  let brierN = 0, brierSum = 0;
+  const eceBins = {};
+  picks.forEach(function (p) {
+    const g = String(p.confidenceGrade || p.confidence || "—").toUpperCase();
+    const mk = String(p.marketKey || p.marketName || "ft").toLowerCase().split("<")[0].trim();
+    const win = String(p.resultStatus).toLowerCase() === "win";
+    const bg = bucket(report.byGrade, g);
+    bg.n++; if (win) bg.w++; else bg.l++;
+    const bm = bucket(report.byMarket, mk);
+    bm.n++; if (win) bm.w++; else bm.l++;
+    const wp = Number(p.winProbability);
+    if (Number.isFinite(wp) && wp >= 0 && wp <= 1) {
+      brierSum += Math.pow(wp - (win ? 1 : 0), 2);
+      brierN++;
+      const bin = String(Math.min(9, Math.floor(wp * 10)));
+      if (!eceBins[bin]) eceBins[bin] = { n: 0, wp: 0, hits: 0 };
+      eceBins[bin].n++; eceBins[bin].wp += wp; eceBins[bin].hits += win ? 1 : 0;
+    }
+  });
+  Object.keys(report.byGrade).forEach(function (g) {
+    const b = report.byGrade[g];
+    b.rate = b.n ? b.w / b.n : null;
+  });
+  Object.keys(report.byMarket).forEach(function (g) {
+    const b = report.byMarket[g];
+    b.rate = b.n ? b.w / b.n : null;
+  });
+  if (brierN) report.brier = brierSum / brierN;
+  let ece = 0, eceN = 0;
+  Object.keys(eceBins).forEach(function (bin) {
+    const b = eceBins[bin];
+    if (!b.n) return;
+    ece += b.n * Math.abs(b.hits / b.n - b.wp / b.n);
+    eceN += b.n;
+  });
+  if (eceN) report.ece = ece / eceN;
+  const order = ["A", "B", "C", "D"].filter(function (g) { return report.byGrade[g] && report.byGrade[g].n >= 5; });
+  report.monotonic = order.length < 2 ? "insufficient" : "ok";
+  for (let i = 1; i < order.length; i++) {
+    if (report.byGrade[order[i]].rate - report.byGrade[order[i - 1]].rate > 0.08) {
+      report.monotonic = "FAIL " + order[i - 1] + "=" + (report.byGrade[order[i - 1]].rate * 100).toFixed(1) + "% < " + order[i] + "=" + (report.byGrade[order[i]].rate * 100).toFixed(1) + "%";
+    }
+  }
+  if (!picks.length) report.notes.push("No settled win/loss tickets in this browser tracker.");
+  if (report.monotonic && String(report.monotonic).indexOf("FAIL") === 0) {
+    report.notes.push("Empirical grades are not monotone. Do not read A as a higher real-world win rate than D on this sample.");
+  }
+  try { localStorage.setItem("BB_BACKTEST_LAST", JSON.stringify(report)); } catch (_e) {}
+  if (typeof engineDebug === "function") engineDebug("Calculation backtest", report);
+  if (typeof refreshAllMarketECEFromTracker === "function") {
+    try { refreshAllMarketECEFromTracker(); } catch (_e2) {}
+  }
+  return report;
+}
+window.runCalculationBacktest = runCalculationBacktest;
+
 function updateEnginePerformanceScore() {
   try {
     try {
@@ -8249,6 +8331,9 @@ function updateEnginePerformanceScore() {
     } catch (_e) {
       /* non-fatal */
     }
+    try {
+      if (typeof runCalculationBacktest === "function") runCalculationBacktest();
+    } catch (_bt) {}
     const MIN_N = 10;
     let log = [];
     try {
@@ -21054,7 +21139,7 @@ function getConfidenceWinProbability(
     (coeff.volRatio ?? (_unfitted ? 0 : -0.3)) * _feat.volRatio +
     (coeff.sampleFull ?? (_unfitted ? 0 : 0.2)) * _feat.sampleFull +
     (coeff.h2h ?? (_unfitted ? 0 : 0.1)) * _feat.h2h +
-    (coeff.trap ?? -0.5) * _feat.trap +
+    (coeff.trap ?? (_unfitted ? 0 : -0.5)) * _feat.trap +
     (coeff.lineupQuality ?? 0) * (_lineupQualityVal - 1.0) +
     (coeff.paceGapRisk ?? 0) * (newSignals.paceGapRisk ? 1 : 0) +
     (coeff.blowoutRisk ?? 0) * (_blowoutRiskFlag ? 1 : 0) +
@@ -25167,6 +25252,16 @@ function computeFTProjection({
     // Do not re-add a fraction of the same gap on the advanced path (double-count).
 
     const advTotal = (isFinite(aS_adv) ? aS_adv : 0) + (isFinite(bS_adv) ? bS_adv : 0);
+    if (typeof engineDebug === "function") {
+      engineDebug("pace-unit probe", {
+        league: league,
+        synPace: synPace,
+        regMinutes: _ftRegMinutes,
+        divisor: _ftDivisor,
+        advTotal: advTotal,
+        expectBand: _ftRegMinutes <= 40 ? "ncaa/wnba ~130-160" : "nba ~200-240",
+      });
+    }
     const _eb = isFinite(eb) ? eb : 220;
     const advSane =
       isFinite(advTotal) &&
@@ -40912,9 +41007,18 @@ function copyTrackerData() {
   const derived = g_trackerDerivedState || { teams: {} };
 
   const lines = [];
+  let bt = null;
+  try { bt = typeof runCalculationBacktest === "function" ? runCalculationBacktest() : null; } catch (_b) {}
   lines.push("==========================================");
   lines.push("       BB ENGINE: FULL TRACKER REPORT     ");
   lines.push("==========================================");
+  if (bt) {
+    lines.push("BACKTEST n=" + bt.n + "  Brier=" + (bt.brier == null ? "n/a" : Number(bt.brier).toFixed(3)) + "  ECE=" + (bt.ece == null ? "n/a" : Number(bt.ece).toFixed(3)) + "  mono=" + bt.monotonic);
+    Object.keys(bt.byGrade || {}).sort().forEach(function (g) {
+      const b = bt.byGrade[g];
+      lines.push("  grade " + g + ": " + b.w + "W-" + b.l + "L (" + (b.rate != null ? (b.rate * 100).toFixed(1) + "%" : "n/a") + ", n=" + b.n + ")");
+    });
+  }
   lines.push(`Generated    : ${new Date().toLocaleString()}`);
   lines.push(`Model Version: ${currentVersion}`);
   lines.push(`Overall Score: ${stats.wins || 0}W - ${stats.losses || 0}L (Win Rate: ${winRate})`);
