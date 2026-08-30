@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1274,6 +1275,7 @@ body.dark-mode.engine-alert .section {
   display: flex;
 }
 .tracker-panel {
+  position: relative;
   width: 100%;
   height: 100%;
   max-height: 100%;
@@ -1284,6 +1286,56 @@ body.dark-mode.engine-alert .section {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+.tracker-delete-confirm {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 24px 16px;
+}
+.tracker-delete-confirm.open {
+  display: flex;
+}
+.tracker-delete-confirm-card {
+  width: min(420px, 100%);
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  padding: 18px 16px 14px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+}
+.tracker-delete-confirm-card p {
+  margin: 0 0 16px;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+.tracker-delete-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+.tracker-delete-confirm-actions button {
+  min-height: 44px;
+  min-width: 72px;
+  padding: 0 16px;
+  font-size: 16px;
+  font-weight: 800;
+  border-radius: 8px;
+  border: 1px solid var(--panel-border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.tracker-delete-confirm-actions .tracker-delete-ok {
+  background: #d91f26;
+  color: #fff;
+  border-color: #d91f26;
 }
 
 .tracker-body-scroll {
@@ -4257,6 +4309,20 @@ body.dark-mode .tracker-analytics-section-head {
         </table>
       </div>
     </div>
+    <div id="trackerDeleteConfirm" class="tracker-delete-confirm" aria-hidden="true">
+      <div
+        class="tracker-delete-confirm-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="trackerDeleteConfirmText"
+      >
+        <p id="trackerDeleteConfirmText"></p>
+        <div class="tracker-delete-confirm-actions">
+          <button type="button" id="trackerDeleteCancelBtn">Cancel</button>
+          <button type="button" id="trackerDeleteOkBtn" class="tracker-delete-ok">OK</button>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 <div
@@ -4580,7 +4646,7 @@ const ENGINE_INTEGRITY_SHIELD = {
   },
 };
 
-const APP_BUILD_VERSION = "v23_seal_20260829_bt";
+const APP_BUILD_VERSION = "v23_seal_20260830_del";
 const MARKET_SEMANTICS = {
   total: "Both teams combined. ft includes OT. h1=Q1+Q2 (or period 1 if regulationPeriods=2). h2=Q3+Q4 both teams, OT excluded.",
   handicap: "Signed home minus away on the same period window as the matching total. Empty line = NO PLAY.",
@@ -12125,6 +12191,7 @@ let g_trackerState = {
   activePicks: [],
   archivedPicks: [],
   shadowPicks: [],
+  deletedSignatures: [],
   stats: {
     total: 0,
     settled: 0,
@@ -12590,6 +12657,10 @@ function rebuildTrackerDerivedState() {
 let g_trackerHydratePromise = null;
 let g_trackerFollowupTimer = null;
 let g_trackerSaveTimer = null;
+let g_deletedSigLock = new Set();
+let g_trackerIgnoreBackdropUntil = 0;
+let g_trackerDeleteConfirmResolver = null;
+let g_trackerDeleteInFlight = false;
 let _lastBackgroundSync = 0;
 const BACKGROUND_SYNC_THROTTLE_MS = 60000;
 let g_refreshTrackedPicksInFlight = false;
@@ -15024,7 +15095,14 @@ function normalizeTrackerState(raw) {
     shadowPicks: Array.isArray(raw?.shadowPicks)
       ? raw.shadowPicks.map((p) => ensureTrackedPickKeys(p))
       : [],
-    deletedSignatures: Array.isArray(raw?.deletedSignatures) ? raw.deletedSignatures : [],
+    deletedSignatures: [
+      ...new Set(
+        [
+          ...(Array.isArray(raw?.deletedSignatures) ? raw.deletedSignatures : []),
+          ...(g_deletedSigLock ? [...g_deletedSigLock] : []),
+        ].filter(Boolean),
+      ),
+    ],
     stats: {
       total: Number(raw?.stats?.total) || 0,
       settled: Number(raw?.stats?.settled) || 0,
@@ -15036,6 +15114,21 @@ function normalizeTrackerState(raw) {
     lineMemory: {},
   };
 
+  const _del = AppState.tracker.state.deletedSignatures || [];
+  const _isGone = (p) => {
+    if (typeof isPickDeleted === "function") return isPickDeleted(p, _del);
+    const keys = [p?.signature, p?.pickId].filter(Boolean);
+    return keys.some((k) => _del.includes(k) || (g_deletedSigLock && g_deletedSigLock.has(k)));
+  };
+  AppState.tracker.state.activePicks = (AppState.tracker.state.activePicks || []).filter(
+    (p) => !_isGone(p),
+  );
+  AppState.tracker.state.archivedPicks = (AppState.tracker.state.archivedPicks || []).filter(
+    (p) => !_isGone(p),
+  );
+  if (AppState.tracker.state.shadowPicks) {
+    AppState.tracker.state.shadowPicks = AppState.tracker.state.shadowPicks.filter((p) => !_isGone(p));
+  }
   rebuildTrackerStats();
   return AppState.tracker.state;
 }
@@ -15327,6 +15420,10 @@ function throttledRefreshBackground(force = false) {
 }
 
 async function refreshTrackerInBackground(forceHydrate = false) {
+  if (g_trackerDeleteInFlight) {
+    queueTrackerFollowupRefresh(400);
+    return;
+  }
   if (g_refreshTrackedPicksInFlight || window.__engineRunInProgress) {
     if (forceHydrate) queueTrackerFollowupRefresh(2000);
     return;
@@ -15739,6 +15836,7 @@ function createEmptyTrackerState() {
     activePicks: [],
     archivedPicks: [],
     shadowPicks: [],
+    deletedSignatures: [],
     stats: { total: 0, settled: 0, wins: 0, losses: 0, pushes: 0 },
     updatedAt: new Date().toISOString(),
     lineMemory: {},
@@ -15831,16 +15929,43 @@ function resolveTrackedPick(localPick, serverPick) {
   return local;
 }
 
+function collectTrackedPickKeys(pick, extra) {
+  const keys = [];
+  const add = (s) => {
+    if (s) keys.push(String(s));
+  };
+  add(extra);
+  if (pick) {
+    add(typeof makeTrackedSignature === "function" ? makeTrackedSignature(pick) : "");
+    add(typeof makeTrackerActiveMergeKey === "function" ? makeTrackerActiveMergeKey(pick) : "");
+    add(pick.signature);
+    add(pick.pickId);
+  }
+  return [...new Set(keys)];
+}
+
+function lockDeletedPickKeys(keys) {
+  if (!g_deletedSigLock) g_deletedSigLock = new Set();
+  (keys || []).filter(Boolean).forEach((s) => g_deletedSigLock.add(String(s)));
+  if (!AppState?.tracker?.state) return;
+  if (!Array.isArray(AppState.tracker.state.deletedSignatures)) {
+    AppState.tracker.state.deletedSignatures = [];
+  }
+  (keys || []).filter(Boolean).forEach((s) => {
+    const key = String(s);
+    if (!AppState.tracker.state.deletedSignatures.includes(key)) {
+      AppState.tracker.state.deletedSignatures.push(key);
+    }
+  });
+}
+
 function isPickDeleted(pick, deletedList = []) {
-  if (!pick || !deletedList || !deletedList.length) return false;
-  const deletedSet = new Set(deletedList);
-  const sig1 = makeTrackedSignature(pick);
-  const sig2 = makeTrackerActiveMergeKey(pick);
-  const sig3 = pick.signature;
-  const sig4 = pick.pickId;
-  return (
-    deletedSet.has(sig1) || deletedSet.has(sig2) || deletedSet.has(sig3) || deletedSet.has(sig4)
+  if (!pick) return false;
+  const deletedSet = new Set(
+    [...(deletedList || []), ...(g_deletedSigLock ? [...g_deletedSigLock] : [])].filter(Boolean),
   );
+  if (!deletedSet.size) return false;
+  return collectTrackedPickKeys(pick).some((k) => deletedSet.has(k));
 }
 
 function mergeTrackerStates(localState, serverState) {
@@ -15855,7 +15980,9 @@ function mergeTrackerStates(localState, serverState) {
     ...new Set([
       ...(Array.isArray(local.deletedSignatures) ? local.deletedSignatures : []),
       ...(Array.isArray(server.deletedSignatures) ? server.deletedSignatures : []),
-    ]),
+      ...(Array.isArray(g_trackerState?.deletedSignatures) ? g_trackerState.deletedSignatures : []),
+      ...(g_deletedSigLock ? [...g_deletedSigLock] : []),
+    ].filter(Boolean)),
   ];
 
   return {
@@ -16475,7 +16602,7 @@ function renderTrackedPicks() {
 
         const grade = String(p.confidenceGrade || p.confidence || "—").toUpperCase();
         const gradeClass = getConfidenceClass(grade);
-        const encSig = encodeURIComponent(p.signature);
+        const encSig = encodeURIComponent(p.signature || makeTrackedSignature(p) || "");
 
         let statusHtml = "";
         if (status === "pending") {
@@ -16538,7 +16665,7 @@ function renderTrackedPicks() {
           <div class="tracker-custom-settle-btn" data-sig="${encSig}" style="font-size:8px; text-decoration:underline; cursor:pointer; margin-top:2px; font-weight:800; opacity:0.7;">CUSTOM</div>
         </div>`;
         } else {
-          const encSig = encodeURIComponent(p.signature);
+          const encSig = encodeURIComponent(p.signature || makeTrackedSignature(p) || "");
           statusHtml = `<div class="tracker-settled-edit-btn" data-sig="${encSig}" style="cursor:pointer;" title="Click to edit or revert">${status.toUpperCase()}</div>`;
           if (p.actualScore) {
             statusHtml += `<div class="tracker-status-score" style="font-size:9px; font-weight:800; line-height:1.15; margin-top:2px; color:inherit; opacity:0.95;">${safeText(String(p.actualScore))}</div>`;
@@ -19238,74 +19365,105 @@ async function clearAllPendingTrackedPicks() {
 }
 window.clearAllPendingTrackedPicks = clearAllPendingTrackedPicks;
 
+function hideTrackerDeleteConfirm(result) {
+  const overlay = document.getElementById("trackerDeleteConfirm");
+  if (overlay) {
+    overlay.classList.remove("open");
+    overlay.setAttribute("aria-hidden", "true");
+  }
+  g_trackerIgnoreBackdropUntil = Date.now() + 700;
+  const resolver = g_trackerDeleteConfirmResolver;
+  g_trackerDeleteConfirmResolver = null;
+  if (typeof resolver === "function") resolver(!!result);
+}
+
+function showTrackerDeleteConfirm(pickName, matchName) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById("trackerDeleteConfirm");
+    const textEl = document.getElementById("trackerDeleteConfirmText");
+    const msg = `Are you sure you want to permanently delete "${pickName}" for ${matchName}?`;
+    if (!overlay || !textEl) {
+      const ok = window.confirm(msg);
+      g_trackerIgnoreBackdropUntil = Date.now() + 700;
+      resolve(ok);
+      return;
+    }
+    if (typeof g_trackerDeleteConfirmResolver === "function") {
+      g_trackerDeleteConfirmResolver(false);
+    }
+    g_trackerDeleteConfirmResolver = resolve;
+    textEl.textContent = msg;
+    overlay.classList.add("open");
+    overlay.setAttribute("aria-hidden", "false");
+    g_trackerIgnoreBackdropUntil = Date.now() + 86400000;
+  });
+}
+
+function applyTrackedPickDeletion(signature) {
+  const pools = [
+    AppState.tracker.state.activePicks,
+    AppState.tracker.state.archivedPicks,
+    AppState.tracker.state.shadowPicks,
+  ];
+  let pick = null;
+  for (const arr of pools) {
+    if (!Array.isArray(arr)) continue;
+    pick = arr.find((p) => collectTrackedPickKeys(p).includes(signature));
+    if (pick) break;
+  }
+  const keys = collectTrackedPickKeys(pick, signature);
+  lockDeletedPickKeys(keys);
+  const deleted = AppState.tracker.state.deletedSignatures || [];
+  AppState.tracker.state.activePicks = (AppState.tracker.state.activePicks || []).filter(
+    (p) => !isPickDeleted(p, deleted),
+  );
+  AppState.tracker.state.archivedPicks = (AppState.tracker.state.archivedPicks || []).filter(
+    (p) => !isPickDeleted(p, deleted),
+  );
+  if (AppState.tracker.state.shadowPicks) {
+    AppState.tracker.state.shadowPicks = AppState.tracker.state.shadowPicks.filter(
+      (p) => !isPickDeleted(p, deleted),
+    );
+  }
+  AppState.tracker.state.updatedAt = new Date().toISOString();
+  rebuildTrackerStats();
+  return { pick, keys };
+}
+
 async function deleteTrackedPickBySignature(signature) {
   if (!signature) return false;
-  let pick = AppState.tracker.state.activePicks.find(
-    (p) => makeTrackedSignature(p) === signature || p.signature === signature,
-  );
-  if (!pick)
-    pick = AppState.tracker.state.archivedPicks.find(
-      (p) => makeTrackedSignature(p) === signature || p.signature === signature,
-    );
-  if (!pick)
-    pick = AppState.tracker.state.shadowPicks?.find(
-      (p) => makeTrackedSignature(p) === signature || p.signature === signature,
-    );
-
+  const pools = [
+    AppState.tracker.state.activePicks,
+    AppState.tracker.state.archivedPicks,
+    AppState.tracker.state.shadowPicks,
+  ];
+  let pick = null;
+  for (const arr of pools) {
+    if (!Array.isArray(arr)) continue;
+    pick = arr.find((p) => collectTrackedPickKeys(p).includes(signature));
+    if (pick) break;
+  }
   if (!pick) return false;
 
   const pickName = pick.predictionText || "this prediction";
   const matchName = `${pick.homeTeam && pick.homeTeam !== "—" ? pick.homeTeam : "A"} vs ${pick.awayTeam && pick.awayTeam !== "—" ? pick.awayTeam : "B"}`;
-  if (!confirm(`Are you sure you want to permanently delete "${pickName}" for ${matchName}?`)) {
+  const ok = await showTrackerDeleteConfirm(pickName, matchName);
+  if (!ok) return false;
+
+  g_trackerDeleteInFlight = true;
+  try {
+    applyTrackedPickDeletion(signature);
+    if (typeof renderTrackedPicks === "function") renderTrackedPicks();
+    await forceTrackerSaveNow();
+    if (typeof renderTrackedPicks === "function") renderTrackedPicks();
+    trackerDebug("tracked pick deleted permanently", { signature, pickName, matchName });
+    return true;
+  } catch (err) {
+    console.error("[BB Engine] deleteTrackedPickBySignature failed", err);
     return false;
+  } finally {
+    g_trackerDeleteInFlight = false;
   }
-
-  if (!Array.isArray(AppState.tracker.state.deletedSignatures)) {
-    AppState.tracker.state.deletedSignatures = [];
-  }
-  const slotKey = makeTrackerActiveMergeKey(pick);
-  const realSig = makeTrackedSignature(pick);
-  const pickSig = pick.signature;
-  const pickId = pick.pickId;
-
-  [signature, slotKey, realSig, pickSig, pickId].filter(Boolean).forEach((s) => {
-    if (!AppState.tracker.state.deletedSignatures.includes(s)) {
-      AppState.tracker.state.deletedSignatures.push(s);
-    }
-  });
-
-  const isMatch = (p) => {
-    const s1 = makeTrackedSignature(p);
-    const s2 = makeTrackerActiveMergeKey(p);
-    return (
-      s1 === signature ||
-      s2 === signature ||
-      p.signature === signature ||
-      p.pickId === signature ||
-      AppState.tracker.state.deletedSignatures.includes(s1) ||
-      AppState.tracker.state.deletedSignatures.includes(s2)
-    );
-  };
-
-  AppState.tracker.state.activePicks = AppState.tracker.state.activePicks.filter(
-    (p) => !isMatch(p),
-  );
-  AppState.tracker.state.archivedPicks = AppState.tracker.state.archivedPicks.filter(
-    (p) => !isMatch(p),
-  );
-  if (AppState.tracker.state.shadowPicks) {
-    AppState.tracker.state.shadowPicks = AppState.tracker.state.shadowPicks.filter(
-      (p) => !isMatch(p),
-    );
-  }
-
-  AppState.tracker.state.updatedAt = new Date().toISOString();
-  rebuildTrackerStats();
-  await saveTrackerStateToLocal();
-  renderTrackedPicks();
-  await forceTrackerSaveNow();
-  trackerDebug("tracked pick deleted permanently", { signature, pickName, matchName });
-  return true;
 }
 
 function handleTrackedPicksActionClick(event) {
@@ -19314,9 +19472,21 @@ function handleTrackedPicksActionClick(event) {
 
   const deleteBtn = target.closest?.(".tracker-delete-pick-btn");
   if (deleteBtn) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === "function") event.stopImmediatePropagation();
     const encoded = deleteBtn.getAttribute("data-sig") || "";
-    const sig = encoded ? decodeURIComponent(encoded) : "";
-    if (sig) deleteTrackedPickBySignature(sig);
+    let sig = "";
+    try {
+      sig = encoded ? decodeURIComponent(encoded) : "";
+    } catch (decodeErr) {
+      sig = encoded;
+    }
+    if (sig) {
+      deleteTrackedPickBySignature(sig).catch((err) => {
+        console.error("[BB Engine] delete click failed", err);
+      });
+    }
     return;
   }
 
@@ -32371,6 +32541,30 @@ document.addEventListener("DOMContentLoaded", () => {
   const trackerCloseBtn = document.getElementById("trackerCloseBtn");
   if (trackerCloseBtn) trackerCloseBtn.addEventListener("click", closeTrackerModal);
 
+  const trackerDeleteCancelBtn = document.getElementById("trackerDeleteCancelBtn");
+  const trackerDeleteOkBtn = document.getElementById("trackerDeleteOkBtn");
+  if (trackerDeleteCancelBtn)
+    trackerDeleteCancelBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      hideTrackerDeleteConfirm(false);
+    });
+  if (trackerDeleteOkBtn)
+    trackerDeleteOkBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      hideTrackerDeleteConfirm(true);
+    });
+  const trackerDeleteConfirm = document.getElementById("trackerDeleteConfirm");
+  if (trackerDeleteConfirm)
+    trackerDeleteConfirm.addEventListener("click", (e) => {
+      if (e.target === trackerDeleteConfirm) {
+        e.preventDefault();
+        e.stopPropagation();
+        hideTrackerDeleteConfirm(false);
+      }
+    });
+
   const trackerCopyDataBtn = document.getElementById("trackerCopyDataBtn");
   if (trackerCopyDataBtn)
     trackerCopyDataBtn.addEventListener("click", function () {
@@ -32406,7 +32600,10 @@ document.addEventListener("DOMContentLoaded", () => {
   const trackerModal = document.getElementById("trackerModal");
   if (trackerModal) {
     trackerModal.addEventListener("click", (e) => {
-      if (e.target === trackerModal) closeTrackerModal();
+      if (e.target !== trackerModal) return;
+      if (Date.now() < g_trackerIgnoreBackdropUntil) return;
+      if (document.getElementById("trackerDeleteConfirm")?.classList.contains("open")) return;
+      closeTrackerModal();
     });
   }
 
