@@ -4659,6 +4659,7 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
   const scoredList = [],
     allowedList = [];
   const eventIds = [];
+  const overallGamesMeta = [];
   const homeScoredList = [],
     homeAllowedList = [];
   const awayScoredList = [],
@@ -4807,6 +4808,19 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
         scoredList.push(myFT);
         allowedList.push(oppFT);
         eventIds.push(ev && ev.id != null ? String(ev.id) : "");
+        const _wentOT =
+          String(ev.status && ev.status.type ? ev.status.type : "") === "afterExtraTime" ||
+          (myScore && myScore.overtime != null) ||
+          (oppScore && oppScore.overtime != null) ||
+          (myScore && myScore.period5 != null && myScore.period5 !== "") ||
+          (oppScore && oppScore.period5 != null && oppScore.period5 !== "");
+        overallGamesMeta.push({
+          eventId: ev && ev.id != null ? String(ev.id) : "",
+          isHome: isHome,
+          myFT: myFT,
+          oppFT: oppFT,
+          wentOT: !!_wentOT,
+        });
         const _ssPer = function (obj, k) {
           if (!obj || obj[k] == null || obj[k] === "") return NaN;
           const n = Number(obj[k]);
@@ -5032,7 +5046,268 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
     q4ScoredDates,
     lastGameDate,
     eventIds,
+    overallGamesMeta,
+    pace10: [],
+    ortg10: [],
+    drtg10: [],
   };
+}
+
+const _ssEventStatsCache = new Map();
+
+function ssIsNcaaSofaLeague(league) {
+  const lg = String(league || "").toLowerCase();
+  return lg === "ncaa" || lg === "ncaaw";
+}
+
+function ssNormStatToken(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[%._\s-]+/g, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function ssPickAllPeriodGroups(statsJson) {
+  if (!statsJson) return [];
+  const arr = Array.isArray(statsJson.statistics)
+    ? statsJson.statistics
+    : Array.isArray(statsJson)
+      ? statsJson
+      : [];
+  if (!arr.length) return [];
+  const isAll = function (p) {
+    const per = String((p && (p.period || p.periodName)) || "")
+      .toUpperCase()
+      .trim();
+    return per === "" || per === "ALL" || per === "FULL" || per === "MATCH" || per === "FT" || per === "GAME";
+  };
+  const all = arr.find(isAll);
+  if (all && Array.isArray(all.groups) && all.groups.length) return all.groups;
+  const first = arr[0];
+  const per = String((first && (first.period || first.periodName)) || "")
+    .toUpperCase()
+    .trim();
+  if (first && Array.isArray(first.groups) && !/^(1ST|2ND|3RD|4TH|Q[1-4]|OT|H1|H2)/.test(per)) {
+    return first.groups;
+  }
+  return [];
+}
+
+function ssFindStatItem(groups, spec) {
+  const wantKeys = (spec.keys || []).map(ssNormStatToken);
+  const wantNames = (spec.names || []).map(function (n) {
+    return String(n).toLowerCase().trim();
+  });
+  const excludeRe = spec.excludeNameRe || null;
+  const items = [];
+  (groups || []).forEach(function (g) {
+    const list = (g && (g.statisticsItems || g.items)) || [];
+    list.forEach(function (it) {
+      if (it) items.push(it);
+    });
+  });
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const k = ssNormStatToken(it.key);
+    const n = String(it.name || "").toLowerCase().trim();
+    if (excludeRe && excludeRe.test(n)) continue;
+    if (k && wantKeys.indexOf(k) >= 0) return it;
+  }
+  for (let j = 0; j < items.length; j++) {
+    const it2 = items[j];
+    const n2 = String(it2.name || "").toLowerCase().trim();
+    if (excludeRe && excludeRe.test(n2)) continue;
+    if (wantNames.indexOf(n2) >= 0) return it2;
+  }
+  return null;
+}
+
+function ssSideAttempts(item, side) {
+  if (!item) return NaN;
+  const totalKey = side === "home" ? "homeTotal" : "awayTotal";
+  const t = Number(item[totalKey]);
+  if (isFinite(t) && t > 0) return t;
+  const raw = String(item[side] != null ? item[side] : "");
+  const m = raw.match(/(\d+)\s*\/\s*(\d+)/);
+  if (m) return Number(m[2]);
+  const valKey = side === "home" ? "homeValue" : "awayValue";
+  const valRaw = String(item[valKey] != null ? item[valKey] : "");
+  const m2 = valRaw.match(/(\d+)\s*\/\s*(\d+)/);
+  if (m2) return Number(m2[2]);
+  return NaN;
+}
+
+function ssSideCount(item, side) {
+  if (!item) return NaN;
+  const valKey = side === "home" ? "homeValue" : "awayValue";
+  const n = Number(item[valKey]);
+  if (isFinite(n)) return n;
+  const n2 = Number(item[side]);
+  return isFinite(n2) ? n2 : NaN;
+}
+
+function ssBoxFromGroups(groups, side) {
+  const fgEx = /(?:^|\b)(?:2[\s-]*point|3[\s-]*point|two[\s-]*point|three[\s-]*point)/i;
+  const fgItem = ssFindStatItem(groups, {
+    keys: ["fieldgoals", "fieldgoalspercentage", "fieldgoalsattempted", "fga", "fg"],
+    names: ["field goals", "field goals %", "field goals attempted", "fg"],
+    excludeNameRe: fgEx,
+  });
+  let fga = ssSideAttempts(fgItem, side);
+  if (!(isFinite(fga) && fga > 0)) {
+    const fg2 = ssFindStatItem(groups, {
+      keys: ["twopointers", "twopointerspercentage", "twopointfieldgoals", "fg2"],
+      names: ["2-point field goals", "2-point field goals %", "two-point field goals"],
+    });
+    const fg3 = ssFindStatItem(groups, {
+      keys: ["threepointers", "threepointerspercentage", "threepointfieldgoals", "fg3"],
+      names: ["3-point field goals", "3-point field goals %", "three-point field goals"],
+    });
+    const a2 = ssSideAttempts(fg2, side);
+    const a3 = ssSideAttempts(fg3, side);
+    if (isFinite(a2) && a2 >= 0 && isFinite(a3) && a3 >= 0 && a2 + a3 > 0) fga = a2 + a3;
+  }
+  const ftItem = ssFindStatItem(groups, {
+    keys: ["freethrows", "freethrowspercentage", "freethrowsattempted", "fta", "ft"],
+    names: ["free throws", "free throws %", "free throws attempted"],
+  });
+  const fta = ssSideAttempts(ftItem, side);
+  const orbItem = ssFindStatItem(groups, {
+    keys: ["offensiverebounds", "oreb", "offensiverebound"],
+    names: ["offensive rebounds", "offensive rebound", "off. rebounds"],
+  });
+  const orb = ssSideCount(orbItem, side);
+  const tovItem = ssFindStatItem(groups, {
+    keys: ["turnovers", "totalturnovers", "tov"],
+    names: ["turnovers", "total turnovers"],
+  });
+  const tov = ssSideCount(tovItem, side);
+  if (!(isFinite(fga) && fga > 0)) return null;
+  return {
+    fieldGoalsAttempted: fga,
+    freeThrowsAttempted: isFinite(fta) ? fta : 0,
+    offensiveRebounds: isFinite(orb) ? orb : 0,
+    totalTurnovers: isFinite(tov) ? tov : 0,
+    turnovers: isFinite(tov) ? tov : 0,
+  };
+}
+
+function ssMapEventStatistics(statsJson) {
+  const groups = ssPickAllPeriodGroups(statsJson);
+  if (!groups.length) return null;
+  const home = ssBoxFromGroups(groups, "home");
+  const away = ssBoxFromGroups(groups, "away");
+  if (!home || !away) return null;
+  return { home: home, away: away };
+}
+
+async function ssFetchEventStatistics(eventId) {
+  const id = String(eventId || "").trim();
+  if (!id || id === "undefined" || id === "null") return null;
+  if (_ssEventStatsCache.has(id)) return _ssEventStatsCache.get(id);
+  const url = "https://api.sofascore.com/api/v1/event/" + encodeURIComponent(id) + "/statistics";
+  let data = null;
+  try {
+    if (typeof proxyFetch === "function") {
+      data = await proxyFetch(url, 8000);
+    }
+  } catch (e) {
+    engineDebug("ss event statistics fetch failed", {
+      eventId: id,
+      error: e && e.message ? e.message : String(e),
+    });
+    data = null;
+  }
+  const mapped = ssMapEventStatistics(data);
+  // Cache misses too so tournament-id reprocess does not hammer 403s.
+  _ssEventStatsCache.set(id, mapped);
+  return mapped;
+}
+
+function ssRenderPaceStatus() {
+  const st = document.getElementById("ssFetchStatus");
+  if (!st) return;
+  if (/^❌/.test(String(st.textContent || "").trim())) return;
+  const aN = ((AppState.context.data.A && AppState.context.data.A.pace10) || []).length;
+  const bN = ((AppState.context.data.B && AppState.context.data.B.pace10) || []).length;
+  const hasA = (window.__lastEventsA || []).length > 0;
+  const hasB = (window.__lastEventsB || []).length > 0;
+  const bits = [];
+  if (hasA) bits.push(aN > 0 ? "A pace measured n=" + aN : "A scores only (no box)");
+  if (hasB) bits.push(bN > 0 ? "B pace measured n=" + bN : "B scores only (no box)");
+  const prefix = window.__ssLastPasteMsg || "";
+  const line = bits.join(" · ");
+  if (!line && !prefix) return;
+  const anyBox = aN > 0 || bN > 0;
+  st.style.color = anyBox ? "#2f8f4a" : "#d98a00";
+  st.textContent = prefix ? (line ? prefix + " · " + line : prefix) : line;
+}
+
+async function ssFetchAndAttachPace(side, stats) {
+  if (!stats || (side !== "A" && side !== "B")) return stats;
+  const league =
+    (document.getElementById("leagueSelect") && document.getElementById("leagueSelect").value) || "";
+  if (ssIsNcaaSofaLeague(league)) {
+    stats.pace10 = [];
+    stats.ortg10 = [];
+    stats.drtg10 = [];
+    updateTeamUIFromStats(side, stats);
+    return stats;
+  }
+  const meta = Array.isArray(stats.overallGamesMeta) ? stats.overallGamesMeta.slice(0, 10) : [];
+  const pace10 = [],
+    ortg10 = [],
+    drtg10 = [];
+  const regMins =
+    typeof getLeagueRegulationMinutes === "function" ? getLeagueRegulationMinutes(league) : 40;
+  const jobs = meta.map(function (g) {
+    return ssFetchEventStatistics(g && g.eventId).then(function (mapped) {
+      return { g: g, mapped: mapped };
+    });
+  });
+  let rows = [];
+  try {
+    rows = await Promise.all(jobs);
+  } catch (_eAll) {
+    rows = [];
+  }
+  rows.forEach(function (row) {
+    if (!row || !row.g || !row.mapped) return;
+    if (row.g.wentOT) return;
+    const mine = row.g.isHome ? row.mapped.home : row.mapped.away;
+    const opp = row.g.isHome ? row.mapped.away : row.mapped.home;
+    if (typeof calculateAdvancedMetrics !== "function") return;
+    const adv = calculateAdvancedMetrics(mine, opp, row.g.myFT, row.g.oppFT, regMins, league);
+    if (adv && isFinite(adv.pace) && isFinite(adv.ortg) && isFinite(adv.drtg)) {
+      pace10.push(adv.pace);
+      ortg10.push(adv.ortg);
+      drtg10.push(adv.drtg);
+    }
+  });
+  stats.pace10 = pace10;
+  stats.ortg10 = ortg10;
+  stats.drtg10 = drtg10;
+  updateTeamUIFromStats(side, stats);
+  return stats;
+}
+
+function ssKickoffPaceEnrichment(bundle) {
+  const jobs = [];
+  if (bundle && bundle.A) jobs.push(ssFetchAndAttachPace("A", bundle.A));
+  if (bundle && bundle.B) jobs.push(ssFetchAndAttachPace("B", bundle.B));
+  const done = function () {
+    ssRenderPaceStatus();
+    if (typeof invalidateFetchedAudit === "function") invalidateFetchedAudit();
+  };
+  if (!jobs.length) {
+    done();
+    return;
+  }
+  Promise.all(jobs)
+    .catch(function (e) {
+      engineDebug("ss pace enrich failed", { error: e && e.message ? e.message : String(e) });
+    })
+    .then(done);
 }
 
 function clearPasteJSON(side) {
@@ -5043,6 +5318,7 @@ function clearPasteJSON(side) {
     st.style.color = "";
     st.textContent = "";
   }
+  window.__ssLastPasteMsg = "";
 }
 
 window.__jsonPasteCountA = 0;
@@ -5350,18 +5626,23 @@ function updateTeamUIFromStats(side, stats) {
     );
   }
 
+  AppState.context.data[side].ortg10 = Array.isArray(stats.ortg10) ? stats.ortg10.slice(0, 10) : [];
+  AppState.context.data[side].drtg10 = Array.isArray(stats.drtg10) ? stats.drtg10.slice(0, 10) : [];
+  AppState.context.data[side].pace10 = Array.isArray(stats.pace10) ? stats.pace10.slice(0, 10) : [];
   const tagEl = document.getElementById(prefix + "AutoTag");
   if (tagEl) tagEl.style.display = "inline";
 }
 
 function reprocessBothTeamsFromEvents() {
   const tid = getFixtureTournamentId();
+  const bundle = { A: null, B: null };
 
   if (window.__lastEventsA && window.__lastEventsA.length) {
     const idA = (document.getElementById("ssTeamAId")?.value || "").trim();
     if (idA) {
       const statsA = ssProcessTeamEvents(window.__lastEventsA, idA, "Team A", tid);
       updateTeamUIFromStats("A", statsA);
+      bundle.A = statsA;
     }
   }
 
@@ -5370,10 +5651,13 @@ function reprocessBothTeamsFromEvents() {
     if (idB) {
       const statsB = ssProcessTeamEvents(window.__lastEventsB, idB, "Team B", tid);
       updateTeamUIFromStats("B", statsB);
+      bundle.B = statsB;
     }
   }
 
   extractH2HFromPastedEvents();
+  if (typeof ssKickoffPaceEnrichment === "function") ssKickoffPaceEnrichment(bundle);
+  return bundle;
 }
 
 function onTournamentIdInput() {
@@ -5599,6 +5883,7 @@ function parseSofascoreIndividual(side) {
       st.style.color = "#2f8f4a";
       st.textContent = "✅ H2H updated from additional JSON for team " + side;
     }
+    window.__ssLastPasteMsg = st ? st.textContent : "";
     if (pasteEl) pasteEl.value = "";
 
     openSection("marketSection");
@@ -10324,23 +10609,49 @@ const ESPN_LEAGUE_SLUGS = {
   nba_gl: "nba-g-league",
   nba_summer: "nba-summer-las-vegas",
   euroleague: "euroleague",
-  eurocup: "eurocup",
-  champions_league: "basketball-champions-league",
-  turkey_bsl: "turkish-bsl",
-  acb: "spanish-liga-acb",
-  bbl: "german-bbl",
-  ausnbl: "australian-nbl",
-  lba: "italian-lba",
-  bleague: "japan-b-league",
-  united_league: "vtb-united-league",
-  proa: "french-pro-a",
-  bcl: "greek-basket-league",
-  aba: "adriatic-basketball-association",
-  isl: "israel-super-league",
-  cebl: "cebl",
+  eurocup: "eurocup", // ESPN site API 404 (tried eurocup/euro-cup/ueleurocup/7days-eurocup) — Fetch stays manual
+  champions_league: "basketball-champions-league", // ESPN 404 (tried basketball-champions-league/fiba-champions-league/bcl/fiba-bcl)
+  turkey_bsl: "turkish-bsl", // ESPN 404 (tried turkish-bsl/bsl/turkey-bsl/turkish-super-league/tbl)
+  acb: "acb", // was spanish-liga-acb (404); proven site.web.api 2026-08-30
+  bbl: "german-bbl", // ESPN 404 (tried german-bbl/bbl/easycredit-bbl/basketball-bundesliga/germany-bbl)
+  ausnbl: "nbl", // was australian-nbl (404); proven site.web.api 2026-08-30
+  lba: "lba", // was italian-lba (404); proven site.web.api 2026-08-30
+  bleague: "japan-b-league", // ESPN 404 (tried japan-b-league/b-league/bleague/b1/jbl)
+  united_league: "vtb-united-league", // ESPN 404 (tried vtb-united-league/vtb/united-league)
+  proa: "french-pro-a", // ESPN 404 (tried french-pro-a/pro-a/lnb/betclic-elite/jeep-elite)
+  bcl: "greek-basket-league", // ESPN 404 (tried greek-basket-league/greek-a1/heba/a1-ethniki)
+  aba: "adriatic-basketball-association", // ESPN 404 (tried adriatic-basketball-association/aba/aba-liga/adriatic-league)
+  isl: "israel-super-league", // ESPN 404 (tried israel-super-league/israeli-bsl/winner-league/israel-bsl)
+  cebl: "cebl", // ESPN 404 (tried cebl/canadian-elite-basketball-league/canada-cebl)
 };
 function getEspnLeagueSlug(league) {
   return ESPN_LEAGUE_SLUGS[String(league || "").toLowerCase()] || null;
+}
+// ESPN auto-fetch = any ESPN_LEAGUE_SLUGS key, not TRUE_BIG5.
+// Dead site-API slugs (HTTP 404 as of 2026-08-30) stay manual — do not open Fetch.
+const ESPN_SITE_API_DEAD_KEYS = new Set([
+  "eurocup",
+  "champions_league",
+  "turkey_bsl",
+  "bbl",
+  "bleague",
+  "united_league",
+  "proa",
+  "bcl",
+  "aba",
+  "isl",
+  "cebl",
+]);
+function isEspnAutoFetchLeague(league) {
+  const k = String(league || "").toLowerCase();
+  if (!Object.prototype.hasOwnProperty.call(ESPN_LEAGUE_SLUGS, k)) return false;
+  return !ESPN_SITE_API_DEAD_KEYS.has(k);
+}
+function espnIntlSofaHint(league) {
+  const k = String(league || "").toLowerCase();
+  const us = ["nba", "wnba", "wnba_pre", "ncaa", "ncaaw", "nba_gl", "nba_summer"];
+  if (!Object.prototype.hasOwnProperty.call(ESPN_LEAGUE_SLUGS, k) || us.indexOf(k) >= 0) return "";
+  return " Use SofaScore / manual entry as fallback.";
 }
 
 const VOL_CACHE_KEY = "engineVolCache_v1";
@@ -13610,9 +13921,10 @@ async function proxyFetch(url, timeoutMs = 12000) {
 
   try {
     // D2: only proxy allowlisted sports hosts through the worker.
+    // SofaScore event statistics for last-10 pace, not TRUE_BIG5.
     var _uCheck = String(url || "");
     var _allowedHost =
-      /site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com/i.test(_uCheck);
+      /site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com|api\.sofascore\.com|api\.sofascore\.app/i.test(_uCheck);
     if (!_allowedHost && /https?:\/\//i.test(_uCheck)) {
       engineDebug("proxyFetch blocked non-allowlisted host", { request: fetchLabel });
       throw new Error("proxyFetch: target host not allowlisted");
@@ -13644,19 +13956,19 @@ async function proxyFetch(url, timeoutMs = 12000) {
       }
     } catch (_noteErr) {}
     try {
-      // Direct fallback only for ESPN hosts — never open-relay arbitrary URLs.
-      if (
-        !/site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com/i.test(
-          String(url || ""),
-        )
-      ) {
+      // Direct fallback only for allowlisted sports hosts — never open-relay arbitrary URLs.
+      var _uDirect = String(url || "");
+      var _espnDirect =
+        /site\.api\.espn\.com|site\.web\.api\.espn\.com|sports\.core\.api\.espn\.com/i.test(_uDirect);
+      var _sofaDirect = /api\.sofascore\.com|api\.sofascore\.app/i.test(_uDirect);
+      if (!_espnDirect && !_sofaDirect) {
         throw workerErr;
       }
-      const directData = await fetchJson(url, "DirectESPN");
+      const directData = await fetchJson(url, _espnDirect ? "DirectESPN" : "DirectSofa");
       _proxyFetchCache.set(cacheKey, { data: directData, timestamp: Date.now() });
       return directData;
     } catch (directErr) {
-      engineDebug("Direct ESPN fetch failed — no unverified public proxy fallback", {
+      engineDebug("Direct allowlisted fetch failed — no unverified public proxy fallback", {
         request: fetchLabel,
         error: directErr?.message || String(directErr),
       });
@@ -22306,34 +22618,9 @@ function formatFixtureTime(dateStr) {
 }
 
 function getLeagueBase(league) {
-  const l = String(league || "").toLowerCase();
-  const _BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/";
-  const _SLUG_MAP = {
-    nba: "nba",
-    wnba: "wnba",
-    wnba_pre: "wnba",
-    ncaa: "mens-college-basketball",
-    ncaaw: "womens-college-basketball",
-    nba_gl: "nba-g-league",
-
-    nba_summer: "nba-summer-las-vegas",
-    euroleague: "euroleague",
-    eurocup: "eurocup",
-    champions_league: "basketball-champions-league",
-    turkey_bsl: "turkish-bsl",
-    acb: "spanish-liga-acb",
-    bbl: "german-bbl",
-    ausnbl: "australian-nbl",
-    lba: "italian-lba",
-    bleague: "japan-b-league",
-    united_league: "vtb-united-league",
-    proa: "french-pro-a",
-    bcl: "greek-basket-league",
-    aba: "adriatic-basketball-association",
-    isl: "israel-super-league",
-    cebl: "cebl",
-  };
-  return _SLUG_MAP[l] ? _BASE + _SLUG_MAP[l] : "";
+  const slug = getEspnLeagueSlug(league);
+  if (!slug) return "";
+  return "https://site.api.espn.com/apis/site/v2/sports/basketball/" + slug;
 }
 
 function getCurrentSeasonYear(league) {
@@ -22589,8 +22876,8 @@ async function onTeamInput(side) {
     closeDrop(dropId);
     return;
   }
-  const espnLeagues = ["nba", "wnba", "wnba_pre", "ncaa", "ncaaw", "nba_gl", "nba_summer"];
-  if (!espnLeagues.includes(league)) {
+  // ESPN auto-fetch = any ESPN_LEAGUE_SLUGS key, not TRUE_BIG5.
+  if (!isEspnAutoFetchLeague(league)) {
     closeDrop(dropId);
     return;
   }
@@ -23795,8 +24082,8 @@ async function loadFixtures(offset = 0) {
   selectedTeamIds = { A: null, B: null };
   validateFetchSection();
 
-  const espnLeagues = new Set(Object.keys(ESPN_LEAGUE_SLUGS));
-  if (espnLeagues.has(league)) {
+  // ESPN auto-fetch = any ESPN_LEAGUE_SLUGS key, not TRUE_BIG5.
+  if (isEspnAutoFetchLeague(league)) {
     await loadFixturesESPN(league, offset, myToken);
   } else {
     if (myToken !== _fixtureLoadToken) return;
@@ -24018,10 +24305,10 @@ async function fetchESPN() {
     return;
   }
 
-  const TRUE_BIG5 = new Set(["nba", "wnba", "wnba_pre", "ncaa", "ncaaw", "nba_gl", "nba_summer"]);
-  if (!TRUE_BIG5.has(league)) {
+  // ESPN auto-fetch = any ESPN_LEAGUE_SLUGS key, not TRUE_BIG5.
+  if (!isEspnAutoFetchLeague(league)) {
     setStatusText(
-      "⛔ Auto-fetch only available for NBA / WNBA / NCAA / NCAAW / G-League / NBA Summer League. Use SofaScore for this league.",
+      "⛔ Auto-fetch is not available for this league on ESPN. Use SofaScore / manual entry.",
       "err",
     );
     unlockFetchBtn();
@@ -24040,15 +24327,8 @@ async function fetchESPN() {
   g_activeFetchController = new AbortController();
   window.__abortSignal = g_activeFetchController.signal;
 
-  const espnLeagues = new Set(["nba", "wnba", "wnba_pre", "ncaa", "ncaaw", "nba_gl", "nba_summer"]);
-  if (espnLeagues.has(league)) {
-    await fetchESPNCore(league, teamAName, teamBName);
-  } else {
-    setStatusText(
-      "This league uses manual entry. Enter team stats in the fields below, then click Run.",
-      "ok",
-    );
-  }
+  // ESPN auto-fetch = any ESPN_LEAGUE_SLUGS key, not TRUE_BIG5.
+  await fetchESPNCore(league, teamAName, teamBName);
 
   const _cooldownBtn = document.getElementById("fetchBtn");
   if (_cooldownBtn) {
@@ -24123,8 +24403,14 @@ async function fetchESPNCore(league, teamAName, teamBName) {
       teamBId = await searchTeamFromAPI(espnBase, teamBName, league);
     if (!validateTeamId(teamBId, league)) teamBId = null;
 
-    if (!teamAId) throw new Error(`Can't find "${teamAName}". Try a fuller team name.`);
-    if (!teamBId) throw new Error(`Can't find "${teamBName}". Try a fuller team name.`);
+    if (!teamAId)
+      throw new Error(
+        `Can't find "${teamAName}". Try a fuller team name.` + espnIntlSofaHint(league),
+      );
+    if (!teamBId)
+      throw new Error(
+        `Can't find "${teamBName}". Try a fuller team name.` + espnIntlSofaHint(league),
+      );
     if (String(teamAId) === String(teamBId))
       throw new Error("Team A and Team B cannot be the same team.");
 
@@ -24207,7 +24493,8 @@ async function fetchESPNCore(league, teamAName, teamBName) {
         stashSeriesDates("B", qk, bStats[qk + "ScoredDates"]);
     });
 
-    if (!aStats && !bStats) throw new Error("No recent schedule data found from ESPN.");
+    if (!aStats && !bStats)
+      throw new Error("No recent schedule data found from ESPN." + espnIntlSofaHint(league));
 
     AppState.injuries.A = defaultInjuryMeta();
     AppState.injuries.B = defaultInjuryMeta();
@@ -24662,8 +24949,11 @@ async function fetchESPNCore(league, teamAName, teamBName) {
     }
   } catch (e) {
     if (e.name !== "AbortError") {
-      setFetchAuditIssues([e.message]);
-      setStatusText("❌ " + e.message, "err");
+      const _msg = e.message || String(e);
+      setFetchAuditIssues([_msg]);
+      const _hint = espnIntlSofaHint(league);
+      const _out = _hint && _msg.indexOf("SofaScore") >= 0 ? _msg : _msg + _hint;
+      setStatusText("❌ " + _out, "err");
     }
   } finally {
     btn.disabled = false;
@@ -31883,9 +32173,13 @@ function onLeagueChange() {
   if (teamMarketSection) {
     teamMarketSection.style.gridTemplateColumns = "1fr 1fr";
   }
+  // ESPN auto-fetch = any ESPN_LEAGUE_SLUGS key, not TRUE_BIG5.
+  const _isEspnAuto = isEspnAutoFetchLeague(league);
   const _espnEl = document.getElementById("espnSection");
-  if (_espnEl) _espnEl.style.display = _isBig5 ? "block" : "none";
+  if (_espnEl) _espnEl.style.display = _isEspnAuto ? "block" : "none";
   const _sofaEl = document.getElementById("sofascoreManualSection");
+  // TRUE_BIG5: ESPN on, SofaScore off (NCAA is ESPN-only by owner design).
+  // International ESPN slugs: keep SofaScore visible as fallback (ESPN can be thin off-season).
   if (_sofaEl) _sofaEl.style.display = !league || _isBig5 ? "none" : "block";
 
   document.getElementById("aQSection").style.display = isQs || !isNbaOrNcaa ? "block" : "none";
