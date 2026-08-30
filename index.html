@@ -1,3 +1,4 @@
+S
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3402,8 +3403,8 @@ body.dark-mode .tracker-analytics-section-head {
             <textarea id="minutesOverrideB" rows="3" placeholder="Ogwumike 30" style="width:100%;max-width:100%;font-size:12px;padding:6px 8px;background:var(--input-bg);color:var(--text);border:1px solid var(--input-border)"></textarea>
           </div>
         </div>
-        <label style="margin-top:8px">Matchup (optional — season per-game)</label>
-        <small class="muted-note">Leave blank if unknown. Used only when both sides of a pair are filled. Cap ±2.5 pts.</small>
+        <label style="margin-top:8px">Matchup (ESPN last-10 boxes, or type over)</label>
+        <small class="muted-note">Auto-fills after Fetch when the box score has paint / 3s / fast-break. Used only when both sides of a pair have numbers. Cap ±2.5 pts.</small>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px">
           <div><label>A paint scored</label><input id="matchPaintA" placeholder="e.g. 42" /></div>
           <div><label>B paint allowed</label><input id="matchPaintAllowB" placeholder="e.g. 43" /></div>
@@ -13919,6 +13920,136 @@ function _readBoxStat(sMap, aliases) {
   return NaN;
 }
 
+
+function _readBoxStatNumeric(sMap, aliases) {
+  if (!sMap || typeof sMap !== "object") return NaN;
+  const keys = Object.keys(sMap);
+  const tryKey = function (raw) {
+    if (raw == null || raw === "") return NaN;
+    const str = String(raw).replace("%", "").trim();
+    const pair = typeof _parseMadeAttempted === "function" ? _parseMadeAttempted(str) : null;
+    if (pair && Number.isFinite(pair.made) && Number.isFinite(pair.attempted) && pair.attempted > 0) {
+      return pair.made;
+    }
+    const n = parseFloat(str);
+    return Number.isFinite(n) ? n : NaN;
+  };
+  for (let i = 0; i < aliases.length; i++) {
+    const a = aliases[i];
+    if (sMap[a] != null) {
+      const n = tryKey(sMap[a]);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  for (let i = 0; i < aliases.length; i++) {
+    const want = String(aliases[i]).toLowerCase();
+    const found = keys.find(function (k) { return String(k).toLowerCase() === want; });
+    if (found != null) {
+      const n = tryKey(sMap[found]);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  for (let i = 0; i < aliases.length; i++) {
+    const want = String(aliases[i]).toLowerCase();
+    const found = keys.find(function (k) { return String(k).toLowerCase().indexOf(want) >= 0; });
+    if (found != null) {
+      const n = tryKey(sMap[found]);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return NaN;
+}
+function extractMatchupFromBoxMaps(sMapMine, sMapOpp) {
+  const paintMine = _readBoxStatNumeric(sMapMine, [
+    "pointsInPaint", "paintPoints", "pointsInThePaint", "PIP",
+  ]);
+  const paintOpp = _readBoxStatNumeric(sMapOpp, [
+    "pointsInPaint", "paintPoints", "pointsInThePaint", "PIP",
+  ]);
+  const fbMine = _readBoxStatNumeric(sMapMine, [
+    "fastBreakPoints", "fastbreakPoints", "fastBreak", "fbPoints",
+  ]);
+  const fbOpp = _readBoxStatNumeric(sMapOpp, [
+    "fastBreakPoints", "fastbreakPoints", "fastBreak", "fbPoints",
+  ]);
+  let tpaMine = _readBoxStat(sMapMine, [
+    "threePointFieldGoalsAttempted",
+    "threePointFieldGoalAttempts",
+    "threePointAttempts",
+    "3PA",
+  ]);
+  let tpaOpp = _readBoxStat(sMapOpp, [
+    "threePointFieldGoalsAttempted",
+    "threePointFieldGoalAttempts",
+    "threePointAttempts",
+    "3PA",
+  ]);
+  let tpPctMine = _readBoxStatNumeric(sMapMine, [
+    "threePointFieldGoalPct", "threePointPct", "3P%", "threePointPercentage",
+  ]);
+  let tpPctOpp = _readBoxStatNumeric(sMapOpp, [
+    "threePointFieldGoalPct", "threePointPct", "3P%", "threePointPercentage",
+  ]);
+  const tpmMine = _readBoxStatNumeric(sMapMine, [
+    "threePointFieldGoalsMade", "threePointMade", "3PM",
+  ]);
+  const tpmOpp = _readBoxStatNumeric(sMapOpp, [
+    "threePointFieldGoalsMade", "threePointMade", "3PM",
+  ]);
+  if (!Number.isFinite(tpPctMine) && Number.isFinite(tpmMine) && Number.isFinite(tpaMine) && tpaMine > 0) {
+    tpPctMine = (100 * tpmMine) / tpaMine;
+  }
+  if (!Number.isFinite(tpPctOpp) && Number.isFinite(tpmOpp) && Number.isFinite(tpaOpp) && tpaOpp > 0) {
+    tpPctOpp = (100 * tpmOpp) / tpaOpp;
+  }
+  return {
+    paintScored: paintMine,
+    paintAllowed: paintOpp,
+    fbScored: fbMine,
+    fbAllowed: fbOpp,
+    tpa: tpaMine,
+    tpPctAllowed: tpPctOpp,
+  };
+}
+function _avgFiniteSeries(arr) {
+  const xs = (Array.isArray(arr) ? arr : []).map(Number).filter(function (n) {
+    return Number.isFinite(n) && n >= 0;
+  });
+  if (!xs.length) return NaN;
+  return xs.reduce(function (a, b) { return a + b; }, 0) / xs.length;
+}
+function fillEspnMatchupFields(aStats, bStats) {
+  const setIfEmpty = function (id, val, digits) {
+    const el = document.getElementById(id);
+    if (!el || !Number.isFinite(val)) return false;
+    if (String(el.value || "").trim() !== "") return false;
+    el.value = Number(val).toFixed(digits);
+    el.dataset.espnAutofill = "1";
+    return true;
+  };
+  let n = 0;
+  if (setIfEmpty("matchPaintA", _avgFiniteSeries(aStats && aStats.paintScored), 1)) n++;
+  if (setIfEmpty("matchPaintAllowB", _avgFiniteSeries(bStats && bStats.paintAllowed), 1)) n++;
+  if (setIfEmpty("matchPaintB", _avgFiniteSeries(bStats && bStats.paintScored), 1)) n++;
+  if (setIfEmpty("matchPaintAllowA", _avgFiniteSeries(aStats && aStats.paintAllowed), 1)) n++;
+  if (setIfEmpty("match3paA", _avgFiniteSeries(aStats && aStats.threePa), 1)) n++;
+  if (setIfEmpty("match3pDefB", _avgFiniteSeries(bStats && bStats.threePctAllowed), 1)) n++;
+  if (setIfEmpty("match3paB", _avgFiniteSeries(bStats && bStats.threePa), 1)) n++;
+  if (setIfEmpty("match3pDefA", _avgFiniteSeries(aStats && aStats.threePctAllowed), 1)) n++;
+  if (setIfEmpty("matchFbA", _avgFiniteSeries(aStats && aStats.fbScored), 1)) n++;
+  if (setIfEmpty("matchFbAllowB", _avgFiniteSeries(bStats && bStats.fbAllowed), 1)) n++;
+  if (setIfEmpty("matchFbB", _avgFiniteSeries(bStats && bStats.fbScored), 1)) n++;
+  if (setIfEmpty("matchFbAllowA", _avgFiniteSeries(aStats && aStats.fbAllowed), 1)) n++;
+  if (typeof engineDebug === "function") {
+    engineDebug("ESPN matchup autofill", {
+      filled: n,
+      aPaintN: (aStats && aStats.paintScored && aStats.paintScored.length) || 0,
+      bPaintN: (bStats && bStats.paintScored && bStats.paintScored.length) || 0,
+    });
+  }
+  return n;
+}
+
 function _extractTeamBoxStatMap(boxTeam) {
   const sMap = {};
   if (!boxTeam) return sMap;
@@ -24154,6 +24285,12 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
   const h1Scored10 = [];
   const h1Allowed10 = [];
   const h2Scored10 = [];
+  const paintScoredArr = [];
+  const paintAllowedArr = [];
+  const fbScoredArr = [];
+  const fbAllowedArr = [];
+  const threePaArr = [];
+  const threePctAllowedArr = [];
   const h2Allowed10 = [];
   const h2Scored10Dates = [];
 
@@ -24171,6 +24308,7 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
         h2oStored = null;
       let gotLS = false;
       let advanced = null;
+      let boxMatchup = null;
 
       try {
         const key = `${base}:sum:${ref.id}`;
@@ -24261,6 +24399,9 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
               } else {
                 advanced = calculateAdvancedMetrics(sMapMine, sMapOpp, ms, os, _regMins, leagueKey);
               }
+              if (typeof extractMatchupFromBoxMaps === "function") {
+                boxMatchup = extractMatchupFromBoxMaps(sMapMine, sMapOpp);
+              }
             }
           }
         }
@@ -24335,6 +24476,7 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
         h2o: h2oStored,
         qs: ref.qs,
         advanced: advanced,
+        matchup: boxMatchup || null,
         advancedH1: advancedH1,
         advancedH2: advancedH2,
         advancedQ: advancedQ,
@@ -24374,6 +24516,14 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
       h2Scored10Dates.push(game.date || null);
     }
 
+    if (game.matchup) {
+      if (Number.isFinite(game.matchup.paintScored)) paintScoredArr.push(game.matchup.paintScored);
+      if (Number.isFinite(game.matchup.paintAllowed)) paintAllowedArr.push(game.matchup.paintAllowed);
+      if (Number.isFinite(game.matchup.fbScored)) fbScoredArr.push(game.matchup.fbScored);
+      if (Number.isFinite(game.matchup.fbAllowed)) fbAllowedArr.push(game.matchup.fbAllowed);
+      if (Number.isFinite(game.matchup.tpa)) threePaArr.push(game.matchup.tpa);
+      if (Number.isFinite(game.matchup.tpPctAllowed)) threePctAllowedArr.push(game.matchup.tpPctAllowed);
+    }
     if (game.qs) {
       qS.q1.push(game.qs.m[0]);
       qS.q2.push(game.qs.m[1]);
@@ -24456,6 +24606,12 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
           .map((s) => s.advancedQ.q4.pace),
         scored10,
         allowed10,
+        paintScored: paintScoredArr.slice(0, 10),
+        paintAllowed: paintAllowedArr.slice(0, 10),
+        fbScored: fbScoredArr.slice(0, 10),
+        fbAllowed: fbAllowedArr.slice(0, 10),
+        threePa: threePaArr.slice(0, 10),
+        threePctAllowed: threePctAllowedArr.slice(0, 10),
         scoredDates: scoredDates10.slice(0, 10),
         ftScoredDates: scoredDates10.slice(0, 10),
         h1Scored10,
