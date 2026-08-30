@@ -1,3 +1,4 @@
+A
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3405,6 +3406,18 @@ body.dark-mode .tracker-analytics-section-head {
         <div id="qualityPaceCard" style="margin-top:10px;padding:8px;border:1px solid var(--panel-border);background:var(--panel-soft);font-size:11px;line-height:1.6">
           <div style="font-weight:800;margin-bottom:4px">How good / how fast (last 10, ESPN)</div>
           <div id="qualityPaceBody" style="color:var(--muted)">Fetch stats to load ORTG, DRTG, net and pace.</div>
+        </div>
+        <label style="margin-top:8px">Extra outs tonight (ESPN missed / FIBA)</label>
+        <small class="muted-note">One name per line. Applied as Out and shrinks that side’s last-10 offense. Cleared when you pick a new match.</small>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px">
+          <div>
+            <label>Team A extra outs</label>
+            <textarea id="extraOutA" rows="2" placeholder="Williams&#10;Salaun" style="width:100%;max-width:100%;font-size:12px;padding:6px 8px;background:var(--input-bg);color:var(--text);border:1px solid var(--input-border)"></textarea>
+          </div>
+          <div>
+            <label>Team B extra outs</label>
+            <textarea id="extraOutB" rows="2" placeholder="Leite" style="width:100%;max-width:100%;font-size:12px;padding:6px 8px;background:var(--input-bg);color:var(--text);border:1px solid var(--input-border)"></textarea>
+          </div>
         </div>
         <small class="muted-note">Injuries come from ESPN’s official list. Questionable stars are not “in.” Confirm Q/DTD yourself before tip — no feed is 100% at gametime.</small>
       </div>
@@ -22927,6 +22940,81 @@ function getV24MinutesGate() {
 function getV24ContextFlag() {
   return String(document.getElementById("contextFlag")?.value || "none");
 }
+function resetCardExtrasOnMatchChange() {
+  const wipe = ["minutesOverrideA", "minutesOverrideB", "extraOutA", "extraOutB"];
+  wipe.forEach(function (id) {
+    const el = document.getElementById(id);
+    if (el) el.value = "";
+  });
+  const ctx = document.getElementById("contextFlag");
+  if (ctx) ctx.value = "none";
+  const q = document.getElementById("qualityPaceBody");
+  if (q) q.textContent = "Fetch stats to load ORTG, DRTG, net and pace.";
+}
+function parseNameList(id) {
+  return String(document.getElementById(id)?.value || "")
+    .split(/\n|;|,/)
+    .map(function (s) {
+      return s.replace(/\d+/g, "").trim();
+    })
+    .filter(function (s) {
+      return s.length > 1;
+    });
+}
+function applyExtraOutsToInjury(inj, names) {
+  inj = inj || defaultInjuryMeta();
+  if (!inj.notes) inj.notes = [];
+  const have = inj.notes
+    .map(function (n) {
+      return String(n.text || "").toLowerCase();
+    })
+    .join(" | ");
+  let extra = 0;
+  names.forEach(function (name) {
+    const n = String(name || "").trim();
+    if (!n) return;
+    if (have.indexOf(n.toLowerCase()) >= 0) return;
+    inj.notes.push({
+      type: "out",
+      text: n + " — OUT (manual / FIBA) → last-10 offense cut",
+    });
+    inj.outCount = (inj.outCount || 0) + 1;
+    extra++;
+  });
+  if (extra > 0) {
+    const cut = Math.min(0.18, extra * 0.06);
+    const cur = Number.isFinite(Number(inj.scoringMult)) ? Number(inj.scoringMult) : 1;
+    inj.scoringMult = Math.max(0.72, cur * (1 - cut));
+    inj.extraOutsApplied = extra;
+  }
+  return inj;
+}
+function applyAvailabilityLayer() {
+  if (typeof AppState === "undefined" || !AppState.injuries) return;
+  AppState.injuries.A = applyExtraOutsToInjury(AppState.injuries.A, parseNameList("extraOutA"));
+  AppState.injuries.B = applyExtraOutsToInjury(AppState.injuries.B, parseNameList("extraOutB"));
+  if (typeof renderInjuryBox === "function") {
+    renderInjuryBox("injuryBoxA", "injuryContentA", AppState.injuries.A);
+    renderInjuryBox("injuryBoxB", "injuryContentB", AppState.injuries.B);
+  }
+}
+function suggestContextAfterFetch() {
+  const el = document.getElementById("contextFlag");
+  if (!el || el.value !== "none") return;
+  const raw = String(
+    (typeof AppState !== "undefined" && AppState.context && AppState.context.data && AppState.context.data.eventDate) ||
+      "",
+  );
+  const ms = Date.parse(raw);
+  if (!Number.isFinite(ms)) return;
+  const d = new Date(ms);
+  const month = d.getUTCMonth();
+  const day = d.getUTCDate();
+  const league = String(document.getElementById("leagueSelect")?.value || "").toLowerCase();
+  if (league === "wnba" && ((month === 7 && day >= 28) || month === 8)) {
+    el.value = "last_before_break";
+  }
+}
 function getV24MatchupAdjust() {
   return { dA: 0, dB: 0, used: false };
 }
@@ -23905,7 +23993,14 @@ async function fetchInjuryMeta(base, teamId, teamAvgScored, league) {
       const isOut =
         status.includes("out") ||
         status.includes("injured reserve") ||
-        status.includes("suspended");
+        status.includes("suspended") ||
+        status.includes("not with team") ||
+        status.includes("not_with_team") ||
+        status.includes("fiba") ||
+        status.includes("world cup") ||
+        status.includes("national team") ||
+        status.includes("pregnancy") ||
+        status.includes("maternity");
       const isDTD =
         status.includes("questionable") ||
         status.includes("doubtful") ||
@@ -24873,17 +24968,33 @@ function renderInjuryBox(boxId, contentId, inj) {
   const box = document.getElementById(boxId);
   const content = document.getElementById(contentId);
   if (!box || !content) return;
-  if (!inj.notes.length) {
-    content.innerHTML = "";
-    box.style.display = "none";
-    return;
+  inj = inj || {};
+  const notes = Array.isArray(inj.notes) ? inj.notes : [];
+  const bits = [];
+  if (inj.fetchFailed) {
+    bits.push(
+      '<div class="inj-dtd">Injury feed failed — availability UNKNOWN. Do not treat this roster as full strength.</div>',
+    );
+  } else if (inj.confirmedNone && !notes.length) {
+    bits.push(
+      '<div class="inj-dtd">ESPN list empty. Confirm FIBA / not-with-team yourself in Extra outs.</div>',
+    );
+  } else if (!notes.length) {
+    bits.push('<div>No ESPN absences listed. Confirm stars yourself before sides.</div>');
   }
-  content.innerHTML = inj.notes
-    .map((n) => {
-      const cls = n.type === "out" ? "inj-out" : n.type === "dtd" ? "inj-dtd" : "";
-      return `<div class="${cls}">${safeText(n.text)}</div>`;
-    })
-    .join("");
+  notes.forEach(function (n) {
+    const cls = n.type === "out" ? "inj-out" : n.type === "dtd" ? "inj-dtd" : "";
+    bits.push('<div class="' + cls + '">' + safeText(n.text) + "</div>");
+  });
+  const mult = Number(inj.scoringMult);
+  if (Number.isFinite(mult) && mult < 0.999) {
+    bits.push(
+      "<div>Offense scaled to " +
+        Math.round(mult * 100) +
+        "% of last-10 after absences.</div>",
+    );
+  }
+  content.innerHTML = bits.join("");
   box.style.display = "block";
 }
 
@@ -25055,6 +25166,7 @@ function pickFixture(homeName, homeId, awayName, awayId) {
   clearSideFields("A");
   clearSideFields("B");
   clearH2HFields();
+  if (typeof resetCardExtrasOnMatchChange === "function") resetCardExtrasOnMatchChange();
   const _pFlds = [
     "ftMarket",
     "h1Market",
@@ -25561,6 +25673,9 @@ async function fetchESPNCore(league, teamAName, teamBName) {
               tsPercent: tsa > 0 ? parseFloat((pts / (2 * tsa)).toFixed(3)) : null,
               minPG: _fs("avgMinutes") || _fs("minutes") || null,
               plusMinus: _fs("plusMinus") || null,
+              statusType: String(
+                a.status?.type || a.status?.name || a.injuryStatus || a.status || "",
+              ),
             };
           })
           .sort((a, b) => b.ppg - a.ppg)
@@ -25577,8 +25692,20 @@ async function fetchESPNCore(league, teamAName, teamBName) {
       fetchRoster(teamBId),
     ]);
 
-    AppState.injuries.A = injA;
-    AppState.injuries.B = injB;
+    function absorbRosterStatus(inj, roster) {
+      const names = [];
+      (roster || []).forEach(function (p) {
+        const st = String(p.statusType || "").toLowerCase();
+        if (
+          /not.with|fiba|world cup|national|suspend|out for season|pregnancy/.test(st)
+        ) {
+          if (p.name) names.push(p.name);
+        }
+      });
+      return applyExtraOutsToInjury(inj, names);
+    }
+    AppState.injuries.A = absorbRosterStatus(injA, rostA);
+    AppState.injuries.B = absorbRosterStatus(injB, rostB);
 
     AppState.context.data = {
       league,
@@ -25713,6 +25840,8 @@ async function fetchESPNCore(league, teamAName, teamBName) {
 
     renderInjuryBox("injuryBoxA", "injuryContentA", AppState.injuries.A);
     renderInjuryBox("injuryBoxB", "injuryContentB", AppState.injuries.B);
+    if (typeof applyAvailabilityLayer === "function") applyAvailabilityLayer();
+    if (typeof suggestContextAfterFetch === "function") suggestContextAfterFetch();
     if (typeof renderQualityPaceCard === "function") renderQualityPaceCard();
 
     updateIntelligencePack(league, {
@@ -29591,6 +29720,7 @@ try {
 async function runEngine() {
   window.__engineInvariantFailed = false;
   window.__engineInvariantFailure = null;
+  if (typeof applyAvailabilityLayer === "function") applyAvailabilityLayer();
   const runBtn = document.getElementById("runBtn");
   const table = document.getElementById("results");
 
