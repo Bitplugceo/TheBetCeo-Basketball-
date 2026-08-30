@@ -4192,14 +4192,6 @@ body.dark-mode .tracker-analytics-section-head {
         </button>
         <button
           type="button"
-          id="trackerBacktestBtn"
-          class="tracker-insights-btn"
-          title="WNBA backtest"
-        >
-          📉
-        </button>
-        <button
-          type="button"
           id="trackerConfigBtn"
           class="tracker-insights-btn"
           title="View/Edit verified configs"
@@ -6864,9 +6856,6 @@ window.getLockedConfigMeta = getLockedConfigMeta;
 window.clearLockedConfig = clearLockedConfig;
 
 function getTunableParam(key, league, market) {
-  if (window.__btParamOverride && Object.prototype.hasOwnProperty.call(window.__btParamOverride, key)) {
-    return window.__btParamOverride[key];
-  }
   const entry = TUNABLE_PARAM_REGISTRY[key];
   if (!entry) {
     engineDebug("getTunableParam: unknown key '" + key + "' — check TUNABLE_PARAM_REGISTRY", {
@@ -8258,267 +8247,6 @@ function refreshAllMarketECEFromTracker() {
   }
 }
 
-function runCalculationBacktest() {
-  const picks = (typeof getAllTrackedPicksForReport === "function" ? getAllTrackedPicksForReport() : [])
-    .filter(function (p) {
-      const s = String(p.resultStatus || "").toLowerCase();
-      return s === "win" || s === "loss";
-    });
-  const report = {
-    generated: new Date().toISOString(),
-    build: typeof APP_BUILD_VERSION === "string" ? APP_BUILD_VERSION : "",
-    n: picks.length,
-    byGrade: {},
-    byMarket: {},
-    brier: null,
-    ece: null,
-    monotonic: null,
-    notes: [],
-  };
-  function bucket(map, key) {
-    if (!map[key]) map[key] = { n: 0, w: 0, l: 0 };
-    return map[key];
-  }
-  let brierN = 0, brierSum = 0;
-  const eceBins = {};
-  picks.forEach(function (p) {
-    const g = String(p.confidenceGrade || p.confidence || "—").toUpperCase();
-    const mk = String(p.marketKey || p.marketName || "ft").toLowerCase().split("<")[0].trim();
-    const win = String(p.resultStatus).toLowerCase() === "win";
-    const bg = bucket(report.byGrade, g);
-    bg.n++; if (win) bg.w++; else bg.l++;
-    const bm = bucket(report.byMarket, mk);
-    bm.n++; if (win) bm.w++; else bm.l++;
-    const wp = Number(p.winProbability);
-    if (Number.isFinite(wp) && wp >= 0 && wp <= 1) {
-      brierSum += Math.pow(wp - (win ? 1 : 0), 2);
-      brierN++;
-      const bin = String(Math.min(9, Math.floor(wp * 10)));
-      if (!eceBins[bin]) eceBins[bin] = { n: 0, wp: 0, hits: 0 };
-      eceBins[bin].n++; eceBins[bin].wp += wp; eceBins[bin].hits += win ? 1 : 0;
-    }
-  });
-  Object.keys(report.byGrade).forEach(function (g) {
-    const b = report.byGrade[g];
-    b.rate = b.n ? b.w / b.n : null;
-  });
-  Object.keys(report.byMarket).forEach(function (g) {
-    const b = report.byMarket[g];
-    b.rate = b.n ? b.w / b.n : null;
-  });
-  if (brierN) report.brier = brierSum / brierN;
-  let ece = 0, eceN = 0;
-  Object.keys(eceBins).forEach(function (bin) {
-    const b = eceBins[bin];
-    if (!b.n) return;
-    ece += b.n * Math.abs(b.hits / b.n - b.wp / b.n);
-    eceN += b.n;
-  });
-  if (eceN) report.ece = ece / eceN;
-  const order = ["A", "B", "C", "D"].filter(function (g) { return report.byGrade[g] && report.byGrade[g].n >= 5; });
-  report.monotonic = order.length < 2 ? "insufficient" : "ok";
-  for (let i = 1; i < order.length; i++) {
-    if (report.byGrade[order[i]].rate - report.byGrade[order[i - 1]].rate > 0.08) {
-      report.monotonic = "FAIL " + order[i - 1] + "=" + (report.byGrade[order[i - 1]].rate * 100).toFixed(1) + "% < " + order[i] + "=" + (report.byGrade[order[i]].rate * 100).toFixed(1) + "%";
-    }
-  }
-  if (!picks.length) report.notes.push("No settled win/loss tickets in this browser tracker.");
-  if (report.monotonic && String(report.monotonic).indexOf("FAIL") === 0) {
-    report.notes.push("Empirical grades are not monotone. Do not read A as a higher real-world win rate than D on this sample.");
-  }
-  try { localStorage.setItem("BB_BACKTEST_LAST", JSON.stringify(report)); } catch (_e) {}
-  if (typeof engineDebug === "function") engineDebug("Calculation backtest", report);
-  if (typeof refreshAllMarketECEFromTracker === "function") {
-    try { refreshAllMarketECEFromTracker(); } catch (_e2) {}
-  }
-  return report;
-}
-
-window.runCalculationBacktest = runCalculationBacktest;
-
-function btNumSeries(v) {
-  if (Array.isArray(v)) return v.map(Number).filter(Number.isFinite);
-  if (v == null || v === "") return [];
-  return String(v).split(",").map(function (x) { return Number(String(x).trim()); }).filter(Number.isFinite);
-}
-
-function btBuildParsed(g) {
-  return {
-    aFTScored: btNumSeries(g.aFTScored || g.a && g.a.ft),
-    aFTAllowed: btNumSeries(g.aFTAllowed || g.a && g.a.ftAllowed),
-    bFTScored: btNumSeries(g.bFTScored || g.b && g.b.ft),
-    bFTAllowed: btNumSeries(g.bFTAllowed || g.b && g.b.ftAllowed),
-    a1HScored: btNumSeries(g.a1HScored || g.a && g.a.h1),
-    a1HAllowed: btNumSeries(g.a1HAllowed || g.a && g.a.h1Allowed),
-    b1HScored: btNumSeries(g.b1HScored || g.b && g.b.h1),
-    b1HAllowed: btNumSeries(g.b1HAllowed || g.b && g.b.h1Allowed),
-    aQ1Scored: btNumSeries(g.aQ1Scored),
-    bQ1Scored: btNumSeries(g.bQ1Scored),
-    aQ2Scored: btNumSeries(g.aQ2Scored),
-    bQ2Scored: btNumSeries(g.bQ2Scored),
-    aQ3Scored: btNumSeries(g.aQ3Scored),
-    bQ3Scored: btNumSeries(g.bQ3Scored),
-    aQ4Scored: btNumSeries(g.aQ4Scored),
-    bQ4Scored: btNumSeries(g.bQ4Scored),
-  };
-}
-
-function btEmptyLines() {
-  return {
-    ftLine: null, h1Line: null, h2Line: null,
-    aLine: null, bLine: null,
-    q1aLine: null, q2aLine: null, q3aLine: null, q4aLine: null,
-    handicapLine: null, handicapH1Line: null, handicapH2Line: null,
-    h1aLine: null, h1bLine: null,
-  };
-}
-
-function btScoreGame(game, league, cfg) {
-  const parsed = btBuildParsed(game);
-  const lines = btEmptyLines();
-  const config = { forceVenueNeutral: !!(cfg && cfg.forceVenueNeutral) };
-  const act = game.actual || {};
-  const out = { err: {} };
-  try {
-    const ft = computeFTProjection({ league: league, parsed: parsed, lines: lines, config: config });
-    out.ft = ft && ft.ftProj;
-    out.team_a = ft && ft.projAFT;
-    out.team_b = ft && ft.projBFT;
-    if (Number.isFinite(out.ft) && Number.isFinite(Number(act.ft))) out.err.ft = out.ft - Number(act.ft);
-    if (Number.isFinite(out.team_a) && Number.isFinite(Number(act.team_a))) out.err.team_a = out.team_a - Number(act.team_a);
-    if (Number.isFinite(out.team_b) && Number.isFinite(Number(act.team_b))) out.err.team_b = out.team_b - Number(act.team_b);
-  } catch (e) { out.ftError = String(e && e.message || e); }
-  try {
-    if (typeof compute1HProjection === "function" && (btNumSeries(game.a1HScored).length >= 4 || act.h1 != null)) {
-      const h1 = compute1HProjection({ league: league, parsed: parsed, lines: lines, config: config });
-      out.h1 = h1 && (h1.h1Proj || h1.proj);
-      if (Number.isFinite(out.h1) && Number.isFinite(Number(act.h1))) out.err.h1 = out.h1 - Number(act.h1);
-    }
-  } catch (e2) { out.h1Error = String(e2 && e2.message || e2); }
-  try {
-    if (typeof compute2HProjection === "function" && act.h2 != null) {
-      const h2 = compute2HProjection({ league: league, parsed: parsed, lines: lines, config: config });
-      out.h2 = h2 && (h2.h2Proj || h2.proj);
-      if (Number.isFinite(out.h2) && Number.isFinite(Number(act.h2))) out.err.h2 = out.h2 - Number(act.h2);
-    }
-  } catch (e3) { out.h2Error = String(e3 && e3.message || e3); }
-  return out;
-}
-
-function btMae(errs) {
-  if (!errs.length) return null;
-  return errs.reduce(function (s, x) { return s + Math.abs(x); }, 0) / errs.length;
-}
-
-function btSampleCfg(rng) {
-  const pick = function (arr) { return arr[Math.floor(rng() * arr.length)]; };
-  return {
-    h2hMaxWeight: pick([0.12, 0.2, 0.28, 0.35, 0.45]),
-    h2hFactor: pick([0.55, 0.75, 0.9, 1.0]),
-    recencyScale: pick([0.7, 0.85, 1.0, 1.2, 1.4]),
-    forceVenueNeutral: rng() < 0.35,
-  };
-}
-
-function btMulberry32(a) {
-  return function () {
-    a |= 0; a = a + 0x6D2B79F5 | 0;
-    var t = Math.imul(a ^ a >>> 15, 1 | a);
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-    return ((t ^ t >>> 14) >>> 0) / 4294967296;
-  };
-}
-
-function runWnbaScoreSearch(payload, trials) {
-  const league = String((payload && payload.league) || "wnba").toLowerCase();
-  const games = (payload && payload.games) || [];
-  if (!games.length) return { error: "No games[] in JSON" };
-  trials = Math.max(20, Math.min(8000, Number(trials) || 400));
-  const rng = btMulberry32(20260829);
-  let best = null;
-  const baselineCfg = { h2hMaxWeight: 0.3, h2hFactor: 1, recencyScale: 1, forceVenueNeutral: false };
-  function evalCfg(cfg) {
-    window.__btParamOverride = cfg;
-    const bag = { ft: [], h1: [], h2: [], team_a: [], team_b: [] };
-    games.forEach(function (g) {
-      const r = btScoreGame(g, league, cfg);
-      Object.keys(bag).forEach(function (k) {
-        if (Number.isFinite(r.err[k])) bag[k].push(r.err[k]);
-      });
-    });
-    const mae = {
-      ft: btMae(bag.ft), h1: btMae(bag.h1), h2: btMae(bag.h2),
-      team_a: btMae(bag.team_a), team_b: btMae(bag.team_b),
-    };
-    const parts = [mae.ft, mae.h1, mae.h2].filter(Number.isFinite);
-    const score = parts.length ? parts.reduce(function (s, x) { return s + x; }, 0) / parts.length : 999;
-    return { cfg: cfg, mae: mae, n: { ft: bag.ft.length, h1: bag.h1.length, h2: bag.h2.length, team_a: bag.team_a.length, team_b: bag.team_b.length }, score: score };
-  }
-  const base = evalCfg(baselineCfg);
-  for (let i = 0; i < trials; i++) {
-    const row = evalCfg(btSampleCfg(rng));
-    if (!best || row.score < best.score) best = row;
-  }
-  window.__btParamOverride = null;
-  const report = {
-    league: league,
-    games: games.length,
-    trials: trials,
-    baseline: base,
-    best: best,
-    note: "Minimized mean |proj-actual| on FT/H1/H2. Not a betting backtest. Seal writes locked params for live WNBA only.",
-  };
-  try { localStorage.setItem("BB_WNBA_BT_LAST", JSON.stringify(report)); } catch (_e) {}
-  window.__wnbaBtLast = report;
-  return report;
-}
-
-function sealWnbaFromBacktest() {
-  const r = window.__wnbaBtLast;
-  if (!r || !r.best || !r.best.cfg) return "Run search first.";
-  const params = {
-    h2hMaxWeight: r.best.cfg.h2hMaxWeight,
-    h2hFactor: r.best.cfg.h2hFactor,
-  };
-  const meta = { source: "wnba-score-search", mae: r.best.mae, games: r.games, trials: r.trials, recencyScale: r.best.cfg.recencyScale, forceVenueNeutral: r.best.cfg.forceVenueNeutral };
-  ["ft", "h1", "h2"].forEach(function (mk) {
-    saveLockedConfig("wnba", mk, params, meta);
-  });
-  try { localStorage.setItem("BB_WNBA_SEAL", JSON.stringify({ params: params, meta: meta, at: new Date().toISOString() })); } catch (_e) {}
-  return "Sealed WNBA ft/h1/h2 locks from best MAE config.";
-}
-
-function bindWnbaBacktestUi() {
-  const run = document.getElementById("wnbaBtRunBtn");
-  const out = document.getElementById("wnbaBtOut");
-  if (!run) return;
-  if (run.__bound) return;
-  run.__bound = true;
-  run.addEventListener("click", function () {
-    let payload;
-    try { payload = JSON.parse(document.getElementById("wnbaBtJson").value || "{}"); }
-    catch (e) { if (out) out.textContent = "Invalid JSON: " + e.message; return; }
-    const trials = Number(document.getElementById("wnbaBtTrials").value || 400);
-    if (out) out.textContent = "Searching " + trials + " configs on " + ((payload.games || []).length) + " games…";
-    setTimeout(function () {
-      const report = runWnbaScoreSearch(payload, trials);
-      if (out) out.textContent = JSON.stringify(report, null, 2);
-    }, 30);
-  });
-  const seal = document.getElementById("wnbaBtSealBtn");
-  if (seal) seal.addEventListener("click", function () {
-    const msg = sealWnbaFromBacktest();
-    if (out) out.textContent = (out.textContent || "") + "\n\n" + msg;
-  });
-  const clr = document.getElementById("wnbaBtClearSealBtn");
-  if (clr) clr.addEventListener("click", function () {
-    clearLockedConfig("wnba");
-    try { localStorage.removeItem("BB_WNBA_SEAL"); } catch (_e) {}
-    if (out) out.textContent = "Cleared WNBA locked configs.";
-  });
-}
-document.addEventListener("DOMContentLoaded", bindWnbaBacktestUi);
-if (document.readyState !== "loading") bindWnbaBacktestUi();
 
 
 function updateEnginePerformanceScore() {
@@ -8528,9 +8256,6 @@ function updateEnginePerformanceScore() {
     } catch (_e) {
       /* non-fatal */
     }
-    try {
-      if (typeof runCalculationBacktest === "function") runCalculationBacktest();
-    } catch (_bt) {}
     const MIN_N = 10;
     let log = [];
     try {
@@ -10479,11 +10204,6 @@ function getLeagueRecencyDefaults(league) {
     Array.isArray(learned) && learned.length ? learned : configured || MODEL_TUNING.recencyWeights;
   const isFlat = activeRecencyWeights.every((w) => w === 1);
   if (isFlat) return [1.35, 1.2, 1.0, 0.85, 0.7, 0.56, 0.44, 0.33, 0.24, 0.16];
-  const scale = window.__btParamOverride && Number(window.__btParamOverride.recencyScale);
-  if (Number.isFinite(scale) && scale > 0 && scale !== 1) {
-    const mid = 0.7;
-    return activeRecencyWeights.map(function (w) { return Math.max(0.05, mid + (w - mid) * scale); });
-  }
   return activeRecencyWeights;
 }
 
@@ -12497,9 +12217,6 @@ function isTrackerConfigsView() {
 function isTrackerHealthView() {
   return AppState.ui.modalView === "health";
 }
-function isTrackerBacktestView() {
-  return AppState.ui.modalView === "backtest";
-}
 
 function trackerDebug(message, extra = null) {
   try {
@@ -13111,7 +12828,6 @@ function updateTrackerInsightsButton() {
     else if (isTrackerReportView()) titleEl.textContent = "Engine Report";
     else if (isTrackerConfigsView()) titleEl.textContent = "Verified Configs";
     else if (isTrackerHealthView()) titleEl.textContent = "Engine Health";
-    else if (isTrackerBacktestView()) titleEl.textContent = "WNBA Backtest";
   }
 
   if (militaryBtn) {
@@ -13119,11 +12835,7 @@ function updateTrackerInsightsButton() {
   }
 
   if (healthBtn) {
-    healthBtn.style.display = isTrackerReportView() || isTrackerBacktestView() ? "" : "none";
-  }
-  const backtestBtn = document.getElementById("trackerBacktestBtn");
-  if (backtestBtn) {
-    backtestBtn.style.display = isTrackerReportView() || isTrackerBacktestView() ? "" : "none";
+    healthBtn.style.display = isTrackerReportView() ? "" : "none";
   }
 
   if (isTrackerHealthView() && typeof updateEnginePerformanceScore === "function") {
@@ -13166,7 +12878,7 @@ function syncTrackerModalView() {
 }
 
 function setTrackerModalView(view) {
-  const next = ["picks", "report", "debug", "configs", "health", "backtest", ""].includes(String(view || ""))
+  const next = ["picks", "report", "debug", "configs", "health", ""].includes(String(view || ""))
     ? String(view)
     : "picks";
   AppState.ui.modalView = next;
@@ -13189,18 +12901,6 @@ function toggleTrackerConfigsView() {
 function toggleTrackerHealthView() {
   if (isTrackerHealthView()) setTrackerModalView("picks");
   else setTrackerModalView("health");
-}
-function toggleTrackerBacktestView() {
-  if (isTrackerBacktestView()) setTrackerModalView("report");
-  else setTrackerModalView("backtest");
-}
-async function openWnbaBacktestPage() {
-  const modal = document.getElementById("trackerModal");
-  if (!modal) return;
-  if (!modal.classList.contains("open")) {
-    try { await openTrackerModal(); } catch (_e) {}
-  }
-  setTrackerModalView("backtest");
 }
 
 // g_trackerSaveFailureCount / g_fetchInputErrors / g_fetchAuditIssues
@@ -17131,60 +16831,6 @@ function renderConfigsPanel() {
   updateTrackerInsightsButton();
 }
 
-function renderWnbaBacktestPanel() {
-  const panel = document.getElementById("trackerAnalyticsPanel");
-  if (!panel) return;
-  let last = "";
-  try {
-    const raw = localStorage.getItem("BB_WNBA_BT_LAST") || localStorage.getItem("BB_BACKTEST_LAST") || "";
-    if (raw) last = raw;
-  } catch (_e) {}
-  panel.innerHTML = `
-    <div class="tracker-analytics-shell">
-      <div class="tracker-analytics-topbar">
-        <div class="tracker-analytics-heading">
-          <div class="tracker-analytics-kicker">Engine Report</div>
-          <div class="tracker-analytics-title">WNBA backtest</div>
-          <div class="tracker-analytics-subtitle">
-            2026 ESPN tape already ran off-device (230 games, as-of last-10 + pace + H2H + venue vs DraftKings).
-            Paste JSON only if you want a local search. This is not a 100% seal.
-          </div>
-        </div>
-      </div>
-      <div class="tracker-analytics-card">
-        <div class="tracker-analytics-card-head">
-          <div class="tracker-analytics-card-title">Last off-device result</div>
-        </div>
-        <div class="tracker-analytics-card-body" style="font-size:12px;line-height:1.45;">
-          FT miss 16.1 pts · vs DK close 3.7 pts · O/U hit 51% (118/230) · Winner 66% · ATS 54% ·
-          Best in-sample weights 52%. Do not seal WNBA totals from this.
-        </div>
-      </div>
-      <div class="tracker-analytics-card">
-        <div class="tracker-analytics-card-head">
-          <div class="tracker-analytics-card-title">Local JSON search</div>
-        </div>
-        <div class="tracker-analytics-card-body">
-          <textarea id="wnbaBtJson" rows="7" style="width:100%;font-size:11px;font-family:ui-monospace,monospace" placeholder='{"league":"wnba","games":[...]}'></textarea>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;align-items:center">
-            <label style="font-size:11px">Trials <input id="wnbaBtTrials" type="number" min="20" max="8000" value="400" style="width:72px" /></label>
-            <button type="button" id="wnbaBtRunBtn">Run search</button>
-            <button type="button" id="wnbaBtSealBtn">Seal best to WNBA</button>
-            <button type="button" id="wnbaBtClearSealBtn">Clear WNBA seal</button>
-          </div>
-          <pre id="wnbaBtOut" style="white-space:pre-wrap;font-size:11px;max-height:240px;overflow:auto;background:var(--panel-soft);padding:8px">${last ? "" : "Paste games JSON or leave this for the off-device summary above."}</pre>
-        </div>
-      </div>
-    </div>`;
-  if (last) {
-    const out = document.getElementById("wnbaBtOut");
-    if (out) {
-      try { out.textContent = JSON.stringify(JSON.parse(last), null, 2); }
-      catch (_e2) { out.textContent = last; }
-    }
-  }
-  if (typeof bindWnbaBacktestUi === "function") bindWnbaBacktestUi();
-}
 
 function renderTrackerAnalytics() {
   const panel = document.getElementById("trackerAnalyticsPanel");
@@ -17219,14 +16865,6 @@ function renderTrackerAnalytics() {
     return;
   }
 
-  if (currentView === "backtest") {
-    renderWnbaBacktestPanel();
-    syncTrackerModalView();
-    panel.classList.remove("tracker-hidden");
-    panel.style.display = "block";
-    g_lastRenderedTrackerView = currentView;
-    return;
-  }
 
   if (
     g_lastRenderedTrackerVersion === g_trackerState.updatedAt &&
@@ -32075,12 +31713,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const trackerHealthBtn = document.getElementById("trackerHealthBtn");
   if (trackerHealthBtn) trackerHealthBtn.addEventListener("click", toggleTrackerHealthView);
-  const trackerBacktestBtn = document.getElementById("trackerBacktestBtn");
-  if (trackerBacktestBtn) trackerBacktestBtn.addEventListener("click", toggleTrackerBacktestView);
-  const wnbaBacktestHeaderBtn = document.getElementById("wnbaBacktestHeaderBtn");
-  if (wnbaBacktestHeaderBtn) wnbaBacktestHeaderBtn.addEventListener("click", function () {
-    openWnbaBacktestPage();
-  });
 
   const trackerCloseBtn = document.getElementById("trackerCloseBtn");
   if (trackerCloseBtn) trackerCloseBtn.addEventListener("click", closeTrackerModal);
@@ -41312,18 +40944,9 @@ function copyTrackerData() {
   const derived = g_trackerDerivedState || { teams: {} };
 
   const lines = [];
-  let bt = null;
-  try { bt = typeof runCalculationBacktest === "function" ? runCalculationBacktest() : null; } catch (_b) {}
   lines.push("==========================================");
   lines.push("       BB ENGINE: FULL TRACKER REPORT     ");
   lines.push("==========================================");
-  if (bt) {
-    lines.push("BACKTEST n=" + bt.n + "  Brier=" + (bt.brier == null ? "n/a" : Number(bt.brier).toFixed(3)) + "  ECE=" + (bt.ece == null ? "n/a" : Number(bt.ece).toFixed(3)) + "  mono=" + bt.monotonic);
-    Object.keys(bt.byGrade || {}).sort().forEach(function (g) {
-      const b = bt.byGrade[g];
-      lines.push("  grade " + g + ": " + b.w + "W-" + b.l + "L (" + (b.rate != null ? (b.rate * 100).toFixed(1) + "%" : "n/a") + ", n=" + b.n + ")");
-    });
-  }
   lines.push(`Generated    : ${new Date().toLocaleString()}`);
   lines.push(`Model Version: ${currentVersion}`);
   lines.push(`Overall Score: ${stats.wins || 0}W - ${stats.losses || 0}L (Win Rate: ${winRate})`);
