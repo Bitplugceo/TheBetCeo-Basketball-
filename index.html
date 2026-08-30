@@ -3301,6 +3301,10 @@ body.dark-mode .tracker-analytics-section-head {
 
     <div id="fetchStatus"></div>
     <div id="last10SeriesAlert" role="alert"></div>
+    <input type="hidden" id="a2HScored" />
+    <input type="hidden" id="a2HAllowed" />
+    <input type="hidden" id="b2HScored" />
+    <input type="hidden" id="b2HAllowed" />
 
     <div class="injury-box" id="injuryBoxA">
       <div class="inj-title">Team A - Injury Report</div>
@@ -4432,6 +4436,13 @@ body.dark-mode .tracker-analytics-section-head {
   function __betceoWatchdogError(e) {
     if (e.message === "Script error." && e.lineno === 0) return;
     const file = e.filename ? e.filename.split("/").pop() : "Inline Script";
+    const msg = String(e.message || "");
+    const isInitDeath =
+      e.error instanceof ReferenceError ||
+      /is not defined|Cannot access .* before initialization|clampNumber/.test(msg);
+    if (isInitDeath && typeof spawnFatalTerminal === "function") {
+      spawnFatalTerminal(msg, file, e.lineno, e.colno, e.error && e.error.stack);
+    }
     if (typeof window.engineDebug === "function") {
       window.engineDebug("ENGINE BREAKDOWN", `${e.message} | Loc: ${file}:${e.lineno}`);
     }
@@ -4647,6 +4658,7 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
   // Temporal: prediction asOf / eventDate / filterEventsAsOf — exclude post-cutoff games.
   const scoredList = [],
     allowedList = [];
+  const eventIds = [];
   const homeScoredList = [],
     homeAllowedList = [];
   const awayScoredList = [],
@@ -4656,6 +4668,9 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
     h1HomeAllowedList = [];
   const h1AwayScoredList = [],
     h1AwayAllowedList = [];
+  const h2ScoredList = [],
+    h2AllowedList = [];
+  const h2ScoredDates = [];
   const h1ScoredList = [],
     h1AllowedList = [];
   const h1ScoredDates = [];
@@ -4715,24 +4730,13 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
     // For national-team / multi-competition pastes the strict filter often
     // leaves almost nothing. If the result is too thin, ignore the filter
     // and use all basketball games instead.
-    const MIN_GAMES_FOR_TOURNAMENT_FILTER = 8;
-    if (filtered.length >= MIN_GAMES_FOR_TOURNAMENT_FILTER) {
-      competitionEvents = filtered;
-      const crossBlocked = basketballEvents.length - filtered.length;
-      if (crossBlocked > 0) {
-        engineDebug("ssProcessTeamEvents: blocked " + crossBlocked + " cross-competition events", {
-          label,
-          fixtureTournamentId,
-          kept: filtered.length,
-        });
-      }
-    } else {
-      competitionEvents = basketballEvents;
-      engineDebug("ssProcessTeamEvents: tournament filter skipped (too thin)", {
+    competitionEvents = filtered;
+    const crossBlocked = basketballEvents.length - filtered.length;
+    if (crossBlocked > 0) {
+      engineDebug("ssProcessTeamEvents: blocked " + crossBlocked + " cross-competition events", {
         label,
         fixtureTournamentId,
-        matched: filtered.length,
-        fallback: basketballEvents.length,
+        kept: filtered.length,
       });
     }
   }
@@ -4802,14 +4806,20 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
       if (myFT > 0) {
         scoredList.push(myFT);
         allowedList.push(oppFT);
-        const myQ1 = Number(myScore.period1 ?? 0);
-        const myQ2 = Number(myScore.period2 ?? 0);
-        const myQ3 = Number(myScore.period3 ?? 0);
-        const myQ4 = Number(myScore.period4 ?? 0);
-        const oppQ1 = Number(oppScore.period1 ?? 0);
-        const oppQ2 = Number(oppScore.period2 ?? 0);
-        const oppQ3 = Number(oppScore.period3 ?? 0);
-        const oppQ4 = Number(oppScore.period4 ?? 0);
+        eventIds.push(ev && ev.id != null ? String(ev.id) : "");
+        const _ssPer = function (obj, k) {
+          if (!obj || obj[k] == null || obj[k] === "") return NaN;
+          const n = Number(obj[k]);
+          return Number.isFinite(n) ? n : NaN;
+        };
+        const myQ1 = _ssPer(myScore, "period1");
+        const myQ2 = _ssPer(myScore, "period2");
+        const myQ3 = _ssPer(myScore, "period3");
+        const myQ4 = _ssPer(myScore, "period4");
+        const oppQ1 = _ssPer(oppScore, "period1");
+        const oppQ2 = _ssPer(oppScore, "period2");
+        const oppQ3 = _ssPer(oppScore, "period3");
+        const oppQ4 = _ssPer(oppScore, "period4");
 
         const _evDate = ev.startTimestamp ? new Date(ev.startTimestamp * 1000).toISOString() : null;
         if (_evDate) ftScoredDates.push(_evDate);
@@ -4825,28 +4835,46 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
         } catch (_eP) {}
         if (_regP <= 2) {
           // 2-period leagues: period1 = H1, period2 = H2; do not treat as quarters.
-          if (myQ1 > 0) {
+          if (Number.isFinite(myQ1) && Number.isFinite(oppQ1)) {
             h1ScoredList.push(myQ1);
             h1AllowedList.push(oppQ1);
             h1ScoredDates.push(_evDate);
           }
-        } else if (myQ1 + myQ2 + myQ3 + myQ4 > 0) {
-          q1ScoredList.push(myQ1);
-          q2ScoredList.push(myQ2);
-          q3ScoredList.push(myQ3);
-          q4ScoredList.push(myQ4);
-          q1AllowedList.push(oppQ1);
-          q2AllowedList.push(oppQ2);
-          q3AllowedList.push(oppQ3);
-          q4AllowedList.push(oppQ4);
-          q1ScoredDates.push(_evDate);
-          q2ScoredDates.push(_evDate);
-          q3ScoredDates.push(_evDate);
-          q4ScoredDates.push(_evDate);
-          if (myQ1 + myQ2 > 0) {
+          if (Number.isFinite(myQ2) && Number.isFinite(oppQ2)) {
+            h2ScoredList.push(myQ2);
+            h2AllowedList.push(oppQ2);
+            h2ScoredDates.push(_evDate);
+          }
+        } else {
+          if (Number.isFinite(myQ1) && Number.isFinite(oppQ1)) {
+            q1ScoredList.push(myQ1);
+            q1AllowedList.push(oppQ1);
+            q1ScoredDates.push(_evDate);
+          }
+          if (Number.isFinite(myQ2) && Number.isFinite(oppQ2)) {
+            q2ScoredList.push(myQ2);
+            q2AllowedList.push(oppQ2);
+            q2ScoredDates.push(_evDate);
+          }
+          if (Number.isFinite(myQ3) && Number.isFinite(oppQ3)) {
+            q3ScoredList.push(myQ3);
+            q3AllowedList.push(oppQ3);
+            q3ScoredDates.push(_evDate);
+          }
+          if (Number.isFinite(myQ4) && Number.isFinite(oppQ4)) {
+            q4ScoredList.push(myQ4);
+            q4AllowedList.push(oppQ4);
+            q4ScoredDates.push(_evDate);
+          }
+          if (Number.isFinite(myQ1) && Number.isFinite(myQ2) && Number.isFinite(oppQ1) && Number.isFinite(oppQ2)) {
             h1ScoredList.push(myQ1 + myQ2);
             h1AllowedList.push(oppQ1 + oppQ2);
             h1ScoredDates.push(_evDate);
+          }
+          if (Number.isFinite(myQ3) && Number.isFinite(myQ4) && Number.isFinite(oppQ3) && Number.isFinite(oppQ4)) {
+            h2ScoredList.push(myQ3 + myQ4);
+            h2AllowedList.push(oppQ3 + oppQ4);
+            h2ScoredDates.push(_evDate);
           }
         }
       }
@@ -4883,13 +4911,18 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
             _regPVenue = Number(LEAGUE_FETCH_RULES[_lgV].regulationPeriods) || 4;
           }
         } catch (_ePV) {}
-        const myQ1h = Number(myScore.period1 ?? 0),
-          myQ2h = Number(myScore.period2 ?? 0);
-        const oppQ1h = Number(oppScore.period1 ?? 0),
-          oppQ2h = Number(oppScore.period2 ?? 0);
-        const _venueH1Mine = _regPVenue <= 2 ? myQ1h : myQ1h + myQ2h;
-        const _venueH1Opp = _regPVenue <= 2 ? oppQ1h : oppQ1h + oppQ2h;
-        if (_venueH1Mine > 0) {
+        const _ssPerV = function (obj, k) {
+          if (!obj || obj[k] == null || obj[k] === "") return NaN;
+          const n = Number(obj[k]);
+          return Number.isFinite(n) ? n : NaN;
+        };
+        const myQ1h = _ssPerV(myScore, "period1"),
+          myQ2h = _ssPerV(myScore, "period2");
+        const oppQ1h = _ssPerV(oppScore, "period1"),
+          oppQ2h = _ssPerV(oppScore, "period2");
+        const _venueH1Mine = _regPVenue <= 2 ? myQ1h : (Number.isFinite(myQ1h) && Number.isFinite(myQ2h) ? myQ1h + myQ2h : NaN);
+        const _venueH1Opp = _regPVenue <= 2 ? oppQ1h : (Number.isFinite(oppQ1h) && Number.isFinite(oppQ2h) ? oppQ1h + oppQ2h : NaN);
+        if (Number.isFinite(_venueH1Mine) && Number.isFinite(_venueH1Opp)) {
           if (isHome) {
             if (h1HomeScoredList.length < 10) {
               h1HomeScoredList.push(_venueH1Mine);
@@ -4906,14 +4939,19 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
         // Q-SPREAD: same isHome branch, one quarter at a time, each list
         // independently capped at 10 (a team can have a q3 value on a game
         // where q4 was missing, etc., so these are not forced to move in lockstep).
-        const myQ1 = Number(myScore.period1 ?? 0),
-          myQ2 = Number(myScore.period2 ?? 0),
-          myQ3 = Number(myScore.period3 ?? 0),
-          myQ4 = Number(myScore.period4 ?? 0);
-        const oppQ1 = Number(oppScore.period1 ?? 0),
-          oppQ2 = Number(oppScore.period2 ?? 0),
-          oppQ3 = Number(oppScore.period3 ?? 0),
-          oppQ4 = Number(oppScore.period4 ?? 0);
+        const _ssPerQ = function (obj, k) {
+          if (!obj || obj[k] == null || obj[k] === "") return NaN;
+          const n = Number(obj[k]);
+          return Number.isFinite(n) ? n : NaN;
+        };
+        const myQ1 = _ssPerQ(myScore, "period1"),
+          myQ2 = _ssPerQ(myScore, "period2"),
+          myQ3 = _ssPerQ(myScore, "period3"),
+          myQ4 = _ssPerQ(myScore, "period4");
+        const oppQ1 = _ssPerQ(oppScore, "period1"),
+          oppQ2 = _ssPerQ(oppScore, "period2"),
+          oppQ3 = _ssPerQ(oppScore, "period3"),
+          oppQ4 = _ssPerQ(oppScore, "period4");
         const _qPairs = [
           [myQ1, oppQ1, q1HomeScoredList, q1HomeAllowedList, q1AwayScoredList, q1AwayAllowedList],
           [myQ2, oppQ2, q2HomeScoredList, q2HomeAllowedList, q2AwayScoredList, q2AwayAllowedList],
@@ -4922,7 +4960,7 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
         ];
         if (_regPVenue > 2) {
         _qPairs.forEach(([myQ, oppQ, homeS, homeA, awayS, awayA]) => {
-          if (myQ > 0 || oppQ > 0) {
+          if (Number.isFinite(myQ) && Number.isFinite(oppQ)) {
             if (isHome) {
               if (homeS.length < 10) {
                 homeS.push(myQ);
@@ -4957,6 +4995,9 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
     h1AwayAllowedList,
     h1ScoredList,
     h1AllowedList,
+    h2ScoredList,
+    h2AllowedList,
+    h2ScoredDates,
 
     q1HomeScoredList,
     q1HomeAllowedList,
@@ -4990,6 +5031,7 @@ function ssProcessTeamEvents(events, teamId, label, fixtureTournamentId, predict
     q3ScoredDates,
     q4ScoredDates,
     lastGameDate,
+    eventIds,
   };
 }
 
@@ -5187,6 +5229,10 @@ function updateTeamUIFromStats(side, stats) {
     setVal(prefix + "1HScored", stats.h1ScoredList.slice(0, 10).join(","));
     setVal(prefix + "1HAllowed", stats.h1AllowedList.slice(0, 10).join(","));
   }
+  if (stats.h2ScoredList?.length >= 2) {
+    setVal(prefix + "2HScored", stats.h2ScoredList.slice(0, 10).join(","));
+    setVal(prefix + "2HAllowed", stats.h2AllowedList.slice(0, 10).join(","));
+  }
 
   if (stats.q1ScoredList?.length >= 2) {
     setVal(prefix + "Q1Scored", stats.q1ScoredList.slice(0, 10).join(","));
@@ -5273,6 +5319,7 @@ function updateTeamUIFromStats(side, stats) {
       stats.q2ScoredList.slice(0, 10),
       stats.q3ScoredList.slice(0, 10),
       stats.q4ScoredList.slice(0, 10),
+      (stats.eventIds || []).slice(0, 10),
     );
 
     // Q-SPREAD: overall + venue-specific quarter margin form, SofaScore path.
@@ -5680,30 +5727,35 @@ function extractH2HFromPastedEvents() {
         oppScoreObj?.normaltime ?? oppScoreObj?.current ?? oppScoreObj?.display ?? 0,
       );
       if (myFT > 0) {
-        const mQ1 = Number(myScoreObj?.period1 ?? 0);
-        const mQ2 = Number(myScoreObj?.period2 ?? 0);
-        const mQ3 = Number(myScoreObj?.period3 ?? 0);
-        const mQ4 = Number(myScoreObj?.period4 ?? 0);
-        const oQ1 = Number(oppScoreObj?.period1 ?? 0);
-        const oQ2 = Number(oppScoreObj?.period2 ?? 0);
-        const oQ3 = Number(oppScoreObj?.period3 ?? 0);
-        const oQ4 = Number(oppScoreObj?.period4 ?? 0);
+        const _ssPerH = function (obj, k) {
+          if (!obj || obj[k] == null || obj[k] === "") return NaN;
+          const n = Number(obj[k]);
+          return Number.isFinite(n) ? n : NaN;
+        };
+        const mQ1 = _ssPerH(myScoreObj, "period1");
+        const mQ2 = _ssPerH(myScoreObj, "period2");
+        const mQ3 = _ssPerH(myScoreObj, "period3");
+        const mQ4 = _ssPerH(myScoreObj, "period4");
+        const oQ1 = _ssPerH(oppScoreObj, "period1");
+        const oQ2 = _ssPerH(oppScoreObj, "period2");
+        const oQ3 = _ssPerH(oppScoreObj, "period3");
+        const oQ4 = _ssPerH(oppScoreObj, "period4");
         newEntries.push({
           id: m.id,
           ts: m.startTimestamp || 0,
           aFT: myFT,
           bFT: oppFT,
-          aH1: mQ1 + mQ2,
-          bH1: oQ1 + oQ2,
+          aH1: Number.isFinite(mQ1) && Number.isFinite(mQ2) ? mQ1 + mQ2 : NaN,
+          bH1: Number.isFinite(oQ1) && Number.isFinite(oQ2) ? oQ1 + oQ2 : NaN,
           aQ1: mQ1,
           bQ1: oQ1,
           aQ2: mQ2,
           bQ2: oQ2,
-          aQ3: mQ3,
-          bQ3: oQ3,
-          aQ4: mQ4,
-          bQ4: oQ4,
-          hasQ: mQ1 > 0 || mQ2 > 0,
+          aQ3: Number.isFinite(mQ3) ? mQ3 : NaN,
+          bQ3: Number.isFinite(oQ3) ? oQ3 : NaN,
+          aQ4: Number.isFinite(mQ4) ? mQ4 : NaN,
+          bQ4: Number.isFinite(oQ4) ? oQ4 : NaN,
+          hasQ: Number.isFinite(mQ1) && Number.isFinite(mQ2),
         });
       }
     });
@@ -6891,14 +6943,7 @@ function getTunableParam(key, league, market) {
       return lockedVal;
     }
   }
-  // H2 lock missing: inherit H1 lock rather than silently using unlocked defaults
-  // while H1 is promoted. Do not inherit FT into H2.
-  if (league && effectiveMarket === "h2" && hasLockedConfig(league, "h1")) {
-    const lockedVal = getLockedParam(key, league, "h1");
-    if (lockedVal !== undefined) {
-      return lockedVal;
-    }
-  }
+  // H2 lock missing: use unlocked defaults. Do not inherit H1 or FT into H2.
 
   let overrideValue = entry.value;
   let overrideStamp = entry.lastVerifiedAt || null;
@@ -7850,7 +7895,7 @@ function calibrateEngineConstants() {
     // manual scores/lines with whatever game happens to be loaded right now.
     const _calibContextData = pick.snapshot?.contextData || pick.snapshot?.context || null;
     if (!(injMultA < 1 || injMultB < 1)) return;
-    const numericActual = (typeof parseFinalScore === 'function' ? parseFinalScore(pick.actualScore).total : parseFloat(pick.actualScore));
+    const numericActual = typeof actualForMarket === "function" ? actualForMarket(pick) : (typeof parseFinalScore === "function" ? parseFinalScore(pick.actualScore).total : parseFloat(pick.actualScore));
     if (!isFinite(numericActual)) return;
 
     TUNABLE_CONSTANTS_GRID.INJURY_OPPONENT_BOOST_FACTOR.forEach((candidate) => {
@@ -7923,7 +7968,7 @@ function calibrateEngineConstants() {
       !isFinite(pick.lineAtPick ?? pick.line)
     )
       return;
-    const numericActual = (typeof parseFinalScore === 'function' ? parseFinalScore(pick.actualScore).total : parseFloat(pick.actualScore));
+    const numericActual = typeof actualForMarket === "function" ? actualForMarket(pick) : (typeof parseFinalScore === "function" ? parseFinalScore(pick.actualScore).total : parseFloat(pick.actualScore));
     if (!isFinite(numericActual)) return;
     const edge = Number(pick.rawEdge ?? pick.edge);
     const lineVal = Number(pick.lineAtPick ?? pick.line);
@@ -8348,10 +8393,34 @@ function parseFinalScore(raw) {
   return { home: NaN, away: NaN, total: NaN, raw: s };
 }
 
+function actualForMarket(pick) {
+  if (!pick) return NaN;
+  const mk = String(pick.marketKey || pick.snapshot?.marketKey || "").toLowerCase();
+  const raw = pick.actualScore;
+  if (raw == null || raw === "") return NaN;
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  const s = String(raw).trim();
+  const parsed = typeof parseFinalScore === "function" ? parseFinalScore(s) : { total: parseFloat(s), home: NaN, away: NaN };
+  const looksScoreline = /^\d+(?:\.\d+)?\s*[-–:]\s*\d+(?:\.\d+)?$/.test(s);
+  if (mk === "ft") return Number.isFinite(parsed.total) ? parsed.total : NaN;
+  if (mk === "h1" || mk === "h2" || /^q[1-4]$/.test(mk) || mk === "high_q_ou" || mk === "low_q_ou") {
+    if (looksScoreline) return NaN;
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : NaN;
+  }
+  if (mk === "team_a" || mk === "team_b" || mk === "h1_team_a" || mk === "h1_team_b" || mk.indexOf("_team_") !== -1) {
+    if (looksScoreline) return NaN;
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : NaN;
+  }
+  if (mk === "winner" || mk === "htft" || mk.indexOf("handicap") === 0 || mk.indexOf("margin") === 0) return NaN;
+  return Number.isFinite(parsed.total) ? parsed.total : NaN;
+}
+
 function evaluatePickWithParams(pick, paramOverrides) {
   if (!pick.snapshot || pick.actualScore == null) return null;
   const { parsed, lines, league, injMultA, injMultB, marketKey } = pick.snapshot;
-  const numericActual = (typeof parseFinalScore === 'function' ? parseFinalScore(pick.actualScore).total : parseFloat(pick.actualScore));
+  const numericActual = typeof actualForMarket === "function" ? actualForMarket(pick) : (typeof parseFinalScore === "function" ? parseFinalScore(pick.actualScore).total : parseFloat(pick.actualScore));
   if (!isFinite(numericActual)) return null;
 
   const originalGetParam = window.getParam;
@@ -8441,7 +8510,7 @@ function evaluatePickWithParams(pick, paramOverrides) {
         contextData: _replayCtx,
       });
       proj = calc.h2Proj;
-      lineVal = finalLines.h2Line;
+      lineVal = Number.isFinite(Number(finalLines && finalLines.h2Line)) ? Number(finalLines.h2Line) : Number(pick.line);
       edge = calc.h2Edge;
     } else if (marketKey.startsWith("q")) {
       // Quarter parameter tuning is disabled until the tuner is routed through
@@ -8848,8 +8917,18 @@ function runCoordinateAscentTuner(allPicks, targetLeague) {
   if (_oosCutoffTs !== null) {
     settled = settledUniverse.filter((p) => Date.parse(p.createdAt) < _oosCutoffTs);
   } else {
-    const _tunerCutIdx = Math.floor(settledUniverse.length * 0.8);
-    settled = settledUniverse.slice(0, _tunerCutIdx);
+    try {
+      const _gStored = JSON.parse(localStorage.getItem("BB_OOS_CUTOFF_global") || "null");
+      if (_gStored && isFinite(_gStored.cutoffTs)) {
+        settled = settledUniverse.filter((p) => Date.parse(p.createdAt) < _gStored.cutoffTs);
+      } else {
+        const _tunerCutIdx = Math.floor(settledUniverse.length * 0.8);
+        settled = settledUniverse.slice(0, _tunerCutIdx);
+      }
+    } catch (_eCut) {
+      const _tunerCutIdx = Math.floor(settledUniverse.length * 0.8);
+      settled = settledUniverse.slice(0, _tunerCutIdx);
+    }
   }
 
   const minRequired = targetLeague ? 250 : 125;
@@ -9163,7 +9242,7 @@ async function runRetrospectiveAnalysis(pick) {
   }
 
   const { parsed, lines, fixtureMeta, injMultA, injMultB, configSnapshot } = snapshot;
-  const numericActual = (typeof parseFinalScore === 'function' ? parseFinalScore(actualScore).total : parseFloat(actualScore));
+  const numericActual = typeof actualForMarket === "function" ? actualForMarket({ marketKey: marketKey, actualScore: actualScore }) : (typeof parseFinalScore === "function" ? parseFinalScore(actualScore).total : parseFloat(actualScore));
   if (!isFinite(numericActual)) return;
 
   const { recencyProfiles, edgeMults } = TUNING_GRID;
@@ -9971,6 +10050,13 @@ function getLeagueEdgePointThreshold(league, marketKey) {
                       : null;
 
   if (key === "winner" || key === "handicap" || key === "handicap_h1" || key === "handicap_h2") {
+    const leagueOverride = paramKey ? g_tunableParamLeagueOverrides?.[lk]?.[paramKey] : null;
+    if (leagueOverride && isFinite(Number(leagueOverride.value)) && Number(leagueOverride.value) > 0) {
+      return Number(leagueOverride.value);
+    }
+    const staticRowEarly = LEAGUE_EDGE_POINT_THRESHOLDS[lk] || LEAGUE_EDGE_POINT_THRESHOLDS.default;
+    const staticEarly = Number(staticRowEarly?.[key]);
+    if (isFinite(staticEarly) && staticEarly > 0) return staticEarly;
     const _routed = getParam(paramKey, lk);
     if (isFinite(_routed) && Number(_routed) > 0) return Number(_routed);
   }
@@ -10389,7 +10475,7 @@ function saveQuarterShapeStore(store) {
   }
 }
 
-function updateTeamQuarterShapeProfile(league, teamName, q1s, q2s, q3s, q4s) {
+function updateTeamQuarterShapeProfile(league, teamName, q1s, q2s, q3s, q4s, eventIds) {
   const key = getTeamQuarterShapeKey(league, teamName);
   if (!key) return;
   const n = Math.min(
@@ -10401,15 +10487,19 @@ function updateTeamQuarterShapeProfile(league, teamName, q1s, q2s, q3s, q4s) {
   if (n < 2) return;
 
   const store = loadQuarterShapeStore();
-  const entry = store[key] || { n: 0, meanShare: [0.25, 0.25, 0.25, 0.25], m2: [0, 0, 0, 0] };
+  const entry = store[key] || { n: 0, meanShare: [0.25, 0.25, 0.25, 0.25], m2: [0, 0, 0, 0], seen: {} };
+  if (!entry.seen || typeof entry.seen !== "object") entry.seen = {};
 
   for (let i = 0; i < n; i++) {
+    const eid = Array.isArray(eventIds) && eventIds[i] != null && eventIds[i] !== "" ? String(eventIds[i]) : "";
+    if (eid && entry.seen[eid]) continue;
     const q1 = Number(q1s[i]),
       q2 = Number(q2s[i]),
       q3 = Number(q3s[i]),
       q4 = Number(q4s[i]);
     const total = q1 + q2 + q3 + q4;
     if (!isFinite(total) || total <= 0) continue;
+    if (eid) entry.seen[eid] = 1;
     const shares = [q1 / total, q2 / total, q3 / total, q4 / total];
     entry.n += 1;
     for (let qi = 0; qi < 4; qi++) {
@@ -11236,6 +11326,7 @@ function defaultInjuryMeta() {
     unknownImpactCount: 0,
     hasUnknownImpact: false,
     highUncertainty: false,
+    fetchFailed: false,
   };
 }
 
@@ -11817,6 +11908,8 @@ function isPickEligibleForLearning(pick) {
   if (mkt === "winner" || mkt === "htft") {
     // side outcomes may be "Home"/"Away"/"Tie" — allow non-numeric
     if (pick.actualScore == null || pick.actualScore === "") return false;
+  } else if (typeof actualForMarket === "function") {
+    if (!Number.isFinite(actualForMarket(pick))) return false;
   } else if (!(parsed && isFinite(parsed.total))) {
     return false;
   }
@@ -12462,7 +12555,7 @@ window.recordPickVariance =
   function (pick) {
     try {
       const proj = Number(pick?.proj);
-      const actual = (typeof parseFinalScore === 'function' ? parseFinalScore(pick?.actualScore).total : parseFloat(pick?.actualScore));
+      const actual = typeof actualForMarket === "function" ? actualForMarket(pick) : (typeof parseFinalScore === "function" ? parseFinalScore(pick?.actualScore).total : parseFloat(pick?.actualScore));
       if (!isFinite(proj) || !isFinite(actual)) return;
       window.g_pickVarianceLog.push({ error: Math.abs(actual - proj), ts: Date.now() });
       if (window.g_pickVarianceLog.length > 500) {
@@ -13243,6 +13336,8 @@ function calculateAdvancedMetrics(sMapMine, sMapOpp, ptsMine, ptsOpp, regMinutes
   }
 
   if (!(isFinite(pace) && pace > 0 && isFinite(ortg) && isFinite(drtg))) {
+    // Do not invent a 10-game ORTG series from league pace * points. Keep league priors as priors.
+    return null;
     const LEAGUE_AVG_TOTAL =
       LEAGUE_BASES[String(league || "").toLowerCase()] || LEAGUE_BASES.unknown || 224;
     const LEAGUE_AVG_PACE =
@@ -13764,7 +13859,16 @@ function last10SeriesFieldIds() {
     "bQ1Scored","bQ1Allowed","bQ2Scored","bQ2Allowed",
     "bQ3Scored","bQ3Allowed","bQ4Scored","bQ4Allowed",
     "bFTScoredHome","bFTAllowedHome","bFTScoredAway","bFTAllowedAway",
+    "a2HScored","a2HAllowed","b2HScored","b2HAllowed",
   ];
+}
+function last10OverallFieldIds() {
+  return [
+    "aFTScored","aFTAllowed","bFTScored","bFTAllowed",
+  ];
+}
+function isVenueSplitLast10Field(id) {
+  return /Home$|Away$/.test(String(id || ""));
 }
 
 function countLast10Commas(raw) {
@@ -13781,11 +13885,16 @@ function auditLast10SeriesInputs() {
     const raw = String(el.value || "").trim();
     el.classList.remove("last10-short-field");
     if (!raw) return;
-    const commaN = countLast10Commas(raw);
     const parts = raw.split(",").map(function (x) { return x.trim(); }).filter(Boolean);
-    if (commaN !== 9 || parts.length !== 10) {
+    // Venue-split fields with n<10 are optional — treat like empty (do not hard-block Run).
+    if (typeof isVenueSplitLast10Field === "function" && isVenueSplitLast10Field(id) && parts.length < 10) {
+      return;
+    }
+    // One n-in-8..10 rule on overall FT (and other overall series). 8-9 = thin, allowed.
+    const minN = (id === "aFTScored" || id === "bFTScored" || id === "aFTAllowed" || id === "bFTAllowed") ? 8 : 8;
+    if (parts.length < minN || parts.length > 10) {
       el.classList.add("last10-short-field");
-      issues.push(id + " has " + parts.length + " value(s), " + commaN + " comma(s) — need 10 values / 9 commas");
+      issues.push(id + " has " + parts.length + " value(s) — need 8-10");
     }
   });
   return issues;
@@ -13798,7 +13907,7 @@ function applyLast10SeriesAlert(issues) {
     document.body.classList.add("bb-last10-alert");
     if (banner) {
       banner.classList.add("visible");
-      banner.textContent = "⚠ LAST-10 INCOMPLETE — " + list.length + " field(s) are not 10 games (9 commas). " + list[0];
+      banner.textContent = "⚠ LAST-10 INCOMPLETE — " + list.length + " field(s) are outside 8-10 games. " + list[0];
     }
     if (typeof setStatusText === "function") {
       setStatusText("⚠ Last-10 short: " + list.length + " field(s). Expand the red boxes.", "err");
@@ -13942,9 +14051,16 @@ function trimmedAvg(arr) {
 
 function weightedRecentAverageByDate(
   items,
-  weights = (typeof getParam === "function" ? getParam("recencyWeights", "nba") : null) ||
-    MODEL_TUNING.recencyWeights,
+  weights,
+  league,
+  market,
 ) {
+  if (weights == null) {
+    weights =
+      (typeof getParam === "function"
+        ? getParam("recencyWeights", league || "", market || "")
+        : null) || MODEL_TUNING.recencyWeights;
+  }
   const clean = Array.isArray(items)
     ? items
         .filter((it) => it && it.date != null && isFinite(Number(it.value)))
@@ -13968,43 +14084,67 @@ function weightedRecentAverageByDate(
     : truncated.reduce((s, it) => s + it.value, 0) / truncated.length;
 }
 
-function getDateAwareOrFallbackAverage(series, side, marketKey) {
+function getDateAwareOrFallbackAverage(series, side, marketKey, contextData, league) {
   // Temporal: asOf / eventDate / predictionDate / filterEventsAsOf / filterNumericSeriesWithParallelDates
   let clean = Array.isArray(series) ? series.map(Number).filter((v) => isFinite(v)) : [];
   if (!clean.length) return NaN;
-  let dates = getStashedSeriesDates(side, marketKey);
+  const _ctx = contextData || null;
+  let dates = null;
+  if (_ctx) {
+    const sideObj = _ctx[side] || {};
+    dates =
+      sideObj[marketKey + "ScoredDates"] ||
+      sideObj.overall && (sideObj.overall[marketKey + "ScoredDates10"] || sideObj.overall.ftScoredDates10) ||
+      _ctx.predictionDates ||
+      null;
+  }
+  if (!dates || !dates.length) dates = getStashedSeriesDates(side, marketKey);
   let asOf = null;
   try {
-    asOf =
-      (typeof resolvePredictionAsOf === "function" && resolvePredictionAsOf(null, null)) ||
-      (document.getElementById("eventDate") && document.getElementById("eventDate").value) ||
-      null;
-    if (!asOf && typeof getCurrentFixtureMeta === "function") {
-      const m = getCurrentFixtureMeta();
-      asOf = (m && (m.eventDate || m.predictionDate || m.asOf || m.date)) || null;
+    if (typeof resolvePredictionAsOf === "function") {
+      asOf = resolvePredictionAsOf(null, _ctx) || null;
+    }
+    if (!asOf && !_ctx) {
+      asOf =
+        (document.getElementById("eventDate") && document.getElementById("eventDate").value) ||
+        null;
+      if (!asOf && typeof getCurrentFixtureMeta === "function") {
+        const m = getCurrentFixtureMeta();
+        asOf = (m && (m.eventDate || m.predictionDate || m.asOf || m.date)) || null;
+      }
     }
   } catch (_eAs) {}
-  if (asOf && dates && dates.length && typeof filterNumericSeriesWithParallelDates === "function") {
-    clean = filterNumericSeriesWithParallelDates(clean, dates, asOf);
-    // Re-pair dates after filter (filter keeps parallel indices)
+  if (asOf && typeof filterNumericSeriesWithParallelDates === "function") {
+    // Invoke the helper whenever a cutoff exists, even if dates are missing (fail-closed).
+    clean = filterNumericSeriesWithParallelDates(
+      Array.isArray(series) ? series : [],
+      dates,
+      asOf,
+    );
+    if (!clean.length) return NaN;
     const paired = [];
     const raw = Array.isArray(series) ? series.map(Number) : [];
-    for (let i = 0; i < raw.length && i < dates.length; i++) {
-      if (!isFinite(raw[i])) continue;
-      const t = Date.parse(dates[i]);
-      const cut = Date.parse(asOf);
-      if (Number.isFinite(cut) && Number.isFinite(t) && t > cut) continue;
-      paired.push({ value: raw[i], date: dates[i] });
+    if (Array.isArray(dates) && dates.length) {
+      for (let i = 0; i < raw.length && i < dates.length; i++) {
+        if (!isFinite(raw[i])) continue;
+        const t = Date.parse(dates[i]);
+        const cut = Date.parse(asOf);
+        if (Number.isFinite(cut) && Number.isFinite(t) && t > cut) continue;
+        paired.push({ value: raw[i], date: dates[i] });
+      }
     }
     if (paired.length) {
-      const dateAware = weightedRecentAverageByDate(paired);
+      const dateAware = weightedRecentAverageByDate(paired, null, league, marketKey);
       if (isFinite(dateAware)) return dateAware;
     }
-    if (!clean.length) return NaN;
+    return NaN;
   }
   if (dates && dates.length === clean.length) {
     const dateAware = weightedRecentAverageByDate(
       clean.map((v, i) => ({ value: v, date: dates[i] })),
+      null,
+      league,
+      marketKey,
     );
     if (isFinite(dateAware)) return dateAware;
   }
@@ -15321,12 +15461,18 @@ function getTrackerPickStamp(pick) {
   );
 }
 
+function trackedLineSegment(pick) {
+  const n = pick == null ? NaN : Number(pick.line);
+  if (Number.isFinite(n)) return String(n);
+  return "noline";
+}
 function makeTrackerActiveMergeKey(pick = {}) {
   const safe = ensureTrackedPickKeys(pick);
   return [
     String(safe.eventId || ""),
     String(safe.marketKey || ""),
     String(safe.side || "").toLowerCase(),
+    trackedLineSegment(safe),
   ].join("|");
 }
 
@@ -15696,10 +15842,7 @@ function safeParseDate(val) {
 }
 
 function makeTrackedSignature(pick) {
-  const _lineSegment =
-    isFinite(Number(pick.line)) && Number(pick.line) > 0
-      ? displayLine(pick.line)
-      : pick.pickId || pick.side || "noline";
+  const _lineSegment = trackedLineSegment(pick);
   return [
     pick.eventId || "",
     pick.eventDate || "",
@@ -18508,15 +18651,17 @@ async function settleTrackedPickManualFull(signature) {
   );
   if (closingLineInput !== null && closingLineInput.trim() !== "") {
     const _cl = parseFloat(closingLineInput.trim());
-    if (isFinite(_cl) && _cl > 0) {
+    if (Number.isFinite(_cl)) {
       pick.closingLine = _cl;
       const _lp = Number(pick.lineAtPick ?? pick.line);
       const _s = String(pick.side || "").toLowerCase();
-      if (isFinite(_lp) && _lp > 0) {
-        pick.clv =
-          _s === "under"
-            ? Math.round((_lp - _cl) * 100) / 100
-            : Math.round((_cl - _lp) * 100) / 100;
+      if (Number.isFinite(_lp)) {
+        // Home-centric line: Home CLV = pick - close. Away flips sign. Over/under uses same home-centric number.
+        if (_s === "away") {
+          pick.clv = Math.round((_cl - _lp) * 100) / 100;
+        } else {
+          pick.clv = Math.round((_lp - _cl) * 100) / 100;
+        }
       }
     }
   }
@@ -18542,6 +18687,20 @@ async function settleTrackedPickManualFull(signature) {
   if (!finalStatus) return alert("Invalid status.");
 
   pick.actualScore = score;
+  if ((finalStatus === "win" || finalStatus === "loss") && String(score || "").trim()) {
+    const _act = typeof actualForMarket === "function" ? actualForMarket(pick) : NaN;
+    const _line = Number(pick.line);
+    const _side = String(pick.side || "").toLowerCase();
+    if (Number.isFinite(_act) && Number.isFinite(_line) && (_side === "over" || _side === "under")) {
+      let implied = "push";
+      if (_act > _line) implied = _side === "over" ? "win" : "loss";
+      else if (_act < _line) implied = _side === "under" ? "win" : "loss";
+      if (implied !== "push" && implied !== finalStatus) {
+        alert("Typed " + finalStatus.toUpperCase() + " contradicts score " + score + " vs line " + _line + " (would be " + implied.toUpperCase() + "). Settlement refused.");
+        return;
+      }
+    }
+  }
   await applyManualSettlementToTrackedPick(signature, finalStatus);
 }
 
@@ -18653,24 +18812,27 @@ async function applyManualSettlementToTrackedPick(signature, resultStatus) {
     );
     for (const sp of shadowMatches) {
       if (sp.resultStatus !== "pending") continue;
-      sp.actualScore = updatedPick.actualScore;
-      const side = sp.side;
-      const marketLine = sp.line;
-      const actual = (typeof parseFinalScore === 'function' ? parseFinalScore(sp.actualScore).total : parseFloat(sp.actualScore));
-
-      if (String(side).toLowerCase() === "no_play") {
+      if (String(sp.side || "").toLowerCase() === "no_play") {
         sp.resultStatus = "no_play_settled";
         sp.settledAt = new Date().toISOString();
         continue;
       }
-      if (isFinite(actual) && isFinite(marketLine)) {
-        let shadowStatus = "push";
-        if (actual > marketLine) shadowStatus = side === "over" ? "win" : "loss";
-        else if (actual < marketLine) shadowStatus = side === "under" ? "win" : "loss";
-        sp.resultStatus = shadowStatus;
-        sp.settledAt = new Date().toISOString();
-        if (typeof runRetrospectiveAnalysis === "function") {
-          runRetrospectiveAnalysis(sp).catch((err) => engineDebug("Shadow retro error", err));
+      // Do not copy parent actualScore across markets. Leave pending without linescores.
+      const _sameMarket = String(sp.marketKey || "") === String(updatedPick.marketKey || "");
+      if (_sameMarket && updatedPick.actualScore != null) {
+        const _act = typeof actualForMarket === "function" ? actualForMarket({ ...sp, actualScore: updatedPick.actualScore }) : NaN;
+        if (Number.isFinite(_act) && Number.isFinite(Number(sp.line))) {
+          sp.actualScore = updatedPick.actualScore;
+          const side = String(sp.side || "").toLowerCase();
+          const marketLine = Number(sp.line);
+          let shadowStatus = "push";
+          if (_act > marketLine) shadowStatus = side === "over" ? "win" : "loss";
+          else if (_act < marketLine) shadowStatus = side === "under" ? "win" : "loss";
+          sp.resultStatus = shadowStatus;
+          sp.settledAt = new Date().toISOString();
+          if (typeof runRetrospectiveAnalysis === "function") {
+            runRetrospectiveAnalysis(sp).catch((err) => engineDebug("Shadow retro error", err));
+          }
         }
       }
     }
@@ -19061,12 +19223,25 @@ function settleTrackedPickFromCompetition(pick, competition, allowPartialSettlem
     // FT totals: books are OT-inclusive; keep final score sum.
     actual = sHome + sAway;
   } else if (market === "h2") {
-    // h2 = combined 2H TOTAL (home Q3+Q4 + away Q3+Q4). Not one team.
-    // OT points are excluded. Missing Q3/Q4 → pending; never FT-H1.
-    if (q3Home + q3Away + q4Home + q4Away > 0) {
+    // h2 = combined 2H TOTAL. 4-period: Q3+Q4. 2-period: ls[1]+ls[1]. Never FT-H1.
+    const _regPH2tot =
+      (typeof LEAGUE_FETCH_RULES !== "undefined" &&
+        LEAGUE_FETCH_RULES[pick.league || ""] &&
+        LEAGUE_FETCH_RULES[pick.league || ""].regulationPeriods) ||
+      4;
+    const q3q4ReadyTot =
+      Number.isFinite(q3Home) &&
+      Number.isFinite(q3Away) &&
+      Number.isFinite(q4Home) &&
+      Number.isFinite(q4Away);
+    if (_regPH2tot <= 2 && lsHome.length >= 2 && lsAway.length >= 2) {
+      const p2H = getVal(lsHome[1]);
+      const p2A = getVal(lsAway[1]);
+      if (!Number.isFinite(p2H) || !Number.isFinite(p2A)) return "pending";
+      actual = p2H + p2A;
+    } else if (q3q4ReadyTot) {
       actual = q3Home + q3Away + q4Home + q4Away;
     } else {
-      // No FT-H1 fallback. Missing quarters → pending (protects OT games).
       return "pending";
     }
   } else if (market === "winner") {
@@ -19170,49 +19345,51 @@ function settleTrackedPickFromCompetition(pick, competition, allowPartialSettlem
     pick.engineResultStatus = engineGrade;
     return engineGrade;
   } else if (market === "h1") {
-    if (!h1Home && !h1Away) return "pending";
+    if (!Number.isFinite(h1Home) || !Number.isFinite(h1Away)) return "pending";
     actual = h1Home + h1Away;
   } else if (market === "team_a") {
     actual = isTeamAHome ? sHome : sAway;
+    if (!Number.isFinite(actual)) return "pending";
   } else if (market === "team_b") {
     actual = isTeamAHome ? sAway : sHome;
+    if (!Number.isFinite(actual)) return "pending";
   } else if (market === "q1") {
-    if (!q1Home && !q1Away) return "pending";
+    if (!Number.isFinite(q1Home) || !Number.isFinite(q1Away)) return "pending";
     actual = q1Home + q1Away;
   } else if (market === "q2") {
-    if (!q2Home && !q2Away) return "pending";
+    if (!Number.isFinite(q2Home) || !Number.isFinite(q2Away)) return "pending";
     actual = q2Home + q2Away;
   } else if (market === "q3") {
-    if (!q3Home && !q3Away) return "pending";
+    if (!Number.isFinite(q3Home) || !Number.isFinite(q3Away)) return "pending";
     actual = q3Home + q3Away;
   } else if (market === "q4") {
-    if (!q4Home && !q4Away) return "pending";
+    if (!Number.isFinite(q4Home) || !Number.isFinite(q4Away)) return "pending";
     actual = q4Home + q4Away;
   } else if (market === "high_q_ou") {
-    if (!q4Home && !q4Away) return "pending";
+    if (!Number.isFinite(q1Home) || !Number.isFinite(q1Away) || !Number.isFinite(q2Home) || !Number.isFinite(q2Away) || !Number.isFinite(q3Home) || !Number.isFinite(q3Away) || !Number.isFinite(q4Home) || !Number.isFinite(q4Away)) return "pending";
     const qs = [q1Home + q1Away, q2Home + q2Away, q3Home + q3Away, q4Home + q4Away].filter((q) =>
       Number.isFinite(q),
     );
     if (!qs.length) return "pending";
     actual = Math.max(...qs);
   } else if (market === "low_q_ou") {
-    if (!q4Home && !q4Away) return "pending";
+    if (!Number.isFinite(q1Home) || !Number.isFinite(q1Away) || !Number.isFinite(q2Home) || !Number.isFinite(q2Away) || !Number.isFinite(q3Home) || !Number.isFinite(q3Away) || !Number.isFinite(q4Home) || !Number.isFinite(q4Away)) return "pending";
     const qs = [q1Home + q1Away, q2Home + q2Away, q3Home + q3Away, q4Home + q4Away].filter((q) =>
       Number.isFinite(q),
     );
     if (!qs.length) return "pending";
     actual = Math.min(...qs);
   } else if (market === "q1_team_a") {
-    if (!q1Home && !q1Away) return "pending";
+    if (!Number.isFinite(q1Home) || !Number.isFinite(q1Away)) return "pending";
     actual = isTeamAHome ? q1Home : q1Away;
   } else if (market === "q1_team_b") {
-    if (!q1Home && !q1Away) return "pending";
+    if (!Number.isFinite(q1Home) || !Number.isFinite(q1Away)) return "pending";
     actual = isTeamAHome ? q1Away : q1Home;
   } else if (market === "h1_team_a") {
-    if (!h1Home && !h1Away) return "pending";
+    if (!Number.isFinite(h1Home) || !Number.isFinite(h1Away)) return "pending";
     actual = isTeamAHome ? h1Home : h1Away;
   } else if (market === "h1_team_b") {
-    if (!h1Home && !h1Away) return "pending";
+    if (!Number.isFinite(h1Home) || !Number.isFinite(h1Away)) return "pending";
     actual = isTeamAHome ? h1Away : h1Home;
   } else if (market === "htft") {
     if ((!isFinite(h1Home) || !isFinite(h1Away) || (h1Home === 0 && h1Away === 0))) return "pending";
@@ -19242,7 +19419,7 @@ function settleTrackedPickFromCompetition(pick, competition, allowPartialSettlem
     pick.engineResultStatus = isWin ? "win" : "loss";
     return isWin ? "win" : "loss";
   } else if (market === "high_q" || market === "low_q") {
-    if (!q4Home && !q4Away) return "pending";
+    if (!Number.isFinite(q1Home) || !Number.isFinite(q1Away) || !Number.isFinite(q4Home) || !Number.isFinite(q4Away)) return "pending";
     const qs = [q1Home + q1Away, q2Home + q2Away, q3Home + q3Away, q4Home + q4Away].filter((q) =>
       Number.isFinite(q),
     );
@@ -19266,6 +19443,10 @@ function settleTrackedPickFromCompetition(pick, competition, allowPartialSettlem
   }
   const pickSide = String(pick.side).toLowerCase();
 
+  if (!Number.isFinite(actual) || !Number.isFinite(marketLine)) {
+    pick.engineResultStatus = "pending";
+    return "pending";
+  }
   let engineGrade = "push";
   if (actual > marketLine) engineGrade = pickSide === "over" ? "win" : "loss";
   else if (actual < marketLine) engineGrade = pickSide === "under" ? "win" : "loss";
@@ -20503,7 +20684,10 @@ function getPick(edge, line, league, marketKey, context = {}) {
     if (context.blowoutGap > _blowoutGapThresh) pointThreshold *= _blowoutPickMult;
   }
 
-  if (absEdge < pointThreshold) return "NO PLAY";
+  if (absEdge < pointThreshold) {
+    if (context) context.noPlayReason = "edge " + absEdge.toFixed(1) + " < threshold " + Number(pointThreshold).toFixed(1);
+    return "NO PLAY";
+  }
 
   return edge > 0 ? "OVER " + displayLine(line) : "UNDER " + displayLine(line);
 }
@@ -20809,7 +20993,12 @@ function getMarginPick(edge, league, marketKey) {
 
   const pointThreshold = getLeagueEdgePointThreshold(league, marketKey);
 
-  if (absEdge < pointThreshold) return "NO PLAY";
+  if (absEdge < pointThreshold) {
+    if (typeof engineDebug === "function") {
+      engineDebug("NO PLAY: winner/spread edge below threshold", { edge, absEdge, pointThreshold, league, marketKey });
+    }
+    return "NO PLAY";
+  }
 
   return edge > 0 ? "HOME" : "AWAY";
 }
@@ -21265,6 +21454,10 @@ function getConfidenceGrade(params) {
     quarterFormAgreement,
     league = "",
   } = params || {};
+  const injuryFetchFailed = !!(params && params.injuryFetchFailed) ||
+    (typeof AppState !== "undefined" &&
+      ((AppState.injuries && AppState.injuries.A && AppState.injuries.A.fetchFailed) ||
+        (AppState.injuries && AppState.injuries.B && AppState.injuries.B.fetchFailed)));
 
   if (
     !pick ||
@@ -21333,6 +21526,9 @@ function getConfidenceGrade(params) {
 
   if (Number.isFinite(winProb) && !isConfidenceModelFitted(league)) {
     winProb = Math.min(winProb, 0.72);
+  }
+  if (params && params.injuryFetchFailed) {
+    winProb = Math.min(Number.isFinite(winProb) ? winProb : 0.5, 0.62);
   }
 
   if (!Number.isFinite(winProb)) {
@@ -22987,7 +23183,7 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
     }
     if (_schedAsOf && typeof filterEventsAsOf === "function") {
       const cut = filterEventsAsOf(uniqueAll, _schedAsOf);
-      unique = cut.length >= 2 ? cut : uniqueAll;
+      unique = cut;
     }
   } catch (_eAsOfSched) {}
 
@@ -23004,6 +23200,9 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
   const scoredDates10 = [];
   const h1Scored10 = [];
   const h1Allowed10 = [];
+  const h2Scored10 = [];
+  const h2Allowed10 = [];
+  const h2Scored10Dates = [];
 
   const qS = { q1: [], q2: [], q3: [], q4: [] };
   const qA = { q1: [], q2: [], q3: [], q4: [] };
@@ -23015,6 +23214,8 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
       let os = ref.rawA;
       let h1m = 0,
         h1o = 0;
+      let h2mStored = null,
+        h2oStored = null;
       let gotLS = false;
       let advanced = null;
 
@@ -23043,29 +23244,41 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
           const opp = competitors.find((c) => !matchesTeam(c, tId));
 
           if (mine && opp) {
-            gotLS = true;
             ms = parseFloat(mine.score) || ms;
             os = parseFloat(opp.score) || os;
 
             const lm = mine?.linescores || [];
             const lo = opp?.linescores || [];
+            gotLS = lm.length >= 1 && lo.length >= 1;
 
             const _wentToOT =
               lm.length > rules.regulationPeriods && lo.length > rules.regulationPeriods;
 
             if (lm.length >= 1 && lo.length >= 1) {
               if (rules.regulationPeriods >= 4) {
-                h1m = (readVal(lm[0]) || 0) + (readVal(lm[1]) || 0);
-                h1o = (readVal(lo[0]) || 0) + (readVal(lo[1]) || 0);
+                const _h1m0 = readVal(lm[0]), _h1m1 = readVal(lm[1]);
+                const _h1o0 = readVal(lo[0]), _h1o1 = readVal(lo[1]);
+                if (Number.isFinite(_h1m0) && Number.isFinite(_h1m1) && Number.isFinite(_h1o0) && Number.isFinite(_h1o1)) {
+                  h1m = _h1m0 + _h1m1;
+                  h1o = _h1o0 + _h1o1;
+                } else {
+                  h1m = null;
+                  h1o = null;
+                }
                 if (lm.length >= 4 && lo.length >= 4) {
                   const _qm = [readVal(lm[0]), readVal(lm[1]), readVal(lm[2]), readVal(lm[3])];
                   const _qo = [readVal(lo[0]), readVal(lo[1]), readVal(lo[2]), readVal(lo[3])];
-                  if (_qm.every((v) => v > 0) && _qo.every((v) => v > 0)) {
+                  if (_qm.every((v) => Number.isFinite(v)) && _qo.every((v) => Number.isFinite(v))) {
                     ref.qs = { m: _qm, o: _qo };
                   }
                 }
               } else {
                 [h1m, h1o] = extractFirstHalf(lm, lo);
+                const _h2pair = extractSecondHalf(lm, lo);
+                if (Number.isFinite(_h2pair[0]) && Number.isFinite(_h2pair[1])) {
+                  h2mStored = Math.round(_h2pair[0]);
+                  h2oStored = Math.round(_h2pair[1]);
+                }
               }
               [ms, os] = stripOTFromScores(ms, os, lm, lo, rules.regulationPeriods);
             }
@@ -23090,7 +23303,11 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
               }
 
               const _regMins = getLeagueRegulationMinutes(leagueKey);
-              advanced = calculateAdvancedMetrics(sMapMine, sMapOpp, ms, os, _regMins, leagueKey);
+              if (_wentToOT) {
+                advanced = null;
+              } else {
+                advanced = calculateAdvancedMetrics(sMapMine, sMapOpp, ms, os, _regMins, leagueKey);
+              }
             }
           }
         }
@@ -23131,9 +23348,9 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
               );
             }
           }
-          const h2m = (Number(_qm[2]) || 0) + (Number(_qm[3]) || 0);
-          const h2o = (Number(_qo[2]) || 0) + (Number(_qo[3]) || 0);
-          if (h2m > 0 && h2o > 0) {
+          const h2m = Number.isFinite(_qm[2]) && Number.isFinite(_qm[3]) ? _qm[2] + _qm[3] : NaN;
+          const h2o = Number.isFinite(_qo[2]) && Number.isFinite(_qo[3]) ? _qo[2] + _qo[3] : NaN;
+          if (Number.isFinite(h2m) && Number.isFinite(h2o)) {
             advancedH2 = derivePeriodAdvanced(advanced, h2m, h2o, 0.5, leagueKey);
           }
         } else if (_regP === 2 && isFinite(ms) && isFinite(os) && h1m > 0 && h1o > 0) {
@@ -23146,12 +23363,23 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
         }
       }
 
+      if (h2mStored == null && ref.qs && Array.isArray(ref.qs.m) && ref.qs.m.length >= 4) {
+        const _qm = ref.qs.m.map(Number);
+        const _qo = (ref.qs.o || []).map(Number);
+        if (Number.isFinite(_qm[2]) && Number.isFinite(_qm[3]) && Number.isFinite(_qo[2]) && Number.isFinite(_qo[3])) {
+          h2mStored = Math.round(_qm[2] + _qm[3]);
+          h2oStored = Math.round(_qo[2] + _qo[3]);
+        }
+      }
       return {
         ms: Math.round(ms),
         os: Math.round(os),
         gotLS: !!gotLS,
-        h1m: gotLS && h1m > 0 ? Math.round(h1m) : null,
-        h1o: gotLS && h1o > 0 ? Math.round(h1o) : null,
+        eventId: ref.id || null,
+        h1m: gotLS && Number.isFinite(h1m) && h1m > 0 ? Math.round(h1m) : null,
+        h1o: gotLS && Number.isFinite(h1o) && h1o > 0 ? Math.round(h1o) : null,
+        h2m: h2mStored,
+        h2o: h2oStored,
         qs: ref.qs,
         advanced: advanced,
         advancedH1: advancedH1,
@@ -23187,6 +23415,11 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
       h1Allowed10.push(game.h1o);
       h1Scored10Dates.push(game.date || null);
     }
+    if (game.h2m !== null && game.h2o !== null && Number.isFinite(game.h2m) && Number.isFinite(game.h2o)) {
+      h2Scored10.push(game.h2m);
+      h2Allowed10.push(game.h2o);
+      h2Scored10Dates.push(game.date || null);
+    }
 
     if (game.qs) {
       qS.q1.push(game.qs.m[0]);
@@ -23210,6 +23443,10 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
         allowed: allowed10.slice(0, 10),
         h1Scored: h1Scored10.slice(0, 10),
         h1Allowed: h1Allowed10.slice(0, 10),
+        h2Scored: h2Scored10.slice(0, 10),
+        h2Allowed: h2Allowed10.slice(0, 10),
+        h2ScoredDates: h2Scored10Dates.slice(0, 10),
+        eventIds: summaries.filter(Boolean).map((s) => s.eventId).slice(0, 10),
         q1Scored: qS.q1.slice(0, 10),
         q2Scored: qS.q2.slice(0, 10),
         q3Scored: qS.q3.slice(0, 10),
@@ -23222,12 +23459,12 @@ async function fetchScheduleCore(base, teamId, leagueKey, requiredVenue, allowFa
         drtg10: summaries.filter((s) => s && s.advanced).map((s) => s.advanced.drtg),
         pace10: summaries.filter((s) => s && s.advanced).map((s) => s.advanced.pace),
         // Period-native advanced series (box possessions × period points)
-        ortg10_h1: summaries.filter((s) => s && s.advancedH1).map((s) => s.advancedH1.ortg),
-        drtg10_h1: summaries.filter((s) => s && s.advancedH1).map((s) => s.advancedH1.drtg),
-        pace10_h1: summaries.filter((s) => s && s.advancedH1).map((s) => s.advancedH1.pace),
-        ortg10_h2: summaries.filter((s) => s && s.advancedH2).map((s) => s.advancedH2.ortg),
-        drtg10_h2: summaries.filter((s) => s && s.advancedH2).map((s) => s.advancedH2.drtg),
-        pace10_h2: summaries.filter((s) => s && s.advancedH2).map((s) => s.advancedH2.pace),
+        ortg10_h1: summaries.filter((s) => s && s.advancedH1 && !s.advancedH1.synthetic).map((s) => s.advancedH1.ortg),
+        drtg10_h1: summaries.filter((s) => s && s.advancedH1 && !s.advancedH1.synthetic).map((s) => s.advancedH1.drtg),
+        pace10_h1: summaries.filter((s) => s && s.advancedH1 && !s.advancedH1.synthetic).map((s) => s.advancedH1.pace),
+        ortg10_h2: summaries.filter((s) => s && s.advancedH2 && !s.advancedH2.synthetic).map((s) => s.advancedH2.ortg),
+        drtg10_h2: summaries.filter((s) => s && s.advancedH2 && !s.advancedH2.synthetic).map((s) => s.advancedH2.drtg),
+        pace10_h2: summaries.filter((s) => s && s.advancedH2 && !s.advancedH2.synthetic).map((s) => s.advancedH2.pace),
         ortg10_q1: summaries
           .filter((s) => s && s.advancedQ && s.advancedQ.q1)
           .map((s) => s.advancedQ.q1.ortg),
@@ -23390,9 +23627,22 @@ async function fetchH2HCore(base, teamAId, teamBId, leagueKey) {
 
   if (!candidateMap.size) return [];
 
-  const refs = [...candidateMap.values()]
-    .sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0))
-    .slice(0, 10);
+  let refs = [...candidateMap.values()]
+    .sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+  try {
+    let _h2hAsOf =
+      (typeof resolvePredictionAsOf === "function" && resolvePredictionAsOf(null, null)) ||
+      (document.getElementById("eventDate") && document.getElementById("eventDate").value) ||
+      "";
+    if (!_h2hAsOf && typeof getCurrentFixtureMeta === "function") {
+      const _fmH = getCurrentFixtureMeta();
+      _h2hAsOf = (_fmH && (_fmH.eventDate || _fmH.predictionDate || _fmH.asOf || _fmH.date)) || "";
+    }
+    if (_h2hAsOf && typeof filterEventsAsOf === "function") {
+      refs = filterEventsAsOf(refs, _h2hAsOf);
+    }
+  } catch (_eAsOfH2H) {}
+  refs = refs.slice(0, 10);
 
   const summaries = await Promise.all(
     refs.map(async (ref) => {
@@ -23929,6 +24179,7 @@ async function fetchESPNCore(league, teamAName, teamBName) {
         aStats.q2Scored,
         aStats.q3Scored,
         aStats.q4Scored,
+        aStats.eventIds,
       );
     }
     if (bStats?.q1Scored?.length >= 2) {
@@ -23939,6 +24190,7 @@ async function fetchESPNCore(league, teamAName, teamBName) {
         bStats.q2Scored,
         bStats.q3Scored,
         bStats.q4Scored,
+        bStats.eventIds,
       );
     }
 
@@ -23946,6 +24198,8 @@ async function fetchESPNCore(league, teamAName, teamBName) {
     if (bStats?.ftScoredDates?.length) stashSeriesDates("B", "ft", bStats.ftScoredDates);
     if (aStats?.h1ScoredDates?.length) stashSeriesDates("A", "h1", aStats.h1ScoredDates);
     if (bStats?.h1ScoredDates?.length) stashSeriesDates("B", "h1", bStats.h1ScoredDates);
+    if (aStats?.h2ScoredDates?.length) stashSeriesDates("A", "h2", aStats.h2ScoredDates);
+    if (bStats?.h2ScoredDates?.length) stashSeriesDates("B", "h2", bStats.h2ScoredDates);
     ["q1", "q2", "q3", "q4"].forEach((qk) => {
       if (aStats?.[qk + "ScoredDates"]?.length)
         stashSeriesDates("A", qk, aStats[qk + "ScoredDates"]);
@@ -23995,6 +24249,10 @@ async function fetchESPNCore(league, teamAName, teamBName) {
         document.getElementById("a1HScored").value = aStats.h1Scored.join(",");
       if (aStats.h1Allowed?.length > 0)
         document.getElementById("a1HAllowed").value = aStats.h1Allowed.join(",");
+      if (aStats.h2Scored?.length > 0 && document.getElementById("a2HScored"))
+        document.getElementById("a2HScored").value = aStats.h2Scored.join(",");
+      if (aStats.h2Allowed?.length > 0 && document.getElementById("a2HAllowed"))
+        document.getElementById("a2HAllowed").value = aStats.h2Allowed.join(",");
 
       if (aStats.q1Scored?.length > 0) {
         document.getElementById("aQ1Scored").value = aStats.q1Scored.join(",");
@@ -24042,6 +24300,10 @@ async function fetchESPNCore(league, teamAName, teamBName) {
         document.getElementById("b1HScored").value = bStats.h1Scored.join(",");
       if (bStats.h1Allowed?.length > 0)
         document.getElementById("b1HAllowed").value = bStats.h1Allowed.join(",");
+      if (bStats.h2Scored?.length > 0 && document.getElementById("b2HScored"))
+        document.getElementById("b2HScored").value = bStats.h2Scored.join(",");
+      if (bStats.h2Allowed?.length > 0 && document.getElementById("b2HAllowed"))
+        document.getElementById("b2HAllowed").value = bStats.h2Allowed.join(",");
 
       if (bStats.q1Scored?.length > 0) {
         document.getElementById("bQ1Scored").value = bStats.q1Scored.join(",");
@@ -24467,8 +24729,18 @@ function filterEventsAsOf(events, predictionDate) {
 function resolvePredictionAsOf(explicit, contextData) {
   if (explicit != null && explicit !== "") return explicit;
   try {
-    if (contextData && (contextData.predictionDate || contextData.asOf || contextData.eventDate)) {
-      return contextData.predictionDate || contextData.asOf || contextData.eventDate;
+    if (contextData) {
+      const fm = contextData.fixtureMeta || {};
+      const v =
+        fm.eventDate ||
+        contextData.eventDate ||
+        contextData.predictionDate ||
+        contextData.asOf ||
+        fm.predictionDate ||
+        fm.asOf ||
+        fm.date ||
+        null;
+      if (v) return v;
     }
   } catch (_e) {}
   try {
@@ -24483,21 +24755,21 @@ function resolvePredictionAsOf(explicit, contextData) {
 
 function filterNumericSeriesWithParallelDates(values, dates, predictionDate) {
   const vals = Array.isArray(values) ? values : [];
-  const clean = vals.map(Number).filter(function (v) { return isFinite(v) && v > 0; });
+  const clean = vals.map(Number).filter(function (v) { return isFinite(v); });
   if (!predictionDate) return clean;
   const cutoff = Date.parse(predictionDate);
-  if (!Number.isFinite(cutoff)) return clean;
-  if (!Array.isArray(dates) || !dates.length) return clean;
+  if (!Number.isFinite(cutoff)) return [];
+  if (!Array.isArray(dates) || !dates.length) return [];
   const out = [];
   for (let i = 0; i < vals.length; i++) {
     const v = Number(vals[i]);
-    if (!isFinite(v) || v <= 0) continue;
+    if (!isFinite(v)) continue;
     const d = dates[i];
     if (d == null || d === "") continue;
     const ts = typeof d === "number" ? d : Date.parse(d);
     if (Number.isFinite(ts) && ts <= cutoff) out.push(v);
   }
-  return out.length ? out : clean;
+  return out;
 }
 
 function getFetchedSeries(side, scope, marketKey, metric, contextData = null) {
@@ -24620,6 +24892,12 @@ function getManualSeries(side, marketKey, parsed, contextRoot = null) {
   if (side === "B" && marketKey === "h1") return safeArr(parsed.b1HScored) || [];
 
   if (marketKey === "h2") {
+    const persisted = side === "A" ? (safeArr(parsed.a2HScored) || []) : (safeArr(parsed.b2HScored) || []);
+    if (persisted.length) return persisted;
+    const _fbRoot =
+      contextRoot || (typeof AppState !== "undefined" ? AppState.context?.data : null) || {};
+    const ctxH2 = _fbRoot?.[side]?.h2Scored || _fbRoot?.[side]?.overall?.h2Scored10;
+    if (Array.isArray(ctxH2) && ctxH2.length) return ctxH2.slice(0, 10);
     // FIX (CRITICAL #2): pass contextRoot through the recursive q3/q4 calls so
     // the fallback below resolves against the caller's contextData, not AppState.
     const q3 = getManualSeries(side, "q3", parsed, contextRoot);
@@ -24649,7 +24927,7 @@ function getManualSeries(side, marketKey, parsed, contextRoot = null) {
   return [];
 }
 
-function getManualAllowedSeries(side, marketKey, parsed) {
+function getManualAllowedSeries(side, marketKey, parsed, contextRoot = null) {
   // Temporal: same as getManualSeries — filterEventsAsOf / asOf / eventDate / predictionDate.
   // Temporal filter must be invoked with (events, asOf) — not merely referenced.
   // void-filterEventsAsOf removed (Issue 34: auditor must not treat a void ref as proof).
@@ -24660,8 +24938,14 @@ function getManualAllowedSeries(side, marketKey, parsed) {
   if (side === "B" && marketKey === "h1") return safeArr(parsed.b1HAllowed) || [];
 
   if (marketKey === "h2") {
-    const q3 = getManualAllowedSeries(side, "q3", parsed);
-    const q4 = getManualAllowedSeries(side, "q4", parsed);
+    const persisted = side === "A" ? (safeArr(parsed.a2HAllowed) || []) : (safeArr(parsed.b2HAllowed) || []);
+    if (persisted.length) return persisted;
+    const _fbRoot =
+      contextRoot || (typeof AppState !== "undefined" ? AppState.context?.data : null) || {};
+    const ctxH2A = _fbRoot?.[side]?.overall?.h2Allowed10;
+    if (Array.isArray(ctxH2A) && ctxH2A.length) return ctxH2A.slice(0, 10);
+    const q3 = getManualAllowedSeries(side, "q3", parsed, contextRoot);
+    const q4 = getManualAllowedSeries(side, "q4", parsed, contextRoot);
     const n = Math.min(q3.length, q4.length);
     const out = [];
     for (let i = 0; i < n; i++) {
@@ -24678,7 +24962,7 @@ function getManualAllowedSeries(side, marketKey, parsed) {
   return [];
 }
 
-function getH2HSeries(side, marketKey, parsed) {
+function getH2HSeries(side, marketKey, parsed, contextRoot = null) {
   // Temporal: H2H series must come from asOf-filtered H2H events
   // (filterEventsAsOf / resolvePredictionAsOf / eventDate / predictionDate).
   // Temporal filter must be invoked with (events, asOf) — not merely referenced.
@@ -24695,14 +24979,24 @@ function getH2HSeries(side, marketKey, parsed) {
     if (parsed && Array.isArray(parsed[parsedH2Key]) && parsed[parsedH2Key].length >= 2) {
       return safeArr(parsed[parsedH2Key]).slice(0, 10);
     }
+    const _h2hRoot = contextRoot || (parsed && parsed.h2hGames ? parsed : null);
     const gamesFromParsed =
       parsed && Array.isArray(parsed.h2hGames) ? parsed.h2hGames : null;
+    const gamesFromCtx =
+      _h2hRoot && Array.isArray(_h2hRoot.h2hGames) ? _h2hRoot.h2hGames : null;
     const gamesFromApp =
-      AppState.context && Array.isArray(AppState.context.data?.h2hGames)
+      !_h2hRoot && AppState.context && Array.isArray(AppState.context.data?.h2hGames)
         ? AppState.context.data.h2hGames
         : [];
-    const games = gamesFromParsed && gamesFromParsed.length ? gamesFromParsed : gamesFromApp;
-    const tId = String((side === "A" ? selectedTeamIds?.A : selectedTeamIds?.B) || "");
+    const games = (gamesFromParsed && gamesFromParsed.length)
+      ? gamesFromParsed
+      : (gamesFromCtx && gamesFromCtx.length ? gamesFromCtx : (contextRoot ? [] : gamesFromApp));
+    const tId = String(
+      (games[0] && (side === "A" ? games[0].teamAId : games[0].teamBId)) ||
+        (contextRoot && contextRoot.fixtureMeta && (side === "A" ? contextRoot.fixtureMeta.teamAId : contextRoot.fixtureMeta.teamBId)) ||
+        (contextRoot && !contextRoot.h2hGames ? "" : (side === "A" ? selectedTeamIds?.A : selectedTeamIds?.B)) ||
+        "",
+    );
     if (games.length && tId) {
       const fromGames = [];
       for (const g of games) {
@@ -24715,8 +25009,8 @@ function getH2HSeries(side, marketKey, parsed) {
       }
       if (fromGames.length >= 2) return fromGames.slice(0, 10);
     }
-    const q3 = getH2HSeries(side, "q3", parsed);
-    const q4 = getH2HSeries(side, "q4", parsed);
+    const q3 = getH2HSeries(side, "q3", parsed, contextRoot);
+    const q4 = getH2HSeries(side, "q4", parsed, contextRoot);
     const n = Math.min(q3.length, q4.length);
     const out = [];
     for (let i = 0; i < n; i++) {
@@ -25040,8 +25334,8 @@ function computeFTProjection({
 
   const aFTS = getOverallSeries("A", 10, _ctxRoot, parsed?.aFTScored);
   const bFTS = getOverallSeries("B", 10, _ctxRoot, parsed?.bFTScored);
-  const aFTA = getManualAllowedSeries("A", "ft", parsed);
-  const bFTA = getManualAllowedSeries("B", "ft", parsed);
+  const aFTA = getManualAllowedSeries("A", "ft", parsed, _ctxRoot);
+  const bFTA = getManualAllowedSeries("B", "ft", parsed, _ctxRoot);
 
   // Venue-neutral: when venueEffect/netVenueEffect is explicitly 0, do not blend
   // home/away splits (avoids hidden A/B asymmetry under identical overall series).
@@ -25061,8 +25355,8 @@ function computeFTProjection({
   }
 
   const sampleSize = Math.min(aFTS.length, bFTS.length);
-  const aOverallAvg = getDateAwareOrFallbackAverage(aFTS, "A", "ft");
-  const bOverallAvg = getDateAwareOrFallbackAverage(bFTS, "B", "ft");
+  const aOverallAvg = getDateAwareOrFallbackAverage(aFTS, "A", "ft", _ctxRoot, league);
+  const bOverallAvg = getDateAwareOrFallbackAverage(bFTS, "B", "ft", _ctxRoot, league);
   const aVenueAvg = avgOrNaN(aVenueFTS);
   const bVenueAvg = avgOrNaN(bVenueFTS);
   const aScoredBlendFT = computeVenueBlend(aOverallAvg, aVenueAvg, aVenueFTS.length);
@@ -25087,6 +25381,8 @@ function computeFTProjection({
 
   const isEspnLeague = Object.prototype.hasOwnProperty.call(ESPN_LEAGUE_SLUGS, league);
 
+  const _hasNamedPace = Object.prototype.hasOwnProperty.call(LEAGUE_PACE_BASES, league);
+  const _hasNamedRating = Object.prototype.hasOwnProperty.call(LEAGUE_RATING_BASES, league);
   const leaguePaceBase =
     LEAGUE_PACE_BASES[league] ||
     LEAGUE_PACE_BASES.default *
@@ -25097,6 +25393,7 @@ function computeFTProjection({
     LEAGUE_RATING_BASES.default *
       ((LEAGUE_BASES[league] || LEAGUE_BASES.unknown) / LEAGUE_BASES.unknown) ||
     110;
+  const _pointsOnlyPrior = !_hasNamedPace || !_hasNamedRating;
 
   const leagueBaseFT = eb / 2;
   let synPace = leaguePaceBase;
@@ -25296,8 +25593,8 @@ function computeFTProjection({
     _ftVolRatio = clampNumber(_ftVolRatio * 1.15, 0, 2.5);
   }
 
-  const aH2H = getH2HSeries("A", "ft", parsed);
-  const bH2H = getH2HSeries("B", "ft", parsed);
+  const aH2H = getH2HSeries("A", "ft", parsed, _ctxRoot);
+  const bH2H = getH2HSeries("B", "ft", parsed, _ctxRoot);
   const ftHasH2H =
     maybeReadH2HEnabled("ft", _ctxRoot?.h2hToggleSnapshot) && aH2H.length >= 2 && bH2H.length >= 2;
   let projAFT = aS;
@@ -25471,6 +25768,7 @@ function computeFTProjection({
     projBFT,
     ftProj,
     ftSampleTier,
+    pointsOnlyPrior: !!_pointsOnlyPrior,
     ftHasH2H,
     ftEdge,
     aEdge,
@@ -25529,11 +25827,11 @@ function compute1HProjection({
 
   let aS1 = getManualSeries("A", "h1", parsed);
   let bS1 = getManualSeries("B", "h1", parsed);
-  let aA1 = getManualAllowedSeries("A", "h1", parsed);
-  let bA1 = getManualAllowedSeries("B", "h1", parsed);
+  let aA1 = getManualAllowedSeries("A", "h1", parsed, _ctxRoot);
+  let bA1 = getManualAllowedSeries("B", "h1", parsed, _ctxRoot);
 
-  const _dateAwareAvgA1 = getDateAwareOrFallbackAverage(aS1, "A", "h1");
-  const _dateAwareAvgB1 = getDateAwareOrFallbackAverage(bS1, "B", "h1");
+  const _dateAwareAvgA1 = getDateAwareOrFallbackAverage(aS1, "A", "h1", _ctxRoot, league);
+  const _dateAwareAvgB1 = getDateAwareOrFallbackAverage(bS1, "B", "h1", _ctxRoot, league);
 
   const h1SampleTier = getSampleTier(aS1, bS1);
   if (h1SampleTier === "insufficient") {
@@ -25638,14 +25936,21 @@ function compute1HProjection({
   }
 
   let projA1H, projB1H;
-  const _tw1 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+  const _tw1Raw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+  const _tw1 = Math.min(1, Math.max(0, _tw1Raw));
   const _ow1 = 1 - _tw1;
   const _missingDefenseA1 = !isFinite(bAllowed);
   const _missingDefenseB1 = !isFinite(aAllowed);
+  let _tw1Eff = _tw1;
+  let _ow1Eff = _ow1;
+  if (_missingDefenseA1 || _missingDefenseB1) {
+    _tw1Eff = Math.min(_tw1, 0.55);
+    _ow1Eff = 1 - _tw1Eff;
+  }
   const projA1H_points =
-    isFinite(aS_pre) && isFinite(bAllowed) ? aS_pre * _tw1 + bAllowed * _ow1 : aS_pre;
+    isFinite(aS_pre) && isFinite(bAllowed) ? aS_pre * _tw1Eff + bAllowed * _ow1Eff : aS_pre;
   const projB1H_points =
-    isFinite(bS_pre) && isFinite(aAllowed) ? bS_pre * _tw1 + aAllowed * _ow1 : bS_pre;
+    isFinite(bS_pre) && isFinite(aAllowed) ? bS_pre * _tw1Eff + aAllowed * _ow1Eff : bS_pre;
 
   if (isEspnLeague && hasRealRatings && hasRealPace) {
     const _betaO1 = Math.min(1.5, Math.max(0.25, Number((typeof getParam === "function" ? getParam("advBetaOffense", league) : null) ?? 1.0)));
@@ -25710,8 +26015,8 @@ function compute1HProjection({
       ? clampNumber(_h1TotalSd / volLimit, 0.5, 2.5)
       : Math.max(aVol1 || 0, bVol1 || 0);
 
-  const aH2H = getH2HSeries("A", "h1", parsed);
-  const bH2H = getH2HSeries("B", "h1", parsed);
+  const aH2H = getH2HSeries("A", "h1", parsed, _ctxRoot);
+  const bH2H = getH2HSeries("B", "h1", parsed, _ctxRoot);
   const h1HasH2H =
     maybeReadH2HEnabled("h1", _ctxRoot?.h2hToggleSnapshot) && aH2H.length >= 2 && bH2H.length >= 2;
   if (h1HasH2H) {
@@ -25888,11 +26193,11 @@ function compute2HProjection({
 
   let aS2 = getManualSeries("A", "h2", parsed, _ctxRoot2H);
   let bS2 = getManualSeries("B", "h2", parsed, _ctxRoot2H);
-  let aA2 = getManualAllowedSeries("A", "h2", parsed);
-  let bA2 = getManualAllowedSeries("B", "h2", parsed);
+  let aA2 = getManualAllowedSeries("A", "h2", parsed, _ctxRoot2H);
+  let bA2 = getManualAllowedSeries("B", "h2", parsed, _ctxRoot2H);
 
-  const _dateAwareAvgA2 = getDateAwareOrFallbackAverage(aS2, "A", "h2");
-  const _dateAwareAvgB2 = getDateAwareOrFallbackAverage(bS2, "B", "h2");
+  const _dateAwareAvgA2 = getDateAwareOrFallbackAverage(aS2, "A", "h2", _ctxRoot2H, league);
+  const _dateAwareAvgB2 = getDateAwareOrFallbackAverage(bS2, "B", "h2", _ctxRoot2H, league);
 
   const h2SampleTier = getSampleTier(aS2, bS2);
   if (h2SampleTier === "insufficient") {
@@ -25978,12 +26283,21 @@ function compute2HProjection({
   }
 
   let projA2H, projB2H;
-  const _tw2 = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+  const _tw2Raw = isFinite(config?.teamWeight) ? Number(config.teamWeight) : 0.65;
+  const _tw2 = Math.min(1, Math.max(0, _tw2Raw));
   const _ow2 = 1 - _tw2;
+  const _missingDefenseA2 = !isFinite(bAllowed);
+  const _missingDefenseB2 = !isFinite(aAllowed);
+  let _tw2Eff = _tw2;
+  let _ow2Eff = _ow2;
+  if (_missingDefenseA2 || _missingDefenseB2) {
+    _tw2Eff = Math.min(_tw2, 0.55);
+    _ow2Eff = 1 - _tw2Eff;
+  }
   const projA2H_points =
-    isFinite(aS_pre) && isFinite(bAllowed) ? aS_pre * _tw2 + bAllowed * _ow2 : aS_pre;
+    isFinite(aS_pre) && isFinite(bAllowed) ? aS_pre * _tw2Eff + bAllowed * _ow2Eff : aS_pre;
   const projB2H_points =
-    isFinite(bS_pre) && isFinite(aAllowed) ? bS_pre * _tw2 + aAllowed * _ow2 : bS_pre;
+    isFinite(bS_pre) && isFinite(aAllowed) ? bS_pre * _tw2Eff + aAllowed * _ow2Eff : bS_pre;
 
   // 2H advanced: prefer auto-fetch H2 box series (possessions × H2 points).
   // Fallback: synthetic efficiency from H2 scored/allowed + game pace (no FT ORTG).
@@ -26004,7 +26318,7 @@ function compute2HProjection({
       drtgB_h2,
       paceForAdv = synPace;
 
-    if (_advA2.source === "h2" && _advB2.source === "h2") {
+    if (_advA2.source === "h2" && _advB2.source === "h2" && _advA2.source !== "synthetic") {
       ortgA_h2 = avgOrNaN(_advA2.ortg);
       drtgA_h2 = avgOrNaN(_advA2.drtg);
       ortgB_h2 = avgOrNaN(_advB2.ortg);
@@ -26013,20 +26327,11 @@ function compute2HProjection({
       const pB = avgOrNaN(_advB2.pace);
       if (isFinite(pA) && pA > 0 && isFinite(pB) && pB > 0) paceForAdv = (pA + pB) / 2;
     } else {
-      const halfMins = _h2RegMinutes / 2;
-      const halfPoss = isFinite(synPace) && synPace > 0 ? (synPace * halfMins) / 48 : NaN;
-      ortgA_h2 =
-        isFinite(halfPoss) && halfPoss > 0 && isFinite(aS_pre) ? (100 * aS_pre) / halfPoss : NaN;
-      drtgA_h2 =
-        isFinite(halfPoss) && halfPoss > 0 && isFinite(aAllowed)
-          ? (100 * aAllowed) / halfPoss
-          : NaN;
-      ortgB_h2 =
-        isFinite(halfPoss) && halfPoss > 0 && isFinite(bS_pre) ? (100 * bS_pre) / halfPoss : NaN;
-      drtgB_h2 =
-        isFinite(halfPoss) && halfPoss > 0 && isFinite(bAllowed)
-          ? (100 * bAllowed) / halfPoss
-          : NaN;
+      // Honesty: never reconstruct ORTG from the H2 points kernel. Period-native or points-only.
+      ortgA_h2 = NaN;
+      drtgA_h2 = NaN;
+      ortgB_h2 = NaN;
+      drtgB_h2 = NaN;
     }
 
     const hasNativeAdv2H =
@@ -26100,8 +26405,8 @@ function compute2HProjection({
       ? clampNumber(_h2TotalSd / volLimit, 0.5, 2.5)
       : Math.max(aVol2 || 0, bVol2 || 0);
 
-  const aH2H = getH2HSeries("A", "h2", parsed);
-  const bH2H = getH2HSeries("B", "h2", parsed);
+  const aH2H = getH2HSeries("A", "h2", parsed, _ctxRoot2H);
+  const bH2H = getH2HSeries("B", "h2", parsed, _ctxRoot2H);
   const h2HasH2H =
     maybeReadH2HEnabled("h2", _ctxRoot2H?.h2hToggleSnapshot) &&
     aH2H.length >= 2 &&
@@ -26270,8 +26575,18 @@ function getSeasonYearForDateAndLeague(dateObj, league) {
   const year = dateObj.getUTCFullYear();
   const month = dateObj.getUTCMonth();
   const l = String(league || "").toLowerCase();
-
-  if (["nba", "ncaa", "ncaaw", "nba_gl"].includes(l) && month >= 9) return year + 1;
+  // Share getCurrentSeasonYear's wrap map so NCAA October and WNBA winter agree.
+  const LEAGUE_SEASON_START_MONTH = {
+    nba: 9, ncaa: 10, ncaaw: 10, nba_gl: 10,
+    euroleague: 8, eurocup: 8, champions_league: 8, acb: 8, lba: 8, bbl: 8,
+    turkey_bsl: 8, ausnbl: 9, bleague: 8, united_league: 9, proa: 8,
+    korea_kbl: 9, cba: 10, bal: 2, aba: 8, aba_pre: 8,
+  };
+  if (Object.prototype.hasOwnProperty.call(LEAGUE_SEASON_START_MONTH, l)) {
+    const startMonth = LEAGUE_SEASON_START_MONTH[l];
+    return month >= startMonth ? year + 1 : year;
+  }
+  if (["wnba", "wnba_pre"].includes(l) && month < 4) return year - 1;
   if (["wnba", "wnba_pre"].includes(l)) return year;
 
   const singleYearLeagues = [
@@ -26374,6 +26689,9 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed, contextData = null
             : [],
       };
     }
+    if (marketKey === "h2") {
+      return { A: [], B: [] };
+    }
     return { A: [], B: [] };
   }
 
@@ -26399,9 +26717,9 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed, contextData = null
   games.slice(0, weights.length).forEach((g) => {
     // FIX Issue 36: bind to selected Team A id (fetchH2HCore scoreA identity), not homeId.
     const teamAIdStr = String(
-      (typeof selectedTeamIds !== "undefined" && selectedTeamIds?.A) ||
-        fixtureMeta?.teamAId ||
+      fixtureMeta?.teamAId ||
         fixtureMeta?.selectedTeamAId ||
+        (_h2hRoot && _h2hRoot.fixtureMeta && _h2hRoot.fixtureMeta.teamAId) ||
         "",
     );
     const isTeamA =
@@ -26422,7 +26740,9 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed, contextData = null
                 ? isTeamA ? g.q3A : g.q3B
                 : marketKey === "q4"
                   ? isTeamA ? g.q4A : g.q4B
-                  : 0;
+                  : marketKey === "h2"
+                    ? isTeamA ? g.h2A : g.h2B
+                    : 0;
 
     const valueB =
       marketKey === "ft"
@@ -26437,7 +26757,9 @@ function getMassacreH2HSeries(marketKey, fixtureMeta, parsed, contextData = null
                 ? isTeamA ? g.q3B : g.q3A
                 : marketKey === "q4"
                   ? isTeamA ? g.q4B : g.q4A
-                  : 0;
+                  : marketKey === "h2"
+                    ? isTeamA ? g.h2B : g.h2A
+                    : 0;
 
     const vA = Number(valueA);
     const vB = Number(valueB);
@@ -26877,12 +27199,7 @@ function runOutOfSampleValidation(league) {
   let _cutoffTs = null;
   try {
     const _stored = JSON.parse(localStorage.getItem(_oosCutoffKey) || "null");
-    if (
-      _stored &&
-      isFinite(_stored.cutoffTs) &&
-      isFinite(_stored.setAt) &&
-      Date.now() - _stored.setAt < _oosRolloverMs
-    ) {
+    if (_stored && isFinite(_stored.cutoffTs)) {
       _cutoffTs = _stored.cutoffTs;
     }
   } catch (e) {
@@ -27095,14 +27412,33 @@ function buildTrackedPickPayload({
         bFTAllowedHome: readLooseSeries("bFTAllowedHome"),
         bFTScoredAway: readLooseSeries("bFTScoredAway"),
         bFTAllowedAway: readLooseSeries("bFTAllowedAway"),
+        aFTAllowed: readLooseSeries("aFTAllowed"),
+        bFTAllowed: readLooseSeries("bFTAllowed"),
+        a1HAllowed: readLooseSeries("a1HAllowed"),
+        b1HAllowed: readLooseSeries("b1HAllowed"),
+        a2HScored: readLooseSeries("a2HScored"),
+        b2HScored: readLooseSeries("b2HScored"),
+        a2HAllowed: readLooseSeries("a2HAllowed"),
+        b2HAllowed: readLooseSeries("b2HAllowed"),
+        aQ1Allowed: readLooseSeries("aQ1Allowed"),
+        aQ2Allowed: readLooseSeries("aQ2Allowed"),
+        aQ3Allowed: readLooseSeries("aQ3Allowed"),
+        aQ4Allowed: readLooseSeries("aQ4Allowed"),
+        bQ1Allowed: readLooseSeries("bQ1Allowed"),
+        bQ2Allowed: readLooseSeries("bQ2Allowed"),
+        bQ3Allowed: readLooseSeries("bQ3Allowed"),
+        bQ4Allowed: readLooseSeries("bQ4Allowed"),
       };
       const linesSnapshot = {
         ftLine: parseMarketLine(document.getElementById("ftMarket")?.value || ""),
         h1Line: parseMarketLine(document.getElementById("h1Market")?.value || ""),
+        h2Line: parseMarketLine(document.getElementById("h2Market")?.value || ""),
         aLine: parseMarketLine(document.getElementById("teamAMarket")?.value || ""),
         bLine: parseMarketLine(document.getElementById("teamBMarket")?.value || ""),
 
         handicapLine: parseHandicapLine(document.getElementById("handicapMarket")?.value || ""),
+        handicapH1Line: parseHandicapLine(document.getElementById("handicapH1Market")?.value || ""),
+        handicapH2Line: parseHandicapLine(document.getElementById("handicapH2Market")?.value || ""),
       };
       const fixtureMetaSnapshot = getCurrentFixtureMeta();
 
@@ -27203,6 +27539,8 @@ function buildTrackedPickPayload({
         fixtureMeta: fixtureMetaSnapshot,
         injMultA: AppState.injuries.A.scoringMult,
         injMultB: AppState.injuries.B.scoringMult,
+        injFetchFailedA: !!AppState.injuries.A.fetchFailed,
+        injFetchFailedB: !!AppState.injuries.B.fetchFailed,
         paramRegistryValues: paramRegistryValues,
         contextData: contextDataSnapshot,
         configSnapshot: {
@@ -27918,6 +28256,10 @@ function extractInputs(league) {
     a1HAllowed: readSeries("a1HAllowed"),
     b1HScored: readSeries("b1HScored"),
     b1HAllowed: readSeries("b1HAllowed"),
+    a2HScored: readSeries("a2HScored"),
+    a2HAllowed: readSeries("a2HAllowed"),
+    b2HScored: readSeries("b2HScored"),
+    b2HAllowed: readSeries("b2HAllowed"),
     aQ1Scored: readSeries("aQ1Scored"),
     aQ1Allowed: readSeries("aQ1Allowed"),
     aQ2Scored: readSeries("aQ2Scored"),
@@ -27989,7 +28331,14 @@ function validateExtractedInputs(extracted, league) {
   if ((tAId && tAId === tBId) || (normA && normA === normB))
     errors.push("Team A and Team B cannot be the same team.");
   function chk(s, lbl) {
-    if (s?.err) errors.push(`<b>${lbl}:</b> ${s.err}`);
+    if (s?.err) {
+      const _esc = typeof escapeHtml === "function"
+        ? escapeHtml(String(s.err))
+        : String(s.err).replace(/[&<>"']/g, function (c) {
+            return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c];
+          });
+      errors.push(`<b>${lbl}:</b> ${_esc}`);
+    }
   }
   chk(parsed.aFTScored, "Team A FT Scored");
   chk(parsed.aFTAllowed, "Team A FT Allowed");
@@ -28170,7 +28519,7 @@ async function runEngine() {
       : window.__phase2FTRecencyWeights;
     window.__phase2H2RecencyWeights = Array.isArray(_lockH2Weights) && _lockH2Weights.length
       ? _lockH2Weights
-      : window.__phase2H1RecencyWeights;
+      : null;
     if (typeof engineDebug === "function") {
       engineDebug("PHASE 7: using Lock Store", {
         league: currentLeagueForRun,
@@ -28274,7 +28623,7 @@ async function runEngine() {
         "<tr><th>Pick</th><th>Projection</th><th>Edge</th><th>Model Grade</th><th>Prediction</th></tr>" +
         '<tr><td colspan="5">⚠ Last-10 incomplete — ' +
         _last10BeforeRun.length +
-        " field(s) do not have 10 values (9 commas). Fill or re-fetch before Run.</td></tr>";
+        " field(s) are outside 8-10 values. Fill or re-fetch before Run.</td></tr>";
     }
     return;
   }
@@ -28536,7 +28885,7 @@ async function runEngine() {
       _h2VolRatio,
       league,
     );
-    const _runH2Weights = window.__phase2H2RecencyWeights || _runH1Weights;
+    const _runH2Weights = window.__phase2H2RecencyWeights || getLeagueRecencyDefaults(currentLeagueForRun);
     MODEL_TUNING.recencyWeights = _runH2Weights;
     const h2Calc = compute2HProjection({
       league,
@@ -28717,8 +29066,8 @@ async function runEngine() {
       const aS = getManualSeries("A", qKey, parsed);
       const bS = getManualSeries("B", qKey, parsed);
 
-      const _dateAwareAvgAQ = getDateAwareOrFallbackAverage(aS, "A", qKey);
-      const _dateAwareAvgBQ = getDateAwareOrFallbackAverage(bS, "B", qKey);
+      const _dateAwareAvgAQ = getDateAwareOrFallbackAverage(aS, "A", qKey, AppState.context?.data || null, league);
+      const _dateAwareAvgBQ = getDateAwareOrFallbackAverage(bS, "B", qKey, AppState.context?.data || null, league);
 
       const pKeyA = "a" + qKey.toUpperCase() + "Allowed";
       const pKeyB = "b" + qKey.toUpperCase() + "Allowed";
@@ -29093,10 +29442,10 @@ async function runEngine() {
     const ctxAQOuter = AppState.context.data?.A || {};
     const ctxBQOuter = AppState.context.data?.B || {};
 
-    const rawQ12Sum = (q1?.proj || 0) + (q2?.proj || 0);
-    const rawQ34Sum = (q3?.proj || 0) + (q4?.proj || 0);
+    const rawQ12Sum = (Number.isFinite(q1?.proj) ? q1.proj : 0) + (Number.isFinite(q2?.proj) ? q2.proj : 0);
+    const rawQ34Sum = (Number.isFinite(q3?.proj) ? q3.proj : 0) + (Number.isFinite(q4?.proj) ? q4.proj : 0);
     const h1Target = isFinite(h1Calc.h1Proj) && h1Calc.h1Proj > 0 ? h1Calc.h1Proj : rawQ12Sum;
-    const h2Target = isFinite(ftCalc.ftProj) && h1Target > 0 ? ftCalc.ftProj - h1Target : rawQ34Sum;
+    const h2Target = isFinite(h2Calc.h2Proj) && h2Calc.h2Proj > 0 ? h2Calc.h2Proj : rawQ34Sum;
     const _qAnchorW = getParam("quarterAnchorBlendWeight") ?? MODEL_TUNING.quarterAnchorBlendWeight;
 
     if (rawQ12Sum > 0 && isFinite(h1Target)) {
@@ -29271,7 +29620,7 @@ async function runEngine() {
           trap: _q3TrapPostAnchor,
           paceGapRisk: q3.paceGapRisk,
           blowoutGap: Math.abs((q3.projA || 0) - (q3.projB || 0)),
-          siblingEdge: ftCalc.ftEdge,
+          siblingEdge: (h2Calc && isFinite(h2Calc.h2Edge) ? h2Calc.h2Edge : ftCalc.ftEdge),
           quarterFormAgreement: q3.quarterFormAgreement,
           league,
         });
@@ -29322,7 +29671,7 @@ async function runEngine() {
           trap: _q4TrapPostAnchor,
           paceGapRisk: q4.paceGapRisk,
           blowoutGap: Math.abs((q4.projA || 0) - (q4.projB || 0)),
-          siblingEdge: ftCalc.ftEdge,
+          siblingEdge: (h2Calc && isFinite(h2Calc.h2Edge) ? h2Calc.h2Edge : ftCalc.ftEdge),
           quarterFormAgreement: q4.quarterFormAgreement,
           league,
         });
@@ -31563,15 +31912,26 @@ function onLeagueChange() {
   if (h1MarketElManual) h1MarketElManual.style.display = leagueVal ? "block" : "none";
 
   const h2MarketEl = document.getElementById("h2MarketSection");
-  if (h2MarketEl) h2MarketEl.style.display = leagueVal && !isWnba ? "block" : "none";
+  const h2Input = document.getElementById("h2Market");
+  const _h2SeriesA = String(document.getElementById("a2HScored")?.value || "").trim();
+  const _h2SeriesB = String(document.getElementById("b2HScored")?.value || "").trim();
+  const _q3A = String(document.getElementById("aQ3Scored")?.value || "").trim();
+  const _q4A = String(document.getElementById("aQ4Scored")?.value || "").trim();
+  const _h2SeriesReady = (_h2SeriesA && _h2SeriesB) || (_q3A && _q4A);
+  if (h2MarketEl) h2MarketEl.style.display = leagueVal && !isWnba && _h2SeriesReady ? "block" : "none";
+  if (h2Input) {
+    h2Input.disabled = !_h2SeriesReady;
+    if (!_h2SeriesReady) h2Input.value = "";
+  }
   const handicapFullEl = document.getElementById("handicapMarketSection");
   if (handicapFullEl) handicapFullEl.style.display = leagueVal && !isWnba ? "block" : "none";
   const handicapH1H2El = document.getElementById("handicapH1H2MarketSection");
   if (handicapH1H2El) handicapH1H2El.style.display = leagueVal && isWnba ? "grid" : "none";
 
+  const _qSeriesShown = isQs || !isNbaOrNcaa;
   ["q1q2MarketSection", "q3q4MarketSection"].forEach((id) => {
     const el = document.getElementById(id);
-    if (el) el.style.display = leagueVal ? "grid" : "none";
+    if (el) el.style.display = leagueVal && _qSeriesShown ? "grid" : "none";
   });
 
   const highLowQEl = document.getElementById("highLowQMarketSection");
@@ -37340,9 +37700,12 @@ const EngineAuditor = (function () {
   }
 
   function forensicLayerExecutionProof(functions) {
+    const _PURE = /^(getPick|applyVolatility|stdDev|anchorProjection|resolveConfidenceGradeFromWinProbability|forensicIndependentSettle|parseFinalScore|actualForMarket|trimmedAvg|weightedRecentAverage|clampNumber|displayLine|avgOrNaN)$/;
+    const _DENY = /save|write|clear|apply|fetch|run|settle|promote|lock|wipe|calibrat|prune|copy|init|refresh|persist|record|delete/i;
     const productFns = (functions || []).filter(f => !forensicFunctionIsAuditor(f, _forensicState.auditorStartLine || 1e9, _forensicState.auditorEndLine || -1));
     let tested = 0, proven = 0;
     productFns.forEach(function (f) {
+      if (!_PURE.test(f.name) || _DENY.test(f.name)) return;
       const fn = (typeof window !== "undefined" && typeof window[f.name] === "function") ? window[f.name]
         : (typeof globalThis !== "undefined" && typeof globalThis[f.name] === "function" ? globalThis[f.name] : null);
       if (!fn) return;
@@ -38848,11 +39211,15 @@ const EngineAuditor = (function () {
 
   function forensicLayerAutoGeneratedProbes(functions) {
     // Auto-discover exported calculation helpers and run safe smoke probes
+    const _PURE = /^(getPick|applyVolatility|stdDev|anchorProjection|resolveConfidenceGradeFromWinProbability|forensicIndependentSettle|parseFinalScore|actualForMarket|trimmedAvg|weightedRecentAverage|clampNumber|displayLine|avgOrNaN)$/;
+    const _DENY = /save|write|clear|apply|fetch|run|settle|promote|lock|wipe|calibrat|prune|copy|init|refresh|persist|record|delete/i;
     const fns = functions || _forensicState.functions || [];
     const names = fns.map(function (f) { return f.name; }).filter(Boolean);
     let probed = 0;
     names.forEach(function (name) {
-      if (!_FORENSIC_CORE_NAME_RE.test(name)) return;
+      if (!_PURE.test(name)) return;
+      if (_DENY.test(name)) return;
+      if (!_FORENSIC_CORE_NAME_RE.test(name) && !_PURE.test(name)) return;
       const fn = window[name] || globalThis[name];
       if (typeof fn !== "function") return;
       if (fn.length > 4) return; // skip heavy multi-arg without adapter
@@ -39889,8 +40256,26 @@ const EngineAuditor = (function () {
     _categoryErrors = {};
     _srcCache = null;
     _fullSrcCache = null;
+    const _prevLiveMarket = typeof g_currentLiveComputeMarket !== "undefined" ? g_currentLiveComputeMarket : null;
+    const _wrapCompute = function (orig) {
+      if (typeof orig !== "function") return orig;
+      return function () {
+        const _p = typeof g_currentLiveComputeMarket !== "undefined" ? g_currentLiveComputeMarket : null;
+        try { return orig.apply(this, arguments); }
+        finally { if (typeof g_currentLiveComputeMarket !== "undefined") g_currentLiveComputeMarket = _p; }
+      };
+    };
+    const _origFT = typeof computeFTProjection === "function" ? computeFTProjection : null;
+    const _origH1 = typeof compute1HProjection === "function" ? compute1HProjection : null;
+    const _origH2 = typeof compute2HProjection === "function" ? compute2HProjection : null;
+    try {
+      if (_origFT) { computeFTProjection = _wrapCompute(_origFT); if (typeof window !== "undefined") window.computeFTProjection = computeFTProjection; }
+      if (_origH1) { compute1HProjection = _wrapCompute(_origH1); if (typeof window !== "undefined") window.compute1HProjection = compute1HProjection; }
+      if (_origH2) { compute2HProjection = _wrapCompute(_origH2); if (typeof window !== "undefined") window.compute2HProjection = compute2HProjection; }
+    } catch (_eWrap) {}
 
     const started = Date.now();
+    try {
     for (const cat of CATEGORIES) {
       const catStart = Date.now();
       try {
@@ -39916,6 +40301,14 @@ const EngineAuditor = (function () {
         );
       }
       _categoryTimings[cat.id] = Date.now() - catStart;
+    }
+    } finally {
+      try {
+        if (_origFT) { computeFTProjection = _origFT; if (typeof window !== "undefined") window.computeFTProjection = _origFT; }
+        if (_origH1) { compute1HProjection = _origH1; if (typeof window !== "undefined") window.compute1HProjection = _origH1; }
+        if (_origH2) { compute2HProjection = _origH2; if (typeof window !== "undefined") window.compute2HProjection = _origH2; }
+        if (typeof g_currentLiveComputeMarket !== "undefined") g_currentLiveComputeMarket = _prevLiveMarket;
+      } catch (_eRestore) {}
     }
 
     _lastRunMs = Date.now() - started;
@@ -40905,6 +41298,7 @@ document.addEventListener("DOMContentLoaded", function () {
 // hidden-textarea + execCommand('copy') trick for browsers/contexts without it.
 // Replaces 6 near-identical copies of this logic that used to be inlined at each call site.
 function copyTextToClipboard(text, onDone) {
+  const _done = typeof onDone === "function" ? onDone : function () {};
   const fallback = () => {
     try {
       const ta = Object.assign(document.createElement("textarea"), {
@@ -40915,15 +41309,15 @@ function copyTextToClipboard(text, onDone) {
       ta.select();
       document.execCommand("copy");
       document.body.removeChild(ta);
-      onDone(true);
+      _done(true);
     } catch (_) {
-      onDone(false);
+      _done(false);
     }
   };
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard
       .writeText(text)
-      .then(() => onDone(true))
+      .then(() => _done(true))
       .catch(fallback);
   } else {
     fallback();
